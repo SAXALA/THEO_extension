@@ -18,20 +18,20 @@ package ethstore
 
 import (
 	"testing"
-	"./ethstore"
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/dbtest"
+		// "github.com/ethereum/go-ethereum/ethdb/ethstore" // <-- REMOVE OR COMMENT OUT THIS LINE
 )
 
 func TestEthStore(t *testing.T) {
 	t.Run("DatabaseSuite", func(t *testing.T) {
 		dbtest.TestDatabaseSuite(t, func() ethdb.KeyValueStore {
-			db, err := ethstore.Open("")
+			db, err := Open("") // Assuming Open is defined in ethstore package
 			if err != nil {
 				t.Fatal(err)
 			}
-			return &Database{
+			return &Database{ // Assuming Database is defined in ethstore package
 				db: db,
 			}
 		})
@@ -40,11 +40,11 @@ func TestEthStore(t *testing.T) {
 
 func BenchmarkEthStore(b *testing.B) {
 	dbtest.BenchDatabaseSuite(b, func() ethdb.KeyValueStore {
-		db, err := ethstore.Open("")
+		db, err := Open("") // Assuming Open is defined in ethstore package
 		if err != nil {
 			b.Fatal(err)
 		}
-		return &Database{
+		return &Database{ // Assuming Database is defined in ethstore package
 			db: db,
 		}
 	})
