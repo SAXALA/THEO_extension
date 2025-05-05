@@ -21,7 +21,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/dbtest"
-		// "github.com/ethereum/go-ethereum/ethdb/ethstore" // <-- REMOVE OR COMMENT OUT THIS LINE
 )
 
 func TestEthStore(t *testing.T) {
