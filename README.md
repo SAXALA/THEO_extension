@@ -11,6 +11,9 @@
     1. Add write batch and write commit as Pebble.
     2. Write batch: use a write batch to record all the writes and then write them to the disk with a single write.
     3. In memory write batch -> create a skip list index (temp index).
+    4. Orgainze slots based on the modified KV pairs.
+    5. Reclaim old slots (append to free list). pwrite (offset, data, size);-> size % slot size == 0 (padding 0).
+    6. Free slots list to manage all the free slots.
 4. Read path:
     1. Read append only slots: reverse the order of KV pairs in the slots. If find duplicate KV pairs, then remove them.
     2. Read accessed slots: If find duplicate KV pairs, then remove them.
@@ -25,5 +28,6 @@
     1. Prefix-aware: If the leaf node is cached, then the sibling nodes are also cached.
     2. Cache eviction: use LFU to evict the least frequently used nodes (based on leaf node). Remove the sibling nodes from the cache (if not required by other nodes in the cache).
     3. Impl: reference counter for internal nodes.
+    4. Cache + write batch: write the new KV pair into the cache, then flush the slots to the disk.
 6. Look at the writing path in Geth. Find a way to determine which KV pairs belong to the same smart contract.
     1. Use the same prefix (based on the account) for all the KV pairs of the same smart contract. E.g., Code, Account, Storage.
