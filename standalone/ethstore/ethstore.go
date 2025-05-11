@@ -159,18 +159,15 @@ func (d *Database) Put(key []byte, value []byte) error {
 }
 
 // Delete removes the key from the key-value store.
-// WARNING: This requires a block ID. Using a placeholder '0' which is likely incorrect.
-// This needs a proper mechanism to determine the block ID.
 func (d *Database) Delete(key []byte) error {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
 	if d.closed {
-		return ErrClosed // Use custom ErrClosed
+		return ErrClosed
 	}
-	// TODO: Determine the correct block ID. Using 0 as a placeholder.
-	blockID := uint64(0) // <<< PLACEHOLDER - NEEDS PROPER IMPLEMENTATION
-	d.log.Warn("Using placeholder blockID for Delete operation", "blockID", blockID, "key", string(key))
-	return d.aol.Delete(blockID, string(key))
+	// The blockID is not directly passed to AppendOnlyLog.Delete.
+	// AppendOnlyLog.Delete internally decides the blockID for the tombstone.
+	return d.aol.Delete(string(key))
 }
 
 // DeleteRange removes all keys between start and end (exclusive of end).

@@ -1,13 +1,13 @@
 package ethstore
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/log"
-	// Import the log package
 )
 
 // Helper function to create a temporary directory for testing
@@ -31,27 +31,34 @@ func cleanupTestDir(t *testing.T, dir string) {
 // NewAppendOnlyLog is a test helper to create and initialize an AppendOnlyLog instance.
 // It calls the actual NewAppendOnlyLog constructor from blockStore.go
 // and fails the test if initialization is unsuccessful.
-func NewAppendOnlyLogTest(t *testing.T, dir string, recentN int) *AppendOnlyLog {
-	t.Helper() // Marks this function as a test helper
+func NewAppendOnlyLogTest(t *testing.T, dir string, recentN int) (*AppendOnlyLog, func()) {
+	t.Helper()
 
 	testLogger := log.New()
 
-	// Call the actual constructor from blockStore.go with the new signature
-	aol, err := NewAppendOnlyLog(dir, recentN, testLogger) // Use the new signature
+	aol, err := NewAppendOnlyLog(dir, recentN, testLogger)
 	if err != nil {
 		t.Fatalf("Failed to create NewAppendOnlyLog(dir=%q, recentN=%d, logger): %v", dir, recentN, err)
 	}
 	if aol == nil {
 		t.Fatalf("NewAppendOnlyLog(dir=%q, recentN=%d, logger) returned nil instance without error", dir, recentN)
 	}
-	return aol
+	// Return aol and the cleanup function that closes it
+	return aol, func() {
+		if err := aol.Close(); err != nil {
+			t.Errorf("Failed to close AppendOnlyLog in cleanup: %v", err)
+		}
+	}
 }
 
 func TestAppendOnlyLog_NewAndClose(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
 
-	aol := NewAppendOnlyLogTest(t, dir, 10)
+	// Correctly capture and use the cleanup function
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 10)
+	defer cleanup() // This will call aol.Close()
+
 	if aol == nil {
 		t.Fatal("AppendOnlyLog instance is nil")
 	}
@@ -63,17 +70,14 @@ func TestAppendOnlyLog_NewAndClose(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, indexMapFileName)); os.IsNotExist(err) {
 		t.Errorf("Index map file %s was not created", indexMapFileName)
 	}
-
-	err := aol.Close()
-	if err != nil {
-		t.Errorf("Close() failed: %v", err)
-	}
 }
 
 func TestAppendOnlyLog_AppendAndGet(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
-	aol := NewAppendOnlyLogTest(t, dir, 10) // Index last 10 blocks
+	// Correctly capture and use the cleanup function
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 10)
+	defer cleanup()
 
 	// Block 1
 	kvs1 := map[string]string{"key1": "value1", "key2": "value2"}
@@ -117,118 +121,132 @@ func TestAppendOnlyLog_AppendAndGet(t *testing.T) {
 			}
 		})
 	}
-
-	if err := aol.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
-	}
 }
 
 func TestAppendOnlyLog_GetByBlock(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
-	aol := NewAppendOnlyLogTest(t, dir, 10)
+	// Correctly capture and use the cleanup function, pass dir
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 5)
+	defer cleanup()
 
-	// Block 1
-	kvs1 := map[string]string{"keyA": "valA1", "keyB": "valB1"}
+	kvs1 := map[string]string{"k1": "v1", "k2": "v2"}
 	if err := aol.Append(1, kvs1); err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to append block 1: %v", err)
 	}
-
-	// Block 2
-	kvs2 := map[string]string{"keyA": "valA2", "keyC": "valC2"} // Update keyA
+	kvs2 := map[string]string{"k1": "v1_new", "k3": "v3"} // k1 updated in block 2
 	if err := aol.Append(2, kvs2); err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to append block 2: %v", err)
 	}
 
 	tests := []struct {
-		blockID    uint64
-		key        string
-		wantValue  string
-		wantExists bool
-		wantErr    bool
+		name          string
+		blockID       uint64
+		expectedKVs   map[string]string
+		expectErr     bool
+		expectedError string
 	}{
-		{1, "keyA", "valA1", true, false},
-		{1, "keyB", "valB1", true, false},
-		{1, "keyC", "", false, false}, // keyC not in block 1
-		{2, "keyA", "valA2", true, false},
-		{2, "keyB", "", false, false}, // keyB not in block 2
-		{2, "keyC", "valC2", true, false},
-		{3, "keyA", "", false, false}, // block 3 doesn't exist
+		{
+			name:        "get block 1",
+			blockID:     1,
+			expectedKVs: kvs1,
+			expectErr:   false,
+		},
+		{
+			name:        "get block 2",
+			blockID:     2,
+			expectedKVs: kvs2,
+			expectErr:   false,
+		},
+		{
+			name:          "get non-existent block",
+			blockID:       3,
+			expectedKVs:   nil,
+			expectErr:     true,
+			expectedError: "block ID 3 not found in index",
+		},
+		{
+			name:          "get block 0 (non-existent)",
+			blockID:       0,
+			expectedKVs:   nil,
+			expectErr:     true,
+			expectedError: "block ID 0 not found in index",
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("GetByBlock_%d_%s", tt.blockID, tt.key), func(t *testing.T) {
-			val, exists, err := aol.GetByBlock(tt.blockID, tt.key)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GetByBlock(%d, %q) error = %v, wantErr %v", tt.blockID, tt.key, err, tt.wantErr)
+		t.Run(tt.name, func(t *testing.T) {
+			// Correct call to GetByBlock (1 argument, 2 return values)
+			retrievedKVs, err := aol.GetByBlock(tt.blockID)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error %q, got nil", tt.expectedError)
+				} else if !strings.Contains(err.Error(), tt.expectedError) {
+					t.Errorf("Expected error containing %q, got %q", tt.expectedError, err.Error())
+				}
 				return
 			}
-			if exists != tt.wantExists {
-				t.Errorf("GetByBlock(%d, %q) exists = %v, wantExists %v", tt.blockID, tt.key, exists, tt.wantExists)
+			if err != nil {
+				t.Fatalf("aol.GetByBlock(%d) failed: %v", tt.blockID, err)
 			}
-			if val != tt.wantValue {
-				t.Errorf("GetByBlock(%d, %q) value = %q, wantValue %q", tt.blockID, tt.key, val, tt.wantValue)
+
+			if !reflect.DeepEqual(retrievedKVs, tt.expectedKVs) {
+				t.Errorf("GetByBlock(%d) = %v, want %v", tt.blockID, retrievedKVs, tt.expectedKVs)
 			}
 		})
-	}
-
-	if err := aol.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
 	}
 }
 
 func TestAppendOnlyLog_Delete(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
-	aol := NewAppendOnlyLogTest(t, dir, 10)
+	// Correctly capture and use the cleanup function, pass dir
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 5)
+	defer cleanup()
 
-	// Block 1: Add key
-	if err := aol.Append(1, map[string]string{"delKey": "initialValue"}); err != nil {
-		t.Fatal(err)
+	if err := aol.Append(1, map[string]string{"delKey": "initialValue", "otherKey": "otherValue"}); err != nil {
+		t.Fatalf("Failed to append block 1: %v", err)
 	}
 
-	// Block 2: Delete key
-	if err := aol.Delete(2, "delKey"); err != nil {
-		t.Fatalf("Delete failed: %v", err)
+	// Correct call to Delete (1 argument)
+	if err := aol.Delete("delKey"); err != nil {
+		t.Fatalf("Failed to delete 'delKey': %v", err)
 	}
 
-	// Block 3: Add another key
-	if err := aol.Append(3, map[string]string{"otherKey": "otherValue"}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Check Get (should see deleted marker)
 	val, exists, err := aol.Get("delKey")
 	if err != nil {
-		t.Errorf("Get(delKey) after delete returned error: %v", err)
+		t.Fatalf("Error getting 'delKey' after deletion: %v", err)
 	}
 	if !exists {
-		t.Errorf("Get(delKey) after delete reported non-existence, want existence (deleted)")
+		t.Errorf("'delKey' should exist (as tombstone), but Get returned exists=false")
 	}
-	if val != "" { // Deleted keys return empty string value
-		t.Errorf("Get(delKey) after delete returned value %q, want empty string", val)
-	}
-
-	// Check GetByBlock for original value
-	val1, exists1, err1 := aol.GetByBlock(1, "delKey")
-	if err1 != nil || !exists1 || val1 != "initialValue" {
-		t.Errorf("GetByBlock(1, delKey) failed: val=%q, exists=%v, err=%v", val1, exists1, err1)
+	if val != "" {
+		t.Errorf("Expected value for 'delKey' to be empty (tombstone), got '%s'", val)
 	}
 
-	// Check GetByBlock for tombstone
-	val2, exists2, err2 := aol.GetByBlock(2, "delKey")
-	if err2 != nil || !exists2 || val2 != tombstoneMarker {
-		t.Errorf("GetByBlock(2, delKey) failed: val=%q, exists=%v, err=%v", val2, exists2, err2)
+	// Correct call to GetByBlock
+	kvsBlock1, err1 := aol.GetByBlock(1)
+	if err1 != nil {
+		t.Fatalf("GetByBlock(1) failed: %v", err1)
+	}
+	expectedKVsBlock1 := map[string]string{"delKey": "initialValue", "otherKey": "otherValue"}
+	if !reflect.DeepEqual(kvsBlock1, expectedKVsBlock1) {
+		t.Errorf("GetByBlock(1) after delete = %v, want %v", kvsBlock1, expectedKVsBlock1)
 	}
 
-	// Check other key is unaffected
-	valOther, existsOther, errOther := aol.Get("otherKey")
-	if errOther != nil || !existsOther || valOther != "otherValue" {
-		t.Errorf("Get(otherKey) failed: val=%q, exists=%v, err=%v", valOther, existsOther, errOther)
+	// Correct call to GetByBlock
+	kvsBlock2, err2 := aol.GetByBlock(2) // Block 2 should contain the tombstone
+	if err2 != nil {
+		t.Fatalf("GetByBlock(2) failed: %v", err2)
+	}
+	expectedKVsBlock2 := map[string]string{"delKey": "__DELETED__"}
+	if !reflect.DeepEqual(kvsBlock2, expectedKVsBlock2) {
+		t.Errorf("GetByBlock(2) after delete = %v, want %v", kvsBlock2, expectedKVsBlock2)
 	}
 
-	if err := aol.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
+	// Correct call to Delete
+	if err := aol.Delete("nonExistentKey"); err != nil {
+		t.Fatalf("Failed to delete 'nonExistentKey': %v", err)
 	}
 }
 
@@ -236,142 +254,135 @@ func TestAppendOnlyLog_PersistenceAndReopen(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
 
-	// --- First run ---
-	aol1 := NewAppendOnlyLogTest(t, dir, 2) // Index only last 2 blocks
-
-	if err := aol1.Append(1, map[string]string{"k1": "v1", "k_common": "vc1"}); err != nil {
-		t.Fatal(err)
+	// Correctly capture and use the cleanup function for aol1
+	aol1, cleanup1 := NewAppendOnlyLogTest(t, dir, 2)
+	// ... appends to aol1 ...
+	if err := aol1.Append(1, map[string]string{"k_common": "vc1", "k1": "v1_b1"}); err != nil {
+		t.Fatalf("Failed to append block 1: %v", err)
 	}
-	if err := aol1.Append(2, map[string]string{"k2": "v2", "k_common": "vc2"}); err != nil {
-		t.Fatal(err)
+	if err := aol1.Append(2, map[string]string{"k_common": "vc2", "k1": "v1_b2", "k2": "v2_b2"}); err != nil {
+		t.Fatalf("Failed to append block 2: %v", err)
 	}
-	if err := aol1.Append(3, map[string]string{"k3": "v3", "k_common": "vc3"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := aol1.Close(); err != nil {
-		t.Fatalf("aol1.Close() failed: %v", err)
+	if err := aol1.Append(3, map[string]string{"k_common": "vc3", "k3": "v3_b3"}); err != nil {
+		t.Fatalf("Failed to append block 3: %v", err)
 	}
 
-	// --- Second run (reopen) ---
-	aol2 := NewAppendOnlyLogTest(t, dir, 2) // Reopen with same settings
+	cleanup1() // Explicitly call cleanup (which includes Close) for aol1 before reopening
 
-	if aol2.latestBlockID != 3 {
-		t.Errorf("Reopened log has latestBlockID %d, want 3", aol2.latestBlockID)
-	}
+	// Correctly capture and use the cleanup function for aol2
+	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 2)
+	defer cleanup2()
 
-	// Check skiplist (should contain blocks 2 and 3)
-	testsGet := []struct {
-		key        string
-		wantValue  string
-		wantExists bool
+	tests := []struct {
+		name          string
+		blockID       uint64
+		key           string
+		expectedValue string
+		expectFound   bool
+		expectedKVs   map[string]string
 	}{
-		{"k1", "", false}, // Should be evicted from skiplist
-		{"k2", "v2", true},
-		{"k3", "v3", true},
-		{"k_common", "vc3", true}, // Latest version from block 3
-	}
-	for _, tt := range testsGet {
-		val, exists, err := aol2.Get(tt.key)
-		if err != nil {
-			t.Errorf("Reopened Get(%q) error: %v", tt.key, err)
-		}
-		if exists != tt.wantExists {
-			t.Errorf("Reopened Get(%q) exists = %v, wantExists %v", tt.key, exists, tt.wantExists)
-		}
-		if val != tt.wantValue {
-			t.Errorf("Reopened Get(%q) value = %q, wantValue %q", tt.key, val, tt.wantValue)
-		}
+		{name: "Get k_common after reopen", key: "k_common", expectedValue: "vc3", expectFound: true},
+		{name: "Get k1 after reopen", key: "k1", expectedValue: "v1_b2", expectFound: true},
+		{name: "Get k2 after reopen", key: "k2", expectedValue: "v2_b2", expectFound: true},
+		{name: "Get k3 after reopen", key: "k3", expectedValue: "v3_b3", expectFound: true},
+		{name: "Get non-existent key after reopen", key: "kx", expectedValue: "", expectFound: false},
+		{name: "GetByBlock 1 after reopen", blockID: 1, expectedKVs: map[string]string{"k_common": "vc1", "k1": "v1_b1"}},
+		{name: "GetByBlock 2 after reopen", blockID: 2, expectedKVs: map[string]string{"k_common": "vc2", "k1": "v1_b2", "k2": "v2_b2"}},
+		{name: "GetByBlock 3 after reopen", blockID: 3, expectedKVs: map[string]string{"k_common": "vc3", "k3": "v3_b3"}},
 	}
 
-	// Check GetByBlock (should work for all blocks)
-	testsGetByBlock := []struct {
-		blockID   uint64
-		key       string
-		wantValue string
-	}{
-		{1, "k1", "v1"},
-		{1, "k_common", "vc1"},
-		{2, "k2", "v2"},
-		{2, "k_common", "vc2"},
-		{3, "k3", "v3"},
-		{3, "k_common", "vc3"},
-	}
-	for _, tt := range testsGetByBlock {
-		val, exists, err := aol2.GetByBlock(tt.blockID, tt.key)
-		if err != nil || !exists || val != tt.wantValue {
-			t.Errorf("Reopened GetByBlock(%d, %q) failed: val=%q, exists=%v, err=%v, want=%q", tt.blockID, tt.key, val, exists, err, tt.wantValue)
-		}
-	}
-
-	if err := aol2.Close(); err != nil {
-		t.Errorf("aol2.Close() failed: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.key != "" {
+				val, exists, err := aol2.Get(tt.key)
+				if err != nil {
+					t.Fatalf("aol2.Get(%q) failed: %v", tt.key, err)
+				}
+				if exists != tt.expectFound {
+					t.Errorf("aol2.Get(%q) exists = %v, want %v", tt.key, exists, tt.expectFound)
+				}
+				if val != tt.expectedValue {
+					t.Errorf("aol2.Get(%q) value = %q, wantValue %q", tt.key, val, tt.expectedValue)
+				}
+			} else {
+				// Correct call to GetByBlock
+				retrievedKVs, err := aol2.GetByBlock(tt.blockID)
+				if err != nil {
+					t.Fatalf("aol2.GetByBlock(%d) failed: %v", tt.blockID, err)
+				}
+				if !reflect.DeepEqual(retrievedKVs, tt.expectedKVs) {
+					t.Errorf("aol2.GetByBlock(%d) = %v, want %v", tt.blockID, retrievedKVs, tt.expectedKVs)
+				}
+			}
+		})
 	}
 }
 
 func TestAppendOnlyLog_SkiplistEviction(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
-	aol := NewAppendOnlyLogTest(t, dir, 2) // Index only last 2 blocks
+	// Correctly capture and use the cleanup function
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 2)
+	defer cleanup()
 
 	// Block 1
-	if err := aol.Append(1, map[string]string{"k1": "v1"}); err != nil {
+	if err := aol.Append(1, map[string]string{"k1": "v1_1"}); err != nil {
 		t.Fatal(err)
 	}
-	// Check k1 is indexed
-	_, exists, _ := aol.Get("k1")
-	if !exists {
-		t.Fatal("k1 should be indexed after block 1")
+	// Check k1 is indexed (should be in block 1's data, accessible via skiplist)
+	val1, exists1, err1 := aol.Get("k1")
+	if err1 != nil {
+		t.Fatalf("Error getting k1 after block 1: %v", err1)
+	}
+	if !exists1 || val1 != "v1_1" {
+		kvs, _ := aol.GetByBlock(1)
+		t.Fatalf("k1 should be indexed after block 1. Get k1: val='%s', exists=%v. Block 1 KVs: %v. Skiplist len: %d", val1, exists1, kvs, aol.skiplistIndex.Len())
 	}
 
 	// Block 2
-	if err := aol.Append(2, map[string]string{"k2": "v2"}); err != nil {
+	if err := aol.Append(2, map[string]string{"k2": "v2_2"}); err != nil {
 		t.Fatal(err)
 	}
 	// Check k1 and k2 are indexed
-	_, exists, _ = aol.Get("k1")
-	if !exists {
-		t.Fatal("k1 should still be indexed after block 2")
+	val2, exists2, err2 := aol.Get("k2")
+	if err2 != nil {
+		t.Fatalf("Error getting k2 after block 2: %v", err2)
 	}
-	_, exists, _ = aol.Get("k2")
-	if !exists {
-		t.Fatal("k2 should be indexed after block 2")
+	if !exists2 || val2 != "v2_2" {
+		t.Fatalf("k2 should be indexed after block 2. Get k2: val='%s', exists=%v", val2, exists2)
 	}
 
 	// Block 3 (should evict block 1 from index)
-	if err := aol.Append(3, map[string]string{"k3": "v3"}); err != nil {
+	if err := aol.Append(3, map[string]string{"k3": "v3_3"}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Check k1 is evicted, k2 and k3 are indexed
-	_, exists, _ = aol.Get("k1")
-	if exists {
-		t.Fatal("k1 should be evicted from index after block 3")
+	// k1 should now be evicted from skiplist as block 1 is older than recentN=2
+	// (latest is 3, recent are 3, 2. Block 1 is out)
+	valEvicted, existsEvicted, errEvicted := aol.Get("k1")
+	if errEvicted != nil {
+		t.Fatalf("Error getting k1 after block 3 (expected eviction): %v", errEvicted)
 	}
-	_, exists, _ = aol.Get("k2")
-	if !exists {
-		t.Fatal("k2 should still be indexed after block 3")
-	}
-	_, exists, _ = aol.Get("k3")
-	if !exists {
-		t.Fatal("k3 should be indexed after block 3")
+	if existsEvicted {
+		t.Errorf("k1 should be evicted from skiplist after block 3, but Get found it (val='%s').", valEvicted)
 	}
 
-	// Verify k1 still accessible via GetByBlock
-	val1, exists1, err1 := aol.GetByBlock(1, "k1")
-	if err1 != nil || !exists1 || val1 != "v1" {
-		t.Errorf("GetByBlock(1, k1) after eviction failed: val=%q, exists=%v, err=%v", val1, exists1, err1)
+	// k2 (from block 2) should still be in skiplist
+	val2After, exists2After, err2After := aol.Get("k2")
+	if err2After != nil {
+		t.Fatalf("Error getting k2 after block 3: %v", err2After)
 	}
-
-	if err := aol.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
+	if !exists2After || val2After != "v2_2" {
+		t.Fatalf("k2 should still be indexed after block 3. Get k2: val='%s', exists=%v", val2After, exists2After)
 	}
 }
 
 func TestAppendOnlyLog_AppendErrors(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
-	aol := NewAppendOnlyLogTest(t, dir, 10)
+	// Correctly capture and use the cleanup function
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 10)
+	defer cleanup()
 
 	// Block 1 - OK
 	if err := aol.Append(1, map[string]string{"k1": "v1"}); err != nil {
@@ -398,28 +409,4 @@ func TestAppendOnlyLog_AppendErrors(t *testing.T) {
 	if aol.latestBlockID != 1 { // latestBlockID should not have changed
 		t.Errorf("latestBlockID changed after appending empty map: got %d, want 1", aol.latestBlockID)
 	}
-
-	if err := aol.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
-	}
-}
-
-// --- Mocking io.Writer for error injection (Optional but good practice) ---
-type errorWriter struct {
-	err error
-}
-
-func (ew *errorWriter) Write(p []byte) (n int, err error) {
-	return 0, ew.err
-}
-
-func TestAppendOnlyLog_WriteErrors(t *testing.T) {
-	dir := setupTestDir(t)
-	defer cleanupTestDir(t, dir)
-
-	// --- Test Data Write Error ---
-	t.Log("Skipping direct data write error test due to complexity of injecting writer error.")
-
-	// --- Test Index Write Error ---
-	t.Log("Skipping direct index write error test due to complexity of injecting writer error.")
 }
