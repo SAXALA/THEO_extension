@@ -9,14 +9,15 @@ import (
 
 	"path/filepath"
 
+	"bytes"
+	"sort"
+
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
-	"bytes"
-	"sort"
 )
 
 // Define custom errors to replace ethdb's if they are undefined
@@ -122,7 +123,9 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	// Initialize Pebble store for non-AOL data
 	pebblePath := filepath.Join(dirPath, "pebble")
 	logger.Info("Initializing Pebble store", "path", pebblePath)
-	pebbleStore, err := NewPebbleStore(pebblePath)
+	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
+	// Pass through namespace and readonly from the New function's parameters.
+	pebbleStore, err := NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
 	if err != nil {
 		// Close AOL if Pebble initialization fails
 		appendLog.Close()
