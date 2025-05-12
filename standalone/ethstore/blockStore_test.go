@@ -410,3 +410,184 @@ func TestAppendOnlyLog_AppendErrors(t *testing.T) {
 		t.Errorf("latestBlockID changed after appending empty map: got %d, want 1", aol.latestBlockID)
 	}
 }
+
+func TestAppendOnlyLog_DeleteByPrefixInBlock(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 10) // recentN=10 to keep all blocks for verification
+	defer cleanup()
+
+	// Block 1: Initial data
+	kvs1 := map[string]string{
+		"prefixA_key1": "valueA1",
+		"prefixA_key2": "valueA2",
+		"prefixB_key1": "valueB1",
+		"other_key":    "valueOther",
+	}
+	if err := aol.Append(1, kvs1); err != nil {
+		t.Fatalf("Failed to append block 1: %v", err)
+	}
+
+	// Block 2: More data, some with same prefix
+	kvs2 := map[string]string{
+		"prefixA_key3": "valueA3",
+		"prefixC_key1": "valueC1",
+	}
+	if err := aol.Append(2, kvs2); err != nil {
+		t.Fatalf("Failed to append block 2: %v", err)
+	}
+
+	// --- Test Case 1: Basic prefix deletion in Block 1 ---
+	t.Run("Delete prefixA in Block1", func(t *testing.T) {
+		err := aol.DeleteByPrefixInBlock(1, "prefixA")
+		if err != nil {
+			t.Fatalf("DeleteByPrefixInBlock(1, \"prefixA\") failed: %v", err)
+		}
+
+		// Verify Block 1 contents (should be unchanged by GetByBlock)
+		block1KVs, _ := aol.GetByBlock(1)
+		expectedBlock1KVs := map[string]string{"prefixA_key1": "valueA1", "prefixA_key2": "valueA2", "prefixB_key1": "valueB1", "other_key": "valueOther"}
+		if !reflect.DeepEqual(block1KVs, expectedBlock1KVs) {
+			t.Errorf("Block 1 KVs after prefixA delete: got %v, want %v", block1KVs, expectedBlock1KVs)
+		}
+
+		// Verify Block 3 (tombstone block) contents
+		block3KVs, err := aol.GetByBlock(3) // Tombstones should be in a new block (1+1+1=3)
+		if err != nil {
+			t.Fatalf("GetByBlock(3) for tombstones failed: %v", err)
+		}
+		expectedBlock3KVs := map[string]string{"prefixA_key1": "__DELETED__", "prefixA_key2": "__DELETED__"}
+		if !reflect.DeepEqual(block3KVs, expectedBlock3KVs) {
+			t.Errorf("Tombstone Block 3 KVs: got %v, want %v", block3KVs, expectedBlock3KVs)
+		}
+
+		// Verify Get for deleted keys
+		val, exists, _ := aol.Get("prefixA_key1")
+		if !exists || val != "" { // Tombstone means exists=true, val=""
+			t.Errorf("Get(\"prefixA_key1\") after delete: got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+		val, exists, _ = aol.Get("prefixA_key2")
+		if !exists || val != "" {
+			t.Errorf("Get(\"prefixA_key2\") after delete: got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+
+		// Verify Get for non-deleted key in same block
+		val, exists, _ = aol.Get("prefixB_key1")
+		if !exists || val != "valueB1" {
+			t.Errorf("Get(\"prefixB_key1\") after delete: got val='%s', exists=%v; want val='valueB1', exists=true", val, exists)
+		}
+	})
+
+	// --- Test Case 2: Prefix not found in target block ---
+	t.Run("Delete non_existent_prefix in Block2", func(t *testing.T) {
+		// Current latest block is 3. Append a new block to ensure no interference.
+		if err := aol.Append(4, map[string]string{"dummyKey": "dummyVal"}); err != nil {
+			t.Fatalf("Failed to append block 4: %v", err)
+		}
+		err := aol.DeleteByPrefixInBlock(2, "non_existent_prefix")
+		if err != nil {
+			t.Fatalf("DeleteByPrefixInBlock(2, \"non_existent_prefix\") failed: %v", err)
+		}
+		// No new block should be created, latestBlockID should remain 4
+		if aol.latestBlockID != 4 {
+			t.Errorf("latestBlockID after no-op delete: got %d, want 4", aol.latestBlockID)
+		}
+	})
+
+	// --- Test Case 3: Target block is empty (implicitly tested if a block becomes empty) ---
+	// For explicit test: Append an empty block and try to delete from it.
+	t.Run("Delete from empty Block", func(t *testing.T) {
+		if err := aol.Append(5, map[string]string{}); err != nil { // Append empty block 5
+			t.Fatalf("Failed to append empty block 5: %v", err)
+		}
+		err := aol.DeleteByPrefixInBlock(5, "any_prefix")
+		if err != nil {
+			t.Fatalf("DeleteByPrefixInBlock(5, \"any_prefix\") failed: %v", err)
+		}
+		// No new block should be created, latestBlockID should remain 5
+		if aol.latestBlockID != 5 {
+			t.Errorf("latestBlockID after delete from empty block: got %d, want 5", aol.latestBlockID)
+		}
+	})
+
+	// --- Test Case 4: Target block does not exist ---
+	t.Run("Delete from non_existent_block", func(t *testing.T) {
+		err := aol.DeleteByPrefixInBlock(99, "any_prefix")
+		if err == nil {
+			t.Error("Expected error when deleting from non-existent block, got nil")
+		} else if !strings.Contains(err.Error(), "target block ID 99 not found") {
+			t.Errorf("Expected error for non-existent block, got: %v", err)
+		}
+	})
+
+	// --- Test Case 5: Key with prefix already a tombstone ---
+	t.Run("Delete prefix_already_tombstone in Block6", func(t *testing.T) {
+		// Block 6: one key, one tombstone with the same prefix
+		kvs6 := map[string]string{
+			"prefixD_key1": "valueD1",
+			"prefixD_key2": TombstoneMarker, // Already a tombstone
+		}
+		if err := aol.Append(6, kvs6); err != nil {
+			t.Fatalf("Failed to append block 6: %v", err)
+		}
+
+		err := aol.DeleteByPrefixInBlock(6, "prefixD")
+		if err != nil {
+			t.Fatalf("DeleteByPrefixInBlock(6, \"prefixD\") failed: %v", err)
+		}
+
+		// A new block (7) should be created for the tombstone of prefixD_key1
+		// prefixD_key2 should not result in another tombstone.
+		block7KVs, err := aol.GetByBlock(7)
+		if err != nil {
+			t.Fatalf("GetByBlock(7) for tombstones failed: %v", err)
+		}
+		expectedBlock7KVs := map[string]string{"prefixD_key1": "__DELETED__"}
+		if !reflect.DeepEqual(block7KVs, expectedBlock7KVs) {
+			t.Errorf("Tombstone Block 7 KVs: got %v, want %v", block7KVs, expectedBlock7KVs)
+		}
+
+		// Verify Get for prefixD_key1 (now deleted)
+		val, exists, _ := aol.Get("prefixD_key1")
+		if !exists || val != "" {
+			t.Errorf("Get(\"prefixD_key1\") after delete: got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+		// Verify Get for prefixD_key2 (was already tombstone, should still be)
+		val, exists, _ = aol.Get("prefixD_key2")
+		if !exists || val != "" {
+			t.Errorf("Get(\"prefixD_key2\") (already tombstone): got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+	})
+
+	// --- Test Case 6: Delete all keys in a block using empty prefix ---
+	// This is not how it's designed, prefix must be non-empty for strings.HasPrefix to be meaningful in this context.
+	// The current implementation of DeleteByPrefixInBlock would tombstone all non-tombstoned keys if prefix is "".
+	// Let's test this behavior to document it.
+	t.Run("Delete with empty_prefix in Block2", func(t *testing.T) {
+		// Block 2 initially: {"prefixA_key3": "valueA3", "prefixC_key1": "valueC1"}
+		// latestBlockID is 7 from previous test.
+		err := aol.DeleteByPrefixInBlock(2, "") // Empty prefix
+		if err != nil {
+			t.Fatalf("DeleteByPrefixInBlock(2, \"\") failed: %v", err)
+		}
+
+		// New block 8 should contain tombstones for all original keys in block 2
+		block8KVs, err := aol.GetByBlock(8)
+		if err != nil {
+			t.Fatalf("GetByBlock(8) for tombstones failed: %v", err)
+		}
+		expectedBlock8KVs := map[string]string{"prefixA_key3": "__DELETED__", "prefixC_key1": "__DELETED__"}
+		if !reflect.DeepEqual(block8KVs, expectedBlock8KVs) {
+			t.Errorf("Tombstone Block 8 KVs (empty prefix): got %v, want %v", block8KVs, expectedBlock8KVs)
+		}
+
+		val, exists, _ := aol.Get("prefixA_key3")
+		if !exists || val != "" {
+			t.Errorf("Get(\"prefixA_key3\") after empty prefix delete: got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+		val, exists, _ = aol.Get("prefixC_key1")
+		if !exists || val != "" {
+			t.Errorf("Get(\"prefixC_key1\") after empty prefix delete: got val='%s', exists=%v; want val='', exists=true", val, exists)
+		}
+	})
+}
