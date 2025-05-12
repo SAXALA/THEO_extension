@@ -245,6 +245,36 @@ func TestPebbleStore_Reopen(t *testing.T) {
 	}
 }
 
+func TestPebbleStore_ReopenExtended(t *testing.T) {
+	// Create a temporary directory for testing
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "pebble-reopen-test")
+
+	// Create and open the first Pebble database instance
+	store1, err := NewPebbleStore(dbPath)
+	require.NoError(t, err, "First NewPebbleStore should not fail")
+
+	// Write test data
+	testKey := []byte("persist-key")
+	testValue := []byte("persist-value")
+	err = store1.Put(testKey, testValue)
+	require.NoError(t, err, "Put operation should not fail")
+
+	// Close the first database instance
+	err = store1.Close()
+	require.NoError(t, err, "First Close should not fail")
+
+	// Reopen database
+	store2, err := NewPebbleStore(dbPath)
+	require.NoError(t, err, "Second NewPebbleStore should not fail")
+	defer store2.Close()
+
+	// Verify data persistence
+	value, err := store2.Get(testKey)
+	require.NoError(t, err, "Get after reopen should not fail")
+	assert.Equal(t, testValue, value, "Value should persist after reopen")
+}
+
 func TestPebbleStore_MkdirAllError(t *testing.T) {
 	// This test is a bit tricky as os.MkdirAll is quite robust.
 	// We can try to create a file with the same name as the directory path to force an error.
@@ -319,36 +349,6 @@ func TestPebbleStore_BasicOperations(t *testing.T) {
 	// Close database
 	err = store.Close()
 	assert.NoError(t, err, "Close should not fail")
-}
-
-func TestPebbleStore_Reopen(t *testing.T) {
-	// Create a temporary directory for testing
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "pebble-reopen-test")
-
-	// Create and open the first Pebble database instance
-	store1, err := NewPebbleStore(dbPath)
-	require.NoError(t, err, "First NewPebbleStore should not fail")
-
-	// Write test data
-	testKey := []byte("persist-key")
-	testValue := []byte("persist-value")
-	err = store1.Put(testKey, testValue)
-	require.NoError(t, err, "Put operation should not fail")
-
-	// Close the first database instance
-	err = store1.Close()
-	require.NoError(t, err, "First Close should not fail")
-
-	// Reopen database
-	store2, err := NewPebbleStore(dbPath)
-	require.NoError(t, err, "Second NewPebbleStore should not fail")
-	defer store2.Close()
-
-	// Verify data persistence
-	value, err := store2.Get(testKey)
-	require.NoError(t, err, "Get after reopen should not fail")
-	assert.Equal(t, testValue, value, "Value should persist after reopen")
 }
 
 func TestPebbleStore_ManyOperations(t *testing.T) {

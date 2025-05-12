@@ -62,5 +62,12 @@ func (ps *PebbleStore) Close() error {
 // NewIterator creates a new iterator over the Pebble store.
 // The caller is responsible for closing the iterator.
 func (ps *PebbleStore) NewIterator(opts *pebble.IterOptions) *pebble.Iterator {
-	return ps.db.NewIter(opts)
+	if ps.db == nil {
+		return nil
+	}
+	iter, err := ps.db.NewIter(opts)
+	if err != nil {
+		return nil
+	}
+	return iter
 }

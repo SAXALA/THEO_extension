@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"context"
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
@@ -16,6 +15,8 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
+	"bytes"
+	"sort"
 )
 
 // Define custom errors to replace ethdb's if they are undefined
@@ -385,72 +386,6 @@ func (d *Database) Path() string {
 	return d.aol.Path()
 }
 
-// Retrieve retrieves the value for a key from the database.
-// The key should not contain the type prefix.
-func (d *Database) Retrieve(ctx context.Context, dataType DataType, key []byte) ([]byte, error) {
-	d.quitLock.RLock()
-	defer d.quitLock.RUnlock()
-	if d.closed {
-		return nil, ErrClosed
-	}
-	
-	// Get the prefix for the current data type
-	var prefix []byte
-	for _, keyInfo := range keyPrefixes {
-		if keyInfo.DataType == dataType {
-			prefix = []byte{keyInfo.Prefix}
-			break
-		}
-	}
-	if prefix == nil {
-		return nil, fmt.Errorf("unknown data type: %d", dataType)
-	}
-	
-	// Construct the complete key (add prefix)
-	fullKey := append(prefix, key...)
-	
-	// Call the Get method to retrieve data (Get method already handles AOL and Pebble logic)
-	return d.Get(fullKey)
-}
-
-// RetrieveByPrefix retrieves an iterator for keys starting with a given prefix.
-// The prefix should not contain the type prefix.
-func (d *Database) RetrieveByPrefix(ctx context.Context, dataType DataType, prefix []byte) (ethdb.Iterator, error) {
-	d.quitLock.RLock()
-	defer d.quitLock.RUnlock()
-	if d.closed {
-		return nil, ErrClosed
-	}
-	
-	// Get the prefix for the data type
-	var typePrefix byte
-	for _, keyInfo := range keyPrefixes {
-		if keyInfo.DataType == dataType {
-			typePrefix = keyInfo.Prefix
-			break
-		}
-	}
-	
-	// Build the complete prefix (type prefix + user prefix)
-	fullPrefix := append([]byte{typePrefix}, prefix...)
-	
-	// Create iterator options for Pebble
-	iterOpts := &pebble.IterOptions{
-		LowerBound: fullPrefix,
-		UpperBound: append(append([]byte{}, fullPrefix...), 0xFF), // Set upper bound to the maximum possible value for the prefix
-	}
-	
-	// Create Pebble iterator
-	pebbleIter := d.db.NewIterator(iterOpts)
-	
-	// Wrap as an iterator that implements the ethdb.Iterator interface
-	return &ethdbIterator{
-		iter:      pebbleIter,
-		typePrefix: typePrefix,
-		prefixLen: len(fullPrefix),
-	}, nil
-}
-
 // ethdbIterator is a wrapper implementing the ethdb.Iterator interface for Pebble iterator
 type ethdbIterator struct {
 	iter      *pebble.Iterator
@@ -505,6 +440,103 @@ func (it *ethdbIterator) Release() {
 	it.iter.Close()
 }
 
+// Iterator 是一个自定义迭代器类型
+type Iterator struct {
+    db      *Database
+    prefix  []byte
+    current []byte
+    err     error
+}
+
+// NewIterator creates a binary-alphabetical iterator over a subset of database content.
+func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+    iter := &iterator{
+        db:     d,
+        prefix: prefix,
+        start:  start,
+        keys:   make([][]byte, 0),
+        pos:    -1,
+    }
+    
+    iter.init()
+    return iter
+}
+
+// init 初始化迭代器，加载满足条件的所有键
+func (it *iterator) init() {
+    it.db.mu.RLock()
+    defer it.db.mu.RUnlock()
+    
+    for k := range it.db.store {
+        key := []byte(k)
+        if it.prefix != nil && !bytes.HasPrefix(key, it.prefix) {
+            continue
+        }
+        if it.start != nil && bytes.Compare(key, it.start) < 0 {
+            continue
+        }
+        it.keys = append(it.keys, key)
+    }
+    
+    sort.Slice(it.keys, func(i, j int) bool {
+        return bytes.Compare(it.keys[i], it.keys[j]) < 0
+    })
+}
+
+// Next moves to the next key
+func (it *Iterator) Next() bool {
+    if it.err != nil {
+        return false
+    }
+    
+    next, err := it.db.aol.Next(it.current)
+    if err != nil {
+        it.err = err
+        return false
+    }
+    
+    if next == nil {
+        return false
+    }
+    
+    if it.prefix != nil && !bytes.HasPrefix(next, it.prefix) {
+        return false
+    }
+    
+    it.current = next
+    return true
+}
+
+// Error returns any accumulated error
+func (it *Iterator) Error() error {
+    return it.err
+}
+
+// Key returns the key of the current entry
+func (it *Iterator) Key() []byte {
+    return it.current
+}
+
+// Value returns the value of the current entry
+func (it *Iterator) Value() []byte {
+    if it.current == nil {
+        return nil
+    }
+    
+    value, err := it.db.Get(it.current)
+    if err != nil {
+        it.err = err
+        return nil
+    }
+    return value
+}
+
+// Release releases associated resources
+func (it *Iterator) Release() {
+    it.current = nil
+    it.err = nil
+}
+
 // --- Methods below need implementation or removal ---
 
 // NewBatch creates a write-only database batch object.
@@ -516,12 +548,6 @@ func (d *Database) NewBatch() ethdb.Batch {
 // NewBatchWithSize creates a write-only database batch object with pre-allocated buffer size.
 func (d *Database) NewBatchWithSize(size int) ethdb.Batch {
 	d.log.Warn("NewBatchWithSize is not implemented for AppendOnlyLog; returning nil.")
-	return nil // Placeholder
-}
-
-// NewIterator creates a binary-alphabetical iterator over a subset of database content.
-func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	d.log.Warn("NewIterator is not implemented for AppendOnlyLog; returning nil.")
 	return nil // Placeholder
 }
 
@@ -554,6 +580,9 @@ type batch struct {
 // iterator is a wrapper around AppendOnlyLog data access.
 // Needs complete redesign. Might only iterate over skiplist or require full scan.
 type iterator struct {
-	db *Database
-	// ... fields for iteration state ...
+	db     *Database
+	prefix []byte
+	start  []byte
+	keys   [][]byte
+	pos    int
 }
