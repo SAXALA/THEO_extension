@@ -9,9 +9,6 @@ import (
 
 	"path/filepath"
 
-	"bytes"
-	"sort"
-
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -443,12 +440,14 @@ func (it *ethdbIterator) Release() {
 	it.iter.Close()
 }
 
-// Iterator 是一个自定义迭代器类型
-type Iterator struct {
-    db      *Database
-    prefix  []byte
-    current []byte
-    err     error
+// iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database
+type iterator struct {
+	db     *Database
+	prefix []byte
+	start  []byte
+	keys   [][]byte
+	pos    int
+	err    error // Added err field
 }
 
 // NewIterator creates a binary-alphabetical iterator over a subset of database content.
@@ -467,77 +466,71 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 
 // init 初始化迭代器，加载满足条件的所有键
 func (it *iterator) init() {
-    it.db.mu.RLock()
-    defer it.db.mu.RUnlock()
+    it.db.quitLock.RLock() // Using existing quitLock; original 'mu' was likely for a 'store' field
+    defer it.db.quitLock.RUnlock()
     
-    for k := range it.db.store {
-        key := []byte(k)
-        if it.prefix != nil && !bytes.HasPrefix(key, it.prefix) {
-            continue
-        }
-        if it.start != nil && bytes.Compare(key, it.start) < 0 {
-            continue
-        }
-        it.keys = append(it.keys, key)
-    }
-    
-    sort.Slice(it.keys, func(i, j int) bool {
-        return bytes.Compare(it.keys[i], it.keys[j]) < 0
-    })
+    // Original logic for it.db.store is removed as 'store' does not exist on Database.
+    // This iterator will currently not load any keys from such a source.
+    // If this iterator was meant to get data from AOL, it needs a proper implementation here.
+    it.keys = make([][]byte, 0) // Initialize as empty
+    it.pos = -1
+    // it.err = errors.New("AOL iterator data loading not implemented in init()") // Optionally set error
 }
 
 // Next moves to the next key
-func (it *Iterator) Next() bool {
-    if it.err != nil {
-        return false
-    }
-    
-    next, err := it.db.aol.Next(it.current)
-    if err != nil {
-        it.err = err
-        return false
-    }
-    
-    if next == nil {
-        return false
-    }
-    
-    if it.prefix != nil && !bytes.HasPrefix(next, it.prefix) {
-        return false
-    }
-    
-    it.current = next
-    return true
+func (it *iterator) Next() bool { // Receiver changed to *iterator
+	if it.err != nil {
+		return false
+	}
+	// This iterates over the 'keys' slice, which 'init' is supposed to populate.
+	// Since 'init' currently leaves 'keys' empty, this will effectively be an empty iterator.
+	if it.pos+1 < len(it.keys) {
+		it.pos++
+		return true
+	}
+	return false
 }
 
 // Error returns any accumulated error
-func (it *Iterator) Error() error {
-    return it.err
+func (it *iterator) Error() error { // Receiver changed to *iterator
+	return it.err
 }
 
 // Key returns the key of the current entry
-func (it *Iterator) Key() []byte {
-    return it.current
+func (it *iterator) Key() []byte { // Receiver changed to *iterator
+	if it.pos < 0 || it.pos >= len(it.keys) {
+		return nil
+	}
+	return it.keys[it.pos]
 }
 
 // Value returns the value of the current entry
-func (it *Iterator) Value() []byte {
-    if it.current == nil {
-        return nil
-    }
-    
-    value, err := it.db.Get(it.current)
-    if err != nil {
-        it.err = err
-        return nil
-    }
-    return value
+func (it *iterator) Value() []byte { // Receiver changed to *iterator
+	if it.pos < 0 || it.pos >= len(it.keys) {
+		if it.err == nil && len(it.keys) > 0 { // Avoid error if keys was empty from start
+			it.err = errors.New("iterator: invalid position for Value()")
+		}
+		return nil
+	}
+	key := it.keys[it.pos]
+	if key == nil {
+	    if(it.err == nil) { it.err = errors.New("iterator: current key is nil"); }
+		return nil
+	}
+	// Fetches from the main Database.Get, which handles AOL/Pebble dispatch
+	value, err := it.db.Get(key)
+	if err != nil {
+		it.err = err
+		return nil
+	}
+	return value
 }
 
 // Release releases associated resources
-func (it *Iterator) Release() {
-    it.current = nil
-    it.err = nil
+func (it *iterator) Release() { // Receiver changed to *iterator
+	it.keys = nil
+	it.pos = -1
+	// it.err = nil // Optional: clear error on release
 }
 
 // --- Methods below need implementation or removal ---
@@ -588,4 +581,5 @@ type iterator struct {
 	start  []byte
 	keys   [][]byte
 	pos    int
+	err    error // Added err field
 }

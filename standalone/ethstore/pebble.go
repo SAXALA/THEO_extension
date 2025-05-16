@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -161,6 +162,8 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		},
 		ReadOnly: readonly,
 		Logger:   panicLogger{},
+		// Add this line to provide an iterator for PebbleStore
+		NewIter: func(o *pebble.IterOptions) (*pebble.Iterator, error) { return nil, errors.New("PebbleStore.NewIter not implemented") },
 	}
 
 	var err error
@@ -245,6 +248,21 @@ func (d *PebbleStore) NewBatchWithSize(size int) ethdb.Batch {
 // DeleteRange implements the Store interface
 func (d *PebbleStore) DeleteRange(start []byte, end []byte) error {
 	return d.db.DeleteRange(start, end, pebble.Sync)
+}
+
+// NewIterator creates a new iterator over the store.
+// This is a placeholder and needs to be implemented correctly.
+func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+	// This is a non-functional placeholder. 
+	// A proper implementation would use d.db.NewIter or similar, 
+	// and wrap the pebble.Iterator in a type that satisfies ethdb.Iterator.
+	return nil 
+}
+
+type batch struct {
+	db   *PebbleStore
+	b    *pebble.Batch
+	size int
 }
 
 func (b *pebbleBatch) Put(key, value []byte) error {

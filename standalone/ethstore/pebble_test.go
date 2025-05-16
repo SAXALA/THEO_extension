@@ -26,7 +26,7 @@ func TestNewPebbleStore(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath)
+	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() error = %v, wantErr %v", err, false)
 	}
@@ -51,7 +51,7 @@ func TestPebbleStore_PutGetDelete(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath)
+	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("Failed to create PebbleStore: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPebbleStore_Close(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath)
+	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() error = %v", err)
 	}
@@ -149,7 +149,7 @@ func TestPebbleStore_Iterator(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath)
+	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("Failed to create PebbleStore: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestPebbleStore_Reopen(t *testing.T) {
 	defer os.RemoveAll(dbPath)
 
 	// Create and populate DB
-	ps1, err := NewPebbleStore(dbPath)
+	ps1, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() error = %v", err)
 	}
@@ -230,7 +230,7 @@ func TestPebbleStore_Reopen(t *testing.T) {
 	}
 
 	// Reopen the DB
-	ps2, err := NewPebbleStore(dbPath)
+	ps2, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() on reopen error = %v", err)
 	}
@@ -251,7 +251,7 @@ func TestPebbleStore_ReopenExtended(t *testing.T) {
 	dbPath := filepath.Join(tempDir, "pebble-reopen-test")
 
 	// Create and open the first Pebble database instance
-	store1, err := NewPebbleStore(dbPath)
+	store1, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	require.NoError(t, err, "First NewPebbleStore should not fail")
 
 	// Write test data
@@ -265,7 +265,7 @@ func TestPebbleStore_ReopenExtended(t *testing.T) {
 	require.NoError(t, err, "First Close should not fail")
 
 	// Reopen database
-	store2, err := NewPebbleStore(dbPath)
+	store2, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	require.NoError(t, err, "Second NewPebbleStore should not fail")
 	defer store2.Close()
 
@@ -290,11 +290,11 @@ func TestPebbleStore_MkdirAllError(t *testing.T) {
 	f.Close()
 	defer os.Remove(filePath)
 
-	_, err = NewPebbleStore(filePath) // Try to create DB at the path of the file
+	_, err = NewPebbleStore(filePath, 0, 0, "", false) // Try to create DB at the path of the file
 	if err == nil {
 		t.Errorf("NewPebbleStore() did not return error when dbPath is a file")
 		// If it somehow succeeded, clean up
-		ps, _ := NewPebbleStore(filePath)
+		ps, _ := NewPebbleStore(filePath, 0, 0, "", false)
 		ps.Close()
 		os.RemoveAll(filePath) // Attempt to remove if it became a dir
 	} else {
@@ -316,7 +316,7 @@ func TestPebbleStore_BasicOperations(t *testing.T) {
 	dbPath := filepath.Join(tempDir, "pebble-test")
 
 	// Create and open a Pebble database
-	store, err := NewPebbleStore(dbPath)
+	store, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	require.NoError(t, err, "NewPebbleStore should not fail")
 	require.NotNil(t, store, "PebbleStore should not be nil")
 
@@ -357,7 +357,7 @@ func TestPebbleStore_ManyOperations(t *testing.T) {
 	dbPath := filepath.Join(tempDir, "pebble-many-ops-test")
 
 	// Create and open a Pebble database
-	store, err := NewPebbleStore(dbPath)
+	store, err := NewPebbleStore(dbPath, 0, 0, "", false)
 	require.NoError(t, err)
 	defer store.Close()
 
