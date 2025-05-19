@@ -1,7 +1,7 @@
 package ethstore
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -162,8 +162,7 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		},
 		ReadOnly: readonly,
 		Logger:   panicLogger{},
-		// Add this line to provide an iterator for PebbleStore
-		NewIter: func(o *pebble.IterOptions) (*pebble.Iterator, error) { return nil, errors.New("PebbleStore.NewIter not implemented") },
+		// NewIter field removed as it's not a valid pebble.Options field
 	}
 
 	var err error
@@ -229,6 +228,81 @@ func (d *PebbleStore) Delete(key []byte) error {
 	return d.db.Delete(key, pebble.Sync)
 }
 
+// pebbleIterator implements the ethdb.Iterator interface for PebbleDB.
+type pebbleIterator struct {
+	db      *PebbleStore     // Reference to the store for context (e.g., logging)
+	iter    *pebble.Iterator // The underlying Pebble iterator
+	prefix  []byte           // The prefix for iteration, if any
+	initErr error            // Error that occurred during iterator creation
+	// start []byte          // The start key for iteration (handled by IterOptions.LowerBound)
+	// No explicit 'valid' field; pebble.Iterator manages its own validity.
+}
+
+// Next moves the iterator to the next key/value pair.
+// It returns false if the iterator is exhausted.
+func (it *pebbleIterator) Next() bool {
+	if it.initErr != nil || it.iter == nil {
+		return false
+	}
+	// Loop to find the next key that matches the prefix (if a prefix is specified).
+	for it.iter.Next() {
+		if it.prefix == nil || bytes.HasPrefix(it.iter.Key(), it.prefix) {
+			return true // Found a valid key (either no prefix, or key matches prefix)
+		}
+		// Key does not match prefix, continue to the next key in the underlying iterator.
+	}
+	return false // Underlying iterator is exhausted or no more keys match the prefix.
+}
+
+// Error returns any accumulated error. Exhausting all the key/value pairs
+// is not considered to be an error.
+func (it *pebbleIterator) Error() error {
+	if it.initErr != nil {
+		return it.initErr
+	}
+	if it.iter == nil {
+		return nil // Or some specific error indicating iterator was not initialized/already released
+	}
+	return it.iter.Error()
+}
+
+// Key returns the key of the current key/value pair, or nil if done.
+// The caller should not modify the contents of the returned slice.
+func (it *pebbleIterator) Key() []byte {
+	if it.initErr != nil || it.iter == nil || !it.iter.Valid() {
+		return nil
+	}
+	// ethdb.Iterator contract implies the returned slice's contents should not be modified by future Next calls.
+	// Pebble's iterator key slice is valid until the next mutation call on the iterator.
+	// To be safe, we make a copy.
+	key := it.iter.Key()
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	return keyCopy
+}
+
+// Value returns the value of the current key/value pair, or nil if done.
+// The caller should not modify the contents of the returned slice.
+func (it *pebbleIterator) Value() []byte {
+	if it.initErr != nil || it.iter == nil || !it.iter.Valid() {
+		return nil
+	}
+	// Similar to Key(), copy the value to adhere to ethdb.Iterator contract.
+	val := it.iter.Value()
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	return valCopy
+}
+
+// Release releases associated resources. Release should always succeed and can
+// be called multiple times without error.
+func (it *pebbleIterator) Release() {
+	if it.iter != nil {
+		it.iter.Close()
+		it.iter = nil // Prevent multiple closes on the same pebble.Iterator and mark as released
+	}
+}
+
 type pebbleBatch struct {
 	db   *PebbleStore
 	b    *pebble.Batch
@@ -250,64 +324,156 @@ func (d *PebbleStore) DeleteRange(start []byte, end []byte) error {
 	return d.db.DeleteRange(start, end, pebble.Sync)
 }
 
-// NewIterator creates a new iterator over the store.
-// This is a placeholder and needs to be implemented correctly.
-func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	// This is a non-functional placeholder. 
-	// A proper implementation would use d.db.NewIter or similar, 
-	// and wrap the pebble.Iterator in a type that satisfies ethdb.Iterator.
-	return nil 
+// Put inserts the given value into the batch for later committing.
+func (b *pebbleBatch) Put(key []byte, value []byte) error {
+	if b.b == nil {
+		return fmt.Errorf("pebble batch not initialized")
+	}
+	if err := b.b.Set(key, value, nil); err != nil {
+		return err
+	}
+	b.size += len(key) + len(value)
+	return nil
 }
 
-type batch struct {
-	db   *PebbleStore
-	b    *pebble.Batch
-	size int
-}
-
-func (b *pebbleBatch) Put(key, value []byte) error {
-	b.size += len(value)
-	return b.b.Set(key, value, nil)
-}
-
+// Delete inserts the key removal into the batch for later committing.
 func (b *pebbleBatch) Delete(key []byte) error {
-	return b.b.Delete(key, nil)
+	if b.b == nil {
+		return fmt.Errorf("pebble batch not initialized")
+	}
+	if err := b.b.Delete(key, nil); err != nil {
+		return err
+	}
+	b.size += len(key)
+	return nil
 }
 
+// ValueSize retrieves the amount of data queued up for writing.
 func (b *pebbleBatch) ValueSize() int {
 	return b.size
 }
 
+// Write flushes any accumulated data to disk.
 func (b *pebbleBatch) Write() error {
+	if b.b == nil {
+		return fmt.Errorf("pebble batch not initialized")
+	}
+	// Using pebble.Sync for consistency with PebbleStore direct Put/Delete.
+	// Pebble's default is pebble.NoSync for Commit unless WriteOptions are passed.
 	return b.b.Commit(pebble.Sync)
 }
 
+// Reset resets the batch for reuse.
 func (b *pebbleBatch) Reset() {
-	b.b.Reset()
+	if b.b != nil {
+		b.b.Reset()
+	}
 	b.size = 0
 }
 
-// Replay replays the pebbleBatch on a separate database instance
+// Replay replays the batch contents over another KeyValueWriter.
 func (b *pebbleBatch) Replay(w ethdb.KeyValueWriter) error {
+	if b.b == nil {
+		return fmt.Errorf("pebble batch not initialized")
+	}
 	reader := b.b.Reader()
 	for {
-		kind, key, value, ok, err := reader.Next() // Corrected to 5 variables
-		if err != nil { // Added error check
-			return err
-		}
+		kind, k, v, ok, err := reader.Next()
 		if !ok {
-			break
+			if err != nil {
+				return err // Error during iteration
+			}
+			return nil // End of iteration
 		}
+
 		switch kind {
 		case pebble.InternalKeyKindSet:
-			if err := w.Put(key, value); err != nil {
+			if err = w.Put(k, v); err != nil {
 				return err
 			}
 		case pebble.InternalKeyKindDelete:
-			if err := w.Delete(key); err != nil {
+			if err = w.Delete(k); err != nil {
 				return err
 			}
+		default:
+			return fmt.Errorf("unhandled pebble batch operation kind: %v", kind)
 		}
 	}
-	return nil
 }
+
+// NewIterator creates a new iterator over the store.
+func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+	opts := &pebble.IterOptions{}
+	var lowerBound []byte
+
+	if start != nil {
+		lowerBound = start
+	} else if prefix != nil {
+		lowerBound = prefix
+	}
+	// If both start and prefix are nil, lowerBound remains nil, iterating from the DB start.
+
+	if lowerBound != nil {
+		opts.LowerBound = lowerBound
+	}
+
+	// For true prefix iteration, an UpperBound should be set.
+	// E.g. prefix "foo" -> UpperBound "fop".
+	// This is an optimization; without it, our Next() method filters.
+	// if prefix != nil {
+	//    upperBound := calculatePrefixUpperBound(prefix) // calculatePrefixUpperBound would be a helper
+	//    if upperBound != nil {
+	//        opts.UpperBound = upperBound
+	//    }
+	// }
+
+	underlyingIter, err := d.db.NewIter(opts)
+	if err != nil {
+		// Log the error or handle it as per application's error strategy
+		// d.log.Error("Failed to create Pebble iterator", "err", err)
+		return &pebbleIterator{
+			db:      d,
+			iter:    nil,
+			prefix:  prefix,
+			initErr: err,
+		}
+	}
+
+	// The pebble iterator is created. The first call to Next() will position it.
+	// If a prefix is used, our pebbleIterator.Next() will filter.
+	return &pebbleIterator{
+		db:     d,
+		iter:   underlyingIter,
+		prefix: prefix,
+		// start: start, // Storing start is not strictly needed as LowerBound handles it
+	}
+}
+
+// calculatePrefixUpperBound is a helper to get the upper bound for a prefix.
+// For example, prefix "foo" -> upper bound "fop".
+// This ensures the iterator stops after the last key with the given prefix.
+// func calculatePrefixUpperBound(prefix []byte) []byte {
+// 	if len(prefix) == 0 {
+// 		return nil // No prefix, no specific upper bound from it.
+// 	}
+// 	// Create a copy to modify
+// 	upperBound := make([]byte, len(prefix))
+// 	copy(upperBound, prefix)
+// 	// Iterate from the rightmost byte
+// 	for i := len(upperBound) - 1; i >= 0; i-- {
+// 		if upperBound[i] < 0xff {
+// 			upperBound[i]++ // Increment the byte
+// 			return upperBound[:i+1] // Return the modified prefix up to this byte
+// 		}
+// 		// If byte is 0xff, it "overflows" to 0x00 in this position,
+// 		// and we continue to the next byte to the left (the "carry").
+// 	}
+// 	// If all bytes were 0xff, it means this prefix is like "\xff\xff\xff".
+// 	// There's no key with this prefix that's greater than it by just incrementing.
+// 	// In this specific case, an upper bound is not easily formed this way to exclude others.
+// 	// Pebble handles this by iterating up to keys that no longer share the prefix.
+// 	// For simplicity, our Next() method will filter by prefix, so an explicit UpperBound
+// 	// for strict prefix matching might not be strictly necessary if performance is not critical.
+// 	// However, for large ranges, providing an UpperBound to Pebble is much more efficient.
+// 	return nil // Returning nil means iterate to the end (if no other bounds) or rely on Next filtering.
+// }

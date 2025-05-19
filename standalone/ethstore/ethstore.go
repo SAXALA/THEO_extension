@@ -24,6 +24,50 @@ var (
 	ErrCompaction = errors.New("compaction error") // Example, if you need more
 )
 
+// errorIterator is an ethdb.Iterator that always returns an error or represents an invalid state.
+type errorIterator struct {
+	err error
+}
+
+// Next implements ethdb.Iterator, always returns false for errorIterator.
+func (it *errorIterator) Next() bool { return false }
+
+// Error implements ethdb.Iterator, returns the predefined error.
+func (it *errorIterator) Error() error { return it.err }
+
+// Key implements ethdb.Iterator, returns nil for errorIterator.
+func (it *errorIterator) Key() []byte { return nil }
+
+// Value implements ethdb.Iterator, returns nil for errorIterator.
+func (it *errorIterator) Value() []byte { return nil }
+
+// Release implements ethdb.Iterator, is a no-op for errorIterator.
+func (it *errorIterator) Release() {}
+
+// errorBatch is an ethdb.Batch that always returns an error.
+// It's used when a real batch cannot be created (e.g., DB is closed).
+type errorBatch struct {
+	err error
+}
+
+// Put implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) Put(key []byte, value []byte) error { return b.err }
+
+// Delete implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) Delete(key []byte) error { return b.err }
+
+// ValueSize implements ethdb.Batch and returns 0.
+func (b *errorBatch) ValueSize() int { return 0 }
+
+// Write implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) Write() error { return b.err }
+
+// Reset implements ethdb.Batch and is a no-op.
+func (b *errorBatch) Reset() {}
+
+// Replay implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) Replay(w ethdb.KeyValueWriter) error { return b.err }
+
 var aolHandledDataTypes = map[DataType]bool{
 	HeaderDataType:                    true,
 	HeaderNumberDataType:              true,
@@ -440,7 +484,7 @@ func (it *ethdbIterator) Release() {
 	it.iter.Close()
 }
 
-// iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database
+// iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database (primarily for AOL data)
 type iterator struct {
 	db     *Database
 	prefix []byte
@@ -451,30 +495,105 @@ type iterator struct {
 }
 
 // NewIterator creates a binary-alphabetical iterator over a subset of database content.
+// If the prefix indicates an AOL-handled data type, an AOL-specific iterator is returned.
+// Otherwise, the call is delegated to the underlying PebbleStore.
 func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
-    iter := &iterator{
-        db:     d,
-        prefix: prefix,
-        start:  start,
-        keys:   make([][]byte, 0),
-        pos:    -1,
-    }
-    
-    iter.init()
-    return iter
+	d.quitLock.RLock() // Lock for reading d.closed and accessing d.db/d.aol
+	defer d.quitLock.RUnlock()
+
+	if d.closed {
+		d.log.Warn("NewIterator called on closed database")
+		return &errorIterator{err: ErrClosed}
+	}
+
+	dataType := GetDataTypeFromKey(prefix) // Assuming GetDataTypeFromKey is defined elsewhere
+
+	if aolHandledDataTypes[dataType] {
+		// This is an AOL-handled type, use the 'iterator' struct.
+		d.log.Trace("Creating new iterator for AOL", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
+		iter := &iterator{
+			db:     d,
+			prefix: prefix,
+			start:  start,
+			keys:   make([][]byte, 0),
+			pos:    -1,
+		}
+		// The init() method for this AOL iterator needs to be fully implemented
+		// to correctly load keys from the AppendOnlyLog.
+		iter.init()
+		return iter
+	}
+
+	// Not an AOL-handled type, delegate to PebbleStore.
+	if d.db == nil {
+		d.log.Error("Pebble store (d.db) not initialized, cannot create iterator for non-AOL type", "prefix", common.Bytes2Hex(prefix), "dataType", DataTypeStrings[dataType])
+		return &errorIterator{err: errors.New("internal pebble store not initialized for iterator")}
+	}
+
+	d.log.Trace("Delegating NewIterator to PebbleStore", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
+	// PebbleStore's NewIterator is expected to return an ethdb.Iterator (specifically, a *pebbleIterator).
+	// It handles its own internal errors by setting an initErr field in the returned iterator.
+	return d.db.NewIterator(prefix, start)
 }
 
-// init 初始化迭代器，加载满足条件的所有键
+// init initializes the iterator, loading keys that match the prefix and start.
+// For the AOL-specific iterator, this method needs to scan relevant AOL files,
+// filter keys by prefix and start, consider tombstones, and sort them if necessary.
+// WARNING: The current implementation is a placeholder and does not load data from AOL.
 func (it *iterator) init() {
-    it.db.quitLock.RLock() // Using existing quitLock; original 'mu' was likely for a 'store' field
-    defer it.db.quitLock.RUnlock()
-    
-    // Original logic for it.db.store is removed as 'store' does not exist on Database.
-    // This iterator will currently not load any keys from such a source.
-    // If this iterator was meant to get data from AOL, it needs a proper implementation here.
-    it.keys = make([][]byte, 0) // Initialize as empty
-    it.pos = -1
-    // it.err = errors.New("AOL iterator data loading not implemented in init()") // Optionally set error
+	// Ensure it.db and it.db.aol are valid before proceeding with AOL-specific logic
+	if it.db == nil {
+		it.err = errors.New("iterator: database not initialized")
+		return
+	}
+    // The RLock/RUnlock for db.closed and aol access should be managed here if init performs direct aol operations.
+    // For now, we assume NewIterator holds the lock during this call.
+    // If init becomes asynchronous or complex, it needs its own locking.
+
+	// If this iterator is for AOL:
+	if aolHandledDataTypes[GetDataTypeFromKey(it.prefix)] {
+		if it.db.aol == nil {
+			it.err = errors.New("iterator: AOL not initialized in database for AOL-specific iterator")
+			it.keys = make([][]byte, 0)
+			it.pos = -1
+			return
+		}
+		// --- BEGIN AOL Key Loading Logic (Placeholder) ---
+		// This section requires significant implementation:
+		// 1. Identify relevant AOL segment files based on potential block ranges or timestamps if applicable.
+		// 2. Read records from these segment files.
+		// 3. For each record:
+		//    a. Deserialize the key-value pairs.
+		//    b. Check if a key matches `it.prefix`.
+		//    c. If `it.start` is provided, ensure the key is >= `it.start`.
+		//    d. Handle `aolDeleteTombstone`: if a key is marked deleted, it should not be included.
+		//    e. Store valid keys. Keys might need to be unique (latest version wins).
+		// 4. Sort the collected keys if order is not guaranteed by the reading process.
+		//
+		// Example (very simplified, conceptual):
+		// allAOLKeysAndValues := it.db.aol.GetAllMatchingPrefix(it.prefix) // This function doesn't exist, needs to be built
+		// for key, value := range allAOLKeysAndValues {
+		//    if bytes.HasPrefix(key, it.prefix) && (it.start == nil || bytes.Compare(key, it.start) >= 0) {
+		//        if !bytes.Equal(value, []byte(aolDeleteTombstone)) { // Check value if tombstones are stored as values
+		//            it.keys = append(it.keys, key)
+		//        }
+		//    }
+		// }
+		// sort.Slice(it.keys, func(i, j int) bool { return bytes.Compare(it.keys[i], it.keys[j]) < 0 })
+		// --- END AOL Key Loading Logic (Placeholder) ---
+		it.db.log.Debug("AOL iterator init called (data loading logic is a placeholder)", "prefix", common.Bytes2Hex(it.prefix), "start", common.Bytes2Hex(it.start))
+		it.keys = make([][]byte, 0) // Initialize as empty until fully implemented
+		it.pos = -1
+		// To signal that this part is not done, you might set an error:
+		// it.err = errors.New("AOL iterator data loading not implemented in init()")
+	} else {
+		// This 'iterator' struct should ideally not be initialized for non-AOL types if delegation occurs.
+		// However, if NewIterator somehow created this 'iterator' instance before deciding to delegate,
+		// this path might be hit. Setting an error or ensuring it's a no-op is safest.
+		it.err = errors.New("iterator.init() called for a non-AOL type; this should have been delegated to PebbleStore")
+		it.keys = make([][]byte, 0)
+		it.pos = -1
+	}
 }
 
 // Next moves to the next key
@@ -533,18 +652,41 @@ func (it *iterator) Release() { // Receiver changed to *iterator
 	// it.err = nil // Optional: clear error on release
 }
 
-// --- Methods below need implementation or removal ---
-
-// NewBatch creates a write-only database batch object.
+// NewBatch creates a write-only database batch object that operates on the underlying Pebble store.
+// Operations on this batch will NOT be routed to the AppendOnlyLog.
 func (d *Database) NewBatch() ethdb.Batch {
-	d.log.Warn("NewBatch is not implemented for AppendOnlyLog; returning nil.")
-	return nil // Placeholder
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+
+	if d.closed {
+		d.log.Error("NewBatch called on closed database")
+		return &errorBatch{err: ErrClosed}
+	}
+	if d.db == nil {
+		d.log.Error("Pebble store (d.db) not initialized, cannot create batch")
+		return &errorBatch{err: errors.New("internal pebble store not initialized")}
+	}
+	d.log.Trace("Creating new batch via PebbleStore component")
+	return d.db.NewBatch()
 }
 
-// NewBatchWithSize creates a write-only database batch object with pre-allocated buffer size.
+// NewBatchWithSize creates a write-only database batch object with pre-allocated buffer size
+// that operates on the underlying Pebble store.
+// Operations on this batch will NOT be routed to the AppendOnlyLog.
 func (d *Database) NewBatchWithSize(size int) ethdb.Batch {
-	d.log.Warn("NewBatchWithSize is not implemented for AppendOnlyLog; returning nil.")
-	return nil // Placeholder
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+
+	if d.closed {
+		d.log.Error("NewBatchWithSize called on closed database")
+		return &errorBatch{err: ErrClosed}
+	}
+	if d.db == nil {
+		d.log.Error("Pebble store (d.db) not initialized, cannot create batch with size")
+		return &errorBatch{err: errors.New("internal pebble store not initialized")}
+	}
+	d.log.Trace("Creating new batch with size via PebbleStore component", "size", size)
+	return d.db.NewBatchWithSize(size)
 }
 
 // Stat returns a particular internal stat of the database.
@@ -561,25 +703,4 @@ func (d *Database) Stat() (string, error) {
 func (d *Database) Compact(start []byte, limit []byte) error {
 	d.log.Warn("Compact operation may not be applicable or is handled differently by AppendOnlyLog")
 	return nil // Or return an error if not supported
-}
-
-// batch is a wrapper around AppendOnlyLog operations potentially for a single block.
-// Needs complete redesign.
-type batch struct {
-	db      *Database
-	blockID uint64            // The block ID for this batch
-	kvs     map[string]string // Key-value pairs for the batch
-	size    int               // Approximate size
-	lock    sync.Mutex
-}
-
-// iterator is a wrapper around AppendOnlyLog data access.
-// Needs complete redesign. Might only iterate over skiplist or require full scan.
-type iterator struct {
-	db     *Database
-	prefix []byte
-	start  []byte
-	keys   [][]byte
-	pos    int
-	err    error // Added err field
 }

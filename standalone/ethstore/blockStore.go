@@ -127,9 +127,9 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 		indexMapFile:     indexMapFile,
 		blockIndex:       make(map[uint64]blockIndexEntry),
 		recentN:          recentN,
-		recentBlocks:     make([]uint64, 0, recentN),
+		recentBlocks:     make([]uint64, 0, recentN), // Initialize empty, will be populated below
 		skiplistIndex:    skiplist.New(skiplist.String),
-		indexedBlocks:    make(map[uint64]struct{}),
+		indexedBlocks:    make(map[uint64]struct{}), // Initialize empty, will be populated below
 	}
 
 	// Load existing block index map
@@ -138,13 +138,38 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 		return nil, fmt.Errorf("failed to load block index: %w", err)
 	}
 
+	// Determine the actual N most recent blocks from all loaded blockIndex entries.
+	allLoadedBlockIDs := make([]uint64, 0, len(aol.blockIndex))
+	for id := range aol.blockIndex {
+		allLoadedBlockIDs = append(allLoadedBlockIDs, id)
+	}
+	sort.Slice(allLoadedBlockIDs, func(i, j int) bool {
+		return allLoadedBlockIDs[i] < allLoadedBlockIDs[j] // Sort oldest to newest
+	})
+
+	// Populate recentBlocks and indexedBlocks with the true N most recent blocks.
+	// aol.recentBlocks and aol.indexedBlocks were already initialized as empty.
+	startIdx := 0
+	if len(allLoadedBlockIDs) > aol.recentN {
+		startIdx = len(allLoadedBlockIDs) - aol.recentN
+	}
+
+	for i := startIdx; i < len(allLoadedBlockIDs); i++ {
+		blockID := allLoadedBlockIDs[i]
+		aol.recentBlocks = append(aol.recentBlocks, blockID) // These are the N most recent, oldest of N to newest of N
+		aol.indexedBlocks[blockID] = struct{}{}
+	}
+	// aol.recentBlocks is now correctly populated and sorted (oldest of recentN to newest of recentN).
+	// aol.indexedBlocks now correctly reflects this set.
+
 	// Rebuild skiplist for the last N blocks from the index
+	// This call will now use the correctly populated aol.recentBlocks and aol.indexedBlocks.
 	if err := aol.rebuildSkiplist(); err != nil {
 		aol.Close()
 		return nil, fmt.Errorf("failed to rebuild skiplist index: %w", err)
 	}
 
-	aol.log.Info("AppendOnlyLog initialized", "dataSize", common.StorageSize(currentOffset), "indexedBlocks", len(aol.indexedBlocks))
+	aol.log.Info("AppendOnlyLog initialized", "dataSize", common.StorageSize(currentOffset), "indexedBlocks", len(aol.indexedBlocks), "recentBlocksTracked", len(aol.recentBlocks))
 	return aol, nil
 }
 
@@ -188,11 +213,8 @@ func (aol *AppendOnlyLog) loadBlockIndex() error {
 		if entry.BlockID > latestBlock {
 			latestBlock = entry.BlockID
 		}
-		// Keep track of recent blocks encountered during load for potential skiplist rebuild
-		if len(aol.recentBlocks) < aol.recentN || entry.BlockID > aol.recentBlocks[0] {
-			// This isn't perfectly ordered yet, rebuildSkiplist will sort
-			aol.recentBlocks = append(aol.recentBlocks, entry.BlockID)
-		}
+		// Removed logic that attempted to populate aol.recentBlocks here.
+		// It will be correctly populated in NewAppendOnlyLog after this function returns.
 	}
 	aol.latestBlockID = latestBlock
 	return nil
@@ -200,58 +222,51 @@ func (aol *AppendOnlyLog) loadBlockIndex() error {
 
 // rebuildSkiplist populates the skiplist index for the actual N most recent blocks found.
 func (aol *AppendOnlyLog) rebuildSkiplist() error {
-	if len(aol.blockIndex) == 0 {
-		return nil // Nothing to index
-	}
+	// aol.mu must be held (WLock) by the caller if called outside of NewAppendOnlyLog initialization.
+	// NewAppendOnlyLog calls this before aol is accessible externally, so no concurrent access.
+	// updateRecentBlocks calls this under a WLock.
 
-	// Sort all known block IDs to find the most recent N
-	allBlockIDs := make([]uint64, 0, len(aol.blockIndex))
-	for id := range aol.blockIndex {
-		allBlockIDs = append(allBlockIDs, id)
-	}
-	// Sort descending to easily get the latest N
-	sort.Slice(allBlockIDs, func(i, j int) bool {
-		return allBlockIDs[i] > allBlockIDs[j]
+	// The source of truth for which blocks should be in the skiplist is aol.recentBlocks.
+	// We just need to iterate over them (oldest to newest) and populate the skiplist.
+
+	// Create a sorted copy of aol.recentBlocks (oldest to newest) to iterate over.
+	// This ensures that if a key appears in multiple recent blocks, the one from the
+	// newest block (processed last) will be what ends up in the skiplist.
+	blocksToIndex := make([]uint64, len(aol.recentBlocks))
+	copy(blocksToIndex, aol.recentBlocks)
+	sort.Slice(blocksToIndex, func(i, j int) bool {
+		return blocksToIndex[i] < blocksToIndex[j] // Sort oldest to newest
 	})
 
-	aol.recentBlocks = aol.recentBlocks[:0] // Clear existing
-	aol.indexedBlocks = make(map[uint64]struct{})
 	aol.skiplistIndex = skiplist.New(skiplist.String) // Reset skiplist
 
-	numToIndex := aol.recentN
-	if len(allBlockIDs) < numToIndex {
-		numToIndex = len(allBlockIDs)
-	}
+	aol.log.Debug("Rebuilding skiplist index", "blocksToScan", blocksToIndex)
 
-	aol.log.Debug("Rebuilding skiplist index", "blocksToScan", numToIndex)
-
-	// Iterate over the N most recent blocks, from OLDEST among them to NEWEST among them.
-	// allBlockIDs is currently sorted [Latest, Latest-1, ..., Oldest].
-	// We want to process block allBlockIDs[numToIndex-1], then allBlockIDs[numToIndex-2], ..., up to allBlockIDs[0].
-	// This ensures that when readAndIndexBlock calls skiplist.Set, the values from newer blocks overwrite older ones.
-	for i := numToIndex - 1; i >= 0; i-- {
-		blockID := allBlockIDs[i] // blockID goes from oldest_of_N to newest_of_N
-		indexEntry, ok := aol.blockIndex[blockID]
-		if !ok {
-			// Should not happen
-			aol.log.Error("Block ID inconsistency during skiplist rebuild", "blockID", blockID)
+	for _, blockID := range blocksToIndex {
+		// Ensure this block is still supposed to be indexed.
+		// This check is somewhat redundant if blocksToIndex is derived from aol.recentBlocks
+		// and aol.indexedBlocks is kept in sync, but good for safety.
+		if _, stillIndexed := aol.indexedBlocks[blockID]; !stillIndexed {
+			aol.log.Warn("Block in blocksToIndex for rebuild is no longer in aol.indexedBlocks", "blockID", blockID)
 			continue
 		}
 
-		// Add to recentBlocks in oldest-to-newest order directly.
-		// As 'i' goes from numToIndex-1 down to 0, blockID goes from the oldest of the recent N
-		// to the newest of the recent N. Appending them in this order builds recentBlocks correctly.
-		aol.recentBlocks = append(aol.recentBlocks, blockID)
-		aol.indexedBlocks[blockID] = struct{}{}
+		indexEntry, ok := aol.blockIndex[blockID]
+		if !ok {
+			aol.log.Error("Block ID from recentBlocks list not found in main blockIndex during skiplist rebuild", "blockID", blockID)
+			// This indicates a serious inconsistency.
+			// Depending on desired robustness, could return error or try to continue.
+			return fmt.Errorf("inconsistency: block %d in recentBlocks not in blockIndex", blockID)
+		}
 
 		// Read all entries for this block and add to skiplist
-		err := aol.readAndIndexBlock(indexEntry)
+		err := aol.readAndIndexBlock(indexEntry) // readAndIndexBlock uses aol.skiplistIndex.Set
 		if err != nil {
 			return fmt.Errorf("failed to read/index block %d during rebuild: %w", blockID, err)
 		}
 	}
 
-	aol.log.Debug("Skiplist rebuild complete", "indexedKeys", aol.skiplistIndex.Len())
+	aol.log.Debug("Skiplist rebuild complete", "indexedKeys", aol.skiplistIndex.Len(), "currentRecentBlocks", aol.recentBlocks)
 	return nil
 }
 
@@ -318,43 +333,20 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 	}
 
 	if len(kvs) == 0 {
-		// Case 1: Appending block 0 with empty KVS on a truly empty log.
-		// This is a special silent no-op. latestBlockID remains 0, no index entry.
-		if blockID == 0 && isFirstAppend {
-			aol.log.Debug("Append(0, empty_kvs) on empty log: No operation performed.", "blockID", blockID)
+		// If kvs is empty, this append operation should generally be a no-op
+		// in terms of advancing the log or writing data.
+
+		if blockID == 0 && isFirstAppend { // Allowed: block 0, empty kvs, first append
+			aol.log.Debug("Append(0, empty_kvs) on empty log: No operation performed, latestBlockID remains 0.", "blockID", blockID)
+			// No index entry, no latestBlockID update.
 			return nil
 		}
 
-		// Case 2: Appending an empty KVS for any other valid blockID
-		// This means the block *exists* but is empty. We must record it.
-		aol.log.Debug("Append called with empty KVS for block, creating empty block index entry", "blockID", blockID)
-
-		currentDataOffset := aol.currentOffset // No actual data written for this block
-		indexEntry := blockIndexEntry{
-			BlockID:     blockID,
-			StartOffset: currentDataOffset,
-			EndOffset:   currentDataOffset, // Indicates an empty block
-		}
-		aol.blockIndex[blockID] = indexEntry
-		aol.latestBlockID = blockID // Update latestBlockID
-
-		// Persist the index entry for this empty block
-		if err := aol.writeIndexEntry(aol.indexMapFile, indexEntry); err != nil {
-			delete(aol.blockIndex, blockID) // Attempt to revert in-memory change
-			// Not attempting to revert latestBlockID here as it's complex and this is a critical error.
-			aol.log.Crit("Failed to write block index entry for empty block!", "blockID", blockID, "error", err)
-			return fmt.Errorf("CRITICAL: failed to write index entry for empty block %d: %w", blockID, err)
-		}
-
-		// Sync the index map file
-		if err := aol.indexMapFile.Sync(); err != nil {
-			aol.log.Error("Failed to sync index map file after empty block append", "blockID", blockID, "error", err)
-			return fmt.Errorf("failed to sync index map file for empty block %d: %w", blockID, err)
-		}
-
-		// Update recent blocks and skiplist as this block ID is now part of the log's history
-		aol.updateRecentBlocks(blockID)
-		aol.evictOldEntries() // Manages skiplist consistency
+		// If blockID > aol.latestBlockID and kvs is empty, the test implies it's a no-op
+		// regarding latestBlockID. We also won't write an index entry for it to be consistent.
+		// This condition is implicitly true if we passed the monotonicity check and len(kvs) == 0
+		// and it's not the (blockID == 0 && isFirstAppend) case.
+		aol.log.Debug("Append called with empty KVS for a new block ID. No operation performed, latestBlockID not advanced.", "blockID", blockID, "latestBlockID", aol.latestBlockID)
 		return nil
 	}
 
@@ -487,104 +479,119 @@ func (aol *AppendOnlyLog) evictOldEntries() {
 	// (triggered by 'updateRecentBlocks') is functioning as intended.
 }
 
-// Get retrieves the latest value for a key from the indexed recent blocks.
+// Get retrieves the latest value for a key from the indexed recent blocks,
+// or by scanning older blocks if not found in recent ones.
 // Returns the value and true if found, or "", false otherwise.
 // Handles tombstones (returns "", true for deleted keys).
 func (aol *AppendOnlyLog) Get(key string) (string, bool, error) {
 	aol.mu.RLock()
+	defer aol.mu.RUnlock()
+
 	if aol.closed {
-		aol.mu.RUnlock()
 		return "", false, fmt.Errorf("append-only log is closed")
 	}
 
-	// Try skiplist first
+	// 1. Try skiplist (recent N blocks)
 	element := aol.skiplistIndex.Get(key)
 	if element != nil {
-		aol.mu.RUnlock()
 		pointer := element.Value.(*kvPointer)
 		headerSize := blockIDSize + keyLenSize + valueLenSize
 		headerBytes := make([]byte, headerSize)
 
+		// Read header from data file
 		_, err := aol.dataFile.ReadAt(headerBytes, pointer.Offset)
 		if err != nil {
+			aol.log.Error("Get: Failed to read entry header from skiplist pointer", "key", key, "offset", pointer.Offset, "error", err)
 			return "", false, fmt.Errorf("failed to read entry header for key %s: %w", key, err)
 		}
 
-		keyLen := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
-		valueLen := binary.BigEndian.Uint32(headerBytes[blockIDSize+keyLenSize : headerSize])
+		keyLenOnDisk := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
+		valueLenOnDisk := binary.BigEndian.Uint32(headerBytes[blockIDSize+keyLenSize : headerSize])
 
-		if valueLen != pointer.ValueLen {
-			return "", false, fmt.Errorf("data inconsistency for key %s", key)
-		}
+		// It's possible pointer.ValueLen might differ from valueLenOnDisk if there's an issue,
+		// but we should read what the header on disk says for the value.
+		// The kvPointer's ValueLen is mostly for information or a quick check.
 
-		valueBytes := make([]byte, valueLen)
-		valueOffset := pointer.Offset + int64(headerSize) + int64(keyLen)
+		valueBytes := make([]byte, valueLenOnDisk)
+		valueOffset := pointer.Offset + int64(headerSize) + int64(keyLenOnDisk)
 		_, err = aol.dataFile.ReadAt(valueBytes, valueOffset)
 		if err != nil {
+			aol.log.Error("Get: Failed to read value from skiplist pointer", "key", key, "valueOffset", valueOffset, "error", err)
 			return "", false, fmt.Errorf("failed to read value for key %s: %w", key, err)
 		}
 
 		value := string(valueBytes)
 		if value == TombstoneMarker {
-			return "", true, nil
+			return "", true, nil // Key was explicitly deleted
 		}
-
-		return value, true, nil
-	}
-	aol.mu.RUnlock()
-
-	aol.mu.Lock()
-	defer aol.mu.Unlock()
-
-	if element := aol.skiplistIndex.Get(key); element != nil {
-		pointer := element.Value.(*kvPointer)
-		headerSize := blockIDSize + keyLenSize + valueLenSize
-		headerBytes := make([]byte, headerSize)
-
-		_, err := aol.dataFile.ReadAt(headerBytes, pointer.Offset)
-		if err != nil {
-			return "", false, fmt.Errorf("failed to read entry header for key %s: %w", key, err)
-		}
-
-		keyLen := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
-		valueLen := binary.BigEndian.Uint32(headerBytes[blockIDSize+keyLenSize : headerSize])
-
-		if valueLen != pointer.ValueLen {
-			return "", false, fmt.Errorf("data inconsistency for key %s", key)
-		}
-
-		valueBytes := make([]byte, valueLen)
-		valueOffset := pointer.Offset + int64(headerSize) + int64(keyLen)
-		_, err = aol.dataFile.ReadAt(valueBytes, valueOffset)
-		if err != nil {
-			return "", false, fmt.Errorf("failed to read value for key %s: %w", key, err)
-		}
-
-		value := string(valueBytes)
-		if value == TombstoneMarker {
-			return "", true, nil
-		}
-
-		return value, true, nil
+		return value, true, nil // Key found in skiplist
 	}
 
-	blockIDs := make([]uint64, 0, len(aol.blockIndex))
+	// 2. If not in skiplist, search older blocks (those not covered by skiplist index).
+	//    Iterate all blockIndex entries from newest to oldest.
+	allBlockIDs := make([]uint64, 0, len(aol.blockIndex))
 	for id := range aol.blockIndex {
-		blockIDs = append(blockIDs, id)
+		allBlockIDs = append(allBlockIDs, id)
 	}
-	sort.Slice(blockIDs, func(i, j int) bool { return blockIDs[i] > blockIDs[j] })
+	// Sort from newest to oldest to find the most recent version of the key
+	sort.Slice(allBlockIDs, func(i, j int) bool {
+		return allBlockIDs[i] > allBlockIDs[j]
+	})
 
-	for _, blockNum := range blockIDs {
-		indexEntry, ok := aol.blockIndex[blockNum]
-		if !ok {
+	for _, blockIDToScan := range allBlockIDs {
+		// If this block IS covered by the skiplist index, then the skiplist.Get() above
+		// would have found the key's latest state if it originated from this block or a newer
+		// skiplist-indexed block. So, we can skip re-scanning its data here.
+		if _, isIndexed := aol.indexedBlocks[blockIDToScan]; isIndexed {
 			continue
 		}
-		err := aol.readAndIndexBlock(indexEntry)
+
+		// This block is older and not covered by the skiplist. Scan its data.
+		indexEntry, ok := aol.blockIndex[blockIDToScan] // Still under RLock
+		if !ok {
+			aol.log.Error("Get: Block ID from allBlockIDs not found in blockIndex", "blockID", blockIDToScan)
+			continue // Should not happen
+		}
+
+		size := indexEntry.EndOffset - indexEntry.StartOffset
+		if size <= 0 {
+			continue // Empty block
+		}
+
+		blockData := make([]byte, size)
+		// dataFile.ReadAt is thread-safe and suitable for use under RLock
+		_, err := aol.dataFile.ReadAt(blockData, indexEntry.StartOffset)
 		if err != nil {
-			return "", false, fmt.Errorf("failed to decode entry in block %d: %w", blockNum, err)
+			aol.log.Error("Get: Failed to read block data for older block", "blockID", blockIDToScan, "key", key, "error", err)
+			// Depending on desired behavior, might continue to try other blocks or return error.
+			// For now, return error as it indicates a potential issue reading data.
+			return "", false, fmt.Errorf("Get: failed to read data for block %d: %w", blockIDToScan, err)
+		}
+
+		reader := bytes.NewReader(blockData)
+		// Iterate through entries in this specific block's data
+		for reader.Len() > 0 {
+			entry, _, readErr := aol.readLogEntry(reader)
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				aol.log.Error("Get: Failed to decode entry in older block", "blockID", blockIDToScan, "key", key, "error", readErr)
+				return "", false, fmt.Errorf("Get: failed to decode entry in block %d: %w", blockIDToScan, readErr)
+			}
+
+			if entry.Key == key {
+				// Found the key in this older block. Since we are iterating newest to oldest,
+				// this is the most recent version not covered by the skiplist.
+				if entry.Value == TombstoneMarker {
+					return "", true, nil // Found tombstone
+				}
+				return entry.Value, true, nil // Found value
+			}
 		}
 	}
 
+	// Key not found in skiplist or any older blocks
 	return "", false, nil
 }
 

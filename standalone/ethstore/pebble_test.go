@@ -2,12 +2,12 @@ package ethstore
 
 import (
 	"bytes"
+	"errors" // Added for ErrNotFound comparison
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -90,8 +90,9 @@ func TestPebbleStore_PutGetDelete(t *testing.T) {
 	// Test Get non-existent key
 	nonExistentKey := []byte("nonExistentKey")
 	_, err = ps.Get(nonExistentKey)
-	if err != pebble.ErrNotFound {
-		t.Errorf("Get(%s) error = %v, want %v", nonExistentKey, err, pebble.ErrNotFound)
+	// if err != pebble.ErrNotFound { // Changed: Use local ErrNotFound
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(%s) error = %v, want %v", nonExistentKey, err, ErrNotFound)
 	}
 
 	// Test Delete
@@ -101,8 +102,9 @@ func TestPebbleStore_PutGetDelete(t *testing.T) {
 
 	// Test Get after Delete
 	_, err = ps.Get(key1)
-	if err != pebble.ErrNotFound {
-		t.Errorf("Get(%s) after Delete error = %v, want %v", key1, err, pebble.ErrNotFound)
+	// if err != pebble.ErrNotFound { // Changed: Use local ErrNotFound
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(%s) after Delete error = %v, want %v", key1, err, ErrNotFound)
 	}
 
 	// Ensure other key is still present
@@ -164,50 +166,63 @@ func TestPebbleStore_Iterator(t *testing.T) {
 		}
 	}
 
-	iter := ps.NewIterator(nil) // Default options
-	defer iter.Close()
+	iter := ps.NewIterator(nil, nil) // Changed: pass (nil, nil)
+	// defer iter.Close() // Changed: use Release, and handle nil iterator from placeholder
+	if iter != nil {
+		defer iter.Release()
+	}
 
 	var count int
-	for iter.First(); iter.Valid(); iter.Next() {
-		if !bytes.Equal(iter.Key(), keys[count]) {
-			t.Errorf("Iterator key mismatch: got %s, want %s", iter.Key(), keys[count])
+	// for iter.First(); iter.Valid(); iter.Next() { // Changed: adapt to ethdb.Iterator
+	// The actual test logic will fail here if iter is nil due to placeholder NewIterator
+	if iter != nil {
+		for iter.Next() {
+			if !bytes.Equal(iter.Key(), keys[count]) {
+				t.Errorf("Iterator key mismatch: got %s, want %s", iter.Key(), keys[count])
+			}
+			if !bytes.Equal(iter.Value(), values[count]) {
+				t.Errorf("Iterator value mismatch: got %s, want %s", iter.Value(), values[count])
+			}
+			count++
 		}
-		if !bytes.Equal(iter.Value(), values[count]) {
-			t.Errorf("Iterator value mismatch: got %s, want %s", iter.Value(), values[count])
+		if err := iter.Error(); err != nil {
+			t.Fatalf("Iterator error: %v", err)
 		}
-		count++
-	}
-	if err := iter.Error(); err != nil {
-		t.Fatalf("Iterator error: %v", err)
 	}
 
 	if count != len(keys) {
-		t.Errorf("Iterator iterated over %d keys, want %d", count, len(keys))
+		t.Errorf("Iterator iterated over %d keys, want %d (actual iterator might be nil due to placeholder)", count, len(keys))
 	}
 
 	// Test iteration with prefix
 	prefix := []byte("key")
-	iterOpts := &pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: append(prefix, 0xff), // Iterate up to the prefix + max byte
-	}
+	// iterOpts := &pebble.IterOptions{ // Changed: This is Pebble specific, adapt to ethdb.Iterator
+	// 	LowerBound: prefix,
+	// 	UpperBound: append(prefix, 0xff), // Iterate up to the prefix + max byte
+	// }
 	// Recreate iterator with specific options
-	iterWithPrefix := ps.NewIterator(iterOpts)
-	defer iterWithPrefix.Close()
+	iterWithPrefix := ps.NewIterator(prefix, nil) // Changed: pass prefix and nil for start
+	// defer iterWithPrefix.Close() // Changed: use Release, and handle nil
+	if iterWithPrefix != nil {
+		defer iterWithPrefix.Release()
+	}
 
 	count = 0
-	for iterWithPrefix.First(); iterWithPrefix.Valid(); iterWithPrefix.Next() {
-		// Check if key starts with prefix (though bounds should handle this)
-		if !bytes.HasPrefix(iterWithPrefix.Key(), prefix) {
-			t.Errorf("Iterator with prefix returned key %s which does not have prefix %s", iterWithPrefix.Key(), prefix)
+	// for iterWithPrefix.First(); iterWithPrefix.Valid(); iterWithPrefix.Next() { // Changed: adapt to ethdb.Iterator
+	if iterWithPrefix != nil {
+		for iterWithPrefix.Next() {
+			// Check if key starts with prefix (though bounds should handle this)
+			if !bytes.HasPrefix(iterWithPrefix.Key(), prefix) {
+				t.Errorf("Iterator with prefix returned key %s which does not have prefix %s", iterWithPrefix.Key(), prefix)
+			}
+			count++
 		}
-		count++
-	}
-	if err := iterWithPrefix.Error(); err != nil {
-		t.Fatalf("Iterator with prefix error: %v", err)
+		if err := iterWithPrefix.Error(); err != nil {
+			t.Fatalf("Iterator with prefix error: %v", err)
+		}
 	}
 	if count != len(keys) { // All keys in this test have the "key" prefix
-		t.Errorf("Iterator with prefix iterated over %d keys, want %d", count, len(keys))
+		t.Errorf("Iterator with prefix iterated over %d keys, want %d (actual iterator might be nil due to placeholder)", count, len(keys))
 	}
 }
 
