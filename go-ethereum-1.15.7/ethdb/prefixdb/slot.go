@@ -7,8 +7,8 @@ import (
 )
 
 type Slot struct {
-	appendOnlyPart map[string][]byte // append-only part as a map
-	accessedPart   map[string][]byte // sorted part
+	appendOnlyPart map[string][]byte // append-only part
+	// accessedPart   map[string][]byte // sorted part
 }
 
 type SlotManager struct {

@@ -1,6 +1,8 @@
 package prefixdb
 
 import (
+	"errors"
+	"io"
 	"sync"
 )
 
@@ -11,7 +13,6 @@ type WriteBatch struct {
 
 type WriteOperation struct {
 	value       []byte
-	position    int64
 	accountType AccountType
 }
 
@@ -21,10 +22,10 @@ func NewWriteBatch() *WriteBatch {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, position int64, accountType AccountType) {
+func (wb *WriteBatch) add(key, value []byte, accountType AccountType) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
-	wb.operations[string(key)] = WriteOperation{value: value, position: position, accountType: accountType}
+	wb.operations[string(key)] = WriteOperation{value: value, accountType: accountType}
 }
 
 func (wb *WriteBatch) get(key []byte) ([]byte, bool) {
@@ -39,9 +40,55 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 	batch.lock.Lock()
 	defer batch.lock.Unlock()
 
+	var NAEntry []byte
+	var CAEntry []byte
+	NAOffset, _ := db.normalAccountFile.Seek(0, io.SeekEnd)
 	// Write all operations to the database
 	for key, op := range batch.operations {
-		if err := db.writeToFile(op.position, []byte(key), op.value, op.accountType); err != nil {
+		entry, _ := db.ConvertKV([]byte(key), op.value)
+		slotIndex := db.slotManager.getEmptySlot()
+		switch op.accountType {
+
+		case NormalAccount:
+			NAEntry = append(NAEntry, entry...)
+			db.setOffset([]byte(key), NAOffset)
+			NAOffset += int64(len(entry))
+
+		case ContractAccount:
+			if len(CAEntry)+len(entry) > db.slotManager.slotSize {
+				// If the current entry exceeds the slot size, write the current CAEntry to the database
+				slotIndex = db.slotManager.getEmptySlot()
+				if slotIndex == -1 {
+					return errors.New("no empty slot available")
+				}
+				// Pad the CAEntry with zeros to fill the slot
+				// padding := make([]byte, db.slotManager.slotSize-len(CAEntry))
+				// CAEntry = append(CAEntry, padding...)
+				db.contractAccountFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
+				CAEntry = nil
+			}
+			CAEntry = append(CAEntry, entry...)
+			db.setSlotIndex([]byte(key), slotIndex)
+		default:
+			return errors.New("unknown account type")
+		}
+	}
+	// Write the remaining CAEntry to the file
+	if len(CAEntry) > 0 {
+		slotIndex := db.slotManager.getEmptySlot()
+		if slotIndex == -1 {
+			return errors.New("no empty slot available")
+		}
+		// Pad the remaining CAEntry with zeros to fill the slot
+		// padding := make([]byte, db.slotManager.slotSize-len(CAEntry))
+		// CAEntry = append(CAEntry, padding...)
+		db.contractAccountFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
+		CAEntry = nil
+	}
+	// Write the NAEntry to the file
+	if len(NAEntry) > 0 {
+		_, err := db.normalAccountFile.WriteAt(NAEntry, NAOffset-int64(len(NAEntry)))
+		if err != nil {
 			return err
 		}
 	}

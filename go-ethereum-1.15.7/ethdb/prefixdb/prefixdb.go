@@ -2,6 +2,7 @@ package prefixdb
 
 import (
 	"errors"
+	"io"
 	"os"
 	"sync"
 )
@@ -22,7 +23,7 @@ const (
 
 type TrieNode struct {
 	children    map[byte]*TrieNode // children nodes
-	value       []byte             // key of the node
+	value       []byte             // value of the node
 	slotIndex   int                // slot index for contract account
 	offset      int64              // for normal account, offset in the file,for contract account, offset in the slot
 	isLeaf      bool               // is leaf node
@@ -83,7 +84,7 @@ func (db *PrefixDB) Read(key []byte) ([]byte, error) {
 	// Check in batch
 	if db.batch != nil {
 		if value, ok := db.batch.get(key); ok {
-			db.incrementCacheFreq(string(key))
+			// db.incrementCacheFreq(string(key))
 			return value, nil
 		}
 	}
@@ -106,21 +107,17 @@ func (db *PrefixDB) Read(key []byte) ([]byte, error) {
 	// ContractAccount:
 	case ContractAccount:
 		slotIndex := node.slotIndex
-		appendOnlyKVPairs, accessedKVPairs, err := db.loadSlot(slotIndex)
+		appendOnlyKVPairs, err := db.loadSlot(slotIndex)
 		if err != nil {
 			return nil, err
 		}
 		// Add the all valid Pair to cache
-
 		for k, v := range appendOnlyKVPairs {
 			db.addToCache(k, v, false)
 		}
 
 		if value, exists := appendOnlyKVPairs[string(key)]; exists {
-			accessedKVPairs[string(key)] = value
-			go db.performGC(appendOnlyKVPairs, accessedKVPairs, slotIndex)
-			return value, nil
-		} else if value, exists := accessedKVPairs[string(key)]; exists {
+			go db.performGC(appendOnlyKVPairs, slotIndex)
 			return value, nil
 		}
 
@@ -142,34 +139,10 @@ func (db *PrefixDB) Write(key, value []byte) error {
 	if err != nil {
 		return err
 	}
-
-	var position int64
-	switch accountType {
-	case NormalAccount:
-		// Normal account
-		position = db.allocateOffset(accountType)
-		node.offset = position
-		node.slotIndex = -1
-	case ContractAccount:
-		// Contract account
-		lenEntry := len(key) + len(value) + 4
-		for slotIndex, size := range db.slotManager.usedSizes {
-			if size+lenEntry > APPENDONLY_SIZE {
-				db.slotManager.slotStatus[slotIndex] = true
-				continue
-			}
-			node.slotIndex = slotIndex
-			position = int64(db.slotManager.usedSizes[slotIndex])
-			node.offset = position
-			// Update used size
-			if err := db.slotManager.updateUsedSize(slotIndex, lenEntry); err != nil {
-				return err
-			}
-		}
-	}
-
 	// Add the operation to the batch
-	db.batch.add(key, value, position, accountType)
+	db.batch.add(key, value, accountType)
+	// Add to cache
+	db.addToCache(string(key), value, false)
 	return nil
 }
 
@@ -206,7 +179,7 @@ func (db *PrefixDB) createNode(key []byte) (*TrieNode, error) {
 				slotIndex:   0,
 				offset:      0,
 				isLeaf:      true,
-				accountType: NormalAccount, // 或根据逻辑设置
+				accountType: NormalAccount,
 				refCount:    0,
 			}
 		}
@@ -215,17 +188,17 @@ func (db *PrefixDB) createNode(key []byte) (*TrieNode, error) {
 	return current, nil
 }
 
-func (db *PrefixDB) allocateOffset(accountType AccountType) int64 {
-	// Allocate offset based on account type
-	var file *os.File
-	if accountType == ContractAccount {
-		file = db.contractAccountFile
-	} else {
-		file = db.normalAccountFile
-	}
-	stat, _ := file.Stat()
-	return stat.Size()
-}
+// func (db *PrefixDB) allocateOffset(accountType AccountType) int64 {
+// 	// Allocate offset based on account type
+// 	var file *os.File
+// 	if accountType == ContractAccount {
+// 		file = db.contractAccountFile
+// 	} else {
+// 		file = db.normalAccountFile
+// 	}
+// 	stat, _ := file.Stat()
+// 	return stat.Size()
+// }
 
 func (db *PrefixDB) readFromFile(offset int64, accountType AccountType) ([]byte, error) {
 	// Read from the appropriate file based on account type
@@ -265,6 +238,16 @@ func (db *PrefixDB) writeToFile(offset int64, key, value []byte, accountType Acc
 	}
 
 	formattedData, _ := db.ConvertKV(key, value)
+	_, err := file.WriteAt(formattedData, offset)
+	return err
+}
+
+// Write the normal account data to the file
+func (db *PrefixDB) writeNAToFile(key, value []byte) error {
+
+	file := db.normalAccountFile
+	formattedData, _ := db.ConvertKV(key, value)
+	offset, _ := file.Seek(0, io.SeekEnd)
 	_, err := file.WriteAt(formattedData, offset)
 	return err
 }
@@ -334,17 +317,16 @@ func (db *PrefixDB) getSlotIndex(key []byte) int {
 	return node.slotIndex
 }
 
-func (db *PrefixDB) loadSlot(index int) (map[string][]byte, map[string][]byte, error) {
+func (db *PrefixDB) loadSlot(index int) (map[string][]byte, error) {
 	// Load the slot from the contract account file
 	offset := int64(index * SLOT_SIZE)
 	buf := make([]byte, SLOT_SIZE)
 	appendOnlyKVPairs := make(map[string][]byte)
-	accessedKVPairs := make(map[string][]byte)
 
 	// Read the slot from the file
 	_, err := db.contractAccountFile.ReadAt(buf, offset)
 	if err != nil {
-		return appendOnlyKVPairs, accessedKVPairs, errors.New("loadSlot error") // Return empty maps on error
+		return appendOnlyKVPairs, errors.New("loadSlot error") // Return empty maps on error
 	}
 
 	// Parse the append-only part
@@ -365,28 +347,7 @@ func (db *PrefixDB) loadSlot(index int) (map[string][]byte, map[string][]byte, e
 		appendOnlyKVPairs[key] = value
 	}
 
-	// Parse the accessed part
-	data = buf[APPENDONLY_SIZE:]
-	for len(data) > 0 {
-		if data[0] == 0 && data[1] == 0 {
-			break
-		}
-		// Read key size and value size
-		keySize := int(data[0])<<8 | int(data[1])
-		valueSize := int(data[2])<<8 | int(data[3])
-		// Read key and value
-		key := string(data[4 : 4+keySize])
-		value := data[4+keySize : 4+keySize+valueSize]
-		data = data[4+keySize+valueSize:]
-
-		// Update accessedKVPairs if not already present
-		accessedKVPairs[key] = value
-		if _, exists := appendOnlyKVPairs[key]; exists {
-			accessedKVPairs[key] = appendOnlyKVPairs[key]
-		}
-	}
-
-	return appendOnlyKVPairs, accessedKVPairs, nil
+	return appendOnlyKVPairs, nil
 }
 
 func (db *PrefixDB) saveSlot(index int, slot *Slot) {
@@ -404,31 +365,16 @@ func (db *PrefixDB) saveSlot(index int, slot *Slot) {
 		data = data[len(entry):]
 	}
 
-	// Serialize accessedPart map into the buffer
-	data = buf[APPENDONLY_SIZE:]
-	for key, value := range slot.accessedPart {
-		entry, _ := db.ConvertKV([]byte(key), value)
-
-		if len(entry) > len(data) {
-			break
-		}
-
-		// write the entry to the buffer
-		copy(data, entry)
-		data = data[len(entry):]
-	}
-
 	// Write the slot back to the file
 	_, err := db.contractAccountFile.WriteAt(buf, offset)
 	if err != nil {
 		panic("failed to save slot: " + err.Error())
 	}
-	// delete the accessed part
-	for key := range slot.accessedPart {
-		delete(slot.accessedPart, key)
-	}
 	// clear the append-only part
-	slot.appendOnlyPart = nil
+	for k := range slot.appendOnlyPart {
+		delete(slot.appendOnlyPart, k)
+	}
+
 }
 
 func (db *PrefixDB) addToCache(key string, value []byte, loadPath bool) {
@@ -565,7 +511,7 @@ func (db *PrefixDB) ConvertKV(key, value []byte) ([]byte, error) {
 	return formattedData, nil
 }
 
-func (db *PrefixDB) performGC(appendOnlyKVPairs map[string][]byte, accessedKVPairs map[string][]byte, oldSlotIndex int) {
+func (db *PrefixDB) performGC(appendOnlyKVPairs map[string][]byte, oldSlotIndex int) {
 	//  Write valid KV pairs to a new slot
 	newSlotIndex := db.slotManager.getEmptySlot()
 	if newSlotIndex == -1 {
@@ -574,11 +520,9 @@ func (db *PrefixDB) performGC(appendOnlyKVPairs map[string][]byte, accessedKVPai
 
 	newSlot := &Slot{
 		appendOnlyPart: make(map[string][]byte),
-		accessedPart:   make(map[string][]byte),
 	}
 
 	newSlot.appendOnlyPart = appendOnlyKVPairs
-	newSlot.accessedPart = accessedKVPairs
 
 	// Save the new slot
 	db.saveSlot(newSlotIndex, newSlot)
@@ -599,4 +543,20 @@ func (db *PrefixDB) performGC(appendOnlyKVPairs map[string][]byte, accessedKVPai
 	defer db.slotManager.lock.Unlock()
 	db.slotManager.slotStatus[oldSlotIndex] = false
 	db.slotManager.releaseSlot(oldSlotIndex, db.contractAccountFile)
+}
+
+func (db *PrefixDB) setOffset(key []byte, offset int64) {
+	// Set the offset for the key in the prefix tree
+	node, _ := db.findNode(key)
+	if node != nil {
+		node.offset = offset
+	}
+}
+
+func (db *PrefixDB) setSlotIndex(key []byte, slotIndex int) {
+	// Set the slot index for the key in the prefix tree
+	node, _ := db.findNode(key)
+	if node != nil {
+		node.slotIndex = slotIndex
+	}
 }
