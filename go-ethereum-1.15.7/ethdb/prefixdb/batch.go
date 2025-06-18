@@ -13,7 +13,7 @@ type WriteBatch struct {
 
 type WriteOperation struct {
 	value       []byte
-	accountType AccountType
+	accountType KeyType
 }
 
 func NewWriteBatch() *WriteBatch {
@@ -22,7 +22,7 @@ func NewWriteBatch() *WriteBatch {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, accountType AccountType) {
+func (wb *WriteBatch) add(key, value []byte, accountType KeyType) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 	wb.operations[string(key)] = WriteOperation{value: value, accountType: accountType}
@@ -42,57 +42,107 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 
 	var NAEntry []byte
 	var CAEntry []byte
-	NAOffset, _ := db.normalAccountFile.Seek(0, io.SeekEnd)
-	// Write all operations to the database
+
+	// Store pending write data for each slot
+	slotEntries := make(map[int][]byte)
+
+	trieAccountffset, _ := db.accountFile.Seek(0, io.SeekEnd)
+
+	// Process operations by type
 	for key, op := range batch.operations {
 		entry, _ := db.ConvertKV([]byte(key), op.value)
-		slotIndex := db.slotManager.getEmptySlot()
+
 		switch op.accountType {
-
-		case NormalAccount:
+		case TrieAccount:
+			// Write TrieAccount to account file, similar to NormalAccount
 			NAEntry = append(NAEntry, entry...)
-			db.setOffset([]byte(key), NAOffset)
-			NAOffset += int64(len(entry))
+			db.setOffset([]byte(key), trieAccountffset)
+			trieAccountffset += int64(len(entry))
 
-		case ContractAccount:
-			if len(CAEntry)+len(entry) > db.slotManager.slotSize {
-				// If the current entry exceeds the slot size, write the current CAEntry to the database
-				slotIndex = db.slotManager.getEmptySlot()
-				if slotIndex == -1 {
-					return errors.New("no empty slot available")
-				}
-				// Pad the CAEntry with zeros to fill the slot
-				// padding := make([]byte, db.slotManager.slotSize-len(CAEntry))
-				// CAEntry = append(CAEntry, padding...)
-				db.contractAccountFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
-				CAEntry = nil
+		case TrieStorage, TrieCode:
+			// Find corresponding account's slot
+			accountKey := db.getParentAccountKey([]byte(key))
+			if accountKey == nil {
+				continue // Skip invalid entries
 			}
-			CAEntry = append(CAEntry, entry...)
-			db.setSlotIndex([]byte(key), slotIndex)
-		default:
-			return errors.New("unknown account type")
+
+			// Get account node
+			accountNode, err := db.findNode(accountKey)
+			if err != nil || accountNode == nil || accountNode.slotIndex <= 0 {
+				continue // Skip invalid entries
+			}
+
+			slotIndex := accountNode.slotIndex
+
+			// Add entry to corresponding slot's pending write data
+			if _, exists := slotEntries[slotIndex]; !exists {
+				slotEntries[slotIndex] = make([]byte, 0)
+			}
+			slotEntries[slotIndex] = append(slotEntries[slotIndex], entry...)
 		}
 	}
-	// Write the remaining CAEntry to the file
+
+	// Write normal account data
+	if len(NAEntry) > 0 {
+		_, err := db.accountFile.WriteAt(NAEntry, trieAccountffset-int64(len(NAEntry)))
+		if err != nil {
+			return err
+		}
+	}
+
+	// Write contract account data
 	if len(CAEntry) > 0 {
 		slotIndex := db.slotManager.getEmptySlot()
 		if slotIndex == -1 {
 			return errors.New("no empty slot available")
 		}
-		// Pad the remaining CAEntry with zeros to fill the slot
-		// padding := make([]byte, db.slotManager.slotSize-len(CAEntry))
-		// CAEntry = append(CAEntry, padding...)
-		db.contractAccountFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
-		CAEntry = nil
+		db.slotFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
 	}
-	// Write the NAEntry to the file
-	if len(NAEntry) > 0 {
-		_, err := db.normalAccountFile.WriteAt(NAEntry, NAOffset-int64(len(NAEntry)))
-		if err != nil {
-			return err
+
+	// Write Storage and Code data to respective slots
+	for slotIndex, entryData := range slotEntries {
+		// First get slot data from cache - O(1)时间复杂度
+		var slotData map[string][]byte
+		var exists bool
+
+		slotData, exists = db.slotCache.Get(slotIndex)
+		if !exists {
+			// If not in cache, load from file
+			var err error
+			slotData, err = db.loadSlot(slotIndex)
+			if err != nil {
+				slotData = make(map[string][]byte)
+			}
 		}
+
+		// Parse entryData and update slotData
+		data := entryData
+		for len(data) > 0 && len(data) >= 4 {
+			keySize := int(data[0])<<8 | int(data[1])
+			valueSize := int(data[2])<<8 | int(data[3])
+
+			if 4+keySize+valueSize > len(data) {
+				break
+			}
+
+			key := string(data[4 : 4+keySize])
+			value := data[4+keySize : 4+keySize+valueSize]
+			slotData[key] = value
+
+			data = data[4+keySize+valueSize:]
+		}
+
+		// Write to slot in append-only mode
+		slot := &Slot{
+			appendOnlyPart: slotData,
+		}
+		db.saveSlot(slotIndex, slot)
+
+		// Update cache - O(1)时间复杂度
+		db.slotCache.Put(slotIndex, slotData)
 	}
-	// Clear the batch after committing
-	batch.operations = nil
+
+	// Clear batch
+	batch.operations = make(map[string]WriteOperation)
 	return nil
 }
