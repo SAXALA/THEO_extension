@@ -101,7 +101,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 
 	// Write Storage and Code data to respective slots
 	for slotIndex, entryData := range slotEntries {
-		// First get slot data from cache - O(1)时间复杂度
+		// First get slot data from cache - O(1) time complexity
 		var slotData map[string][]byte
 		var exists bool
 
@@ -138,7 +138,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 		}
 		db.saveSlot(slotIndex, slot)
 
-		// Update cache - O(1)时间复杂度
+		// Update cache - O(1) time complexity
 		db.slotCache.Put(slotIndex, slotData)
 	}
 

@@ -86,7 +86,7 @@ func NewPrefixDB(NAfilePath string, CAfilePath string, cacheSize int) (*PrefixDB
 		accountFile: naFilePath,
 		slotFile:    cafilePath,
 		nodeCache:   NewNodeCache(cacheSize),
-		slotCache:   NewSlotCache(50), // 默认slot缓存大小为50
+		slotCache:   NewSlotCache(50), // dafault slot cache size
 		slotManager: NewSlotManager(SLOT_NUM, SLOT_SIZE),
 		batch:       NewWriteBatch(),
 	}, nil
@@ -98,12 +98,12 @@ func (db *PrefixDB) Read(key []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// 检查节点缓存 - O(1)时间复杂度
+	// check in cache
 	if value, ok := db.nodeCache.Get(string(key)); ok {
 		return value, nil
 	}
 
-	// 检查批处理缓存
+	// check in batch
 	if db.batch != nil {
 		if value, ok := db.batch.get(key); ok {
 			return value, nil
@@ -122,9 +122,8 @@ func (db *PrefixDB) Read(key []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		// 添加到缓存 - O(1)时间复杂度
+		// add to cache and cache path of the node
 		db.nodeCache.Put(string(key), value)
-		// 缓存路径上的所有节点
 		db.nodeCache.CachePathToNode(string(key), db)
 		return value, nil
 
@@ -140,19 +139,19 @@ func (db *PrefixDB) Read(key []byte) ([]byte, error) {
 
 		slotIndex := accountNode.slotIndex
 
-		// 检查slot缓存 - O(1)时间复杂度
+		// check slot cache
 		if slotData, exists := db.slotCache.Get(slotIndex); exists {
 			if value, ok := slotData[string(key)]; ok {
 				return value, nil
 			}
 		} else {
-			// 从文件加载slot
+			// load slot
 			slotData, err := db.loadSlot(slotIndex)
 			if err != nil {
 				return nil, err
 			}
 
-			// 添加到缓存 - O(1)时间复杂度
+			// add to slot cache
 			db.slotCache.Put(slotIndex, slotData)
 			if value, exists := slotData[string(key)]; exists {
 				return value, nil
@@ -191,8 +190,6 @@ func (db *PrefixDB) Write(key, value []byte) error {
 		}
 
 		db.batch.add(key, value, TrieAccount)
-
-		// 添加到缓存 - O(1)时间复杂度
 		db.nodeCache.Put(string(key), value)
 
 	case TrieStorage, TrieCode:
@@ -208,7 +205,7 @@ func (db *PrefixDB) Write(key, value []byte) error {
 
 		slotIndex := accountNode.slotIndex
 
-		// 检查slot是否在缓存中 - O(1)时间复杂度
+		// check if the slot is in cache
 		if slotData, exists := db.slotCache.Get(slotIndex); exists {
 			slotData[string(key)] = value
 			db.slotCache.Put(slotIndex, slotData)
@@ -311,6 +308,7 @@ func (db *PrefixDB) Close() error {
 	return nil
 }
 
+// ExtractAccountData extracts account data from the value of a TrieAccount node.
 func (db *PrefixDB) ExtractAccountData(key, value []byte) (*StateAccount, error) {
 	if key == nil || value == nil || key[0] != 'A' {
 		return nil, errors.New("invalid key or value")
@@ -371,6 +369,7 @@ func (db *PrefixDB) ExtractAccountData(key, value []byte) (*StateAccount, error)
 	return &account, nil
 }
 
+// decodeAccountRLP decodes the RLP encoded account data into a StateAccount struct.
 func (db *PrefixDB) decodeAccountRLP(accountRLP []byte, account *StateAccount) error {
 	// Decode the RLP encoded account data
 	fields, err := rlp.Split(accountRLP)
@@ -478,9 +477,6 @@ func (db *PrefixDB) saveSlot(index int, slot *Slot) {
 
 }
 
-// 删除不再需要的方法
-// cachePathToNode和incrementRefCount方法已移至NodeCache中
-
 // Convert key-value pair to byte array: <key size (short) + value size (short) + key + value>
 func (db *PrefixDB) ConvertKV(key, value []byte) ([]byte, error) {
 
@@ -546,41 +542,35 @@ func (db *PrefixDB) setOffset(key []byte, offset int64) {
 	}
 }
 
-// 辅助方法：判断是否为合约账户
+// isContractAccount checks
 func (db *PrefixDB) isContractAccount(value []byte) bool {
-	// 这里可以根据实际情况实现
-	// 简单实现：检查value是否超过一定大小或包含特定字段
-	return len(value) > 128 // 假设大于128字节的value可能是合约账户
+	return len(value) > 128
 }
 
-// 辅助方法：获取键类型
+// getKeyType determines the type of key based on its prefix.
 func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
 	if key == nil || len(key) == 0 {
 		return -1, errors.New("invalid key")
 	}
 
-	// 根据key的前缀判断类型
 	prefix := key[0]
 	switch prefix {
-	case 'A': // 假设A开头的是TrieAccount
+	case 'A':
 		return TrieAccount, nil
-	case 'S': // 假设S开头的是TrieStorage
+	case 'S':
 		return TrieStorage, nil
-	case 'C': // 假设C开头的是TrieCode
+	case 'c':
 		return TrieCode, nil
 	default:
 	}
 	return -1, errors.New("unknown key type")
 }
 
-// 辅助方法：从Storage或Code的key中提取Account key
+// getParentAccountKey retrieves the parent account key from a given (code or storage)key.
 func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
-	// 假设key格式为：前缀(1字节) + 账户地址(20字节) + 其他数据
 	if len(key) < 21 {
 		return nil
 	}
-
-	// 提取账户地址并构造账户key
 	accountAddr := key[1:21]
 	return append([]byte{'A'}, accountAddr...)
 }
