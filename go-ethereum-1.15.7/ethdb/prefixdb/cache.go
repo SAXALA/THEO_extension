@@ -6,44 +6,87 @@ import (
 	"time"
 )
 
-// NodeCache 管理节点的LRU缓存
+// NodeCache 管理节点的缓存，按引用计数排序
+// 使用数组存储多个链表，每个链表对应一个引用计数值引用计数为1的节点在refLists[1]中，引用计数为2的节点在refLists[2]中，依此类推,在每个链表内部，节点按照插入顺序排列，最新插入的在链表头部
 type NodeCache struct {
-	capacity int                      // 缓存容量
-	cache    map[string]*list.Element // 键到链表节点的映射
-	lruList  *list.List               // 按访问顺序排列的双向链表
-	refCount map[string]int           // 引用计数
-	lock     sync.RWMutex
+	capacity    int                      // 缓存容量
+	cache       map[string]*list.Element // 键到链表节点的映射
+	refLists    []*list.List             // 按引用计数分组的链表数组
+	maxRefCount int                      // 当前最大引用计数
+	lock        sync.RWMutex
 }
 
 // 链表节点中存储的数据结构
 type cacheEntry struct {
-	key   string
-	value []byte
+	key      string
+	value    []byte
+	refCount int // 引用计数
 }
 
 // NewNodeCache 创建新的节点缓存
 func NewNodeCache(capacity int) *NodeCache {
+	// 初始创建一定数量的链表，后续可以根据需要扩展
+	const initialListCount = 10
+	refLists := make([]*list.List, initialListCount)
+	for i := range refLists {
+		refLists[i] = list.New()
+	}
+
 	return &NodeCache{
-		capacity: capacity,
-		cache:    make(map[string]*list.Element),
-		lruList:  list.New(),
-		refCount: make(map[string]int),
+		capacity:    capacity,
+		cache:       make(map[string]*list.Element),
+		refLists:    refLists,
+		maxRefCount: 0,
+	}
+}
+
+// ensureRefListCapacity 确保有足够的引用计数链表
+func (nc *NodeCache) ensureRefListCapacity(refCount int) {
+	for refCount >= len(nc.refLists) {
+		nc.refLists = append(nc.refLists, list.New())
+	}
+	if refCount > nc.maxRefCount {
+		nc.maxRefCount = refCount
 	}
 }
 
 // Get 获取缓存中的值，O(1)时间复杂度
 func (nc *NodeCache) Get(key string) ([]byte, bool) {
 	nc.lock.RLock()
-	defer nc.lock.RUnlock()
-
-	if element, exists := nc.cache[key]; exists {
-		// 移动到链表头部表示最近访问
-		nc.lruList.MoveToFront(element)
-		// 增加引用计数
-		nc.refCount[key]++
-		return element.Value.(*cacheEntry).value, true
+	element, exists := nc.cache[key]
+	if !exists {
+		nc.lock.RUnlock()
+		return nil, false
 	}
-	return nil, false
+
+	// 获取条目
+	entry := element.Value.(*cacheEntry)
+	value := entry.value
+	oldRefCount := entry.refCount
+	nc.lock.RUnlock()
+
+	// 增加引用计数并移动到相应的链表
+	nc.lock.Lock()
+	defer nc.lock.Unlock()
+
+	// 确保元素仍存在（可能在获取读锁和写锁之间被删除）
+	if element, exists = nc.cache[key]; !exists {
+		return value, true // 返回之前读取的值
+	}
+
+	entry = element.Value.(*cacheEntry)
+	newRefCount := entry.refCount + 1
+	entry.refCount = newRefCount
+
+	// 确保有足够的链表
+	nc.ensureRefListCapacity(newRefCount)
+
+	// 从旧链表移除并添加到新链表
+	nc.refLists[oldRefCount].Remove(element)
+	newElement := nc.refLists[newRefCount].PushFront(entry)
+	nc.cache[key] = newElement
+
+	return value, true
 }
 
 // Put 添加或更新缓存中的值，O(1)时间复杂度
@@ -51,68 +94,80 @@ func (nc *NodeCache) Put(key string, value []byte) {
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
 
+	// 如果键已存在，更新值和引用计数
 	if element, exists := nc.cache[key]; exists {
-		// 已存在则更新值
-		nc.lruList.MoveToFront(element)
-		element.Value.(*cacheEntry).value = value
-		nc.IncrementRefCount(key)
+		entry := element.Value.(*cacheEntry)
+		oldRefCount := entry.refCount
+		newRefCount := oldRefCount + 1
+		entry.value = value
+		entry.refCount = newRefCount
+
+		// 确保有足够的链表
+		nc.ensureRefListCapacity(newRefCount)
+
+		// 从旧链表移除并添加到新链表
+		nc.refLists[oldRefCount].Remove(element)
+		newElement := nc.refLists[newRefCount].PushFront(entry)
+		nc.cache[key] = newElement
 		return
 	}
 
-	// 缓存已满，移除引用计数最小的项
+	// 如果缓存已满，淘汰引用计数最小的项
 	if len(nc.cache) >= nc.capacity {
-		nc.evictByRefCount()
+		nc.evictMinRefCount()
 	}
 
-	// 添加新项
+	// 添加新项，初始引用计数为1
 	entry := &cacheEntry{
-		key:   key,
-		value: value,
+		key:      key,
+		value:    value,
+		refCount: 1,
 	}
-	element := nc.lruList.PushFront(entry)
+
+	// 添加到引用计数为1的链表
+	nc.ensureRefListCapacity(1)
+	element := nc.refLists[1].PushFront(entry)
 	nc.cache[key] = element
-	nc.refCount[key] = 1
 }
 
-// evictByRefCount 移除引用计数最小的项，O(n)时间复杂度
-// 当有多个引用计数相同的最小值时，优先移除LRU最不常用的
-func (nc *NodeCache) evictByRefCount() {
-	if nc.lruList.Len() == 0 {
-		return
-	}
-
-	minRefCount := int(^uint(0) >> 1) // 最大int值
-	var minElement *list.Element
-
-	// 第一次遍历，找出最小引用计数
-	for e := nc.lruList.Back(); e != nil; e = e.Prev() {
-		entry := e.Value.(*cacheEntry)
-		if count, exists := nc.refCount[entry.key]; exists && count < minRefCount {
-			minRefCount = count
-			minElement = e
+// evictMinRefCount 淘汰引用计数最小的项，O(1)时间复杂度
+func (nc *NodeCache) evictMinRefCount() {
+	// 从引用计数最小的链表开始查找
+	for i := 1; i <= nc.maxRefCount; i++ {
+		list := nc.refLists[i]
+		if list.Len() > 0 {
+			// 从链表尾部移除（最近最少使用的）
+			element := list.Back()
+			entry := element.Value.(*cacheEntry)
+			delete(nc.cache, entry.key)
+			list.Remove(element)
+			return
 		}
-	}
-
-	// 如果所有节点引用计数相同，使用LRU策略
-	if minElement == nil {
-		minElement = nc.lruList.Back()
-	}
-
-	if minElement != nil {
-		entry := minElement.Value.(*cacheEntry)
-		delete(nc.cache, entry.key)
-		delete(nc.refCount, entry.key)
-		nc.lruList.Remove(minElement)
 	}
 }
 
 // IncrementRefCount 增加节点引用计数
 func (nc *NodeCache) IncrementRefCount(key string) {
-	if count, exists := nc.refCount[key]; exists {
-		nc.refCount[key] = count + 1
-	} else {
-		nc.refCount[key] = 1
+	nc.lock.Lock()
+	defer nc.lock.Unlock()
+
+	element, exists := nc.cache[key]
+	if !exists {
+		return
 	}
+
+	entry := element.Value.(*cacheEntry)
+	oldRefCount := entry.refCount
+	newRefCount := oldRefCount + 1
+	entry.refCount = newRefCount
+
+	// 确保有足够的链表
+	nc.ensureRefListCapacity(newRefCount)
+
+	// 从旧链表移除并添加到新链表
+	nc.refLists[oldRefCount].Remove(element)
+	newElement := nc.refLists[newRefCount].PushFront(entry)
+	nc.cache[key] = newElement
 }
 
 // CachePathToNode 缓存从根到节点路径上的所有节点
@@ -154,12 +209,13 @@ func (nc *NodeCache) CachePathToNode(key string, db *PrefixDB) {
 
 		// 创建新条目并添加到缓存
 		entry := &cacheEntry{
-			key:   currentKey,
-			value: nodeValue,
+			key:      currentKey,
+			value:    nodeValue,
+			refCount: 1,
 		}
-		element := nc.lruList.PushFront(entry)
+		nc.ensureRefListCapacity(1)
+		element := nc.refLists[1].PushFront(entry)
 		nc.cache[currentKey] = element
-		nc.refCount[currentKey] = 1
 	}
 }
 
@@ -177,8 +233,8 @@ func (nc *NodeCache) ContainsKey(key string) bool {
 func (nc *NodeCache) GetRefCount(key string) int {
 	nc.lock.RLock()
 	defer nc.lock.RUnlock()
-	if count, exists := nc.refCount[key]; exists {
-		return count
+	if element, exists := nc.cache[key]; exists {
+		return element.Value.(*cacheEntry).refCount
 	}
 	return 0
 }
