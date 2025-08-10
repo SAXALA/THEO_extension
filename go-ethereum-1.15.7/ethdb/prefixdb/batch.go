@@ -1,7 +1,6 @@
 package prefixdb
 
 import (
-	"errors"
 	"io"
 	"sync"
 )
@@ -14,6 +13,7 @@ type WriteBatch struct {
 type WriteOperation struct {
 	value       []byte
 	accountType KeyType
+	slotIndex   int // New field to record the slotIndex for the key-value pair
 }
 
 func NewWriteBatch() *WriteBatch {
@@ -22,10 +22,10 @@ func NewWriteBatch() *WriteBatch {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, accountType KeyType) {
+func (wb *WriteBatch) add(key, value []byte, accountType KeyType, slotIndex int) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
-	wb.operations[string(key)] = WriteOperation{value: value, accountType: accountType}
+	wb.operations[string(key)] = WriteOperation{value: value, accountType: accountType, slotIndex: slotIndex}
 }
 
 func (wb *WriteBatch) get(key []byte) ([]byte, bool) {
@@ -41,7 +41,6 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 	defer batch.lock.Unlock()
 
 	var NAEntry []byte
-	var CAEntry []byte
 
 	// Store pending write data for each slot
 	slotEntries := make(map[int][]byte)
@@ -54,31 +53,31 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 
 		switch op.accountType {
 		case TrieAccount:
-			// Write TrieAccount to account file, similar to NormalAccount
-			NAEntry = append(NAEntry, entry...)
-			db.setOffset([]byte(key), trieAccountffset)
-			trieAccountffset += int64(len(entry))
+			// 使用slotIndex判断账户类型
+			if op.slotIndex != 0 {
+				// 智能合约账户，写入对应的slot
+				if _, exists := slotEntries[op.slotIndex]; !exists {
+					slotEntries[op.slotIndex] = make([]byte, 0)
+				}
+				slotEntries[op.slotIndex] = append(slotEntries[op.slotIndex], entry...)
+			} else {
+				// 普通账户写入账户文件
+				NAEntry = append(NAEntry, entry...)
+				db.setOffset([]byte(key), trieAccountffset)
+				trieAccountffset += int64(len(entry))
+			}
 
 		case TrieStorage, TrieCode:
-			// Find corresponding account's slot
-			accountKey := db.getParentAccountKey([]byte(key))
-			if accountKey == nil {
+			// Use the recorded slotIndex directly, no need to lookup again
+			if op.slotIndex <= 0 {
 				continue // Skip invalid entries
 			}
 
-			// Get account node
-			accountNode, err := db.findNode(accountKey)
-			if err != nil || accountNode == nil || accountNode.slotIndex <= 0 {
-				continue // Skip invalid entries
+			// Add to the pending write data for the corresponding slot
+			if _, exists := slotEntries[op.slotIndex]; !exists {
+				slotEntries[op.slotIndex] = make([]byte, 0)
 			}
-
-			slotIndex := accountNode.slotIndex
-
-			// Add entry to corresponding slot's pending write data
-			if _, exists := slotEntries[slotIndex]; !exists {
-				slotEntries[slotIndex] = make([]byte, 0)
-			}
-			slotEntries[slotIndex] = append(slotEntries[slotIndex], entry...)
+			slotEntries[op.slotIndex] = append(slotEntries[op.slotIndex], entry...)
 		}
 	}
 
@@ -88,15 +87,6 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Write contract account data
-	if len(CAEntry) > 0 {
-		slotIndex := db.slotManager.getEmptySlot()
-		if slotIndex == -1 {
-			return errors.New("no empty slot available")
-		}
-		db.slotFile.WriteAt(CAEntry, int64((slotIndex)*db.slotManager.slotSize))
 	}
 
 	// Write Storage and Code data to respective slots

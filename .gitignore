@@ -29,3 +29,16 @@
 *.exe
 *.out
 *.app
+
+tools
+standalone/ethstore/index
+standalone/ethstore/log
+standalone/svg
+
+
+
+
+standalone/ethstore/workload/workload
+standalone/ethstore/testWorkload/testWorkload
+standalone/ethstore/findKey.py
+go-ethereum-1.15.7/ethdb/prefixdb/question.md

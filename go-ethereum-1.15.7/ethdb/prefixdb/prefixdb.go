@@ -1,10 +1,14 @@
 package prefixdb
 
 import (
+	"bufio"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -14,9 +18,11 @@ const MAX_CACHE_SIZE = 1024   // maximum cache size
 const BUFFER_SIZE = 8192      // buffer size for file operations
 const SLOT_SIZE = 1024 * 1024 // size of each slot
 const SLOT_NUM = 1024
+const accountHashIndexFileName = "/mnt/tmp/index/accountHash_accountKey_index.txt"
 
 // number of slots
 const APPENDONLY_SIZE = 512 * 1024 // size of append-only part in each slot
+const TRIE_FILE_NAME = "trie.dat"  // prefix tree file names
 
 type KeyType int
 
@@ -57,12 +63,17 @@ type PrefixDB struct {
 	slotCache   *SlotCache
 	slotManager *SlotManager
 	batch       *WriteBatch
+	triePath    string // path to the prefix tree file
+}
 
-	// slot cache
-	// slotCache      map[int]map[string][]byte // slotIndex -> (key -> value)
-	// slotCacheLock  sync.RWMutex
-	// slotCacheSize  int           // maximum number of slots in cache
-	// slotAccessTime map[int]int64 // records the last access time of each slot
+// SerializedTrieNode is used for serializing TrieNode to file.
+type SerializedTrieNode struct {
+	IsLeaf      bool
+	AccountType AccountType
+	SlotIndex   int
+	Offset      int64
+	Value       []byte
+	Children    map[byte][]byte
 }
 
 /**
@@ -81,15 +92,27 @@ func NewPrefixDB(NAfilePath string, CAfilePath string, cacheSize int) (*PrefixDB
 		return nil, errors.New("failed to open contract account file")
 	}
 
-	return &PrefixDB{
+	// get the path for the prefix tree file (same directory as normal account file)
+	triePath := filepath.Join(filepath.Dir(NAfilePath), TRIE_FILE_NAME)
+
+	db := &PrefixDB{
 		root:        &TrieNode{children: make(map[byte]*TrieNode)},
 		accountFile: naFilePath,
 		slotFile:    cafilePath,
 		nodeCache:   NewNodeCache(cacheSize),
-		slotCache:   NewSlotCache(50), // dafault slot cache size
+		slotCache:   NewSlotCache(50), // default slot cache size
 		slotManager: NewSlotManager(SLOT_NUM, SLOT_SIZE),
 		batch:       NewWriteBatch(),
-	}, nil
+		triePath:    triePath,
+	}
+
+	// try to load the persisted prefix tree
+	if err := db.LoadTrie(); err != nil {
+		// if loading fails, use an empty prefix tree (already initialized in the constructor)
+		fmt.Printf("unable to load prefix tree, using empty tree: %v\n", err)
+	}
+
+	return db, nil
 }
 
 func (db *PrefixDB) Read(key []byte) ([]byte, error) {
@@ -174,23 +197,57 @@ func (db *PrefixDB) Write(key, value []byte) error {
 	case TrieAccount:
 		existingNode, _ := db.findNode(key)
 		isNewNode := existingNode == nil
-
-		node, err := db.createNode(key)
-		if err != nil {
-			return err
+		var node *TrieNode
+		if isNewNode {
+			var err error
+			node, err = db.createNode(key)
+			if err != nil {
+				return err
+			}
+		} else {
+			node = existingNode
 		}
 
-		// if it's a new node,give it a slot index
-		if db.isContractAccount(value) && (isNewNode || node.slotIndex <= 0) {
+		// judge if the account is a contract account
+		isContract := db.isContractAccount(value)
+
+		// 如果是已有账户（不是新账户）并且是智能合约账户
+		if !isNewNode && isContract && node.slotIndex > 0 {
+			// 检查该账户的 slot 是否已经加载到内存中
+			_, exists := db.slotCache.Get(node.slotIndex)
+			if !exists {
+				// 如果未加载到内存，则加载 slot
+				slotData, err := db.loadSlot(node.slotIndex)
+				if err == nil && slotData != nil {
+					// 加载成功后放入 slotCache
+					db.slotCache.Put(node.slotIndex, slotData)
+				}
+			} else {
+				// 如果已经加载到内存中，直接更新 slotData
+				slotData, _ := db.slotCache.Get(node.slotIndex)
+				slotData[string(key)] = value
+				db.slotCache.Put(node.slotIndex, slotData)
+			}
+		}
+
+		// if the account is a contract account and has no slot allocated, allocate one
+		if isContract && (isNewNode || node.slotIndex <= 0) {
 			slotIndex := db.slotManager.getEmptySlot()
 			if slotIndex == -1 {
 				return errors.New("no empty slot available")
 			}
 			node.slotIndex = slotIndex
+
+			// 将智能合约账户数据放入slotCache
+			slotData := make(map[string][]byte)
+			slotData[string(key)] = value
+			db.slotCache.Put(slotIndex, slotData)
+		} else if !isContract {
+			// 普通账户放入nodeCache
+			db.nodeCache.Put(string(key), value)
 		}
 
-		db.batch.add(key, value, TrieAccount)
-		db.nodeCache.Put(string(key), value)
+		db.batch.add(key, value, TrieAccount, node.slotIndex)
 
 	case TrieStorage, TrieCode:
 		accountKey := db.getParentAccountKey(key)
@@ -220,7 +277,7 @@ func (db *PrefixDB) Write(key, value []byte) error {
 			db.slotCache.Put(slotIndex, slotData)
 		}
 
-		db.batch.add(key, value, keyType)
+		db.batch.add(key, value, keyType, slotIndex)
 	}
 
 	return nil
@@ -298,6 +355,11 @@ func (db *PrefixDB) writeToFile(offset int64, key, value []byte, keyType KeyType
 }
 
 func (db *PrefixDB) Close() error {
+	// Save the prefix tree to file before closing
+	if err := db.SaveTrie(); err != nil {
+		return fmt.Errorf("failed to save prefix tree: %v", err)
+	}
+
 	// Close both files
 	if err := db.accountFile.Close(); err != nil {
 		return err
@@ -306,6 +368,133 @@ func (db *PrefixDB) Close() error {
 		return err
 	}
 	return nil
+}
+
+// SaveTrie saves the current prefix tree to a file.
+func (db *PrefixDB) SaveTrie() error {
+	file, err := os.Create(db.triePath)
+	if err != nil {
+		return fmt.Errorf("创建前缀树文件失败: %v", err)
+	}
+	defer file.Close()
+
+	encoder := gob.NewEncoder(file)
+
+	// serialize and save the root node
+	return db.saveNode(encoder, db.root, []byte{})
+}
+
+// saveNode recursively serializes a node and its children
+func (db *PrefixDB) saveNode(encoder *gob.Encoder, node *TrieNode, path []byte) error {
+	if node == nil {
+		return nil
+	}
+
+	// create a data structure for serializing the node
+	serialNode := SerializedTrieNode{
+		IsLeaf:      node.isLeaf,
+		AccountType: node.accountType,
+		SlotIndex:   node.slotIndex,
+		Offset:      node.offset,
+		Value:       node.value,
+		Children:    make(map[byte][]byte),
+	}
+
+	// record child node paths
+	for b := range node.children {
+		childPath := append(append([]byte{}, path...), b)
+		serialNode.Children[b] = childPath
+	}
+
+	// write the current node
+	if err := encoder.Encode(path); err != nil {
+		return err
+	}
+	if err := encoder.Encode(serialNode); err != nil {
+		return err
+	}
+
+	// recursively save all child nodes
+	for b, child := range node.children {
+		childPath := append(append([]byte{}, path...), b)
+		if err := db.saveNode(encoder, child, childPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// LoadTrie loads the prefix tree from a file.
+func (db *PrefixDB) LoadTrie() error {
+	file, err := os.Open(db.triePath)
+	if err != nil {
+		return fmt.Errorf("failed to open the prefix tree file: %v", err)
+	}
+	defer file.Close()
+
+	decoder := gob.NewDecoder(file)
+
+	// reset the prefix tree
+	db.root = &TrieNode{children: make(map[byte]*TrieNode)}
+
+	// temporary storage for all nodes
+	nodes := make(map[string]*TrieNode)
+	nodes[""] = db.root // root node path is an empty string
+
+	// continuously read until the end of the file
+	for {
+		var path []byte
+		err := decoder.Decode(&path)
+		if err != nil {
+			// reaching the end of the file is expected
+			if err.Error() == "EOF" {
+				break
+			}
+			return err
+		}
+
+		var serialNode SerializedTrieNode
+		if err := decoder.Decode(&serialNode); err != nil {
+			return err
+		}
+
+		// restore the node and its position in the tree
+		pathStr := string(path)
+		if pathStr == "" {
+			// special handling for the root node
+			db.root.isLeaf = serialNode.IsLeaf
+			db.root.accountType = serialNode.AccountType
+			db.root.slotIndex = serialNode.SlotIndex
+			db.root.offset = serialNode.Offset
+			db.root.value = serialNode.Value
+		} else {
+			// create or get the current node
+			currentNode := db.createNodeForPath(path)
+			currentNode.isLeaf = serialNode.IsLeaf
+			currentNode.accountType = serialNode.AccountType
+			currentNode.slotIndex = serialNode.SlotIndex
+			currentNode.offset = serialNode.Offset
+			currentNode.value = serialNode.Value
+			nodes[pathStr] = currentNode
+		}
+	}
+
+	return nil
+}
+
+// createNodeForPath ceates a node for the given path in the prefix tree.
+func (db *PrefixDB) createNodeForPath(path []byte) *TrieNode {
+	current := db.root
+	for _, b := range path {
+		if _, ok := current.children[b]; !ok {
+			current.children[b] = &TrieNode{
+				children: make(map[byte]*TrieNode),
+			}
+		}
+		current = current.children[b]
+	}
+	return current
 }
 
 // ExtractAccountData extracts account data from the value of a TrieAccount node.
@@ -372,37 +561,63 @@ func (db *PrefixDB) ExtractAccountData(key, value []byte) (*StateAccount, error)
 // decodeAccountRLP decodes the RLP encoded account data into a StateAccount struct.
 func (db *PrefixDB) decodeAccountRLP(accountRLP []byte, account *StateAccount) error {
 	// Decode the RLP encoded account data
-	fields, err := rlp.Split(accountRLP)
+	kind, content, _, err := rlp.Split(accountRLP)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to split RLP data: %v", err)
+	}
+	if kind != rlp.List {
+		return fmt.Errorf("expected RLP list, got %v", kind)
+	}
+
+	// Split the content into fields
+	// The expected format is: [nonce, balance, storageRoot, codeHash]
+	var fields [][]byte
+	rest := content
+
+	for i := 0; i < 4; i++ {
+		if len(rest) == 0 {
+			return fmt.Errorf("not enough fields in RLP data, expected 4, got %d", i)
+		}
+
+		var fieldValue []byte
+
+		_, fieldValue, rest, err = rlp.Split(content)
+		if err != nil {
+			return fmt.Errorf("failed to split field %d: %v", i, err)
+		}
+
+		fields = append(fields, fieldValue)
 	}
 
 	// decode nonce
-	if nonce, err := rlp.ParseUint64(fields[0]); err != nil {
-		return fmt.Errorf("invalid nonce: %v", err)
-	} else {
+	if len(fields[0]) > 0 {
+		nonce, err := decodeUint64(fields[0])
+		if err != nil {
+			return fmt.Errorf("解码nonce失败: %w", err)
+		}
 		account.Nonce = nonce
 	}
 
 	// decode balance
-	if balance, err := rlp.ParseBig(fields[1]); err != nil {
-		return fmt.Errorf("invalid balance: %v", err)
+	if len(fields[1]) > 0 {
+		account.Balance = new(big.Int)
+		account.Balance.SetBytes(fields[1])
 	} else {
-		account.Balance = balance
+		account.Balance = new(big.Int)
 	}
 
 	// decode storage root
-	if len(fields[2]) != common.HashLength+1 {
-		return fmt.Errorf("invalid storage root length: %d", len(fields[2])-1)
+	if len(fields[2]) != common.HashLength {
+		return fmt.Errorf("invalid storage root length: %d, expected %d", len(fields[2]), common.HashLength)
 	}
-	copy(account.Root[:], fields[2][1:])
-
+	copy(account.Root[:], fields[2])
 	// decode code hash
-	if len(fields[3]) == common.HashLength+1 {
-		account.CodeHash = make([]byte, common.HashLength)
-		copy(account.CodeHash, fields[3][1:])
-	} else {
-		return fmt.Errorf("invalid code hash length: %d", len(fields[3])-1)
+	if len(fields[3]) > 0 {
+		if len(fields[3]) != common.HashLength {
+			return fmt.Errorf("invalid code hash length: %d, expected %d", len(fields[3]), common.HashLength)
+		}
+		account.CodeHash = make([]byte, len(fields[3]))
+		copy(account.CodeHash, fields[3])
 	}
 
 	return nil
@@ -415,6 +630,22 @@ func (db *PrefixDB) getSlotIndex(key []byte) int {
 		return -1
 	}
 	return node.slotIndex
+}
+
+// decodeUint64 decodes a uint64 from RLP-encoded bytes.
+func decodeUint64(b []byte) (uint64, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if len(b) == 1 && b[0] < 128 {
+		return uint64(b[0]), nil
+	}
+
+	var n uint64
+	for _, byte := range b {
+		n = (n << 8) | uint64(byte)
+	}
+	return n, nil
 }
 
 func (db *PrefixDB) loadSlot(index int) (map[string][]byte, error) {
@@ -544,12 +775,35 @@ func (db *PrefixDB) setOffset(key []byte, offset int64) {
 
 // isContractAccount checks
 func (db *PrefixDB) isContractAccount(value []byte) bool {
-	return len(value) > 128
+	// RLP decode the value to check if it is a contract account
+	if len(value) == 0 {
+		return false
+	}
+	var rawNode []interface{}
+	if err := rlp.DecodeBytes(value, &rawNode); err != nil {
+		return false // decoding failed, not a contract account
+	}
+	// A contract account is identified by having a code hash or a non-empty code
+	if len(rawNode) < 4 {
+		return false // not enough fields to be a contract account
+	}
+	if codeHash, ok := rawNode[3].([]byte); ok && len(codeHash) == common.HashLength {
+		return true // has a valid code hash
+	}
+	if code, ok := rawNode[2].([]byte); ok && len(code) > 0 {
+		return true // has non-empty code
+	}
+	// Check if the value is too long to be a contract account
+	if len(value) > 128 {
+		return true // if the value is longer than 128 bytes, treat it as a contract
+	}
+	// Otherwise, it is not a contract account
+	return false
 }
 
 // getKeyType determines the type of key based on its prefix.
 func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
-	if key == nil || len(key) == 0 {
+	if len(key) == 0 {
 		return -1, errors.New("invalid key")
 	}
 
@@ -557,7 +811,7 @@ func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
 	switch prefix {
 	case 'A':
 		return TrieAccount, nil
-	case 'S':
+	case 'O':
 		return TrieStorage, nil
 	case 'c':
 		return TrieCode, nil
@@ -571,6 +825,53 @@ func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
 	if len(key) < 21 {
 		return nil
 	}
-	accountAddr := key[1:21]
-	return append([]byte{'A'}, accountAddr...)
+	accountHash := key[1:33]
+	accountHashHex := common.Bytes2Hex(accountHash)
+
+	file, err := os.Open(accountHashIndexFileName)
+	if err != nil {
+		fmt.Println("failed to open account hash index file:", err)
+		return nil
+	}
+	defer file.Close()
+
+	// read the account hash index file line by line
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
+		parts := strings.Split(line, " Key: ")
+		if len(parts) != 2 {
+			continue
+		}
+
+		hashPart := parts[0]
+		hashStart := strings.Index(hashPart, "\"")
+		hashEnd := strings.LastIndex(hashPart, "\"")
+		if hashStart == -1 || hashEnd == -1 || hashStart >= hashEnd {
+			continue
+		}
+
+		fileAccountHashHex := hashPart[hashStart+1 : hashEnd]
+
+		if strings.EqualFold(fileAccountHashHex, accountHashHex) {
+			keyPart := parts[1]
+			keyStart := strings.Index(keyPart, "\"")
+			keyEnd := strings.LastIndex(keyPart, "\"")
+			if keyStart == -1 || keyEnd == -1 || keyStart >= keyEnd {
+				continue
+			}
+
+			accountKeyHex := keyPart[keyStart+1 : keyEnd]
+			return common.Hex2Bytes(accountKeyHex)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Println("error reading account hash index file:", err)
+	}
+
+	return nil
 }
