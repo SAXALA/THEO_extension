@@ -12,6 +12,7 @@ import (
 	"sort" // Add this import
 	"strings"
 	"sync"
+	"time"
 
 	// Added testing import
 	"github.com/ethereum/go-ethereum/common" // Added common import
@@ -79,11 +80,21 @@ type BlockAppendOnlyLog struct {
 	skiplistIndex *skiplist.SkipList  // Key: string (key), Value: *kvPointer
 	indexedBlocks map[uint64]struct{} // Set of block IDs currently in the skiplist
 
+	SLIndexFilePath      string // Path to the skiplist index file (if needed)
+	lastPersistedBlockID uint64 // the last block ID that was persisted to disk
+	persistInterval      int    // how many blocks between persistence operations
+
 	// Skiplist for header keys
+
 	headerIndex         *skiplist.SkipList  // Key: string (header key), Value: *kvPointer
 	modifiedHeaders     map[string]struct{} // Track modified header keys
 	headerIndexFilePath string
 	headerIndexFile     *os.File
+
+	indexBuffer      []blockIndexEntry // Buffer for batching index writes
+	indexBufferMu    sync.Mutex        // Mutex for index buffer
+	indexBufferSize  int               // Size threshold for flushing index buffer
+	indexBufferFlush chan struct{}     // Channel to signal index buffer flush
 
 	mu     sync.RWMutex
 	closed bool
@@ -154,7 +165,17 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		headerIndexFile:     headerIndexFile,
 		headerIndex:         skiplist.New(skiplist.String),
 		modifiedHeaders:     make(map[string]struct{}), // Initialize empty for tracking modified headers
+
+		lastPersistedBlockID: 0,
+		persistInterval:      recentN,
+		SLIndexFilePath:      filepath.Join(dirPath, "header_skiplist_index.dat"),
+
+		indexBuffer:      make([]blockIndexEntry, 0, recentN/2),
+		indexBufferSize:  recentN / 2,
+		indexBufferFlush: make(chan struct{}, 1),
 	}
+
+	go baol.backgroundFlush()
 
 	// Load existing block index map
 	if err := baol.loadBlockIndex(); err != nil {
@@ -164,6 +185,10 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 
 	if err := baol.loadHeaderIndex(); err != nil {
 		baol.log.Warn("Failed to load header index, will rebuild", "error", err)
+	}
+
+	if err := baol.loadSkiplistIndex(); err != nil {
+		baol.log.Warn("Failed to load skiplist index, will rebuild", "error", err)
 	}
 
 	// Determine the actual N most recent blocks from all loaded blockIndex entries.
@@ -294,7 +319,7 @@ func (aol *BlockAppendOnlyLog) rebuildSkiplist() error {
 			continue
 		}
 
-		indexEntry, ok := aol.blockIndex[blockID]
+		indexEntry, ok := aol.getBlockIndexEntry(blockID)
 		if !ok {
 			aol.log.Error("Block ID from recentBlocks list not found in main blockIndex during skiplist rebuild", "blockID", blockID)
 			// This indicates a serious inconsistency.
@@ -359,6 +384,7 @@ func (aol *BlockAppendOnlyLog) readAndIndexBlock(indexEntry blockIndexEntry) err
 		ptr := &kvPointer{
 			Offset:   entryOffset,
 			ValueLen: uint32(len(entry.Value)), // Store length for faster Get
+			BlockID:  entry.BlockID,            // Store block ID for reference
 		}
 		aol.skiplistIndex.Set(entry.Key, ptr)
 	}
@@ -408,7 +434,15 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 	}
 
 	// --- Logic for non-empty KVS starts here ---
-	startOffset := aol.currentOffset
+	existingEntry, exists := aol.blockIndex[blockID]
+	var startOffset int64
+	if exists {
+		startOffset = existingEntry.EndOffset
+	} else {
+		// 否则使用当前偏移量
+		startOffset = aol.currentOffset
+	}
+	// startOffset = aol.currentOffset
 	blockDataBuf := new(bytes.Buffer)
 
 	// Serialize all entries for the block into the buffer
@@ -433,9 +467,14 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 	aol.currentOffset = endOffset
 
 	indexEntry := blockIndexEntry{
-		BlockID:     blockID,
-		StartOffset: startOffset,
-		EndOffset:   endOffset,
+		BlockID: blockID,
+		StartOffset: func() int64 {
+			if exists {
+				return existingEntry.StartOffset
+			}
+			return startOffset
+		}(),
+		EndOffset: endOffset,
 	}
 	aol.blockIndex[blockID] = indexEntry
 	aol.latestBlockID = blockID // This is correct for non-empty appends
@@ -449,18 +488,15 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 		return fmt.Errorf("CRITICAL: failed to write index entry for block %d: %w", blockID, err)
 	}
 
-	if err := aol.dataWriter.Flush(); err != nil {
-		aol.log.Error("Failed to flush data writer after append", "blockID", blockID, "error", err)
-		return fmt.Errorf("failed to flush data writer for block %d: %w", blockID, err)
-	}
-	if err := aol.dataFile.Sync(); err != nil {
-		aol.log.Error("Failed to sync data file after append", "blockID", blockID, "error", err)
-		return fmt.Errorf("failed to sync data file for block %d: %w", blockID, err)
-	}
-	if err := aol.indexMapFile.Sync(); err != nil {
-		aol.log.Error("Failed to sync index map file after append", "blockID", blockID, "error", err)
-		return fmt.Errorf("failed to sync index map file for block %d: %w", blockID, err)
-	}
+	// if err := aol.dataWriter.Flush(); err != nil {
+	// 	aol.log.Error("Failed to flush data writer", "error", err)
+	// }
+	// if err := aol.dataFile.Sync(); err != nil {
+	// 	aol.log.Error("Failed to sync data file", "error", err)
+	// }
+	// if err := aol.indexMapFile.Sync(); err != nil {
+	// 	aol.log.Error("Failed to sync index map file", "error", err)
+	// }
 
 	aol.updateRecentBlocks(blockID)
 	if _, isIndexed := aol.indexedBlocks[blockID]; isIndexed {
@@ -479,6 +515,7 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 			ptr := &kvPointer{
 				Offset:   entryPos,
 				ValueLen: uint32(len(entry.Value)),
+				BlockID:  entry.BlockID, // Store block ID for reference
 			}
 			aol.skiplistIndex.Set(entry.Key, ptr)
 			entryPos += bytesReadThisEntry
@@ -511,9 +548,7 @@ func (aol *BlockAppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
 		}
 
 		// Remove keys belonging *only* to the evicted block from the skiplist.
-		if err := aol.rebuildSkiplist(); err != nil {
-			aol.log.Error("Failed to rebuild skiplist after eviction", "evictedBlock", oldestBlockID, "error", err)
-		}
+		aol.evictOldBlockFromSkiplist(oldestBlockID)
 
 		headerIndexModified := false
 		for key, ptr := range oldHeaderKeys {
@@ -533,6 +568,7 @@ func (aol *BlockAppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
 			}
 		}
 	}
+	aol.persistIndexIfNeeded(newBlockID)
 }
 
 // evictOldEntries is called after new data is appended and recent blocks are updated.
@@ -573,6 +609,8 @@ func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 	if aol.closed {
 		return "", false, fmt.Errorf("append-only log is closed")
 	}
+
+	// check in buffer first
 
 	// Check if the key is in the skiplist index
 	element := aol.skiplistIndex.Get(key)
@@ -665,7 +703,7 @@ func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		}
 
 		// This block is older and not covered by the skiplist. Scan its data.
-		indexEntry, ok := aol.blockIndex[blockIDToScan] // Still under RLock
+		indexEntry, ok := aol.getBlockIndexEntry(blockIDToScan) // Still under RLock
 		if !ok {
 			aol.log.Error("Get: Block ID from allBlockIDs not found in blockIndex", "blockID", blockIDToScan)
 			continue // Should not happen
@@ -684,6 +722,10 @@ func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 			// Depending on desired behavior, might continue to try other blocks or return error.
 			// For now, return error as it indicates a potential issue reading data.
 			return "", false, fmt.Errorf("Get: failed to read data for block %d: %w", blockIDToScan, err)
+		}
+
+		if blockIDToScan == 0 {
+			fmt.Println("mark")
 		}
 
 		reader := bytes.NewReader(blockData)
@@ -785,6 +827,7 @@ func (aol *BlockAppendOnlyLog) Delete(key string) error {
 		ptr := &kvPointer{
 			Offset:   startOffset, // Offset of this specific logEntry (tombstone)
 			ValueLen: uint32(len(TombstoneMarker)),
+			BlockID:  blockIDForDelete, // Store block ID for reference
 		}
 		aol.skiplistIndex.Set(key, ptr)
 	}
@@ -808,7 +851,7 @@ func (aol *BlockAppendOnlyLog) DeleteByPrefixInBlock(targetBlockID uint64, prefi
 		return fmt.Errorf("append-only log is closed")
 	}
 
-	indexEntry, ok := aol.blockIndex[targetBlockID]
+	indexEntry, ok := aol.getBlockIndexEntry(targetBlockID)
 	if !ok {
 		aol.mu.RUnlock()
 		return fmt.Errorf("target block ID %d not found in index", targetBlockID)
@@ -881,7 +924,7 @@ func (aol *BlockAppendOnlyLog) GetByBlock(blockID uint64) (map[string]string, er
 		return nil, fmt.Errorf("append-only log is closed")
 	}
 
-	indexEntry, ok := aol.blockIndex[blockID]
+	indexEntry, ok := aol.getBlockIndexEntry(blockID)
 	if !ok {
 		return nil, fmt.Errorf("block ID %d not found in index", blockID)
 	}
@@ -995,6 +1038,10 @@ func (aol *BlockAppendOnlyLog) readLogEntry(r io.Reader) (*logEntry, int64, erro
 
 // writeIndexEntry appends a block index entry to the index map file.
 func (aol *BlockAppendOnlyLog) writeIndexEntry(w io.Writer, entry blockIndexEntry) error {
+	if f, ok := w.(*os.File); ok && f == aol.indexMapFile {
+		return aol.bufferIndexEntry(entry)
+	}
+
 	buf := make([]byte, blockIDSize+offsetSize+offsetSize)
 	binary.BigEndian.PutUint64(buf[0:blockIDSize], entry.BlockID)
 	binary.BigEndian.PutUint64(buf[blockIDSize:blockIDSize+offsetSize], uint64(entry.StartOffset))
@@ -1004,12 +1051,12 @@ func (aol *BlockAppendOnlyLog) writeIndexEntry(w io.Writer, entry blockIndexEntr
 	if err != nil {
 		return err
 	}
-	if indexWriter, ok := w.(*bufio.Writer); ok {
-		return indexWriter.Flush()
-	}
-	if f, ok := w.(*os.File); ok {
-		return f.Sync()
-	}
+	// if indexWriter, ok := w.(*bufio.Writer); ok {
+	// 	return indexWriter.Flush()
+	// }
+	// if f, ok := w.(*os.File); ok {
+	// 	return f.Sync()
+	// }
 	return nil
 }
 
@@ -1126,6 +1173,7 @@ func (aol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64, 
 			ptr := &kvPointer{
 				Offset:   entryPos,
 				ValueLen: uint32(len(entry.Value)),
+				BlockID:  newBlockID, // Store block ID for reference
 			}
 			aol.skiplistIndex.Set(entry.Key, ptr)
 			entryPos += bytesRead
@@ -1205,6 +1253,39 @@ func (aol *BlockAppendOnlyLog) Close() error {
 
 	var errs []error // Using a slice to collect multiple errors
 
+	select {
+	case aol.indexBufferFlush <- struct{}{}:
+
+	default:
+
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		// Wait for the flush to complete
+		time.Sleep(500 * time.Millisecond)
+		close(flushDone)
+	}()
+
+	select {
+	case <-flushDone:
+
+	case <-time.After(2 * time.Second):
+		fmt.Println("Warning: Timeout waiting for background flush goroutine to exit")
+		errs = append(errs, fmt.Errorf("background flush goroutine exit timeout"))
+	}
+
+	// Flush any remaining buffered index entries
+	if err := aol.flushIndexBuffer(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to flush index buffer on close: %w", err))
+	}
+
+	if aol.dataWriter != nil {
+		if err := aol.dataWriter.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to flush data writer on close: %w", err))
+		}
+	}
+
 	// Persist the final state of the index map.
 	// This ensures that even if the last Append's persistIndexMap had issues
 	// or if there were no appends since the last persist, the current map is written.
@@ -1214,6 +1295,10 @@ func (aol *BlockAppendOnlyLog) Close() error {
 
 	if err := aol.persistHeaderIndex(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to persist header index on close: %w", err))
+	}
+
+	if err := aol.persistSkiplistIndex(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to persist skiplist index on close: %w", err))
 	}
 
 	if aol.dataFile != nil {
@@ -1233,6 +1318,19 @@ func (aol *BlockAppendOnlyLog) Close() error {
 		}
 		aol.headerIndexFile = nil
 	}
+
+	if aol.indexMapFile != nil {
+		if err := aol.indexMapFile.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to sync index map file on close: %w", err))
+		}
+		if err := aol.indexMapFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close index map file: %w", err))
+		}
+		aol.indexMapFile = nil
+	}
+
+	close(aol.indexBufferFlush)
+	aol.indexBufferFlush = nil
 
 	// Combine errors if any occurred
 	if len(errs) > 0 {
@@ -1320,6 +1418,7 @@ func (aol *BlockAppendOnlyLog) initializeHeaderIndex() error {
 				ptr := &kvPointer{
 					Offset:   entryOffset,
 					ValueLen: uint32(len(entry.Value)),
+					BlockID:  blockID, // Store block ID for reference
 				}
 				aol.headerIndex.Set(entry.Key, ptr)
 				aol.log.Debug("Added header key to headerIndex", "key", entry.Key)
@@ -1439,6 +1538,7 @@ func (aol *BlockAppendOnlyLog) loadHeaderIndex() error {
 		ptr := &kvPointer{
 			Offset:   offset,
 			ValueLen: valueLen,
+			BlockID:  0, // Block ID is not stored in header index
 		}
 		aol.headerIndex.Set(key, ptr)
 
@@ -1447,4 +1547,311 @@ func (aol *BlockAppendOnlyLog) loadHeaderIndex() error {
 
 	aol.log.Info("Header index loaded from file", "entries", loadedCount)
 	return nil
+}
+
+func (aol *BlockAppendOnlyLog) evictOldBlockFromSkiplist(oldestBlockID uint64) {
+	aol.log.Debug("Evicting oldest block from skiplist index", "blockID", oldestBlockID)
+
+	// Identify keys to remove that belong only to the evicted block.
+	keysToRemove := make([]string, 0)
+
+	// Iterate through skiplist to find keys associated with the oldestBlockID
+	for e := aol.skiplistIndex.Front(); e != nil; e = e.Next() {
+		ptr := e.Value.(*kvPointer)
+		if ptr.BlockID == oldestBlockID {
+			keysToRemove = append(keysToRemove, e.Key().(string))
+		}
+	}
+
+	// Remove identified keys from skiplist
+	for _, key := range keysToRemove {
+		// check if the key exists in other blocks before removing
+		// shouldRemove := true
+		// existingElement := aol.skiplistIndex.Get(key)
+		// if existingElement != nil {
+		// 	ptr := existingElement.Value.(*kvPointer)
+		// 	if ptr.BlockID != oldestBlockID {
+		// 		// if the key exists in another block, do not remove it
+		// 		shouldRemove = false
+		// 	}
+		// }
+
+		// if shouldRemove {
+		// 	aol.skiplistIndex.Remove(key)
+		// }
+
+		aol.skiplistIndex.Remove(key)
+		aol.log.Debug("Removed key from skiplist during eviction", "key", key, "evictedBlockID", oldestBlockID)
+	}
+}
+
+// persistIndexIfNeeded checks if the index needs to be persisted based on the new block ID.
+func (aol *BlockAppendOnlyLog) persistIndexIfNeeded(currentBlockID uint64) {
+	if aol.lastPersistedBlockID == 0 || (currentBlockID-aol.lastPersistedBlockID) > uint64(aol.persistInterval) {
+		if err := aol.persistSkiplistIndex(); err != nil {
+			aol.log.Error("Failed to persist skiplist index", "error", err)
+		} else {
+			aol.lastPersistedBlockID = currentBlockID
+			aol.log.Info("Successfully persisted skiplist index",
+				"blockID", currentBlockID,
+				"keysIndexed", aol.skiplistIndex.Len())
+		}
+	}
+}
+
+// persistSkiplistIndex writes the current skiplist index to the skiplist index file.
+func (aol *BlockAppendOnlyLog) persistSkiplistIndex() error {
+	file, err := os.Create(aol.SLIndexFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create index file: %w", err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+
+	blockCount := len(aol.recentBlocks)
+	if err := binary.Write(writer, binary.BigEndian, uint32(blockCount)); err != nil {
+		return fmt.Errorf("failed to write block count: %w", err)
+	}
+
+	for _, blockID := range aol.recentBlocks {
+		if err := binary.Write(writer, binary.BigEndian, blockID); err != nil {
+			return fmt.Errorf("failed to write block ID: %w", err)
+		}
+	}
+
+	keyCount := aol.skiplistIndex.Len()
+	if err := binary.Write(writer, binary.BigEndian, uint32(keyCount)); err != nil {
+		return fmt.Errorf("failed to write key count: %w", err)
+	}
+
+	for e := aol.skiplistIndex.Front(); e != nil; e = e.Next() {
+		key := e.Key().(string)
+		ptr := e.Value.(*kvPointer)
+
+		keyBytes := []byte(key)
+		if err := binary.Write(writer, binary.BigEndian, uint32(len(keyBytes))); err != nil {
+			return fmt.Errorf("failed to write key length: %w", err)
+		}
+		if _, err := writer.Write(keyBytes); err != nil {
+			return fmt.Errorf("failed to write key data: %w", err)
+		}
+
+		if err := binary.Write(writer, binary.BigEndian, ptr.Offset); err != nil {
+			return fmt.Errorf("failed to write pointer offset: %w", err)
+		}
+		if err := binary.Write(writer, binary.BigEndian, ptr.ValueLen); err != nil {
+			return fmt.Errorf("failed to write pointer value length: %w", err)
+		}
+		if err := binary.Write(writer, binary.BigEndian, ptr.BlockID); err != nil {
+			return fmt.Errorf("failed to write pointer block ID: %w", err)
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush index data: %w", err)
+	}
+
+	return nil
+}
+
+func (aol *BlockAppendOnlyLog) loadSkiplistIndex() error {
+	// Check if the index file exists
+	if _, err := os.Stat(aol.SLIndexFilePath); os.IsNotExist(err) {
+		aol.log.Info("No persisted skiplist index found, will rebuild from data")
+		return nil
+	}
+
+	file, err := os.Open(aol.SLIndexFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open index file: %w", err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+
+	// read block count
+	var blockCount uint32
+	if err := binary.Read(reader, binary.BigEndian, &blockCount); err != nil {
+		return fmt.Errorf("failed to read block count: %w", err)
+	}
+
+	// read block IDs
+	tempRecentBlocks := make([]uint64, blockCount)
+	tempIndexedBlocks := make(map[uint64]struct{})
+
+	var highestBlockID uint64 = 0
+	for i := uint32(0); i < blockCount; i++ {
+		var blockID uint64
+		if err := binary.Read(reader, binary.BigEndian, &blockID); err != nil {
+			return fmt.Errorf("failed to read block ID: %w", err)
+		}
+		tempRecentBlocks[i] = blockID
+		tempIndexedBlocks[blockID] = struct{}{}
+
+		if blockID > highestBlockID {
+			highestBlockID = blockID
+		}
+	}
+
+	// check if the persisted index is outdated
+	if highestBlockID < aol.latestBlockID {
+		aol.log.Warn("Persisted index is outdated, will rebuild",
+			"indexLatestBlock", highestBlockID,
+			"aolLatestBlock", aol.latestBlockID)
+		return nil
+	}
+
+	aol.skiplistIndex = skiplist.New(skiplist.String)
+
+	// read key count
+	var keyCount uint32
+	if err := binary.Read(reader, binary.BigEndian, &keyCount); err != nil {
+		return fmt.Errorf("failed to read key count: %w", err)
+	}
+
+	// read each key and its pointer
+	for i := uint32(0); i < keyCount; i++ {
+		// read key
+		var keyLen uint32
+		if err := binary.Read(reader, binary.BigEndian, &keyLen); err != nil {
+			return fmt.Errorf("failed to read key length: %w", err)
+		}
+
+		keyBytes := make([]byte, keyLen)
+		if _, err := io.ReadFull(reader, keyBytes); err != nil {
+			return fmt.Errorf("failed to read key data: %w", err)
+		}
+		key := string(keyBytes)
+
+		// read pointer
+		ptr := &kvPointer{}
+		if err := binary.Read(reader, binary.BigEndian, &ptr.Offset); err != nil {
+			return fmt.Errorf("failed to read pointer offset: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &ptr.ValueLen); err != nil {
+			return fmt.Errorf("failed to read pointer value length: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &ptr.BlockID); err != nil {
+			return fmt.Errorf("failed to read pointer block ID: %w", err)
+		}
+
+		// insert into skiplist
+		aol.skiplistIndex.Set(key, ptr)
+	}
+
+	// update recentBlocks and indexedBlocks
+	aol.recentBlocks = tempRecentBlocks
+	aol.indexedBlocks = tempIndexedBlocks
+	aol.lastPersistedBlockID = highestBlockID
+
+	aol.log.Info("Successfully loaded skiplist index from disk",
+		"blockCount", blockCount,
+		"keyCount", keyCount,
+		"lastPersistedBlock", aol.lastPersistedBlockID)
+
+	return nil
+}
+
+func (aol *BlockAppendOnlyLog) backgroundFlush() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-aol.indexBufferFlush:
+			aol.flushIndexBuffer()
+		case <-ticker.C:
+			aol.flushIndexBuffer()
+		}
+
+		aol.mu.RLock()
+		closed := aol.closed
+		aol.mu.RUnlock()
+
+		if closed {
+			return
+		}
+	}
+}
+
+// add an entry to the index buffer and trigger flush if needed
+func (aol *BlockAppendOnlyLog) bufferIndexEntry(entry blockIndexEntry) error {
+	aol.indexBufferMu.Lock()
+	defer aol.indexBufferMu.Unlock()
+
+	aol.indexBuffer = append(aol.indexBuffer, entry)
+
+	// Trigger flush if buffer exceeds threshold
+	if len(aol.indexBuffer) >= aol.indexBufferSize {
+		select {
+		case aol.indexBufferFlush <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (aol *BlockAppendOnlyLog) flushIndexBuffer() error {
+	aol.indexBufferMu.Lock()
+
+	if len(aol.indexBuffer) == 0 {
+		aol.indexBufferMu.Unlock()
+		return nil
+	}
+
+	entries := make([]blockIndexEntry, len(aol.indexBuffer))
+	copy(entries, aol.indexBuffer)
+
+	aol.indexBuffer = aol.indexBuffer[:0]
+	aol.indexBufferMu.Unlock()
+
+	writer := bufio.NewWriter(aol.indexMapFile)
+	for _, entry := range entries {
+		buf := make([]byte, blockIDSize+offsetSize+offsetSize)
+		binary.BigEndian.PutUint64(buf[0:blockIDSize], entry.BlockID)
+		binary.BigEndian.PutUint64(buf[blockIDSize:blockIDSize+offsetSize], uint64(entry.StartOffset))
+		binary.BigEndian.PutUint64(buf[blockIDSize+offsetSize:], uint64(entry.EndOffset))
+
+		if _, err := writer.Write(buf); err != nil {
+			aol.log.Error("Failed to write index entry during flush", "error", err)
+			return err
+		}
+	}
+
+	// Flush and sync
+	if err := writer.Flush(); err != nil {
+		aol.log.Error("Failed to flush index buffer writer", "error", err)
+		return err
+	}
+
+	if err := aol.indexMapFile.Sync(); err != nil {
+		aol.log.Error("Failed to sync index file after buffer flush", "error", err)
+		return err
+	}
+
+	aol.log.Debug("Successfully flushed index buffer", "entries", len(entries))
+	return nil
+}
+
+func (aol *BlockAppendOnlyLog) FlushIndexBuffer() error {
+	return aol.flushIndexBuffer()
+}
+
+// getBlockIndexEntry retrieves the block index entry for a given block ID.
+func (aol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEntry, bool) {
+
+	entry, ok := aol.blockIndex[blockID]
+	if ok {
+		return entry, true
+	}
+	aol.indexBufferMu.Lock()
+	for _, entry := range aol.indexBuffer {
+		if entry.BlockID == blockID {
+			aol.indexBufferMu.Unlock()
+			return entry, true
+		}
+	}
+	aol.indexBufferMu.Unlock()
+	return blockIndexEntry{}, false
 }

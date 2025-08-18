@@ -191,3 +191,38 @@ func TestPrefixDBAccountHash(t *testing.T) {
 	}
 	fmt.Printf("Parent account key for %x: %x\n", SK_1, key)
 }
+
+func TestMemCache(t *testing.T) {
+	dirPath := "/mnt/ssd/ethstore/database"
+	pd, err := NewPrefixDB(dirPath)
+	if err != nil {
+		t.Fatalf("Failed to create PrefixDB: %v", err)
+	}
+	defer pd.Close()
+	SK_1 := []byte("4f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e01")
+	SK_1, _ = hex.DecodeString(string(SK_1))
+	// SV_1 := []byte("SV_1_value")
+
+	pd.getParentAccountKey(SK_1)
+	value, got, err := pd.Get(SK_1)
+	if err != nil || !got {
+		t.Fatalf("Failed to get SK_1: %v", err)
+	}
+	if value == nil {
+		t.Fatalf("Expected value for SK_1, got nil")
+	}
+	fmt.Printf("Value for SK_1: %x\n", value)
+}
+
+func TestReadFile(t *testing.T) {
+	dirPath := "/mnt/ssd/ethstore/testDB"
+	pd, err := NewPrefixDB(dirPath)
+	if err != nil {
+		t.Fatalf("Failed to create PrefixDB: %v", err)
+	}
+	defer pd.Close()
+
+	value, _, _ := pd.readFromFile(117*8, TrieAccount)
+	decodedValue := hex.EncodeToString(value)
+	fmt.Printf("Read value from file: %x\n", decodedValue)
+}

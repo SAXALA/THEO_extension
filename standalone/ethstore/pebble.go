@@ -31,24 +31,24 @@ const (
 	degradationWarnInterval = time.Minute
 
 	// Default values for NewPebbleStore parameters if not specified (i.e., passed as zero value)
-	defaultCacheValue      = 64  // Default cache size in MB
-	defaultHandlesValue    = 256 // Default number of file handles
-	defaultNamespaceValue  = "pebble" // Default namespace for metrics if an empty string is provided
+	defaultCacheValue     = 64       // Default cache size in MB
+	defaultHandlesValue   = 256      // Default number of file handles
+	defaultNamespaceValue = "pebble" // Default namespace for metrics if an empty string is provided
 )
 
 // PebbleStore implements the Store interface using PebbleDB
 type PebbleStore struct {
-	fn string      // filename for reporting
-	db *pebble.DB  // Underlying pebble storage engine
+	fn       string          // filename for reporting
+	db       *pebble.DB      // Underlying pebble storage engine
 	quitChan chan chan error // Quit channel to stop metrics collection
 
-	compCount    int32 // Compaction count
-	compTime     int32 // Compaction time
-	writePause   int32 // Write pause count
-	writeStall   int32 // Write stall count
+	compCount      int32  // Compaction count
+	compTime       int32  // Compaction time
+	writePause     int32  // Write pause count
+	writeStall     int32  // Write stall count
 	diskReadBytes  uint64 // Disk read counter
 	diskWriteBytes uint64 // Disk write counter
-	
+
 	log log.Logger // Contextual logger
 }
 
@@ -130,20 +130,20 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 
 	// Open the db and recover any potential corruptions
 	db := &PebbleStore{
-		fn: file,
-		log: logger,
+		fn:       file,
+		log:      logger,
 		quitChan: make(chan chan error),
 	}
 
 	opt := &pebble.Options{
 		Cache:                       pebble.NewCache(int64(cache * 1024 * 1024)),
-		MaxOpenFiles:               handles,
-		BytesPerSync:               4 * 1024 * 1024,
-		DisableWAL:                false,
-		L0CompactionThreshold:     2,
-		L0StopWritesThreshold:     1000,
-		LBaseMaxBytes:             64 * 1024 * 1024,
-		MemTableSize:              32 * 1024 * 1024,
+		MaxOpenFiles:                handles,
+		BytesPerSync:                4 * 1024 * 1024,
+		DisableWAL:                  false,
+		L0CompactionThreshold:       2,
+		L0StopWritesThreshold:       1000,
+		LBaseMaxBytes:               64 * 1024 * 1024,
+		MemTableSize:                32 * 1024 * 1024,
 		MemTableStopWritesThreshold: 4,
 		Levels: []pebble.LevelOptions{
 			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
@@ -477,3 +477,8 @@ func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 // 	// However, for large ranges, providing an UpperBound to Pebble is much more efficient.
 // 	return nil // Returning nil means iterate to the end (if no other bounds) or rely on Next filtering.
 // }
+
+func (d *PebbleStore) GetIterator() (*pebble.Iterator, error) {
+	iter, err := d.db.NewIter(nil)
+	return iter, err
+}

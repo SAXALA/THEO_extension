@@ -180,6 +180,11 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 
 // Close implements the Store interface
 func (d *PebbleStore) Close() error {
+	if d.db == nil {
+		fmt.Println("PebbleStore already closed or never opened")
+		return nil // Already closed or never opened
+	}
+
 	if d.quitChan != nil {
 		errc := make(chan error)
 		d.quitChan <- errc

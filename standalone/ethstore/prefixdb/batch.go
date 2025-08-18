@@ -338,3 +338,18 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 
 	return nil
 }
+
+func (wb *WriteBatch) getSlot(slotIndex int64) (map[string][]byte, bool) {
+	wb.lock.Lock()
+	defer wb.lock.Unlock()
+
+	if slotIndex < 0 || len(wb.slotBatch) == 0 {
+		return nil, false
+	}
+
+	slotData, exists := wb.slotBatch[slotIndex]
+	if !exists {
+		return nil, false
+	}
+	return slotData, true
+}

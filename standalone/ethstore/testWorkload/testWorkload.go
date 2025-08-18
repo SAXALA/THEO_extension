@@ -24,7 +24,16 @@ import (
 func main() {
 	// sortAol()
 	// buildAccountHashPebble()
-	TestPrefixGet()
+	// TestPrefixGet()
+
+	// filtterTASS()
+
+	go func() {
+		// Start the HTTP server for pprof profiling
+		log.Println(http.ListenAndServe(":6062", nil))
+	}()
+
+	TestMemCache()
 }
 
 func repalyPut() {
@@ -427,4 +436,103 @@ func TestPrefixGet() {
 		}
 
 	}
+}
+
+// 将'o' 开头的键输出到另一个文件
+func filtterTASS() {
+	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+	outputFilePath := "/mnt/ssd/ethstore/TASS.txt"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		log.Fatalf("Failed to create output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	for {
+		counter++
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+
+		if counter < 2223547411 {
+			continue // Skip the first 1967893668 lines
+		}
+
+		// line format: "Key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			log.Printf("无法解析行: %s", line)
+			continue
+		}
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+
+		valueBytes := []byte(valuePart)
+
+		keyBytes, err = hex.DecodeString(string(keyBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode key: %v", err)
+		}
+
+		if keyBytes[0] != 'o' {
+			continue
+		}
+
+		outputFile.WriteString("Key: " + hex.EncodeToString(keyBytes) + ", Value: " + hex.EncodeToString(valueBytes) + "\n")
+
+		if counter%100000 == 0 {
+			fmt.Printf("\rPut test: %d", counter)
+		}
+
+	}
+	fmt.Println("\nFinished filtering TASS keys.")
+}
+
+func TestMemCache() {
+	SK_1 := []byte("4f000001b1d1daa0ba2662877f4fff747d528318c1b343a7575d4429170f40d03101")
+	SK_1, _ = hex.DecodeString(string(SK_1))
+
+	AK_1 := []byte("410000000000010b")
+	AV_1 := []byte("f8669d31d1daa0ba2662877f4fff747d528318c1b343a7575d4429170f40d031b846f8440180a02e90fa6e0dd972de88c3d7365b293f8fb67afadb98ba5c58cac1e1ee8ce47d12a0bafa57ebfbfd24de79a762fec12871b565cd7da7206993a55cae3f2a3476aae3")
+	AK_1, _ = hex.DecodeString(string(AK_1))
+	AV_1, _ = hex.DecodeString(string(AV_1))
+
+	str := string(SK_1)
+	fmt.Printf("SK_1: %s\n", str)
+
+	dirPath := "/mnt/ssd/ethstore/database"
+	pd, err := prefixdb.NewPrefixDB(dirPath)
+	if err != nil {
+		fmt.Printf("Failed to create PrefixDB: %v", err)
+	}
+	defer pd.Close()
+
+	// pd.Put(AK_1, AV_1)
+
+	// SV_1 := []byte("SV_1_value")
+	value, got, err := pd.Get(SK_1)
+	if err != nil || !got {
+		fmt.Printf("Get operation failed for SK_1: %v, got: %t\n", err, got)
+	}
+	if value == nil {
+		fmt.Println("Value for SK_1 is nil")
+	}
+	fmt.Printf("Value for SK_1: %x\n", value)
 }

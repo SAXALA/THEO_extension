@@ -10,14 +10,25 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	// Please replace "ethstore_module" with the actual module path defined in your ethstore/go.mod file
 
+	"github.com/bradfitz/gomemcache/memcache"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 	"github.com/tinoryj/EthStore/standalone/ethstore/ssPrefixdb"
+)
+
+type opType int
+
+const (
+	opGet opType = iota
+	opHas
+	opPut
+	opDelete
 )
 
 func main() {
@@ -106,17 +117,19 @@ func main() {
 
 	go func() {
 		// Start the HTTP server for pprof profiling
-		log.Println(http.ListenAndServe(":6061", nil))
+		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 	// repalyPut()
-	repalyAccountPut()
-	// repPalyAolPut()
-	repalySSPut()
+	// repalyAccountPut()
+	repPalyAolPut()
+	//repalySSPut()
+	// repalyTrace()
 
 	// testPdbPerformance()
-	// testAolProformance()
+	// testAolPreformance()
 	// TestPebblePreformance()
 	// TestGetParentKey()
+	// buildMemCache()
 
 }
 
@@ -220,6 +233,15 @@ func repalyAccountPut() {
 
 	for {
 		counter++
+
+		if counter < 375799413 {
+			continue
+		}
+
+		if counter > 1966138022 {
+			break
+		}
+
 		line, err := reader.ReadString('\n')
 		if err == io.EOF {
 			break // End of file reached
@@ -255,16 +277,30 @@ func repalyAccountPut() {
 			// Perform the Put operation
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)
+
+			// value, ok, err := pdb.Get(keyBytes)
+
 			endTime := time.Now()
 			totalTime += endTime.Sub(startTime)
+
+			// if err != nil {
+			// 	log.Fatalf("Get operation failed for key %s: %v", keyPart, err)
+			// }
+			// if !ok {
+			// 	log.Printf("Key %s not found in PrefixDB", keyPart)
+			// 	continue
+			// }
+			// if !bytes.Equal(value, valueBytes) {
+			// 	log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+			// }
 			if err != nil {
 				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
 			}
-			// Verify the value was stored correctly
 
 			if counter%100000 == 0 {
-				fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
+				fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 			}
+
 			// case 'a', 'o':
 			// 	// Perform the Put operation
 			// 	startTime := time.Now()
@@ -281,6 +317,8 @@ func repalyAccountPut() {
 			// 	}
 		}
 	}
+	pdb.SaveTrie()
+	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 }
 
 func repalySSPut() {
@@ -311,6 +349,10 @@ func repalySSPut() {
 		line, err := reader.ReadString('\n')
 		if err == io.EOF {
 			break // End of file reached
+		}
+
+		if counter < 1967893668 {
+			continue // Skip the first 1967893668 lines
 		}
 
 		// line format: "key: xxxxxx, value: yyyy"
@@ -372,7 +414,7 @@ func repPalyAolPut() {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
-
+	fmt.Println("Start aol put test...")
 	notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
 	txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
 
@@ -394,7 +436,7 @@ func repPalyAolPut() {
 	notxreader := bufio.NewReader(notxfile)
 
 	for {
-		counter++
+
 		line, err := notxreader.ReadString('\n')
 		if err == io.EOF {
 			break // End of file reached
@@ -408,6 +450,7 @@ func repPalyAolPut() {
 			// log.Printf("无法解析行: %s", line)
 			continue
 		}
+		counter++
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
 		valuePart := strings.TrimSpace(parts[1])
 
@@ -428,6 +471,12 @@ func repPalyAolPut() {
 		// Perform the Put operation
 		startTime := time.Now()
 		err = store.Put(keyBytes, valueBytes)
+
+		// value, err := store.Get(keyBytes)
+		// if !bytes.Equal(value, valueBytes) {
+		// 	log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+		// }
+
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
 		if err != nil {
@@ -443,7 +492,7 @@ func repPalyAolPut() {
 	txreader := bufio.NewReader(txfile)
 	counter = 0
 	for {
-		counter++
+
 		line, err := txreader.ReadString('\n')
 		if err == io.EOF {
 			break // End of file reached
@@ -457,6 +506,7 @@ func repPalyAolPut() {
 			// log.Printf("无法解析行: %s", line)
 			continue
 		}
+		counter++
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
 		valuePart := strings.TrimSpace(parts[1])
 
@@ -490,6 +540,7 @@ func repPalyAolPut() {
 	}
 	log.Printf("Total Put operations: %d, Total time: %d ns", counter, totalTime.Nanoseconds())
 	log.Println("Put test completed.")
+	// store.CloseAol()
 }
 
 func TestPrefixGet() {
@@ -667,60 +718,11 @@ func testAolPreformance() {
 
 	var totalTime time.Duration
 	counter := 0
-	// notxreader := bufio.NewReader(notxfile)
+	notxreader := bufio.NewReader(notxfile)
 
-	// for {
-	// 	counter++
-	// 	line, err := notxreader.ReadString('\n')
-	// 	if err == io.EOF {
-	// 		break // End of file reached
-	// 	}
-
-	// 	// line format: "key: xxxxxx, value: yyyy"
-	// 	line = line[:len(line)-1] // Remove the newline character
-
-	// 	parts := strings.Split(line, ", Value:")
-	// 	if len(parts) != 2 {
-	// 		// log.Printf("无法解析行: %s", line)
-	// 		continue
-	// 	}
-	// 	keyPart := strings.TrimPrefix(parts[0], "Key: ")
-	// 	valuePart := strings.TrimSpace(parts[1])
-
-	// 	// Convert key and value to byte slices
-	// 	keyBytes := []byte(keyPart)
-
-	// 	valueBytes := []byte(valuePart)
-
-	// 	keyBytes, err = hex.DecodeString(string(keyBytes))
-	// 	if err != nil {
-	// 		log.Fatalf("Failed to decode key: %v", err)
-	// 	}
-	// 	valueBytes, err = hex.DecodeString(string(valueBytes))
-	// 	if err != nil {
-	// 		log.Fatalf("Failed to decode value: %v", err)
-	// 	}
-
-	// 	// Perform the Put operation
-	// 	startTime := time.Now()
-	// 	err = store.Put(keyBytes, valueBytes)
-	// 	endTime := time.Now()
-	// 	totalTime += endTime.Sub(startTime)
-	// 	if err != nil {
-	// 		log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-	// 	}
-	// 	// Verify the value was stored correctly
-
-	// 	if counter%100000 == 0 {
-	// 		fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
-	// 	}
-	// }
-
-	txreader := bufio.NewReader(txfile)
-	counter = 0
 	for {
-		counter++
-		line, err := txreader.ReadString('\n')
+
+		line, err := notxreader.ReadString('\n')
 		if err == io.EOF {
 			break // End of file reached
 		}
@@ -733,6 +735,7 @@ func testAolPreformance() {
 			// log.Printf("无法解析行: %s", line)
 			continue
 		}
+		counter++
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
 		valuePart := strings.TrimSpace(parts[1])
 
@@ -761,6 +764,57 @@ func testAolPreformance() {
 		// Verify the value was stored correctly
 
 		if counter%100000 == 0 {
+			fmt.Printf("\rPut test: %d, use time: %f ns", counter, totalTime.Seconds())
+		}
+	}
+
+	fmt.Println("total put:", counter, " use time:", totalTime.Seconds(), " s", " avg time:", float64(counter)/totalTime.Seconds(), " s")
+
+	txreader := bufio.NewReader(txfile)
+	counter = 0
+	for {
+		line, err := txreader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+
+		// line format: "key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value:")
+		if len(parts) != 2 {
+			// log.Printf("无法解析行: %s", line)
+			continue
+		}
+		counter++
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+
+		valueBytes := []byte(valuePart)
+
+		keyBytes, err = hex.DecodeString(string(keyBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode key: %v", err)
+		}
+		valueBytes, err = hex.DecodeString(string(valueBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode value: %v", err)
+		}
+
+		// Perform the Put operation
+		startTime := time.Now()
+		err = store.Put(keyBytes, valueBytes)
+		endTime := time.Now()
+		totalTime += endTime.Sub(startTime)
+		if err != nil {
+			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+		}
+		// Verify the value was stored correctly
+
+		if counter%100000 < 10 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
 	}
@@ -864,4 +918,162 @@ func TestGetParentKey() {
 	} else {
 		fmt.Println("Parent key test passed.")
 	}
+}
+
+func repalyTrace() {
+	tempDir := "/mnt/ssd/ethstore/database"
+	store, err := ethstore.New(tempDir, 10, "put_test", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	testFilePath := "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	for {
+		// 读取一行
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err.Error() == "EOF" {
+				fmt.Println("End of file reached")
+			}
+			fmt.Errorf("error reading trace file: %v", err)
+		}
+
+		line = strings.TrimSpace(line)
+
+		// 跳过非操作行
+		if strings.Contains(line, "Global log file opened successfully") ||
+			!strings.Contains(line, "OPType:") {
+			continue
+		}
+
+		matches := opRegex.FindStringSubmatch(line)
+		if len(matches) < 4 {
+			// 无法解析的行，跳过
+			continue
+		}
+
+		opTypeStr := matches[1]
+		keyHex := matches[2]
+		keySize := 0
+		fmt.Sscanf(matches[3], "%d", &keySize)
+
+		// 检查是否有值部分
+		var valueHex string
+		var valueSize int
+		if len(matches) >= 6 && matches[4] != "" {
+			valueHex = matches[4]
+			fmt.Sscanf(matches[5], "%d", &valueSize)
+		}
+
+		keyBytes, err := hex.DecodeString(keyHex)
+		if err != nil {
+			// 无效的键，跳过
+			continue
+		}
+
+		if keyBytes[0] == 'a' && keyBytes[1] == 'o' {
+			continue
+		}
+
+		// keyStr := hex.EncodeToString(keyBytes)
+
+		var op opType
+		switch opTypeStr {
+		case "Get":
+			op = opGet
+		case "Has":
+			op = opHas
+		case "Put", "BatchPut":
+			op = opPut
+		case "Delete", "BatchDelete":
+			op = opDelete
+		default:
+			// 未知操作，跳过
+			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			continue
+		}
+		valueBytes, decodeErr := hex.DecodeString(valueHex)
+		if decodeErr != nil && valueHex != "" {
+			// 无效的值，跳过
+			continue
+		}
+
+		// 执行操作并计时
+		start := time.Now()
+		var opErr error
+
+		switch op {
+		case opGet:
+			_, opErr = store.Get(keyBytes)
+		case opHas:
+			_, opErr = store.Has(keyBytes)
+		case opPut:
+			opErr = store.Put(keyBytes, valueBytes)
+		case opDelete:
+			opErr = store.Delete(keyBytes)
+		}
+
+		elapsed := time.Since(start)
+		totalTime += elapsed
+		counter++
+		if opErr != nil {
+			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+		}
+		if counter%100000 == 0 {
+			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
+		}
+	}
+}
+
+func buildMemCache() error {
+	// insert all kvs in hashKeyPebble into memCache
+	fmt.Println("Building memcache from pebble store...")
+	pebblePath := "/mnt/ssd/ethstore/index/accountHash_key_pebble"
+
+	accountHashKeyPebble, err := ethstore.NewPebbleStore(pebblePath, 0, 0, "", false)
+	if err != nil {
+		return fmt.Errorf("failed to open pebble store: %v", err)
+	}
+	defer accountHashKeyPebble.Close()
+
+	mc := memcache.New("127.0.0.1:11211")
+	iter, err := accountHashKeyPebble.GetIterator()
+	if err != nil {
+		return fmt.Errorf("failed to get iterator from pebble store: %v", err)
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		value := iter.Value()
+		err = mc.Set(&memcache.Item{Key: hex.EncodeToString(key), Value: value})
+		if err != nil {
+			return fmt.Errorf("failed to set item in memcache: %v", err)
+		}
+
+		// test get item from memcache
+		item, err := mc.Get(hex.EncodeToString(key))
+		if err != nil {
+			return fmt.Errorf("failed to get item from memcache: %v", err)
+		}
+		if !bytes.Equal(item.Value, value) {
+			return fmt.Errorf("value mismatch for key %s: expected %x, got %x", hex.EncodeToString(key), value, item.Value)
+		}
+	}
+	fmt.Println("Memcache build complete.")
+	return nil
 }

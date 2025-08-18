@@ -16,13 +16,11 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-const MAX_CACHE_SIZE = 1024  // maximum cache size
-const BUFFER_SIZE = 8192     // buffer size for file operations
-const SLOT_SIZE = 256 * 1024 // size of each slot
+const MAX_CACHE_SIZE = 1024   // maximum cache size
+const BUFFER_SIZE = 8192      // buffer size for file operations
+const SLOT_SIZE = 1024 * 1024 // size of each slot
 const SLOT_NUM = 1024
-
-// number of slots
-const APPENDONLY_SIZE = 256 * 1024 // size of append-only part in each slot
+const avgKVPairsPerSlot = 50 // average number of key-value pairs per slot
 
 type KeyType int
 
@@ -332,32 +330,31 @@ func (db *SSPrefixDB) Put(key, value []byte) error {
 		entrySize := 4 + len(key) + len(value)
 		slotFound := false
 
-		for _, slotIdx := range slotIndices {
-			if slotData, exists := db.slotCache.Get(slotIdx); exists {
-				slotSize := db.slotManager.getSlotUsedSize(int(slotIdx))
-				if slotSize+entrySize <= SLOT_SIZE {
-					slotData[keyStr] = value
-					db.slotCache.MarkSlotModified(slotIdx)
-					db.slotCache.Put(slotIdx, slotData)
-					db.slotManager.updateUsedSize(int(slotIdx), entrySize)
-					slotFound = true
-					break
-				}
+		if len(slotIndices) > 0 {
+			slotIdx := slotIndices[len(slotIndices)-1]
+			var slotData map[string][]byte
+			var slotSize int
+			var exists bool
+			if slotData, exists = db.slotCache.Get(slotIdx); exists {
+				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
+			} else if slotData, exists = db.batch.getSlot(slotIdx); exists {
+				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
 			} else {
-				slotData, err := db.loadSlot(slotIdx)
-				if err == nil {
-					slotSize := db.calculateSlotSize(slotData)
-					db.slotManager.setSlotUsedSize(int(slotIdx), slotSize)
-
-					if slotSize+entrySize <= SLOT_SIZE {
-						slotData[keyStr] = value
-						db.slotCache.Put(slotIdx, slotData)
-						db.slotCache.MarkSlotModified(slotIdx)
-						db.slotManager.updateUsedSize(int(slotIdx), entrySize)
-						slotFound = true
-						break
-					}
+				var err error
+				if slotData, err = db.loadSlot(slotIdx); err != nil {
+					// continue
 				}
+				slotSize = db.calculateSlotSize(slotData)
+				db.slotManager.setSlotUsedSize(int(slotIdx), slotSize)
+			}
+
+			if slotSize+entrySize <= SLOT_SIZE {
+				slotData[keyStr] = value
+				db.slotCache.Put(slotIdx, slotData)
+				db.slotCache.MarkSlotModified(slotIdx)
+				db.slotManager.updateUsedSize(int(slotIdx), entrySize)
+				slotFound = true
+				break
 			}
 		}
 
@@ -691,6 +688,10 @@ func (db *SSPrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, []int
 }
 
 func (db *SSPrefixDB) Close() error {
+
+	db.nodeCache.Close()
+
+	db.slotCache.FlushModifiedSlots()
 	// forbid further writes to the database
 	if db.batch != nil {
 		db.batch.DisableAutoCommit()
@@ -698,14 +699,6 @@ func (db *SSPrefixDB) Close() error {
 		// wait for any ongoing background commit to finish
 		if db.batch.bgCommit {
 			db.batch.DisableBackgroundCommit()
-		}
-	}
-
-	// process any remaining batch operations
-	if db.slotCache != nil {
-		modifiedSlots := db.slotCache.FlushModifiedSlots()
-		if db.batch != nil && len(modifiedSlots) > 0 {
-			_ = db.WriteCommit(db.batch)
 		}
 	}
 
@@ -1027,39 +1020,38 @@ func (db *SSPrefixDB) loadSlot(index int64) (map[string][]byte, error) {
 	buf := getDataBuffer(SLOT_SIZE)
 	defer putDataBuffer(buf)
 
-	// appendOnlyKVPairs := make(map[string][]byte, avgKVPairsPerSlot)
-	appendOnlyKVPairs := make(map[string][]byte)
+	appendOnlyKVPairs := make(map[string][]byte, avgKVPairsPerSlot)
+
 	offset := index * SLOT_SIZE
-	_, err := db.slotFile.ReadAt(buf, offset)
+	n, err := db.slotFile.ReadAt(buf, offset)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("loadSlot error: %v", err)
 	}
 
-	header := headerPool.Get().([]byte)
-	defer headerPool.Put(header)
+	data := buf[:n]
+	position := 0
 
-	data := buf[:APPENDONLY_SIZE]
-	for len(data) >= 4 {
+	for position+4 <= len(data) {
 
-		copy(header, data[:4])
-
-		if header[0] == 0 && header[1] == 0 {
+		if data[position] == 0 && data[position+1] == 0 {
 			break
 		}
 
-		keySize := int(header[0])<<8 | int(header[1])
-		valueSize := int(header[2])<<8 | int(header[3])
+		keySize := int(uint16(data[position])<<8 | uint16(data[position+1]))
+		valueSize := int(uint16(data[position+2])<<8 | uint16(data[position+3]))
 
 		totalSize := 4 + keySize + valueSize
-		if len(data) < totalSize {
+		if position+totalSize > len(data) {
 			break
 		}
-		key := string(data[4 : 4+keySize])
+
+		key := string(data[position+4 : position+4+keySize])
+
 		value := make([]byte, valueSize)
-		copy(value, data[4+keySize:4+keySize+valueSize])
+		copy(value, data[position+4+keySize:position+4+keySize+valueSize])
 
 		appendOnlyKVPairs[key] = value
-		data = data[totalSize:]
+		position += totalSize
 	}
 
 	return appendOnlyKVPairs, nil
@@ -1070,7 +1062,7 @@ func (db *SSPrefixDB) saveSlot(index int64, slot *Slot) {
 	buf := make([]byte, SLOT_SIZE)
 
 	// Serialize appendOnlyPart map into the buffer
-	data := buf[:APPENDONLY_SIZE]
+	data := buf[:SLOT_SIZE]
 	for key, value := range slot.appendOnlyPart {
 		entry, _ := db.ConvertKV([]byte(key), value)
 		if len(entry) > len(data) {

@@ -195,10 +195,10 @@ type Database struct {
 func New(dirPath string, recentN int, namespace string, readonly bool) (*Database, error) {
 	logger := log.New("database", dirPath)
 
-	prefixdb, err := prefixdb.NewPrefixDB(dirPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
-	}
+	// prefixdb, err := prefixdb.NewPrefixDB(dirPath)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+	// }
 
 	ssPrefixdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
 	if err != nil {
@@ -207,8 +207,8 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	db := &Database{
 		fn:       dirPath, // Use directory path now
 		log:      logger,
-		quitChan: make(chan chan error),
-		pdb:      prefixdb, // Initialize PrefixDB with the directory path
+		quitChan: make(chan chan error, 1),
+		pdb:      nil, // Initialize PrefixDB with the directory path
 		spdb:     ssPrefixdb,
 	}
 
@@ -238,23 +238,33 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
 	// Pass through namespace and readonly from the New function's parameters.
 
-	// pebbleStore, err := NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
-	// if err != nil {
-	// 	// Close AOL if Pebble initialization fails
-	// 	appendLog.Close()
-	// 	baol.Close()
-	// 	return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
-	// }
-	db.db = nil
+	pebbleStore, err := NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
+	if err != nil {
+		// Close AOL if Pebble initialization fails
+		db.pdb.Close()
+		db.spdb.Close()
+		appendLog.Close()
+		baol.Close()
+		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
+	}
+	db.db = pebbleStore
 
 	// Initialize metrics
 	db.diskSizeGauge = metrics.GetOrRegisterGauge(namespace+"disk/size", nil)
+
+	// go func() {
+	// 	for errc := range db.quitChan {
+	// 		errc <- nil
+	// 		return
+	// 	}
+	// }()
 
 	return db, nil
 }
 
 // Close stops the metrics collection and closes all io accesses to the underlying key-value store.
 func (d *Database) Close() error {
+
 	d.quitLock.Lock()
 	defer d.quitLock.Unlock()
 	if d.closed {
@@ -512,70 +522,70 @@ func (d *Database) Put(key []byte, value []byte) error {
 
 	dataType := GetDataTypeFromKey(key)
 
-	// if AolHandledDataTypes[dataType] {
-	// 	if d.aol == nil {
-	// 		return fmt.Errorf("AOL is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
-	// 	}
-	// 	var blockID uint64
-	// 	var foundBlockID bool
+	if AolHandledDataTypes[dataType] {
+		if d.aol == nil {
+			return fmt.Errorf("AOL is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		var blockID uint64
+		var foundBlockID bool
 
-	// 	// Try to get blockID from key
-	// 	blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+		// Try to get blockID from key
+		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
 
-	// 	// If not found in key, try from value (for HeaderNumber, TxLookup)
-	// 	if !foundBlockID {
-	// 		blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
-	// 	}
+		// If not found in key, try from value (for HeaderNumber, TxLookup)
+		if !foundBlockID {
+			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
+		}
 
-	// 	if foundBlockID {
-	// 		kvs := map[string]string{string(key): string(value)}
-	// 		var err error
-	// 		if dataType == TransactionLookupMetadataDataType {
-	// 			err = d.aol.Append(blockID, kvs)
-	// 			if err != nil {
-	// 				return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
-	// 			}
-	// 			d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-	// 			return nil // Data stored in AOL
-	// 		} else {
-	// 			err = d.baol.Append(blockID, kvs)
-	// 			if err != nil {
-	// 				return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
-	// 			}
-	// 			d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-	// 			return nil // Data stored in AOL
-	// 		}
-	// 	}
-	// 	// If blockID couldn't be determined for an AOL-handled type.
-	// 	return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
-	// } else if prefixDBHandledDataTypes[dataType] {
-	// 	if d.pdb == nil {
-	// 		return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
-	// 	}
-	// 	// Store in PrefixDB
-	// 	err := d.pdb.Put(key, value)
-	// 	if err != nil {
-	// 		return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-	// 	}
-	// 	d.log.Trace("Stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-	// 	return nil // Data stored in PrefixDB
-	// } else if ssPrefixdbHandledDataTypes[dataType] {
-	// 	if d.spdb == nil {
-	// 		return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
-	// 	}
-	// 	// Store in SSPrefixDB
-	// 	err := d.spdb.Put(key, value)
-	// 	if err != nil {
-	// 		return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-	// 	}
-	// 	d.log.Trace("Stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-	// 	return nil // Data stored in SSPrefixDB
-	// }
+		if foundBlockID {
+			kvs := map[string]string{string(key): string(value)}
+			var err error
+			if dataType == TransactionLookupMetadataDataType {
+				err = d.aol.Append(blockID, kvs)
+				if err != nil {
+					return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				}
+				d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
+			} else {
+				err = d.baol.Append(blockID, kvs)
+				if err != nil {
+					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				}
+				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
+			}
+		}
+		// If blockID couldn't be determined for an AOL-handled type.
+		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
+	} else if prefixDBHandledDataTypes[dataType] {
+		if d.pdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in PrefixDB
+		err := d.pdb.Put(key, value)
+		if err != nil {
+			return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data stored in PrefixDB
+	} else if ssPrefixdbHandledDataTypes[dataType] {
+		if d.spdb == nil {
+			return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in SSPrefixDB
+		err := d.spdb.Put(key, value)
+		if err != nil {
+			return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data stored in SSPrefixDB
+	}
 
-	// // Default: store non-AOL data in Pebble
-	// if d.db == nil {
-	// 	return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
-	// }
+	// Default: store non-AOL data in Pebble
+	if d.db == nil {
+		return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
+	}
 	err := d.db.Put(key, value)
 	if err != nil {
 		return fmt.Errorf("pebble put failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
@@ -967,4 +977,25 @@ func (d *Database) Stat() (string, error) {
 func (d *Database) Compact(start []byte, limit []byte) error {
 	d.log.Warn("Compact operation may not be applicable or is handled differently by AppendOnlyLog")
 	return nil // Or return an error if not supported
+}
+
+func (d *Database) CloseAol() error {
+	d.quitLock.Lock()
+	defer d.quitLock.Unlock()
+	if d.aol != nil {
+		if err := d.aol.Close(); err != nil {
+			d.log.Error("Failed to close AppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close AppendOnlyLog: %w", err)
+		}
+		d.aol = nil // Clear the reference after closing
+	}
+	if d.baol != nil {
+		if err := d.baol.Close(); err != nil {
+			d.log.Error("Failed to close BlockAppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close BlockAppendOnlyLog: %w", err)
+		}
+		d.baol = nil // Clear the reference after closing
+	}
+
+	return nil
 }

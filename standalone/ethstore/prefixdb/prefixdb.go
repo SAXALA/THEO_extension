@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	memcache "github.com/bradfitz/gomemcache/memcache"
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -101,6 +103,7 @@ type PrefixDB struct {
 	batch                *WriteBatch
 	triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *PebbleStore // pebble store for account hash key index
+	memcache             *memcache.Client
 }
 
 // SerializedTrieNode修改为直接存储完整路径
@@ -148,6 +151,12 @@ func NewPrefixDB(ditpath string) (*PrefixDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create PebbleStore: %v", err)
 	}
+
+	db.memcache = memcache.New("127.0.0.1:11211")
+	// err = db.buildMemCache()
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to build memcache: %v", err)
+	// }
 
 	db.batch.EnableAutoCommit(db, 2048) // enable auto commit with a threshold of 1000 operations
 
@@ -207,10 +216,11 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 		var ok bool
 		value := []byte{}
 		if _, slotIndices, ok = db.nodeCache.Get(string(accountKey)); !ok {
-			if value, slotIndices, ok = db.batch.get(key); !ok {
-				offset, exists := db.accountIndex.get(string(key))
+			if value, slotIndices, ok = db.batch.get(accountKey); !ok {
+				offset, exists := db.accountIndex.get(string(accountKey))
 				if !exists {
-					fmt.Printf("Account key %s not found in index\n", string(key))
+					keyStr := hex.EncodeToString([]byte(accountKey))
+					fmt.Printf("Account key %s not found in index\n", keyStr)
 					return nil, false, nil
 				}
 				value, slotIndices, err = db.readFromFile(offset, TrieAccount)
@@ -342,31 +352,30 @@ func (db *PrefixDB) Put(key, value []byte) error {
 		slotFound := false
 
 		for _, slotIdx := range slotIndices {
-			if slotData, exists := db.slotCache.Get(slotIdx); exists {
-				slotSize := db.slotManager.getSlotUsedSize(int(slotIdx))
-				if slotSize+entrySize <= SLOT_SIZE {
-					slotData[keyStr] = value
-					db.slotCache.MarkSlotModified(slotIdx)
-					db.slotCache.Put(slotIdx, slotData)
-					db.slotManager.updateUsedSize(int(slotIdx), entrySize)
-					slotFound = true
-					break
-				}
-			} else {
-				slotData, err := db.loadSlot(slotIdx)
-				if err == nil {
-					slotSize := db.calculateSlotSize(slotData)
-					db.slotManager.setSlotUsedSize(int(slotIdx), slotSize)
+			var slotData map[string][]byte
+			var slotSize int
+			var exists bool
 
-					if slotSize+entrySize <= SLOT_SIZE {
-						slotData[keyStr] = value
-						db.slotCache.Put(slotIdx, slotData)
-						db.slotCache.MarkSlotModified(slotIdx)
-						db.slotManager.updateUsedSize(int(slotIdx), entrySize)
-						slotFound = true
-						break
-					}
+			if slotData, exists = db.slotCache.Get(slotIdx); exists {
+				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
+			} else if slotData, exists = db.batch.getSlot(slotIdx); exists {
+				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
+			} else {
+				var err error
+				if slotData, err = db.loadSlot(slotIdx); err != nil {
+					continue
 				}
+				slotSize = db.calculateSlotSize(slotData)
+				db.slotManager.setSlotUsedSize(int(slotIdx), slotSize)
+			}
+
+			if slotSize+entrySize <= SLOT_SIZE {
+				slotData[keyStr] = value
+				db.slotCache.Put(slotIdx, slotData)
+				db.slotCache.MarkSlotModified(slotIdx)
+				db.slotManager.updateUsedSize(int(slotIdx), entrySize)
+				slotFound = true
+				break
 			}
 		}
 
@@ -703,6 +712,10 @@ func (db *PrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, []int64
 }
 
 func (db *PrefixDB) Close() error {
+
+	db.nodeCache.Close()
+	db.slotCache.FlushModifiedSlots()
+
 	// forbid further writes to the database
 	if db.batch != nil {
 		db.batch.DisableAutoCommit()
@@ -721,15 +734,6 @@ func (db *PrefixDB) Close() error {
 		}
 	}
 
-	if db.slotCache != nil {
-		modifiedSlots := db.slotCache.FlushModifiedSlots()
-		if db.batch != nil && len(modifiedSlots) > 0 {
-			if err := db.WriteCommit(db.batch); err != nil {
-				fmt.Printf("Error committing modified slots: %v\n", err)
-			}
-		}
-	}
-
 	if err := db.SaveTrie(); err != nil {
 		return fmt.Errorf("failed to save prefix tree: %v", err)
 	}
@@ -742,12 +746,6 @@ func (db *PrefixDB) Close() error {
 
 	if err := db.slotFile.Sync(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to sync slot file: %v", err))
-	}
-
-	if db.accountHashKeyPebble != nil {
-		if err := db.accountHashKeyPebble.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
-		}
 	}
 
 	if err := db.accountFile.Close(); err != nil {
@@ -767,6 +765,11 @@ func (db *PrefixDB) Close() error {
 		return errs[0]
 	}
 
+	if db.accountHashKeyPebble != nil {
+		if err := db.accountHashKeyPebble.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
+		}
+	}
 	return nil
 }
 
@@ -868,6 +871,10 @@ func (db *PrefixDB) LoadTrie() error {
 		if err := decoder.Decode(&offset); err != nil {
 			return fmt.Errorf("failed to decode offset at index %d: %v", i, err)
 		}
+		// keybyte := hex.EncodeToString([]byte(key))
+		// if len(keybyte) == 0 {
+		// 	return fmt.Errorf("decoded key is empty at index %d", i)
+		// }
 		db.accountIndex.accountOffset[key] = offset
 	}
 
@@ -1288,8 +1295,7 @@ func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
 		return -1, errors.New("invalid key")
 	}
 
-	prefix := key[0]
-	switch prefix {
+	switch key[0] {
 	case 'A':
 		return TrieAccount, nil
 	case 'O':
@@ -1316,4 +1322,30 @@ func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
 		return nil
 	}
 	return key
+	// item, err := db.memcache.Get(hex.EncodeToString(accountHash))
+	// if err != nil {
+	// 	if err == memcache.ErrCacheMiss {
+	// 		return nil // account not found in cache
+	// 	}
+	// 	fmt.Printf("Error retrieving account key from mem cache: %v\n", err)
+	// 	return nil
+	// }
+	// return item.Value
+}
+
+func (db *PrefixDB) buildMemCache() error {
+	// insert all kvs in hashKeyPebble into memCache
+	fmt.Println("Building memcache from pebble store...")
+	iter, err := db.accountHashKeyPebble.db.NewIter(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create iterator for pebble store: %v", err)
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		accountHash := iter.Key()
+		accountKey := iter.Value()
+		db.memcache.Add(&memcache.Item{Key: hex.EncodeToString(accountHash), Value: accountKey})
+	}
+	fmt.Println("Memcache build complete.")
+	return nil
 }
