@@ -117,11 +117,11 @@ func main() {
 
 	go func() {
 		// Start the HTTP server for pprof profiling
-		log.Println(http.ListenAndServe(":6060", nil))
+		log.Println(http.ListenAndServe(":6061", nil))
 	}()
 	// repalyPut()
-	// repalyAccountPut()
-	repPalyAolPut()
+	repalyAccountPut()
+	// repPalyAolPut()
 	//repalySSPut()
 	// repalyTrace()
 
@@ -130,7 +130,6 @@ func main() {
 	// TestPebblePreformance()
 	// TestGetParentKey()
 	// buildMemCache()
-
 }
 
 func repalyPut() {
@@ -234,9 +233,9 @@ func repalyAccountPut() {
 	for {
 		counter++
 
-		if counter < 375799413 {
-			continue
-		}
+		// if counter < 375799413 {
+		// 	continue
+		// }
 
 		if counter > 1966138022 {
 			break
@@ -278,7 +277,7 @@ func repalyAccountPut() {
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)
 
-			// value, ok, err := pdb.Get(keyBytes)
+			//value, ok, err := pdb.Get(keyBytes)
 
 			endTime := time.Now()
 			totalTime += endTime.Sub(startTime)
@@ -291,7 +290,8 @@ func repalyAccountPut() {
 			// 	continue
 			// }
 			// if !bytes.Equal(value, valueBytes) {
-			// 	log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+			// 	fmt.Println("counter:", counter)
+			// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
 			// }
 			if err != nil {
 				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
@@ -300,7 +300,6 @@ func repalyAccountPut() {
 			if counter%100000 == 0 {
 				fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 			}
-
 			// case 'a', 'o':
 			// 	// Perform the Put operation
 			// 	startTime := time.Now()
@@ -316,8 +315,17 @@ func repalyAccountPut() {
 			// 		fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
 			// 	}
 		}
+
+		// if counter%1000000 == 0 {
+		// 	break
+		// }
 	}
-	pdb.SaveTrie()
+
+	// test get from the beginning of the file
+	// read the file again
+	// file.Seek(0, io.SeekStart)
+
+	// pdb.SaveTrie()
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 }
 
@@ -409,7 +417,7 @@ func repalySSPut() {
 func repPalyAolPut() {
 
 	tempDir := "/mnt/ssd/ethstore/database"
-	store, err := ethstore.New(tempDir, 100, "put_test", false)
+	store, err := ethstore.New(tempDir, 200, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}

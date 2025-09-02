@@ -1,7 +1,6 @@
 package prefixdb
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +9,7 @@ import (
 
 type WriteBatch struct {
 	operations map[string]WriteOperation
-	slotBatch  map[int64]map[string][]byte
+	slotBatch  map[int]map[string][]byte
 	lock       sync.Mutex
 	autoCommit bool // enable auto commit feature
 	threshold  int  // the threshold for auto commit
@@ -24,16 +23,18 @@ type WriteBatch struct {
 }
 
 type WriteOperation struct {
-	value       []byte
-	slotIndices []int64 // slot indices for contract accounts
+	value        []byte
+	slotIndices  []int        // slot indices for contract accounts
+	modifiedType ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
+	offset       int64        // offset in the file for the account
 }
 
-func NewWriteBatch() *WriteBatch {
+func NewWriteBatch(threshold int) *WriteBatch {
 	return &WriteBatch{
 		operations:  make(map[string]WriteOperation),
-		slotBatch:   make(map[int64]map[string][]byte),
+		slotBatch:   make(map[int]map[string][]byte),
 		autoCommit:  true,
-		threshold:   1000,                        //dafault threshold for auto commit
+		threshold:   threshold,                   //dafault threshold for auto commit
 		commitQueue: make(chan *WriteBatch, 100), // buffered channel for commit batches
 		quitCh:      make(chan struct{}),
 		bgCommit:    false,
@@ -145,14 +146,14 @@ func (wb *WriteBatch) checkAndCommit() {
 	if needCommit {
 		batchToCommit = &WriteBatch{
 			operations: make(map[string]WriteOperation, len(wb.operations)),
-			slotBatch:  make(map[int64]map[string][]byte),
+			slotBatch:  make(map[int]map[string][]byte),
 			db:         wb.db,
 		}
 
 		batchToCommit.operations = wb.operations
 		batchToCommit.slotBatch = wb.slotBatch
 		wb.operations = make(map[string]WriteOperation)
-		wb.slotBatch = make(map[int64]map[string][]byte)
+		wb.slotBatch = make(map[int]map[string][]byte)
 	}
 	wb.lock.Unlock()
 
@@ -189,7 +190,7 @@ func (wb *WriteBatch) CommitBatch() error {
 
 	batchToCommit := &WriteBatch{
 		operations: make(map[string]WriteOperation, len(wb.operations)),
-		slotBatch:  make(map[int64]map[string][]byte),
+		slotBatch:  make(map[int]map[string][]byte),
 		db:         wb.db,
 	}
 
@@ -197,7 +198,7 @@ func (wb *WriteBatch) CommitBatch() error {
 	batchToCommit.slotBatch = wb.slotBatch
 
 	wb.operations = make(map[string]WriteOperation)
-	wb.slotBatch = make(map[int64]map[string][]byte)
+	wb.slotBatch = make(map[int]map[string][]byte)
 
 	wb.lock.Unlock()
 
@@ -213,9 +214,9 @@ func (wb *WriteBatch) CommitBatch() error {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, slotIndices []int64) {
+func (wb *WriteBatch) add(key, value []byte, offset int64, slotIndices []int, modifiedType ModifiedType) {
 	wb.lock.Lock()
-	wb.operations[string(key)] = WriteOperation{value: value, slotIndices: slotIndices}
+	wb.operations[string(key)] = WriteOperation{value: value, offset: offset, slotIndices: slotIndices, modifiedType: modifiedType}
 	wb.lock.Unlock()
 
 	wb.checkAndCommit()
@@ -227,15 +228,16 @@ func (wb *WriteBatch) delete(key []byte) {
 	// Use nil value to indicate deletion
 	if wb.operations[string(key)].value == nil {
 		// If the key is already marked for deletion, do nothing
+		wb.lock.Unlock()
 		return
 	}
-	wb.operations[string(key)] = WriteOperation{value: nil, slotIndices: nil}
+	wb.operations[string(key)] = WriteOperation{value: nil, offset: 0, slotIndices: nil, modifiedType: 0}
 	wb.lock.Unlock()
 
 	wb.checkAndCommit()
 }
 
-func (wb *WriteBatch) get(key []byte) ([]byte, []int64, bool) {
+func (wb *WriteBatch) get(key []byte) ([]byte, []int, bool) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 	op, exists := wb.operations[string(key)]
@@ -245,7 +247,7 @@ func (wb *WriteBatch) get(key []byte) ([]byte, []int64, bool) {
 	return op.value, op.slotIndices, exists
 }
 
-func (wb *WriteBatch) getBySlotIndex(slotIndex int64, key []byte) ([]byte, bool) {
+func (wb *WriteBatch) getBySlotIndex(slotIndex int, key []byte) ([]byte, bool) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 
@@ -260,7 +262,7 @@ func (wb *WriteBatch) getBySlotIndex(slotIndex int64, key []byte) ([]byte, bool)
 }
 
 // addSlot 添加整个slot的数据到batch
-func (wb *WriteBatch) addSlot(slotIndex int64, slotData map[string][]byte) error {
+func (wb *WriteBatch) addSlot(slotIndex int, slotData map[string][]byte) error {
 	if slotIndex < 0 {
 		return fmt.Errorf("invalid slot index: %d", slotIndex)
 	}
@@ -286,6 +288,9 @@ func (wb *WriteBatch) addSlot(slotIndex int64, slotData map[string][]byte) error
 
 // Commit writes all operations in the batch to the database
 func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+
 	operations := batch.operations
 	slotBatch := batch.slotBatch
 
@@ -295,31 +300,54 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 	var NAEntry = make([]byte, 0)
 	trieAccountOffset, _ := db.accountFile.Seek(0, io.SeekEnd)
 
+	if trieAccountOffset == 0 {
+		trieAccountOffset = 1 // Ensure we start writing at a non-zero offset
+	}
+
 	// Process
 	for key, op := range operations {
 		keyBytes := []byte(key)
-		// Convert key-value pair to byte array: <key size (short) + value size (short) + key + value>
-		entry, _ := db.ConvertKV(keyBytes, op.value)
-		if len(op.slotIndices) > 0 {
-			slotIndicesSize := uint16(len(op.slotIndices) * 8)
-			sizeBuf := make([]byte, 2)
-			binary.BigEndian.PutUint16(sizeBuf, slotIndicesSize)
-			entry = append(sizeBuf, entry...)
-
-			slotIndexEntry := make([]byte, len(op.slotIndices)*8)
-			for i, slotIndex := range op.slotIndices {
-				binary.BigEndian.PutUint64(
-					slotIndexEntry[i*8:(i+1)*8],
-					uint64(slotIndex),
-				)
+		switch op.modifiedType {
+		case None:
+			// No changes, skip
+			continue
+		case ValueModified:
+			entry, err := db.ConvertKV(keyBytes, op.value)
+			if err != nil {
+				return err
 			}
-			entry = append(entry, slotIndexEntry...)
-		} else {
-			entry = append([]byte{0, 0}, entry...)
+
+			NAEntry = append(NAEntry, entry...)
+			trieAccountOffset += int64(len(entry))
+
+			node := &TrieNode{
+				startSlotindex: 0,
+				slotNum:        int(len(op.slotIndices)),
+				offset:         trieAccountOffset - int64(len(entry)),
+			}
+
+			if len(op.slotIndices) > 0 {
+				node.startSlotindex = op.slotIndices[0]
+			}
+			if err := db.storeNode(keyBytes, node); err != nil {
+				return err
+			}
+
+		case SlotModified:
+			node := &TrieNode{
+				startSlotindex: 0,
+				slotNum:        int(len(op.slotIndices)),
+				offset:         op.offset,
+			}
+
+			if len(op.slotIndices) > 0 {
+				node.startSlotindex = op.slotIndices[0]
+			}
+
+			if err := db.storeNode(keyBytes, node); err != nil {
+				return fmt.Errorf("failed to store node in index file: %w", err)
+			}
 		}
-		NAEntry = append(NAEntry, entry...)
-		db.accountIndex.put(key, trieAccountOffset)
-		trieAccountOffset += int64(len(entry))
 	}
 
 	if len(NAEntry) > 0 {
@@ -339,7 +367,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 	return nil
 }
 
-func (wb *WriteBatch) getSlot(slotIndex int64) (map[string][]byte, bool) {
+func (wb *WriteBatch) getSlot(slotIndex int) (map[string][]byte, bool) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 
@@ -352,4 +380,16 @@ func (wb *WriteBatch) getSlot(slotIndex int64) (map[string][]byte, bool) {
 		return nil, false
 	}
 	return slotData, true
+}
+
+func (wb *WriteBatch) deleteSlot(slotIndex int) {
+	wb.lock.Lock()
+	defer wb.lock.Unlock()
+
+	if slotIndex < 0 || len(wb.slotBatch) == 0 {
+		return
+	}
+
+	delete(wb.slotBatch, slotIndex)
+
 }

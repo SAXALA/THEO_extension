@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ const MAX_CACHE_SIZE = 65535  // maximum cache size
 const BUFFER_SIZE = 8192      // buffer size for file operations
 const SLOT_SIZE = 1024 * 1024 // size of each slot
 const SLOT_NUM = 1024
+const METADATA_SPACE = 1024 * 1024
 
 type KeyType int
 
@@ -46,64 +46,22 @@ type StateAccount struct {
 	CodeHash []byte
 }
 
-type TrieNode struct {
-	slotIndices []int64 // additional slot indices for contract account
-	offset      int64   // offset in the file
-}
-
-type accountIndex struct {
-	accountOffset map[string]int64 // index for account keys
-	indexLock     sync.RWMutex
-}
-
-func (ai *accountIndex) get(key string) (int64, bool) {
-	ai.indexLock.RLock()
-	defer ai.indexLock.RUnlock()
-	offset, exists := ai.accountOffset[key]
-	if !exists {
-		return -1, false
-	}
-	return offset, true
-}
-
-func (ai *accountIndex) put(key string, offset int64) {
-	ai.indexLock.Lock()
-	defer ai.indexLock.Unlock()
-	ai.accountOffset[key] = offset
-}
-
-func (ai *accountIndex) set(key string, offset int64) {
-	ai.indexLock.Lock()
-	defer ai.indexLock.Unlock()
-	if _, exists := ai.accountOffset[key]; !exists {
-		ai.accountOffset[key] = offset
-	}
-}
-
-func (ai *accountIndex) delete(key string) {
-	ai.indexLock.Lock()
-	defer ai.indexLock.Unlock()
-	delete(ai.accountOffset, key)
-}
-
-func NewAccountIndex() *accountIndex {
-	return &accountIndex{
-		accountOffset: make(map[string]int64),
-		indexLock:     sync.RWMutex{},
-	}
-}
-
 type PrefixDB struct {
-	accountIndex         accountIndex
-	accountFile          *os.File
-	slotFile             *os.File
-	nodeCache            *NodeCache
-	slotCache            *SlotCache
-	slotManager          *SlotManager
-	batch                *WriteBatch
-	triePath             string       // path to the prefix tree file
+	prefixTree  *PrefixTree
+	accountFile *os.File
+	slotFile    *os.File
+	trieFile    *os.File
+	indexfile   string
+	nodeCache   *NodeCache
+	slotCache   *SlotCache
+	slotManager *SlotManager
+	batch       *WriteBatch
+	// triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *PebbleStore // pebble store for account hash key index
-	memcache             *memcache.Client
+	// hashIndex  hashIndex to aviod hash collision
+	accountHashKeyIndex sync.Map // index for account keys
+	memcache            *memcache.Client
+	writeMutex          sync.Mutex // mutex for writeCommit
 }
 
 // SerializedTrieNode修改为直接存储完整路径
@@ -117,11 +75,11 @@ type SerializedTrieNode struct {
 /**
  * NewPrefixDB creates a new PrefixDB instance.
  */
-func NewPrefixDB(ditpath string) (*PrefixDB, error) {
+func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 
-	accountFilePath := filepath.Join(ditpath, "prefixdb", "na")
-	slotFilePath := filepath.Join(ditpath, "prefixdb", "ca")
-	triePath := filepath.Join(ditpath, "prefixdb", "trie")
+	accountFilePath := filepath.Join(dirpath, "prefixdb", "na")
+	slotFilePath := filepath.Join(dirpath, "prefixdb", "ca")
+	triePath := filepath.Join(dirpath, "prefixdb", "trie")
 	pebblePath := "/mnt/ssd/ethstore/index/accountHash_key_pebble"
 
 	accountFile, err := os.OpenFile(accountFilePath, os.O_RDWR|os.O_CREATE, 0644)
@@ -132,38 +90,51 @@ func NewPrefixDB(ditpath string) (*PrefixDB, error) {
 	if err != nil {
 		return nil, errors.New("failed to open contract account file")
 	}
+	trieFile, err := os.OpenFile(triePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, errors.New("failed to open prefix tree file")
+	}
 
 	// get the path for the prefix tree file (same directory as normal account file)
 
 	db := &PrefixDB{
-		accountIndex: *NewAccountIndex(),
-		accountFile:  accountFile,
-		slotFile:     slotFile,
-		nodeCache:    NewNodeCache(MAX_CACHE_SIZE),
-		batch:        NewWriteBatch(),
-		slotManager:  NewSlotManager(SLOT_NUM, SLOT_SIZE),
-		triePath:     triePath,
+		accountFile:         accountFile,
+		slotFile:            slotFile,
+		trieFile:            trieFile,
+		batch:               NewWriteBatch(4096),
+		slotManager:         NewSlotManager(SLOT_NUM, SLOT_SIZE),
+		writeMutex:          sync.Mutex{},
+		indexfile:           filepath.Join(dirpath, "prefixdb", "slotIndex"),
+		accountHashKeyIndex: sync.Map{},
 	}
 
+	db.nodeCache = NewNodeCache(MAX_CACHE_SIZE, db)
 	db.slotCache = NewSlotCache(1024, db)
+
+	prefixTree, err := NewPrefixTree(db, dirpath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create prefix tree: %v", err)
+	}
+
+	db.prefixTree = prefixTree
 
 	db.accountHashKeyPebble, err = NewPebbleStore(pebblePath, 0, 0, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create PebbleStore: %v", err)
 	}
 
-	db.memcache = memcache.New("127.0.0.1:11211")
+	//db.memcache = memcache.New("127.0.0.1:11211")
 	// err = db.buildMemCache()
 	// if err != nil {
 	// 	return nil, fmt.Errorf("failed to build memcache: %v", err)
 	// }
 
-	db.batch.EnableAutoCommit(db, 2048) // enable auto commit with a threshold of 1000 operations
+	db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
 	// try to load the persisted prefix tree
-	if err := db.LoadTrie(); err != nil {
+	if err := db.LoadSlotIndex(); err != nil {
 		// if loading fails, use an empty prefix tree (already initialized in the constructor)
-		fmt.Printf("unable to load prefix tree, using empty tree: %v\n", err)
+		fmt.Printf("unable to load slotIndex: %v\n", err)
 	}
 
 	return db, nil
@@ -189,18 +160,26 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			}
 		}
 
-		offset, exists := db.accountIndex.get(string(key))
-		if !exists {
-			fmt.Printf("Account key %s not found in index\n", string(key))
-			return nil, false, nil
-		}
-		value, slotIndices, err := db.readFromFile(offset, TrieAccount)
+		node, err := db.getNode(key)
 		if err != nil {
 			return nil, false, err
 		}
+		if node == nil {
+			fmt.Printf("Account key %s not found in index\n", string(key))
+			return nil, false, nil
+		}
+		value, err := db.readFromFile(node.offset, TrieAccount)
+		if err != nil {
+			return nil, false, err
+		}
+		// build slot indices
+		slotIndices := make([]int, 0, node.slotNum)
+		for i := 0; i < node.slotNum; i++ {
+			slotIndices = append(slotIndices, node.startSlotindex+i)
+		}
 
 		// add to cache and cache path of the node
-		db.nodeCache.Put(string(key), value, slotIndices)
+		db.nodeCache.Put(string(key), value, node.offset, slotIndices, 0)
 		db.nodeCache.AsyncCachePathToNode(string(key), db)
 		return value, true, nil
 
@@ -212,20 +191,31 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			// return nil, false, errors.New("parent account not found")
 		}
 
-		var slotIndices []int64
+		var slotIndices []int
 		var ok bool
 		value := []byte{}
+		var offset int64
 		if _, slotIndices, ok = db.nodeCache.Get(string(accountKey)); !ok {
 			if value, slotIndices, ok = db.batch.get(accountKey); !ok {
-				offset, exists := db.accountIndex.get(string(accountKey))
-				if !exists {
-					keyStr := hex.EncodeToString([]byte(accountKey))
-					fmt.Printf("Account key %s not found in index\n", keyStr)
+				node, err := db.getNode(accountKey)
+				if err != nil {
+					return nil, false, err
+				}
+				if node == nil {
+					fmt.Printf("Account key %s not found in index\n", string(accountKey))
 					return nil, false, nil
 				}
-				value, slotIndices, err = db.readFromFile(offset, TrieAccount)
+				offset = node.offset
+				value, err = db.readFromFile(node.offset, TrieAccount)
+				if err != nil {
+					return nil, false, err
+				}
+				// build slot indices
+				for i := 0; i < node.slotNum; i++ {
+					slotIndices = append(slotIndices, node.startSlotindex+i)
+				}
 			}
-			db.nodeCache.Put(string(accountKey), value, slotIndices)
+			db.nodeCache.Put(string(accountKey), value, offset, slotIndices, 0)
 		}
 
 		// check in batch
@@ -273,42 +263,26 @@ func (db *PrefixDB) Put(key, value []byte) error {
 
 	switch keyType {
 	case TrieAccount:
-		isContract := db.isContractAccount(value)
+		// isContract := db.isContractAccount(value)
 		// check accountIndex
-		var slotIndices []int64
-		if offset, exists := db.accountIndex.get(string(key)); exists {
-			// update existing account
-			var ok bool
-			if _, slotIndices, ok = db.nodeCache.Get(string(key)); !ok {
-				if _, slotIndices, ok = db.batch.get(key); !ok {
-					// not in batch,but offset is 1, is writing to the file
-					if offset == 1 {
-						db.batch.CommitBatch()
-						offset, _ = db.accountIndex.get(string(key))
-					}
-					_, slotIndices, err = db.readFromFile(offset, TrieAccount)
+		var slotIndices []int
+		var ok bool
+		var offset int64
+		if _, slotIndices, ok = db.nodeCache.Get(string(key)); !ok {
+			if _, slotIndices, ok = db.batch.get(key); !ok {
+				// not in batch,but offset is 1, is writing to the file
+				node, err := db.getNode(key)
+				if err != nil {
+					return fmt.Errorf("failed to get node for key %s: %v", string(key), err)
 				}
+				if node == nil {
+					// new account
+					slotIndices = []int{}
+				}
+				offset = -1
 			}
-			if err != nil {
-				return fmt.Errorf("failed to read account data: %v", err)
-			}
-		} else {
-			if isContract {
-				// slotIndex := db.slotManager.getEmptySlot()
-				// if slotIndex == -1 {
-				// 	return errors.New("no empty slot available for contract account")
-				// }
-				// slotIndices = []int64{int64(slotIndex)}
-				slotIndices = []int64{}
-			} else {
-				// if not a contract account, ensure no slot indices are set
-				slotIndices = nil
-			}
-			db.accountIndex.put(string(key), 1) // set a dummy offset, will be updated later
 		}
-
-		db.nodeCache.Put(string(key), value, slotIndices)
-		db.batch.add(key, value, slotIndices)
+		db.nodeCache.Put(string(key), value, offset, slotIndices, 1)
 		db.nodeCache.AsyncCachePathToNode(string(key), db)
 
 	case TrieStorage, TrieCode:
@@ -319,19 +293,29 @@ func (db *PrefixDB) Put(key, value []byte) error {
 			// return errors.New("parent account not found")
 		}
 
-		var slotIndices []int64
+		var slotIndices []int
 		var ok bool
 		var accountValue []byte
+		var offset int64
 		if accountValue, slotIndices, ok = db.nodeCache.Get(string(accountKey)); !ok {
 			if accountValue, slotIndices, ok = db.batch.get(accountKey); !ok {
-				offset, exists := db.accountIndex.get(string(accountKey))
-				if !exists {
-					fmt.Printf("Account key %s not found in index\n", string(key))
+				// offset, exists := db.accountIndex.get(string(accountKey))
+				node, err := db.getNode(accountKey)
+				if err != nil {
+					return fmt.Errorf("failed to get node for account key %s: %v", string(accountKey), err)
+				}
+				if node == nil {
 					return errors.New("parent account not found")
 				}
-				accountValue, slotIndices, err = db.readFromFile(offset, TrieAccount)
+				offset = node.offset
+				accountValue, err = db.readFromFile(node.offset, TrieAccount)
 				if err != nil {
 					return fmt.Errorf("failed to read account data: %v", err)
+				}
+				//build slot indices
+				slotIndices = make([]int, 0, node.slotNum)
+				for i := 0; i < node.slotNum; i++ {
+					slotIndices = append(slotIndices, node.startSlotindex+i)
 				}
 			}
 		}
@@ -341,63 +325,70 @@ func (db *PrefixDB) Put(key, value []byte) error {
 			if newSlotindex == -1 {
 				return errors.New("no empty slot available for expanding contract account")
 			}
-			slotIndices = []int64{int64(newSlotindex)}
+			slotIndices = []int{newSlotindex}
 
-			db.nodeCache.Put(string(accountKey), accountValue, slotIndices)
-			db.batch.add(accountKey, accountValue, slotIndices)
+			db.nodeCache.Put(string(accountKey), accountValue, offset, slotIndices, 2)
+			// db.batch.add(accountKey, accountValue, slotIndices)
 		}
 
 		keyStr := string(key)
 		entrySize := 4 + len(key) + len(value)
 		slotFound := false
 
-		for _, slotIdx := range slotIndices {
-			var slotData map[string][]byte
-			var slotSize int
-			var exists bool
-
-			if slotData, exists = db.slotCache.Get(slotIdx); exists {
-				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
-			} else if slotData, exists = db.batch.getSlot(slotIdx); exists {
-				slotSize = db.slotManager.getSlotUsedSize(int(slotIdx))
-			} else {
-				var err error
-				if slotData, err = db.loadSlot(slotIdx); err != nil {
-					continue
-				}
-				slotSize = db.calculateSlotSize(slotData)
-				db.slotManager.setSlotUsedSize(int(slotIdx), slotSize)
+		slotIdx := slotIndices[len(slotIndices)-1]
+		var slotData map[string][]byte
+		var slotSize int
+		var exists bool
+		if slotData, exists = db.slotCache.Get(slotIdx); exists {
+			slotSize = db.calculateSlotSize(slotData)
+		} else if slotData, exists = db.batch.getSlot(slotIdx); exists {
+			slotSize = db.calculateSlotSize(slotData)
+		} else {
+			var err error
+			if slotData, err = db.loadSlot(slotIdx); err != nil {
+				return fmt.Errorf("failed to load slot %d: %v", slotIdx, err)
 			}
+			slotSize = db.calculateSlotSize(slotData)
+		}
 
-			if slotSize+entrySize <= SLOT_SIZE {
-				slotData[keyStr] = value
-				db.slotCache.Put(slotIdx, slotData)
-				db.slotCache.MarkSlotModified(slotIdx)
-				db.slotManager.updateUsedSize(int(slotIdx), entrySize)
-				slotFound = true
-				break
-			}
+		if slotSize+entrySize <= SLOT_SIZE {
+			slotData[keyStr] = value
+			db.slotCache.Put(slotIdx, slotData)
+			db.slotCache.MarkSlotModified(slotIdx)
+			slotFound = true
 		}
 
 		// no slot found with enough space
 		if !slotFound {
-			newSlotIdx := db.slotManager.getEmptySlot()
-			if newSlotIdx == -1 {
-				return errors.New("no empty slot available for expanding contract account")
+			var newSlotIdx int = -1
+
+			//get adjacent slot
+			if len(slotIndices) > 0 {
+				newSlotIdx = db.slotManager.getAdjSlot(int(slotIndices[len(slotIndices)-1]))
 			}
 
-			slotIndices = append(slotIndices, int64(newSlotIdx))
+			// if adjacent slot is not available, migrate to new slots
+			if newSlotIdx == -1 && len(slotIndices) > 0 {
+				newIndices, err := db.migrateSlots(accountKey, slotIndices)
+				if err != nil {
+					return fmt.Errorf("failed to migrate slots for account %s: %v", string(accountKey), err)
+				}
+				slotIndices = newIndices
+				newSlotIdx = int(slotIndices[len(slotIndices)-1])
+			}
 
 			newSlotData := make(map[string][]byte)
 			newSlotData[keyStr] = value
+			entrySize := db.calculateSlotSize(newSlotData)
+			if entrySize > SLOT_SIZE {
+				return fmt.Errorf("entry size %d exceeds slot size %d", entrySize, SLOT_SIZE)
+			}
 
-			db.slotCache.Put(int64(newSlotIdx), newSlotData)
-			db.slotCache.MarkSlotModified(int64(newSlotIdx))
+			db.slotCache.Put(newSlotIdx, newSlotData)
+			db.slotCache.MarkSlotModified(newSlotIdx)
 
-			db.nodeCache.Put(string(accountKey), accountValue, slotIndices)
-			db.batch.add(accountKey, accountValue, slotIndices)
-
-			db.slotManager.updateUsedSize(newSlotIdx, entrySize)
+			db.nodeCache.Put(string(accountKey), accountValue, offset, slotIndices, 2)
+			// db.batch.add(accountKey, accountValue, slotIndices)
 		}
 	}
 	return nil
@@ -419,12 +410,14 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 
 	switch keyType {
 	case TrieAccount:
-		// check in accountIndex
-		if _, exists := db.accountIndex.get(string(key)); exists {
-			return true, nil
-		} else {
+		node, err := db.getNode(key)
+		if err != nil {
+			return false, err
+		}
+		if node == nil {
 			return false, nil
 		}
+		return true, nil
 	case TrieStorage, TrieCode:
 		accountKey := db.getParentAccountKey(key)
 		if accountKey == nil {
@@ -433,19 +426,31 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 			// return false, errors.New("parent account not found")
 		}
 
-		var slotIndices []int64
+		var slotIndices []int
 		var ok bool
 		value := []byte{}
+		var offset int64
 		if _, slotIndices, ok = db.nodeCache.Get(string(accountKey)); !ok {
 			if value, slotIndices, ok = db.batch.get(accountKey); !ok {
-				offset, exists := db.accountIndex.get(string(accountKey))
-				if !exists {
-					fmt.Printf("Account key %s not found in index\n", string(key))
-					return false, nil
+				node, err := db.getNode(accountKey)
+				if err != nil {
+					return false, err
 				}
-				value, slotIndices, err = db.readFromFile(offset, TrieAccount)
+				if node == nil {
+					return false, errors.New("parent account not found")
+				}
+				offset = node.offset
+				value, err = db.readFromFile(node.offset, TrieAccount)
+				if err != nil {
+					return false, err
+				}
+				//build slot indices
+				slotIndices = make([]int, 0, node.slotNum)
+				for i := 0; i < node.slotNum; i++ {
+					slotIndices = append(slotIndices, node.startSlotindex+i)
+				}
+				db.nodeCache.Put(string(accountKey), value, offset, slotIndices, 0)
 			}
-			db.nodeCache.Put(string(accountKey), value, slotIndices)
 		}
 
 		// check in batch
@@ -512,17 +517,31 @@ func (db *PrefixDB) Delete(key []byte) error {
 
 	switch keyType {
 	case TrieAccount:
-		var slotIndices []int64
+		var slotIndices []int
 		var ok bool
 		if _, slotIndices, ok = db.nodeCache.Get(string(key)); !ok {
 			if _, slotIndices, ok = db.batch.get(key); !ok {
-				offset, exists := db.accountIndex.get(string(key))
-				if !exists {
-					fmt.Printf("Account key %s not found in index\n", string(key))
-					return errors.New("account not found")
+				node, err := db.getNode(key)
+				if err != nil {
+					return err
 				}
-				_, slotIndices, err = db.readFromFile(offset, TrieAccount)
+				if node == nil {
+					fmt.Printf("Account key %s not found in index\n", string(key))
+					return nil
+				}
+				_, err = db.readFromFile(node.offset, TrieAccount)
+				if err != nil {
+					return err
+				}
+				// build slot indices
+				for i := 0; i < node.slotNum; i++ {
+					slotIndices = append(slotIndices, node.startSlotindex+i)
+				}
+			} else {
+				db.batch.delete(key)
 			}
+		} else {
+			db.nodeCache.Delete(string(key))
 		}
 
 		if len(slotIndices) > 0 {
@@ -531,10 +550,13 @@ func (db *PrefixDB) Delete(key []byte) error {
 				db.slotManager.releaseSlot(int(slotIdx), db.slotFile)
 			}
 		}
-
-		db.nodeCache.Delete(string(key))
-		db.batch.delete(key)
-		db.accountIndex.delete(string(key))
+		// delete node
+		db.storeNode(key, &TrieNode{
+			startSlotindex: 0,
+			slotNum:        0,
+			offset:         0,
+		})
+		// db.accountIndex.delete(string(key))
 
 	case TrieStorage, TrieCode:
 		accountKey := db.getParentAccountKey(key)
@@ -544,19 +566,31 @@ func (db *PrefixDB) Delete(key []byte) error {
 			// return errors.New("parent account not found")
 		}
 
-		var slotIndices []int64
+		var slotIndices []int
 		var ok bool
 		value := []byte{}
+		var offset int64
 		if _, slotIndices, ok = db.nodeCache.Get(string(accountKey)); !ok {
 			if value, slotIndices, ok = db.batch.get(accountKey); !ok {
-				offset, exists := db.accountIndex.get(string(accountKey))
-				if !exists {
-					fmt.Printf("Account key %s not found in index\n", string(key))
-					return errors.New("parent account not found")
+				node, err := db.getNode(key)
+				if err != nil {
+					return err
 				}
-				value, slotIndices, err = db.readFromFile(offset, TrieAccount)
+				if node == nil {
+					fmt.Printf("Account key %s not found in index\n", string(key))
+					return nil
+				}
+				offset = node.offset
+				_, err = db.readFromFile(node.offset, TrieAccount)
+				if err != nil {
+					return err
+				}
+				// build slot indices
+				for i := 0; i < node.slotNum; i++ {
+					slotIndices = append(slotIndices, node.startSlotindex+i)
+				}
 			}
-			db.nodeCache.Put(string(accountKey), value, slotIndices)
+			db.nodeCache.Put(string(accountKey), value, offset, slotIndices, 0)
 		}
 
 		for _, slotIdx := range slotIndices {
@@ -653,7 +687,7 @@ func putDataBuffer(buf []byte) {
 	}
 }
 
-func (db *PrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, []int64, error) {
+func (db *PrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, error) {
 	var file *os.File
 	if keyType == TrieStorage || keyType == TrieCode {
 		file = db.slotFile
@@ -665,56 +699,39 @@ func (db *PrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, []int64
 	defer headerPool.Put(header)
 
 	if cap(header) < 6 {
-		header = make([]byte, 6)
+		header = make([]byte, 4)
 	} else {
-		header = header[:6]
+		header = header[:4]
 	}
 
 	_, err := file.ReadAt(header, offset)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read header at offset %d: %v", offset, err)
+		return nil, fmt.Errorf("failed to read header at offset %d: %v", offset, err)
 	}
 
-	slotIndicesSize := binary.BigEndian.Uint16(header[0:2])
-	keySize := int(binary.BigEndian.Uint16(header[2:4]))
-	valueSize := int(binary.BigEndian.Uint16(header[4:6]))
+	keySize := int(binary.BigEndian.Uint16(header[0:2]))
+	valueSize := int(binary.BigEndian.Uint16(header[2:4]))
 
 	totalSize := keySize + valueSize
-	if slotIndicesSize > 0 {
-		totalSize += int(slotIndicesSize)
-	}
 
 	combinedData := getDataBuffer(totalSize)
 	defer putDataBuffer(combinedData)
 
-	_, err = file.ReadAt(combinedData, offset+6)
+	_, err = file.ReadAt(combinedData, offset+4)
 	if err != nil && err != io.EOF {
-		return nil, nil, fmt.Errorf("failed to read combined data at offset %d: %v", offset+6, err)
+		return nil, fmt.Errorf("failed to read combined data at offset %d: %v", offset+6, err)
 	}
 
-	kvSize := keySize + valueSize
 	value := make([]byte, valueSize)
-	copy(value, combinedData[keySize:kvSize])
+	copy(value, combinedData[keySize:totalSize])
 
-	var slotIndices []int64
-	if slotIndicesSize > 0 {
-		slotDataSize := int(slotIndicesSize)
-		slotCount := slotDataSize / 8
-		slotIndices = make([]int64, slotCount)
-
-		slotData := combinedData[kvSize:]
-		for i := 0; i < slotCount; i++ {
-			slotIndices[i] = int64(binary.BigEndian.Uint64(slotData[i*8 : (i+1)*8]))
-		}
-	}
-
-	return value, slotIndices, nil
+	return value, nil
 }
 
 func (db *PrefixDB) Close() error {
 
 	db.nodeCache.Close()
-	db.slotCache.FlushModifiedSlots()
+	db.slotCache.Close()
 
 	// forbid further writes to the database
 	if db.batch != nil {
@@ -734,7 +751,11 @@ func (db *PrefixDB) Close() error {
 		}
 	}
 
-	if err := db.SaveTrie(); err != nil {
+	if err := db.prefixTree.Close(); err != nil {
+		return fmt.Errorf("failed to close prefix tree: %v", err)
+	}
+
+	if err := db.SaveSlotIndex(); err != nil {
 		return fmt.Errorf("failed to save prefix tree: %v", err)
 	}
 
@@ -759,61 +780,31 @@ func (db *PrefixDB) Close() error {
 	db.nodeCache = nil
 	db.slotCache = nil
 	db.batch = nil
-	db.accountHashKeyPebble = nil
+	// db.accountHashKeyPebble = nil
 
 	if len(errs) > 0 {
+		fmt.Printf("Errors occurred during closing: %v\n", errs)
 		return errs[0]
 	}
 
-	if db.accountHashKeyPebble != nil {
-		if err := db.accountHashKeyPebble.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
-		}
-	}
+	// if db.accountHashKeyPebble != nil {
+	// 	if err := db.accountHashKeyPebble.Close(); err != nil {
+	// 		errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
+	// 	}
+	// }
 	return nil
 }
 
-// SaveTrie saves the current prefix tree to a file.
-func (db *PrefixDB) SaveTrie() error {
+// SaveSlotIndex saves the current prefix tree to a file.
+func (db *PrefixDB) SaveSlotIndex() error {
 	// write accountIndex to file
-	file, err := os.Create(db.triePath)
+	file, err := os.Create(db.indexfile)
 	if err != nil {
 		return fmt.Errorf("failed to create the prefix tree file: %v", err)
 	}
 	defer file.Close()
 
 	encoder := gob.NewEncoder(file)
-
-	db.accountIndex.indexLock.RLock()
-	indexSize := len(db.accountIndex.accountOffset)
-
-	if err := encoder.Encode(indexSize); err != nil {
-		db.accountIndex.indexLock.RUnlock()
-		return fmt.Errorf("failed to encode index size: %v", err)
-	}
-
-	keys := make([]string, 0, indexSize)
-	offsets := make([]int64, 0, indexSize)
-
-	for key, offset := range db.accountIndex.accountOffset {
-		keys = append(keys, key)
-		offsets = append(offsets, offset)
-	}
-	db.accountIndex.indexLock.RUnlock()
-
-	for i, key := range keys {
-		offset := offsets[i]
-
-		// encode key
-		if err := encoder.Encode(key); err != nil {
-			return fmt.Errorf("failed to encode key %s: %v", key, err)
-		}
-
-		// encode offset
-		if err := encoder.Encode(offset); err != nil {
-			return fmt.Errorf("failed to encode offset for key %s: %v", key, err)
-		}
-	}
 
 	// save slot manager state
 	db.slotManager.lock.Lock()
@@ -822,15 +813,12 @@ func (db *PrefixDB) SaveTrie() error {
 	if err := encoder.Encode(db.slotManager.slotNum); err != nil {
 		return fmt.Errorf("failed to encode slot num: %v", err)
 	}
-
 	if err := encoder.Encode(db.slotManager.slotSize); err != nil {
 		return fmt.Errorf("failed to encode slot size: %v", err)
 	}
-
-	if err := encoder.Encode(db.slotManager.usedSizes); err != nil {
-		return fmt.Errorf("failed to encode used sizes: %v", err)
+	if err := encoder.Encode(db.slotManager.usedSlots); err != nil {
+		return fmt.Errorf("failed to encode used slots: %v", err)
 	}
-
 	if err := encoder.Encode(db.slotManager.freeSlots); err != nil {
 		return fmt.Errorf("failed to encode free slots: %v", err)
 	}
@@ -838,45 +826,25 @@ func (db *PrefixDB) SaveTrie() error {
 	return nil
 }
 
-// LoadTrie loads the prefix tree from a file.
-func (db *PrefixDB) LoadTrie() error {
-	file, err := os.OpenFile(db.triePath, os.O_RDONLY|os.O_CREATE, 0644)
+// LoadSlotIndex loads the prefix tree from a file.
+func (db *PrefixDB) LoadSlotIndex() error {
+	file, err := os.OpenFile(db.indexfile, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open the prefix tree file: %v", err)
 	}
 	defer file.Close()
 
+	// check if the file is empty
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat the prefix tree file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		// empty file, nothing to load
+		return errors.New("empty prefix tree file")
+	}
+
 	decoder := gob.NewDecoder(file)
-
-	var indexSize int
-	if err := decoder.Decode(&indexSize); err != nil {
-		return fmt.Errorf("failed to decode index size: %v", err)
-	}
-
-	db.accountIndex.indexLock.Lock()
-	defer db.accountIndex.indexLock.Unlock()
-
-	db.accountIndex.accountOffset = make(map[string]int64, indexSize)
-
-	for i := 0; i < indexSize; i++ {
-
-		var key string
-		if err := decoder.Decode(&key); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to decode key at index %d: %v", i, err)
-		}
-		var offset int64
-		if err := decoder.Decode(&offset); err != nil {
-			return fmt.Errorf("failed to decode offset at index %d: %v", i, err)
-		}
-		// keybyte := hex.EncodeToString([]byte(key))
-		// if len(keybyte) == 0 {
-		// 	return fmt.Errorf("decoded key is empty at index %d", i)
-		// }
-		db.accountIndex.accountOffset[key] = offset
-	}
 
 	slotInfoLoaded := false
 
@@ -887,12 +855,12 @@ func (db *PrefixDB) LoadTrie() error {
 			if slotSize == db.slotManager.slotSize {
 				db.slotManager.lock.Lock()
 
-				var usedSizes []int
-				if err := decoder.Decode(&usedSizes); err == nil {
+				var usedSlots map[int]struct{}
+				if err := decoder.Decode(&usedSlots); err == nil {
 					var freeSlots []int
 					if err := decoder.Decode(&freeSlots); err == nil {
 						db.slotManager.slotNum = slotNum
-						db.slotManager.usedSizes = usedSizes
+						db.slotManager.usedSlots = usedSlots
 						db.slotManager.freeSlots = freeSlots
 						slotInfoLoaded = true
 					}
@@ -904,65 +872,11 @@ func (db *PrefixDB) LoadTrie() error {
 	}
 
 	if !slotInfoLoaded {
-		fmt.Println("slot manager state not loaded, reinitializing from slot file")
-		db.markUsedSlots()
+		//fmt.Println("slot manager state not loaded, reinitializing from trie file")
+		// db.markUsedSlots()
 	}
 
 	return nil
-}
-
-// markUsedSlots marks all used slots in the prefix tree.
-func (db *PrefixDB) markUsedSlots() {
-	// get all account keys and their offsets
-	db.accountIndex.indexLock.RLock()
-	keys := make([]string, 0, len(db.accountIndex.accountOffset))
-	offsets := make([]int64, 0, len(db.accountIndex.accountOffset))
-
-	for k, off := range db.accountIndex.accountOffset {
-		keys = append(keys, k)
-		offsets = append(offsets, off)
-	}
-	db.accountIndex.indexLock.RUnlock()
-
-	for i, key := range keys {
-		offset := offsets[i]
-		if offset <= 0 {
-			continue
-		}
-
-		_, slotIndices, exists := db.nodeCache.Get(key)
-		if !exists {
-			// 从文件读取
-			_, slotIndices, err := db.readFromFile(offset, TrieAccount)
-			if err != nil || len(slotIndices) == 0 {
-				continue
-			}
-
-			for _, slotIdx := range slotIndices {
-				if slotIdx >= 0 {
-					db.slotManager.setSlotUsedSize(int(slotIdx), 0)
-
-					slotData, err := db.loadSlot(slotIdx)
-					if err == nil {
-						size := db.calculateSlotSize(slotData)
-						db.slotManager.setSlotUsedSize(int(slotIdx), size)
-					}
-				}
-			}
-		} else {
-			for _, slotIdx := range slotIndices {
-				if slotIdx >= 0 {
-					db.slotManager.setSlotUsedSize(int(slotIdx), 0)
-
-					slotData, err := db.loadSlot(slotIdx)
-					if err == nil {
-						size := db.calculateSlotSize(slotData)
-						db.slotManager.setSlotUsedSize(int(slotIdx), size)
-					}
-				}
-			}
-		}
-	}
 }
 
 // ExtractAccountData extracts account data from the value of a TrieAccount node.
@@ -1107,14 +1021,14 @@ func decodeUint64(b []byte) (uint64, error) {
 	return n, nil
 }
 
-func (db *PrefixDB) loadSlot(index int64) (map[string][]byte, error) {
+func (db *PrefixDB) loadSlot(index int) (map[string][]byte, error) {
 	buf := getDataBuffer(SLOT_SIZE)
 	defer putDataBuffer(buf)
 
 	// appendOnlyKVPairs := make(map[string][]byte, avgKVPairsPerSlot)
 	appendOnlyKVPairs := make(map[string][]byte)
 
-	offset := index * SLOT_SIZE
+	offset := int64(index) * int64(SLOT_SIZE)
 	_, err := db.slotFile.ReadAt(buf, offset)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("loadSlot error: %v", err)
@@ -1150,12 +1064,12 @@ func (db *PrefixDB) loadSlot(index int64) (map[string][]byte, error) {
 	return appendOnlyKVPairs, nil
 }
 
-func (db *PrefixDB) saveSlot(index int64, slot *Slot) error {
+func (db *PrefixDB) saveSlot(index int, slot *Slot) error {
 	if slot == nil {
 		return errors.New("nil slot provided to saveSlot")
 	}
 
-	if index < 0 || index >= int64(SLOT_NUM) {
+	if index < 0 {
 		return fmt.Errorf("invalid slot index: %d", index)
 	}
 
@@ -1322,7 +1236,8 @@ func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
 		return nil
 	}
 	return key
-	// item, err := db.memcache.Get(hex.EncodeToString(accountHash))
+	// accountHashStr := hex.EncodeToString(accountHash)
+	// item, err := db.memcache.Get(accountHashStr)
 	// if err != nil {
 	// 	if err == memcache.ErrCacheMiss {
 	// 		return nil // account not found in cache
@@ -1333,19 +1248,66 @@ func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
 	// return item.Value
 }
 
-func (db *PrefixDB) buildMemCache() error {
-	// insert all kvs in hashKeyPebble into memCache
-	fmt.Println("Building memcache from pebble store...")
-	iter, err := db.accountHashKeyPebble.db.NewIter(nil)
+// migrateSlots migrates all slots of a account to new positions in the slot file.
+func (db *PrefixDB) migrateSlots(accountKey []byte, SlotIndices []int) ([]int, error) {
+	slotCount := len(SlotIndices)
+	if slotCount == 0 {
+		return nil, nil // no slots to migrate
+	}
+
+	startSlot := db.slotManager.findContFreeSlot(slotCount + 1)
+	if startSlot == -1 {
+		return nil, errors.New("no empty slot available for migrating slots")
+	}
+
+	newSlots := db.slotManager.allocateContiguousSlots(startSlot, slotCount+1)
+	if newSlots == nil {
+		return nil, errors.New("failed to allocate contiguous slots for migration")
+	}
+
+	// check in slotCache and batch
+	for i, slotIdx := range SlotIndices {
+		var slotData map[string][]byte
+		var exists bool
+		var err error
+		if slotData, exists = db.slotCache.Get(slotIdx); !exists {
+			if slotData, exists = db.batch.getSlot(slotIdx); !exists {
+				slotData, err = db.loadSlot(slotIdx)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load slot %d: %v", slotIdx, err)
+				}
+			} else {
+				db.batch.deleteSlot(slotIdx)
+			}
+		} else {
+			db.slotCache.Delete(slotIdx)
+		}
+
+		db.slotCache.Put(newSlots[i], slotData)
+		db.slotCache.MarkSlotModified(newSlots[i])
+	}
+	db.slotManager.releaseContiguousSlots(startSlot, slotCount, db.slotFile)
+
+	return newSlots, nil
+}
+
+func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
+	return db.prefixTree.Put(key, node.startSlotindex, node.slotNum, node.offset)
+}
+
+func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
+	startSlotindex, slotNum, offset, found, err := db.prefixTree.Get(key)
 	if err != nil {
-		return fmt.Errorf("failed to create iterator for pebble store: %v", err)
+		return nil, err
 	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		accountHash := iter.Key()
-		accountKey := iter.Value()
-		db.memcache.Add(&memcache.Item{Key: hex.EncodeToString(accountHash), Value: accountKey})
+
+	if !found {
+		return nil, nil
 	}
-	fmt.Println("Memcache build complete.")
-	return nil
+
+	return &TrieNode{
+		startSlotindex: startSlotindex,
+		slotNum:        slotNum,
+		offset:         offset,
+	}, nil
 }

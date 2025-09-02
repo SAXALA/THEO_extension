@@ -60,7 +60,8 @@ func TestPrefixDBAccount(t *testing.T) {
 }
 
 func TestStorage(t *testing.T) {
-	pd, err := NewPrefixDB(t.TempDir())
+	filepath := "/mnt/ssd/ethstore/testDB"
+	pd, err := NewPrefixDB(filepath)
 	if err != nil {
 		t.Fatalf("Failed to create PrefixDB: %v", err)
 	}
@@ -102,13 +103,30 @@ func TestStorage(t *testing.T) {
 	if err != nil || !got || !bytes.Equal(value, SV_2) {
 		t.Fatalf("Failed to get SK_2: %v", err)
 	}
-
 	pd.batch.SetThreshold(1)
-	pd.slotCache.Delete(1023)
+	//pd.nodeCache.FlushModifiedNodes()
+	pd.nodeCache.Evict(string(keystr1))
+	pd.nodeCache.Evict(string(keystr2))
+	pd.slotCache.FlushModifiedSlots()
+	pd.batch.CommitBatch()
+
+	// pd.storeNode(keystr1, &TrieNode{
+	// 	startSlotindex: 0,
+	// 	slotNum:        0,
+	// 	offset:         0,
+	// })
+
+	node, err := pd.getNode(keystr1)
+	if err != nil {
+		t.Fatalf("Failed to get node for key1: %v", err)
+	}
+	if node == nil {
+		t.Fatalf("Expected node for key1, got nil")
+	}
 
 	value, _, err = pd.Get(SK_1)
 	if err != nil || !bytes.Equal(value, SV_1) {
-		t.Fatalf("Failed to put SK_1: %v", err)
+		t.Fatalf("Failed to get SK_1: %v", err)
 	}
 	value, got, err = pd.Get(SK_2)
 	if err != nil || !got || !bytes.Equal(value, SV_2) {
@@ -222,7 +240,7 @@ func TestReadFile(t *testing.T) {
 	}
 	defer pd.Close()
 
-	value, _, _ := pd.readFromFile(117*8, TrieAccount)
+	value, _ := pd.readFromFile(117*8, TrieAccount)
 	decodedValue := hex.EncodeToString(value)
 	fmt.Printf("Read value from file: %x\n", decodedValue)
 }
