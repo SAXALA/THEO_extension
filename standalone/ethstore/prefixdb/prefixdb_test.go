@@ -211,7 +211,7 @@ func TestPrefixDBAccountHash(t *testing.T) {
 }
 
 func TestMemCache(t *testing.T) {
-	dirPath := "/mnt/ssd/ethstore/database"
+	dirPath := "/mnt/ssd/ethstore/testDB"
 	pd, err := NewPrefixDB(dirPath)
 	if err != nil {
 		t.Fatalf("Failed to create PrefixDB: %v", err)

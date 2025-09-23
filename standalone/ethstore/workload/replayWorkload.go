@@ -119,6 +119,8 @@ func main() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6061", nil))
 	}()
+	// buildMemCache()
+
 	// repalyPut()
 	repalyAccountPut()
 	// repPalyAolPut()
@@ -129,7 +131,6 @@ func main() {
 	// testAolPreformance()
 	// TestPebblePreformance()
 	// TestGetParentKey()
-	// buildMemCache()
 }
 
 func repalyPut() {
@@ -230,12 +231,14 @@ func repalyAccountPut() {
 	counter := 0
 	reader := bufio.NewReader(file)
 
+	isSaved := false
+
 	for {
 		counter++
-
-		// if counter < 375799413 {
-		// 	continue
-		// }
+		if counter > 375799415 && !isSaved {
+			pdb.SaveTree()
+			isSaved = true
+		}
 
 		if counter > 1966138022 {
 			break
@@ -316,7 +319,7 @@ func repalyAccountPut() {
 			// 	}
 		}
 
-		// if counter%1000000 == 0 {
+		// if counter%5000000 == 0 {
 		// 	break
 		// }
 	}
@@ -1057,7 +1060,6 @@ func buildMemCache() error {
 	if err != nil {
 		return fmt.Errorf("failed to open pebble store: %v", err)
 	}
-	defer accountHashKeyPebble.Close()
 
 	mc := memcache.New("127.0.0.1:11211")
 	iter, err := accountHashKeyPebble.GetIterator()
@@ -1083,5 +1085,12 @@ func buildMemCache() error {
 		}
 	}
 	fmt.Println("Memcache build complete.")
+
+	if accountHashKeyPebble != nil {
+		if err := accountHashKeyPebble.Close(); err != nil {
+			fmt.Errorf("failed to close pebble store: %v", err)
+		}
+	}
+
 	return nil
 }

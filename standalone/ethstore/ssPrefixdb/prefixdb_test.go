@@ -165,7 +165,7 @@ func TestStorage(t *testing.T) {
 }
 
 func TestGetParentKey(t *testing.T) {
-	dirpath := "/mnt/ssd/ethstore/database/ssprefixdb"
+	dirpath := "/mnt/ssd/ethstore/database"
 	pd, err := NewSSPrefixDB(dirpath)
 	if err != nil {
 		t.Fatalf("Failed to create PrefixDB: %v", err)

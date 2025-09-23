@@ -18,9 +18,9 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-const MAX_CACHE_SIZE = 65535  // maximum cache size
-const BUFFER_SIZE = 8192      // buffer size for file operations
-const SLOT_SIZE = 1024 * 1024 // size of each slot
+const MAX_CACHE_SIZE = 65535 // maximum cache size
+const BUFFER_SIZE = 8192     // buffer size for file operations
+const SLOT_SIZE = 8 * 1024   // size of each slot
 const SLOT_NUM = 1024
 const METADATA_SPACE = 1024 * 1024
 
@@ -123,7 +123,7 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 		return nil, fmt.Errorf("failed to create PebbleStore: %v", err)
 	}
 
-	//db.memcache = memcache.New("127.0.0.1:11211")
+	db.memcache = memcache.New("127.0.0.1:11211")
 	// err = db.buildMemCache()
 	// if err != nil {
 	// 	return nil, fmt.Errorf("failed to build memcache: %v", err)
@@ -787,11 +787,11 @@ func (db *PrefixDB) Close() error {
 		return errs[0]
 	}
 
-	// if db.accountHashKeyPebble != nil {
-	// 	if err := db.accountHashKeyPebble.Close(); err != nil {
-	// 		errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
-	// 	}
-	// }
+	if db.accountHashKeyPebble != nil {
+		if err := db.accountHashKeyPebble.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
+		}
+	}
 	return nil
 }
 
@@ -857,7 +857,7 @@ func (db *PrefixDB) LoadSlotIndex() error {
 
 				var usedSlots map[int]struct{}
 				if err := decoder.Decode(&usedSlots); err == nil {
-					var freeSlots []int
+					var freeSlots map[int]struct{}
 					if err := decoder.Decode(&freeSlots); err == nil {
 						db.slotManager.slotNum = slotNum
 						db.slotManager.usedSlots = usedSlots
@@ -1286,7 +1286,7 @@ func (db *PrefixDB) migrateSlots(accountKey []byte, SlotIndices []int) ([]int, e
 		db.slotCache.Put(newSlots[i], slotData)
 		db.slotCache.MarkSlotModified(newSlots[i])
 	}
-	db.slotManager.releaseContiguousSlots(startSlot, slotCount, db.slotFile)
+	db.slotManager.releaseContiguousSlots(SlotIndices[0], len(SlotIndices), db.slotFile)
 
 	return newSlots, nil
 }
@@ -1310,4 +1310,8 @@ func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 		slotNum:        slotNum,
 		offset:         offset,
 	}, nil
+}
+
+func (pdb *PrefixDB) SaveTree() error {
+	return pdb.prefixTree.SaveToFile(pdb.prefixTree.trieFile)
 }

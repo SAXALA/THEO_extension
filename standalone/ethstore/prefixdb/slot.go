@@ -18,7 +18,7 @@ type SlotManager struct {
 	slotSize  int
 	slotNum   int
 	usedSlots map[int]struct{}
-	freeSlots []int // cache of free slots for quick access
+	freeSlots map[int]struct{} // cache of free slots for quick access
 }
 
 func NewSlotManager(slotNum int, slotSize int) *SlotManager {
@@ -27,11 +27,11 @@ func NewSlotManager(slotNum int, slotSize int) *SlotManager {
 		slotSize:  slotSize,
 		slotNum:   slotNum,
 		usedSlots: make(map[int]struct{}),
-		freeSlots: make([]int, 0, slotNum),
+		freeSlots: make(map[int]struct{}, slotNum),
 	}
 
 	for i := 0; i < slotNum; i++ {
-		sm.freeSlots = append(sm.freeSlots, i)
+		sm.freeSlots[i] = struct{}{}
 	}
 
 	return sm
@@ -42,12 +42,11 @@ func (s *SlotManager) getEmptySlot() int {
 	defer s.lock.Unlock()
 
 	if len(s.freeSlots) > 0 {
-		lastIndex := len(s.freeSlots) - 1
-		slotIndex := s.freeSlots[lastIndex]
-		s.freeSlots = s.freeSlots[:lastIndex]
-		s.usedSlots[slotIndex] = struct{}{}
-		// s.usedSizes[slotIndex] = 0
-		return slotIndex
+		for slotIndex := range s.freeSlots {
+			delete(s.freeSlots, slotIndex)
+			s.usedSlots[slotIndex] = struct{}{}
+			return slotIndex
+		}
 	}
 
 	return s.expandSlots()
@@ -68,8 +67,8 @@ func (s *SlotManager) expandSlots() int {
 	//s.usedSizes = newUsedSizes
 
 	// Initialize new free slots
-	for i := currentSize + 1; i < newSize; i++ {
-		s.freeSlots = append(s.freeSlots, i)
+	for i := currentSize; i < newSize; i++ {
+		s.freeSlots[i] = struct{}{}
 	}
 
 	s.slotNum = newSize
@@ -134,15 +133,15 @@ func (s *SlotManager) releaseSlot(slotIndex int, file *os.File) {
 
 	if slotIndex >= 0 && slotIndex < s.slotNum {
 		// Clear the slot content in the file
-		offset := int64(slotIndex * s.slotSize)
-		emptyData := make([]byte, s.slotSize)
-		_, err := file.WriteAt(emptyData, offset)
-		if err != nil {
-			panic("failed to clear slot content: " + err.Error())
-		}
+		// offset := int64(slotIndex * s.slotSize)
+		// emptyData := make([]byte, s.slotSize)
+		// _, err := file.WriteAt(emptyData, offset)
+		// if err != nil {
+		// 	panic("failed to clear slot content: " + err.Error())
+		// }
 
-		// s.usedSizes[slotIndex] = 0
-		s.freeSlots = append(s.freeSlots, slotIndex)
+		delete(s.usedSlots, slotIndex)
+		s.freeSlots[slotIndex] = struct{}{}
 	}
 }
 
@@ -173,32 +172,32 @@ func (s *SlotManager) getAdjSlot(currentSlot int) int {
 		return -1
 	}
 
-	for i, slot := range s.freeSlots {
-		if slot == nextSlot {
-			s.freeSlots = append(s.freeSlots[:i], s.freeSlots[i+1:]...)
-			break
-		}
+	if _, free := s.freeSlots[nextSlot]; free {
+		delete(s.freeSlots, nextSlot)
+		s.usedSlots[nextSlot] = struct{}{}
+		return nextSlot
 	}
 
-	s.usedSlots[nextSlot] = struct{}{}
-	return nextSlot
+	return -1
 }
 
 func (s *SlotManager) findContFreeSlot(count int) int {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	if count <= 0 || count > len(s.freeSlots) {
+	if count <= 0 {
 		fmt.Println("Invalid count for free slots:", count)
 		return -1
 	}
 
 	if len(s.freeSlots) < count {
-		s.expandSlots()
+		return s.expandSlots()
 	}
 
-	sortedSlots := make([]int, len(s.freeSlots))
-	copy(sortedSlots, s.freeSlots)
+	sortedSlots := make([]int, 0, len(s.freeSlots))
+	for slot := range s.freeSlots {
+		sortedSlots = append(sortedSlots, slot)
+	}
 	sort.Ints(sortedSlots)
 
 	startIndex := -1
@@ -217,13 +216,13 @@ func (s *SlotManager) findContFreeSlot(count int) int {
 			startIndex = -1
 		}
 	}
-	fmt.Println("No contiguous free slots found for count:", count)
-	return -1
+	// fmt.Println("No contiguous free slots found for count:", count)
+	return s.expandSlots()
 }
 
 func (s *SlotManager) allocateContiguousSlots(startSlot, count int) []int {
 	s.lock.Lock()
-	defer s.lock.Lock()
+	defer s.lock.Unlock()
 
 	for i := 0; i < count; i++ {
 		slotIndex := startSlot + i
@@ -236,21 +235,21 @@ func (s *SlotManager) allocateContiguousSlots(startSlot, count int) []int {
 			fmt.Println("Slot", slotIndex, "is already used")
 			return nil
 		}
+
+		if _, free := s.freeSlots[slotIndex]; !free {
+			fmt.Println("Slot", slotIndex, "is not in free list")
+			return nil
+		}
 	}
 
 	allocated := make([]int, count)
 	for i := 0; i < count; i++ {
 		slotIndex := startSlot + i
-		// Mark the slot as used
-		for j, slot := range s.freeSlots {
-			if slot == slotIndex {
-				s.freeSlots = append(s.freeSlots[:j], s.freeSlots[j+1:]...)
-				break
-			}
-		}
+		delete(s.freeSlots, slotIndex)
 		s.usedSlots[slotIndex] = struct{}{}
 		allocated[i] = slotIndex
 	}
+
 	return allocated
 }
 
@@ -258,12 +257,12 @@ func (s *SlotManager) releaseContiguousSlots(startSlot, count int, file *os.File
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	offset := startSlot * s.slotSize
-	emptyData := make([]byte, count*s.slotSize)
-	_, err := file.WriteAt(emptyData, int64(offset))
-	if err != nil {
-		panic("failed to clear contiguous slots content: " + err.Error())
-	}
+	// offset := startSlot * s.slotSize
+	// emptyData := make([]byte, count*s.slotSize)
+	// _, err := file.WriteAt(emptyData, int64(offset))
+	// if err != nil {
+	// 	panic("failed to clear contiguous slots content: " + err.Error())
+	// }
 
 	for i := 0; i < count; i++ {
 		slotIndex := startSlot + i
@@ -271,7 +270,7 @@ func (s *SlotManager) releaseContiguousSlots(startSlot, count int, file *os.File
 			continue
 		}
 		delete(s.usedSlots, slotIndex)
-		s.freeSlots = append(s.freeSlots, slotIndex)
+		s.freeSlots[slotIndex] = struct{}{}
 	}
-	sort.Ints(s.freeSlots) // Keep free slots sorted for easier management
+	// sort.Ints(s.freeSlots) // Keep free slots sorted for easier management
 }
