@@ -31,6 +31,10 @@ const (
 	// TombstoneMarker is a special value to mark deletion
 	TombstoneMarker   = "_D_"
 	initialBufferSize = 4096 // Initial buffer size for writers
+
+	pendingMagic  = "PKV3"
+	pendingRecKV  = byte(0x01) //a single kv record
+	pendingRecFIN = byte(0x02) //finish marker
 )
 
 // logEntry represents a single key-value pair within a block in the data log.
@@ -88,6 +92,15 @@ type AppendOnlyLog struct {
 	indexBufferSize  int               // Size threshold for flushing index buffer
 	indexBufferFlush chan struct{}     // Channel to signal index buffer flush
 
+	pendingFilePath   string
+	pendingFile       *os.File
+	pendingBlocks     map[uint64]map[string]string // In-memory pending KV pairs per block
+	pendingWriter     *bufio.Writer
+	pendingKeyLen     uint16
+	pendingValLen     uint32
+	nextFirstBlockID  uint64
+	nextSecondBlockID uint64
+
 	mu     sync.RWMutex
 	closed bool
 }
@@ -107,6 +120,7 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 
 	dataFilePath := filepath.Join(dirPath, dataFileName)
 	indexMapFilePath := filepath.Join(dirPath, indexMapFileName)
+	pendingFilePath := filepath.Join(dirPath, PendingKVFileName)
 
 	// Open data file for appending
 	dataFile, err := os.OpenFile(dataFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
@@ -125,6 +139,13 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 	if err != nil {
 		dataFile.Close()
 		return nil, fmt.Errorf("failed to open index map file %s: %w", indexMapFilePath, err)
+	}
+
+	pendingfile, err := os.OpenFile(pendingFilePath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		dataFile.Close()
+		indexMapFile.Close()
+		return nil, fmt.Errorf("failed to open pending KV file %s: %w", pendingFilePath, err)
 	}
 
 	aol := &AppendOnlyLog{
@@ -149,6 +170,11 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 		indexBuffer:      make([]blockIndexEntry, 0, recentN/2),
 		indexBufferSize:  recentN / 2,
 		indexBufferFlush: make(chan struct{}, 1),
+
+		pendingFilePath: pendingFilePath,
+		pendingFile:     pendingfile,
+		pendingBlocks:   make(map[uint64]map[string]string),
+		pendingWriter:   bufio.NewWriterSize(pendingfile, 64*1024),
 	}
 
 	// Load existing block index map
@@ -183,6 +209,38 @@ func NewAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*AppendOn
 		aol.recentBlocks = append(aol.recentBlocks, blockID) // These are the N most recent, oldest of N to newest of N
 		aol.indexedBlocks[blockID] = struct{}{}
 	}
+
+	if err := aol.loadPendingBlocks(); err != nil {
+		aol.log.Warn("Failed to load pending blocks, will start empty", "error", err)
+	}
+	// initialize nextFirstBlockID and nextSecondBlockID, nextFirstBlockID=max(latestBlockID, maxPendingID), nextSecondBlockID=minPendingID
+	var maxPendingID, minPendingID uint64
+	first := true
+	for id := range aol.pendingBlocks {
+		if first {
+			minPendingID, maxPendingID, first = id, id, false
+		} else {
+			if id < minPendingID {
+				minPendingID = id
+			}
+			if id > maxPendingID {
+				maxPendingID = id
+			}
+		}
+	}
+	base := aol.latestBlockID
+	if !first && maxPendingID > base {
+		base = maxPendingID
+	}
+	aol.nextFirstBlockID = base
+
+	aol.nextSecondBlockID = 0
+
+	// set file cursor to end
+	if _, err := aol.pendingFile.Seek(0, io.SeekEnd); err != nil {
+		aol.log.Warn("seek pending file to end failed", "error", err)
+	}
+
 	// aol.recentBlocks is now correctly populated and sorted (oldest of recentN to newest of recentN).
 	// aol.indexedBlocks now correctly reflects this set.
 
@@ -356,9 +414,9 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 	// }
 	// 2. If blockID is not 0 (or it is 0 and isFirstAppend), it must be greater than the current latestBlockID.
 	//    (The case blockID == 0 && isFirstAppend means latestBlockID is also 0, so 0 <= 0 is true, but it's allowed).
-	if !(blockID == 0 && isFirstAppend) && blockID < aol.latestBlockID {
-		return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", aol.latestBlockID, blockID)
-	}
+	// if !(blockID == 0 && isFirstAppend) && blockID < aol.latestBlockID {
+	// 	return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", aol.latestBlockID, blockID)
+	// }
 
 	if len(kvs) == 0 {
 		// If kvs is empty, this append operation should generally be a no-op
@@ -384,7 +442,6 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 	if exists {
 		startOffset = existingEntry.EndOffset
 	} else {
-		// 否则使用当前偏移量
 		startOffset = aol.currentOffset
 	}
 	// startOffset = aol.currentOffset
@@ -422,7 +479,9 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 		EndOffset: endOffset,
 	}
 	aol.blockIndex[blockID] = indexEntry
-	aol.latestBlockID = blockID // This is correct for non-empty appends
+	if blockID > aol.latestBlockID {
+		aol.latestBlockID = blockID
+	}
 
 	if err := aol.writeIndexEntry(aol.indexMapFile, indexEntry); err != nil {
 		aol.log.Crit("Failed to write block index entry to file after writing data!", "blockID", blockID, "error", err)
@@ -443,7 +502,9 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 	// 	aol.log.Error("Failed to sync index map file", "error", err)
 	// }
 
-	aol.updateRecentBlocks(blockID)
+	if !exists {
+		aol.updateRecentBlocks(blockID)
+	}
 	if _, isIndexed := aol.indexedBlocks[blockID]; isIndexed {
 		aol.log.Debug("Indexing new block in skiplist", "blockID", blockID)
 		reader := bytes.NewReader(blockBytes) // Using bytes.NewReader
@@ -473,23 +534,44 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 
 // updateRecentBlocks adds the new block ID and removes the oldest if the limit is exceeded.
 func (aol *AppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
-	aol.recentBlocks = append(aol.recentBlocks, newBlockID)
-	aol.indexedBlocks[newBlockID] = struct{}{}
-
-	if len(aol.recentBlocks) > aol.recentN {
-		// Remove the oldest block from index
-		oldestBlockID := aol.recentBlocks[0]
-		aol.recentBlocks = aol.recentBlocks[1:] // Shift slice
-		delete(aol.indexedBlocks, oldestBlockID)
-
-		aol.log.Debug("Evicting oldest block from skiplist index", "blockID", oldestBlockID)
-
-		// Remove keys belonging *only* to the evicted block from the skiplist.
-		// if err := aol.rebuildSkiplist(); err != nil {
-		// 	aol.log.Error("Failed to rebuild skiplist after eviction", "evictedBlock", oldestBlockID, "error", err)
-		// }
-		aol.evictOldBlockFromSkiplist(oldestBlockID)
+	ids := make([]uint64, 0, len(aol.blockIndex))
+	for id := range aol.blockIndex {
+		ids = append(ids, id)
 	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	start := 0
+	if len(ids) > aol.recentN {
+		start = len(ids) - aol.recentN
+	}
+	wanted := ids[start:]
+
+	// Build new indexedBlocks set
+	newIndexed := make(map[uint64]struct{}, len(wanted))
+	for _, id := range wanted {
+		newIndexed[id] = struct{}{}
+	}
+
+	same := len(newIndexed) == len(aol.indexedBlocks)
+	if same {
+		for id := range newIndexed {
+			if _, ok := aol.indexedBlocks[id]; !ok {
+				same = false
+				break
+			}
+		}
+	}
+
+	aol.recentBlocks = append(aol.recentBlocks[:0], wanted...)
+	aol.indexedBlocks = newIndexed
+
+	if !same {
+		// Rebuild skiplist only if the set of indexed blocks has changed
+		if err := aol.rebuildSkiplist(); err != nil {
+			aol.log.Error("Failed to rebuild skiplist after updating recent blocks", "error", err)
+		}
+	}
+
 	aol.persistIndexIfNeeded(newBlockID)
 }
 
@@ -530,6 +612,18 @@ func (aol *AppendOnlyLog) Get(key string) (string, bool, error) {
 
 	if aol.closed {
 		return "", false, fmt.Errorf("append-only log is closed")
+	}
+
+	// try pending blocks first
+	for _, pendingBlockID := range []uint64{aol.nextSecondBlockID, aol.nextFirstBlockID} {
+		if kvs, ok := aol.pendingBlocks[pendingBlockID]; ok {
+			if val, exists := kvs[key]; exists {
+				if val == TombstoneMarker {
+					return "", true, nil // Key was explicitly deleted
+				}
+				return val, true, nil // Key found in pending block
+			}
+		}
 	}
 
 	// 1. Try skiplist (recent N blocks)
@@ -648,6 +742,20 @@ func (aol *AppendOnlyLog) Delete(key string) error {
 	if aol.closed {
 		return fmt.Errorf("append-only log is closed")
 	}
+
+	//check in pending blocks first
+	for _, pendingBlockID := range []uint64{aol.nextSecondBlockID, aol.nextFirstBlockID} {
+		if kvs, ok := aol.pendingBlocks[pendingBlockID]; ok {
+			if _, exists := kvs[key]; exists {
+				// Key exists in pending block, mark as tombstone there
+				kvs[key] = TombstoneMarker
+				aol.log.Info("Marked key as tombstone in pending block", "key", key, "pendingBlockID", pendingBlockID)
+				return nil
+			}
+		}
+	}
+
+	// Create a new block for the tombstone
 
 	blockIDForDelete := aol.latestBlockID + 1
 	if len(aol.blockIndex) == 0 && aol.latestBlockID == 0 {
@@ -1153,6 +1261,15 @@ func (aol *AppendOnlyLog) Close() error {
 		errs = append(errs, fmt.Errorf("background flush goroutine exit timeout"))
 	}
 
+	if aol.pendingWriter != nil {
+		_ = aol.pendingWriter.Flush()
+	}
+	if aol.pendingFile != nil {
+		_ = aol.pendingFile.Sync()
+		_ = aol.pendingFile.Close()
+		aol.pendingFile = nil
+	}
+
 	if err := aol.flushIndexBuffer(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to flush index buffer on close: %w", err))
 	}
@@ -1524,4 +1641,251 @@ func (aol *AppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEntry, b
 	}
 	aol.indexBufferMu.Unlock()
 	return blockIndexEntry{}, false
+}
+
+func (aol *AppendOnlyLog) PutKV(blockID uint64, key, value string) error {
+	var toFlush []uint64
+
+	aol.mu.Lock()
+	if aol.closed {
+		aol.mu.Unlock()
+		return fmt.Errorf("append-only log is closed")
+	}
+	// add to pending map
+	if aol.pendingBlocks[blockID] == nil {
+		aol.pendingBlocks[blockID] = make(map[string]string)
+	}
+	aol.pendingBlocks[blockID][key] = value
+
+	// write to pending tmp log
+	if err := aol.appendPendingKV(blockID, key, value); err != nil {
+		aol.mu.Unlock()
+		return err
+	}
+
+	// optimize for the common case: first put of a new blockID
+	if blockID >= aol.nextFirstBlockID {
+		// nextFirstBlockID
+		if blockID+1 > aol.nextFirstBlockID {
+			aol.nextFirstBlockID = blockID + 1
+		}
+		aol.mu.Unlock()
+		return nil
+	}
+	// the blockID is less than nextFirstBlockID, must be second put
+	if blockID < aol.nextSecondBlockID {
+		aol.mu.Unlock()
+		return fmt.Errorf("second-put out of order: got %d < nextSecond %d", blockID, aol.nextSecondBlockID)
+	}
+	if aol.nextSecondBlockID == 0 {
+		aol.nextSecondBlockID = blockID
+		// find all blockid smaller than blockID to flush
+	}
+	if blockID > aol.nextSecondBlockID {
+		for id := aol.nextSecondBlockID; id < blockID; id++ {
+			if _, ok := aol.pendingBlocks[id]; !ok {
+				aol.mu.Unlock()
+			}
+			toFlush = append(toFlush, id)
+		}
+		aol.nextSecondBlockID = blockID
+	}
+	aol.mu.Unlock()
+
+	// flush in order
+	for _, id := range toFlush {
+		aol.mu.RLock()
+		kvs := aol.pendingBlocks[id]
+		aol.mu.RUnlock()
+		if err := aol.Append(id, kvs); err != nil {
+			return err
+		}
+		aol.mu.Lock()
+		delete(aol.pendingBlocks, id)
+		_ = aol.appendPendingFIN(id)
+		aol.nextSecondBlockID = id + 1
+		aol.mu.Unlock()
+	}
+	return nil
+}
+
+// ensurePendingHeader makes sure the pending tmp file has a header with fixed key/value lengths.
+func (aol *AppendOnlyLog) ensurePendingHeader(keyLen int, valLen int) error {
+	if aol.pendingFile == nil {
+		return nil
+	}
+
+	if aol.pendingKeyLen != 0 && aol.pendingValLen != 0 {
+		if int(aol.pendingKeyLen) == keyLen && int(aol.pendingValLen) == valLen {
+			return nil
+		} else {
+			return fmt.Errorf("fixed key/value length mismatch: expect key=%d val=%d, got key=%d val=%d",
+				aol.pendingKeyLen, aol.pendingValLen, keyLen, valLen)
+		}
+	}
+
+	fi, err := aol.pendingFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	if fi.Size() == 0 {
+		//file is new, write header
+		aol.pendingKeyLen = uint16(keyLen)
+		aol.pendingValLen = uint32(valLen)
+		if _, err := aol.pendingFile.WriteAt([]byte(pendingMagic), 0); err != nil {
+			return err
+		}
+		hdr := make([]byte, 2+4)
+		binary.BigEndian.PutUint16(hdr[0:2], aol.pendingKeyLen)
+		binary.BigEndian.PutUint32(hdr[2:6], aol.pendingValLen)
+		if _, err := aol.pendingFile.WriteAt(hdr, 4); err != nil {
+			return err
+		}
+		// reset file offset to end
+		if _, err := aol.pendingFile.Seek(0, io.SeekEnd); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// if file exists, read header
+	if aol.pendingKeyLen == 0 || aol.pendingValLen == 0 {
+		// read header
+		buf := make([]byte, 4+2+4)
+		if _, err := aol.pendingFile.ReadAt(buf, 0); err != nil {
+			return err
+		}
+		if string(buf[:4]) != pendingMagic {
+			return fmt.Errorf("unknown pending file magic")
+		}
+		aol.pendingKeyLen = binary.BigEndian.Uint16(buf[4:6])
+		aol.pendingValLen = binary.BigEndian.Uint32(buf[6:10])
+	}
+	if int(aol.pendingKeyLen) != keyLen || int(aol.pendingValLen) != valLen {
+		return fmt.Errorf("fixed key/value length mismatch: expect key=%d val=%d, got key=%d val=%d",
+			aol.pendingKeyLen, aol.pendingValLen, keyLen, valLen)
+	}
+	return nil
+}
+
+// add a KV record to pending tmp log: [8]blockID | [keyLen]key | [valLen]value | [1]type
+func (aol *AppendOnlyLog) appendPendingKV(blockID uint64, key, value string) error {
+	if err := aol.ensurePendingHeader(len(key), len(value)); err != nil {
+		return err
+	}
+	if aol.pendingWriter == nil {
+		aol.pendingWriter = bufio.NewWriterSize(aol.pendingFile, 64*1024)
+	}
+	if int(aol.pendingKeyLen) != len(key) || int(aol.pendingValLen) != len(value) {
+		return fmt.Errorf("key/value length not match fixed size")
+	}
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, blockID)
+	if _, err := aol.pendingWriter.Write(buf); err != nil {
+		return err
+	}
+	if _, err := aol.pendingWriter.Write([]byte(key)); err != nil {
+		return err
+	}
+	if _, err := aol.pendingWriter.Write([]byte(value)); err != nil {
+		return err
+	}
+	if err := aol.pendingWriter.WriteByte(pendingRecKV); err != nil {
+		return err
+	}
+	// flush immediately
+	return aol.pendingWriter.Flush()
+}
+
+// add a FIN record to pending tmp log: [8]blockID | [1]type
+func (aol *AppendOnlyLog) appendPendingFIN(blockID uint64) error {
+	if err := aol.ensurePendingHeader(int(aol.pendingKeyLen), int(aol.pendingValLen)); err != nil {
+		return err
+	}
+	if aol.pendingWriter == nil {
+		aol.pendingWriter = bufio.NewWriterSize(aol.pendingFile, 64*1024)
+	}
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, blockID)
+	if _, err := aol.pendingWriter.Write(buf); err != nil {
+		return err
+	}
+	if err := aol.pendingWriter.WriteByte(pendingRecFIN); err != nil {
+		return err
+	}
+	return aol.pendingWriter.Flush()
+}
+
+// loadPendingBlocks reads the pending tmp log and reconstructs the pendingBlocks map.
+func (aol *AppendOnlyLog) loadPendingBlocks() error {
+	if aol.pendingFile == nil {
+		return nil
+	}
+	fi, err := aol.pendingFile.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() == 0 {
+		return nil
+	}
+
+	// read header
+	hdr := make([]byte, 4+2+4)
+	if _, err := aol.pendingFile.ReadAt(hdr, 0); err != nil {
+		return fmt.Errorf("read pending header: %w", err)
+	}
+
+	aol.pendingKeyLen = binary.BigEndian.Uint16(hdr[4:6])
+	aol.pendingValLen = binary.BigEndian.Uint32(hdr[6:10])
+
+	// read records in reverse order
+	headerSize := int64(4 + 2 + 4)
+	pos := fi.Size()
+	finalized := make(map[uint64]struct{})
+	for pos > headerSize {
+		// read record type
+		typeOff := pos - 1
+		tb := []byte{0}
+		if _, err := aol.pendingFile.ReadAt(tb, typeOff); err != nil {
+			return fmt.Errorf("read rec type: %w", err)
+		}
+		var recSize int64
+		switch tb[0] {
+		case pendingRecFIN:
+			recSize = 8 + 1
+			start := pos - recSize
+			idbuf := make([]byte, 8)
+			if _, err := aol.pendingFile.ReadAt(idbuf, start); err != nil {
+				return fmt.Errorf("read fin blockID: %w", err)
+			}
+			bid := binary.BigEndian.Uint64(idbuf)
+			finalized[bid] = struct{}{}
+			pos = start
+		case pendingRecKV:
+			recSize = 8 + int64(aol.pendingKeyLen) + int64(aol.pendingValLen) + 1
+			start := pos - recSize
+			buf := make([]byte, recSize)
+			if _, err := aol.pendingFile.ReadAt(buf, start); err != nil {
+				return fmt.Errorf("read kv rec: %w", err)
+			}
+			bid := binary.BigEndian.Uint64(buf[0:8])
+			if _, done := finalized[bid]; !done {
+				kb := buf[8 : 8+int(aol.pendingKeyLen)]
+				vb := buf[8+int(aol.pendingKeyLen) : 8+int(aol.pendingKeyLen)+int(aol.pendingValLen)]
+				if aol.pendingBlocks[bid] == nil {
+					aol.pendingBlocks[bid] = make(map[string]string)
+				}
+				// only add if key not exists (last write wins)
+				if _, exists := aol.pendingBlocks[bid][string(kb)]; !exists {
+					aol.pendingBlocks[bid][string(kb)] = string(vb)
+				}
+			}
+			pos = start
+		default:
+			return fmt.Errorf("unknown pending record type 0x%x", tb[0])
+		}
+	}
+	aol.log.Info("Pending restored (pkv3)", "blocks", len(aol.pendingBlocks))
+	return nil
 }

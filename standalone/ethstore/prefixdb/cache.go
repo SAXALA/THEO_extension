@@ -43,12 +43,12 @@ const (
 
 // Data structure stored in list nodes
 type cacheEntry struct {
-	key          string
-	value        []byte
-	slotIndices  []int
-	modifiedType ModifiedType
-	offset       int64 // Offset in the file
-	refCount     int   // Reference count
+	key           string
+	value         []byte
+	storageFileID uint32 // Storage file ID
+	storageOffset int64  // Storage offset
+	modifiedType  ModifiedType
+	refCount      int // Reference count
 }
 
 // NewNodeCache creates a new node cache
@@ -79,54 +79,6 @@ func NewNodeCache(capacity int, db *PrefixDB) *NodeCache {
 	return nc
 }
 
-// // SetMaxAllowedRefCount 设置最大允许的引用计数
-// func (nc *NodeCache) SetMaxAllowedRefCount(maxCount int) {
-// 	nc.lock.Lock()
-// 	defer nc.lock.Unlock()
-
-// 	if maxCount > 0 && maxCount < len(nc.refLists) {
-// 		// 如果设置的值小于当前列表长度，可能需要合并一些列表
-// 		nc.maxAllowedRefCount = maxCount
-// 		nc.consolidateExcessiveLists()
-// 	} else if maxCount > 0 {
-// 		nc.maxAllowedRefCount = maxCount
-// 	}
-// }
-
-// // 合并超过最大引用计数的列表
-// func (nc *NodeCache) consolidateExcessiveLists() {
-// 	if len(nc.refLists) <= nc.maxAllowedRefCount {
-// 		return
-// 	}
-
-// 	// 获取最大允许引用计数的列表
-// 	maxList := nc.refLists[nc.maxAllowedRefCount]
-
-// 	// 将所有超过最大引用计数的列表中的元素合并到maxList
-// 	for i := nc.maxAllowedRefCount + 1; i < len(nc.refLists); i++ {
-// 		list := nc.refLists[i]
-// 		for list.Len() > 0 {
-// 			// 移动元素到maxList
-// 			element := list.Front()
-// 			entry := element.Value.(*cacheEntry)
-// 			list.Remove(element)
-
-// 			// 更新引用计数并放入maxList
-// 			entry.refCount = nc.maxAllowedRefCount
-// 			newElement := maxList.PushFront(entry)
-// 			nc.cache[entry.key] = newElement
-// 		}
-// 	}
-
-// 	// 截断refLists，丢弃超过maxAllowedRefCount的列表
-// 	nc.refLists = nc.refLists[:nc.maxAllowedRefCount+1]
-
-// 	// 更新maxRefCount
-// 	if nc.maxRefCount > nc.maxAllowedRefCount {
-// 		nc.maxRefCount = nc.maxAllowedRefCount
-// 	}
-// }
-
 // MarkNodeModified marks a node as modified
 func (nc *NodeCache) MarkNodeModified(key string) {
 	nc.lock.Lock()
@@ -156,12 +108,12 @@ func (nc *NodeCache) Has(key string) bool {
 }
 
 // Get retrieves a value from cache
-func (nc *NodeCache) Get(key string) ([]byte, []int, bool) {
+func (nc *NodeCache) Get(key string) ([]byte, uint32, int64, bool) {
 	nc.lock.RLock()
 	element, exists := nc.cache[key]
 	if !exists {
 		nc.lock.RUnlock()
-		return nil, nil, false
+		return nil, 0, 0, false
 	}
 
 	// Get entry
@@ -175,17 +127,17 @@ func (nc *NodeCache) Get(key string) ([]byte, []int, bool) {
 
 	// Ensure element still exists (may have been deleted between read and write locks)
 	if element, exists = nc.cache[key]; !exists {
-		return entry.value, entry.slotIndices, true // Return previously read value
+		return entry.value, entry.storageFileID, entry.storageOffset, true // Return previously read value
 	}
 
 	entry = element.Value.(*cacheEntry)
 
 	nc.refLists[refCount].MoveToFront(element)
-	return entry.value, entry.slotIndices, true
+	return entry.value, entry.storageFileID, entry.storageOffset, true
 }
 
 // Put adds or updates a value in cache
-func (nc *NodeCache) Put(key string, value []byte, offset int64, slotIndices []int, modfiedType ModifiedType) {
+func (nc *NodeCache) Put(key string, value []byte, storageFileID uint32, storageOffset int64, modfiedType ModifiedType) {
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
 
@@ -198,9 +150,9 @@ func (nc *NodeCache) Put(key string, value []byte, offset int64, slotIndices []i
 			newRefCount = nc.maxAllowedRefCount
 		}
 		entry.value = value
-		entry.slotIndices = slotIndices
+		entry.storageFileID = storageFileID
 		entry.refCount = newRefCount
-		entry.offset = offset
+		entry.storageOffset = storageOffset
 
 		// Just Update modifiedType to the highest level
 		if entry.modifiedType < 1 {
@@ -224,12 +176,12 @@ func (nc *NodeCache) Put(key string, value []byte, offset int64, slotIndices []i
 
 	// Add new item with initial reference count of 1
 	entry := &cacheEntry{
-		key:          key,
-		value:        value,
-		slotIndices:  slotIndices,
-		modifiedType: modfiedType,
-		offset:       offset,
-		refCount:     1,
+		key:           key,
+		value:         value,
+		storageFileID: storageFileID,
+		modifiedType:  modfiedType,
+		storageOffset: storageOffset,
+		refCount:      1,
 	}
 
 	// Add to reference count 1 list
@@ -249,7 +201,7 @@ func (nc *NodeCache) evictMinRefCount() {
 			entry := element.Value.(*cacheEntry)
 
 			if entry.modifiedType > 0 && nc.db != nil && nc.db.batch != nil {
-				nc.db.batch.add([]byte(entry.key), entry.value, entry.offset, entry.slotIndices, entry.modifiedType)
+				nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
 			}
 
 			delete(nc.cache, entry.key)
@@ -344,19 +296,15 @@ func (nc *NodeCache) CachePathToNode(key string, db *PrefixDB) {
 			}
 
 			//build slot indices
-			slotIndices := make([]int, 0, node.slotNum)
-			for i := 0; i < node.slotNum; i++ {
-				slotIndices = append(slotIndices, node.startSlotindex+i)
-			}
 
 			// Add new entry to cache
 			entry := &cacheEntry{
-				key:          currentKey,
-				value:        nodeValue,
-				slotIndices:  slotIndices,
-				offset:       node.offset,
-				modifiedType: 0,
-				refCount:     1,
+				key:           currentKey,
+				value:         nodeValue,
+				storageFileID: node.storageFileID,
+				storageOffset: node.storageOffset,
+				modifiedType:  0,
+				refCount:      1,
 			}
 			nc.ensureRefListCapacity(1)
 			element := nc.refLists[1].PushFront(entry)
@@ -400,7 +348,7 @@ func (nc *NodeCache) Evict(key string) {
 
 	if entry.modifiedType > 0 && nc.db != nil && nc.db.batch != nil {
 		// If the node was modified, add it to the batch for writing
-		nc.db.batch.add([]byte(entry.key), entry.value, entry.offset, entry.slotIndices, entry.modifiedType)
+		nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
 	}
 
 	// Remove from the appropriate reference count list
@@ -435,6 +383,23 @@ func (nc *NodeCache) Delete(key string) {
 	delete(nc.cache, key)
 }
 
+// UpdateStoragePointer updates storage file ID and offset for a cached node
+func (nc *NodeCache) UpdateStoragePointer(key string, fileID uint32, offset int64) {
+	nc.lock.Lock()
+
+	if el, ok := nc.cache[key]; ok {
+		ent := el.Value.(*cacheEntry)
+		ent.storageFileID = fileID
+		ent.storageOffset = offset
+	}
+	nc.lock.Unlock()
+
+	// check in batch
+	if nc.db != nil && nc.db.batch != nil {
+		nc.db.batch.updateStoragePointer([]byte(key), fileID, offset)
+	}
+}
+
 func (nc *NodeCache) FlushModifiedNodes() {
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
@@ -446,7 +411,7 @@ func (nc *NodeCache) FlushModifiedNodes() {
 			entry := e.Value.(*cacheEntry)
 			if entry.modifiedType > 0 {
 				if nc.db != nil && nc.db.batch != nil {
-					nc.db.batch.add([]byte(entry.key), entry.value, entry.offset, entry.slotIndices, entry.modifiedType)
+					nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
 				}
 				entry.modifiedType = None // Reset modified status after flushing
 			}
@@ -457,17 +422,17 @@ func (nc *NodeCache) FlushModifiedNodes() {
 
 // SlotCache manages slot LRU caching
 type SlotCache struct {
-	capacity int                   // Cache capacity
-	cache    map[int]*list.Element // Map from slot indices to list nodes
-	lruList  *list.List            // List ordered by access time
+	capacity int                      // Cache capacity
+	cache    map[string]*list.Element // Map from slot indices to list nodes
+	lruList  *list.List               // List ordered by access time
 	lock     sync.RWMutex
 	db       *PrefixDB // Reference to PrefixDB for batch operations
 }
 
 // Data structure stored in slot cache entries
 type slotCacheEntry struct {
-	slotIndex int
-	data      map[string][]byte
+	accountKey string
+	data       map[string][]byte
 	// timestamp int64
 	modified bool // Track if slot has been modified
 }
@@ -476,192 +441,128 @@ type slotCacheEntry struct {
 func NewSlotCache(capacity int, db *PrefixDB) *SlotCache {
 	return &SlotCache{
 		capacity: capacity,
-		cache:    make(map[int]*list.Element),
+		cache:    make(map[string]*list.Element),
 		lruList:  list.New(),
 		db:       db,
 	}
 }
 
-// Get retrieves slot data from cache, O(1) time complexity
-func (sc *SlotCache) Get(slotIndex int) (map[string][]byte, bool) {
+// GetAccount returns the cached storage map for an account
+func (sc *SlotCache) GetAccount(accountKey string) (map[string][]byte, bool) {
 	sc.lock.RLock()
 	defer sc.lock.RUnlock()
 
-	if element, exists := sc.cache[slotIndex]; exists {
-		// Move to list head to indicate recent access
-		sc.lruList.MoveToFront(element)
-		entry := element.Value.(*slotCacheEntry)
-		// entry.timestamp = time.Now().UnixNano()
-		return entry.data, true
+	if el, ok := sc.cache[accountKey]; ok {
+		sc.lruList.MoveToFront(el)
+		return el.Value.(*slotCacheEntry).data, true
 	}
 	return nil, false
 }
 
-// Put adds or updates slot data in cache, O(1) time complexity
-func (sc *SlotCache) Put(slotIndex int, data map[string][]byte) {
+// PutAccount inserts or replaces an account's storage map into cache
+func (sc *SlotCache) PutAccount(accountKey string, data map[string][]byte) {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
-	if element, exists := sc.cache[slotIndex]; exists {
-		// If exists, update value
-		sc.lruList.MoveToFront(element)
-		entry := element.Value.(*slotCacheEntry)
+	if el, ok := sc.cache[accountKey]; ok {
+		entry := el.Value.(*slotCacheEntry)
 		entry.data = data
-		// entry.timestamp = time.Now().UnixNano()
-		// Don't change modified status for loaded data
+		entry.modified = false
+		sc.lruList.MoveToFront(el)
 		return
 	}
 
-	// If cache is full, remove least recently used item
+	// evict if full
 	if len(sc.cache) >= sc.capacity {
 		sc.evictLRU()
 	}
 
-	// Add new item
 	entry := &slotCacheEntry{
-		slotIndex: slotIndex,
-		data:      data,
-		// timestamp: time.Now().UnixNano(),
-		modified: false,
+		accountKey: accountKey,
+		data:       data,
+		modified:   false,
 	}
-	element := sc.lruList.PushFront(entry)
-	sc.cache[slotIndex] = element
+	el := sc.lruList.PushFront(entry)
+	sc.cache[accountKey] = el
 }
 
-// evictLRU removes least recently used slot, O(1) time complexity
-func (sc *SlotCache) evictLRU() {
-	if sc.lruList.Len() == 0 {
-		return
-	}
-
-	// Get element from list tail
-	element := sc.lruList.Back()
-	if element != nil {
-		entry := element.Value.(*slotCacheEntry)
-
-		// if the slot was modified, add it to the batch for writing
-		if entry.modified && sc.db != nil && sc.db.batch != nil {
-			sc.db.batch.addSlot(entry.slotIndex, entry.data)
-		}
-
-		delete(sc.cache, entry.slotIndex)
-		sc.lruList.Remove(element)
-	}
-}
-
-// ContainsKey checks if a specific slot contains a key, O(1) time complexity
-func (sc *SlotCache) ContainsKey(slotIndex int, key string) bool {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
-
-	if element, exists := sc.cache[slotIndex]; exists {
-		entry := element.Value.(*slotCacheEntry)
-		_, hasKey := entry.data[key]
-		return hasKey
-	}
-	return false
-}
-
-// UpdateKey updates a key's value in a specific slot, O(1) time complexity
-func (sc *SlotCache) UpdateKey(slotIndex int, key string, value []byte) bool {
+// UpdateKey updates one storage key under an account in cache
+func (sc *SlotCache) UpdateKey(accountKey string, key string, value []byte) bool {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
-	if element, exists := sc.cache[slotIndex]; exists {
-		entry := element.Value.(*slotCacheEntry)
+	if el, ok := sc.cache[accountKey]; ok {
+		entry := el.Value.(*slotCacheEntry)
 		entry.data[key] = value
-		// entry.timestamp = time.Now().UnixNano()
 		entry.modified = true
-		sc.lruList.MoveToFront(element)
+		sc.lruList.MoveToFront(el)
 		return true
 	}
 	return false
 }
 
-// Delete removes a slot from the cache
-func (sc *SlotCache) Delete(slotIndex int) {
+// DeleteAccount removes an account entry (flush if modified)
+func (sc *SlotCache) DeleteAccount(accountKey string) {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
-	if element, exists := sc.cache[slotIndex]; exists {
-		entry := element.Value.(*slotCacheEntry)
-
-		if entry.modified && sc.db != nil && sc.db.batch != nil {
-			sc.db.batch.addSlot(entry.slotIndex, entry.data)
+	if el, ok := sc.cache[accountKey]; ok {
+		entry := el.Value.(*slotCacheEntry)
+		// flush before remove if modified
+		if entry.modified && sc.db != nil {
+			_ = sc.db.flushAccountEntry(accountKey, entry.data)
 		}
-
-		sc.lruList.Remove(element)
-		delete(sc.cache, slotIndex)
+		sc.lruList.Remove(el)
+		delete(sc.cache, accountKey)
 	}
 }
 
-func (sc *SlotCache) MarkSlotModified(slotIndex int) {
+// ContainsAccount checks existence
+func (sc *SlotCache) ContainsAccount(accountKey string) bool {
+	sc.lock.RLock()
+	defer sc.lock.RUnlock()
+	_, ok := sc.cache[accountKey]
+	return ok
+}
+
+// evictLRU removes least-recently-used account; flush if modified
+func (sc *SlotCache) evictLRU() {
+	if sc.lruList.Len() == 0 {
+		return
+	}
+	el := sc.lruList.Back()
+	if el == nil {
+		return
+	}
+	entry := el.Value.(*slotCacheEntry)
+
+	if entry.modified && sc.db != nil {
+		err := sc.db.flushAccountEntry(entry.accountKey, entry.data)
+		if err != nil {
+			fmt.Printf("Error flushing modified account %s during eviction: %v\n", entry.accountKey, err)
+		}
+	}
+	delete(sc.cache, entry.accountKey)
+	sc.lruList.Remove(el)
+}
+
+// FlushAll writes all modified accounts to disk and updates prefix tree
+func (sc *SlotCache) FlushAll() {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
-	if element, exists := sc.cache[slotIndex]; exists {
-		entry := element.Value.(*slotCacheEntry)
-		entry.modified = true
-	}
-}
-
-// FlushModifiedSlots flushes all modified slots to the database
-func (sc *SlotCache) FlushModifiedSlots() map[int]map[string][]byte {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	result := make(map[int]map[string][]byte)
-
-	for slotIndex, element := range sc.cache {
-		entry := element.Value.(*slotCacheEntry)
-		if entry.modified {
-			slotData := make(map[string][]byte)
-			for k, v := range entry.data {
-				slotData[k] = v
+	for ak, el := range sc.cache {
+		entry := el.Value.(*slotCacheEntry)
+		if entry.modified && sc.db != nil {
+			if err := sc.db.flushAccountEntry(ak, entry.data); err == nil {
+				entry.modified = false
 			}
-			result[slotIndex] = slotData
-
-			if sc.db != nil && sc.db.batch != nil {
-				sc.db.batch.addSlot(slotIndex, slotData)
-			}
-
-			entry.modified = false
 		}
 	}
-
-	return result
-}
-
-// FlushModifiedSlots flushes all modified slots to the database
-func (sc *SlotCache) flushModifiedSlots() map[int]map[string][]byte {
-
-	result := make(map[int]map[string][]byte)
-
-	for slotIndex, element := range sc.cache {
-		entry := element.Value.(*slotCacheEntry)
-		if entry.modified {
-			slotData := make(map[string][]byte)
-			for k, v := range entry.data {
-				slotData[k] = v
-			}
-			result[slotIndex] = slotData
-
-			if sc.db != nil && sc.db.batch != nil {
-				sc.db.batch.addSlot(slotIndex, slotData)
-			}
-
-			entry.modified = false
-		}
-	}
-
-	return result
 }
 
 func (sc *SlotCache) Close() {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	sc.flushModifiedSlots()
+	sc.FlushAll()
 }
 
 // startWorker starts the background worker for processing path caching requests
@@ -806,20 +707,14 @@ func (nc *NodeCache) batchCachePathNodes(nodes map[string]struct{}, db *PrefixDB
 			if len(nc.cache) >= nc.capacity {
 				nc.evictMinRefCount()
 			}
-
-			//build slot indices
-			slotIndices := make([]int, 0, node.slotNum)
-			for i := 0; i < node.slotNum; i++ {
-				slotIndices = append(slotIndices, node.startSlotindex+i)
-			}
-
 			// add new entry to cache
 			entry := &cacheEntry{
-				key:          currentKey,
-				value:        nodeValue,
-				slotIndices:  slotIndices,
-				modifiedType: None,
-				refCount:     1,
+				key:           currentKey,
+				value:         nodeValue,
+				storageFileID: node.storageFileID,
+				storageOffset: node.storageOffset,
+				modifiedType:  None,
+				refCount:      1,
 			}
 			nc.ensureRefListCapacity(1)
 			element := nc.refLists[1].PushFront(entry)

@@ -25,6 +25,7 @@ const (
 	BlockindexMapFileName = "blockindex.map"
 	HeaderKeyPrefix       = "h" // the prefix for header keys
 	HeaderIndexFileName   = "headerindex.map"
+	PendingKVFileName     = "pending_kv.tmp"
 	// defaultRecentN   = 100 // Default number of recent blocks to keep indexed in memory
 	// offsetSize       = 8   // Size of uint64 for offsets
 	// blockIDSize      = 8   // Assuming block ID is uint64
@@ -33,6 +34,7 @@ const (
 	// // TombstoneMarker is a special value to mark deletion
 	// TombstoneMarker   = "_D_"
 	// initialBufferSize = 4096 // Initial buffer size for writers
+
 )
 
 // // logEntry represents a single key-value pair within a block in the data log.
@@ -98,6 +100,9 @@ type BlockAppendOnlyLog struct {
 
 	mu     sync.RWMutex
 	closed bool
+
+	// opCount   uint64 // for debugging
+	// failedOps uint64 // for debugging
 }
 
 // isHeaderKey checks if a key is a header key.
@@ -173,6 +178,9 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		indexBuffer:      make([]blockIndexEntry, 0, recentN/2),
 		indexBufferSize:  recentN / 2,
 		indexBufferFlush: make(chan struct{}, 1),
+
+		// opCount:   0,
+		// failedOps: 0,
 	}
 
 	go baol.backgroundFlush()
@@ -439,7 +447,7 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 	if exists {
 		startOffset = existingEntry.EndOffset
 	} else {
-		// 否则使用当前偏移量
+		// New block, append at current end offset
 		startOffset = aol.currentOffset
 	}
 	// startOffset = aol.currentOffset
@@ -451,6 +459,19 @@ func (aol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) err
 			return fmt.Errorf("failed to serialize entry for block %d, key %s: %w", blockID, key, err)
 		}
 	}
+
+	// Serialize entries in dictionary order
+	// keys := make([]string, 0, len(kvs))
+	// for k := range kvs {
+	// 	keys = append(keys, k)
+	// }
+	// sort.Strings(keys)
+	// for _, key := range keys {
+	// 	value := kvs[key]
+	// 	if err := aol.writeLogEntry(blockDataBuf, blockID, key, value); err != nil {
+	// 		return fmt.Errorf("failed to serialize entry for block %d, key %s: %w", blockID, key, err)
+	// 	}
+	// }
 
 	blockBytes := blockDataBuf.Bytes()
 	n, err := aol.dataWriter.Write(blockBytes)
@@ -605,7 +626,6 @@ func (aol *BlockAppendOnlyLog) evictOldEntries() {
 func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 	aol.mu.RLock()
 	defer aol.mu.RUnlock()
-
 	if aol.closed {
 		return "", false, fmt.Errorf("append-only log is closed")
 	}
@@ -684,6 +704,52 @@ func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		}
 	}
 
+	dataType := GetDataTypeFromKey([]byte(key))
+	if blockID, ok := parseBlockNumberFromKey([]byte(key), dataType); ok {
+		if blockID > aol.latestBlockID {
+			return "", false, fmt.Errorf("Get: needed blockID lager than aol.lastBlockID")
+		}
+		if aol.latestBlockID-blockID > uint64(aol.recentN) {
+			// If the blockID is older than the recentN threshold, we need to scan that specific block only.
+			if _, isIndexed := aol.indexedBlocks[blockID]; !isIndexed {
+				indexEntry, ok := aol.getBlockIndexEntry(blockID)
+				if ok {
+					size := indexEntry.EndOffset - indexEntry.StartOffset
+					if size > 0 {
+						blockData := make([]byte, size)
+						if _, err := aol.dataFile.ReadAt(blockData, indexEntry.StartOffset); err != nil {
+							aol.log.Error("Get: Failed to read block data for target block", "blockID", blockID, "key", key, "error", err)
+							return "", false, fmt.Errorf("Get: failed to read data for block %d: %w", blockID, err)
+						}
+						reader := bytes.NewReader(blockData)
+						for reader.Len() > 0 {
+							entry, _, readErr := aol.readLogEntry(reader)
+							if readErr == io.EOF {
+								break
+							}
+							if readErr != nil {
+								aol.log.Error("Get: Failed to decode entry in target block", "blockID", blockID, "key", key, "error", readErr)
+								return "", false, fmt.Errorf("Get: failed to decode entry in block %d: %w", blockID, readErr)
+							}
+							if entry.Key == key {
+								if entry.Value == TombstoneMarker {
+									return "", true, nil
+								}
+								return entry.Value, true, nil
+							}
+						}
+					}
+				}
+			}
+			return "", false, nil
+		} else {
+			// fmt.Printf("Get: key is within recentN range and should be indexed (blockID %d, latestBlockID %d, sub %d) total: %d/%d\n",
+			return "", false, nil
+		}
+	}
+
+	return "", false, nil
+
 	//    Iterate all blockIndex entries from newest to oldest.
 	allBlockIDs := make([]uint64, 0, len(aol.blockIndex))
 	for id := range aol.blockIndex {
@@ -725,7 +791,7 @@ func (aol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		}
 
 		if blockIDToScan == 0 {
-			fmt.Println("mark")
+			fmt.Println("key:", key, "keyType:", dataType, "mark")
 		}
 
 		reader := bytes.NewReader(blockData)

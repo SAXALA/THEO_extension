@@ -19,6 +19,12 @@ import (
 	"github.com/tinoryj/EthStore/standalone/ethstore/ssPrefixdb"
 )
 
+// backendStats tracks operation counts and durations
+type backendStats struct {
+	ops   uint64
+	durNs uint64
+}
+
 // Define custom errors to replace ethdb's if they are undefined
 var (
 	ErrClosed     = errors.New("database closed")
@@ -186,6 +192,17 @@ type Database struct {
 	closed   bool            // keep track of whether we're Closed
 
 	log log.Logger // Contextual logger tracking the database path
+
+	// count tracks the number of operations (Has/Get/Put/Delete)
+	statsAOL    backendStats
+	statsBAOL   backendStats
+	statsPDB    backendStats
+	statsSPDB   backendStats
+	statsPebble backendStats
+
+	opCounter         uint64     // total number of operations
+	reportMu          sync.Mutex // protects the reporting fields
+	lastReportedTotal uint64     // last reported total operations
 }
 
 // New returns a wrapped EthStore object using AppendOnlyLog.
@@ -195,10 +212,10 @@ type Database struct {
 func New(dirPath string, recentN int, namespace string, readonly bool) (*Database, error) {
 	logger := log.New("database", dirPath)
 
-	// prefixdb, err := prefixdb.NewPrefixDB(dirPath)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
-	// }
+	prefixdb, err := prefixdb.NewPrefixDB(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+	}
 
 	ssPrefixdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
 	if err != nil {
@@ -208,7 +225,7 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 		fn:       dirPath, // Use directory path now
 		log:      logger,
 		quitChan: make(chan chan error, 1),
-		pdb:      nil, // Initialize PrefixDB with the directory path
+		pdb:      prefixdb, // Initialize PrefixDB with the directory path
 		spdb:     ssPrefixdb,
 	}
 
@@ -339,7 +356,6 @@ func (d *Database) Has(key []byte) (bool, error) {
 	if d.closed {
 		return false, ErrClosed
 	}
-
 	dataType := GetDataTypeFromKey(key)
 
 	if AolHandledDataTypes[dataType] {
@@ -350,7 +366,6 @@ func (d *Database) Has(key []byte) (bool, error) {
 		var exists bool
 		var err error
 		if dataType == TransactionLookupMetadataDataType {
-
 			// First check if the key exists in AOL
 			valStr, exists, err = d.aol.Get(string(key))
 			if err != nil {
@@ -366,6 +381,7 @@ func (d *Database) Has(key []byte) (bool, error) {
 		} else {
 
 			valStr, exists, err = d.baol.Get(string(key))
+
 			if err != nil {
 				return false, err
 			}
@@ -384,7 +400,9 @@ func (d *Database) Has(key []byte) (bool, error) {
 		}
 
 		// Check if the key exists in PrefixDB
+
 		exists, err := d.pdb.Has(key)
+
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
 		}
@@ -394,7 +412,9 @@ func (d *Database) Has(key []byte) (bool, error) {
 			return false, fmt.Errorf("SSPrefixDB is not initialized, cannot check key %x(type %s)", key, DataTypeStrings[dataType])
 		}
 		// Check if the key exists in SSPrefixDB
+
 		exists, err := d.spdb.Has(key)
+
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in SSPrefixDB: %w", key, err)
 		}
@@ -402,7 +422,9 @@ func (d *Database) Has(key []byte) (bool, error) {
 	}
 
 	// Check if the key exists in Pebble
+
 	_, err := d.db.Get(key)
+
 	if err == nil {
 		return true, nil // Key exists
 	} else if err == pebble.ErrNotFound {
@@ -431,6 +453,7 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		var err error
 
 		if dataType == TransactionLookupMetadataDataType {
+
 			valStr, exists, err = d.aol.Get(string(key))
 			if err != nil {
 				return nil, err
@@ -444,7 +467,9 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 				return []byte(valStr), nil
 			}
 		} else {
+
 			valStr, exists, err = d.baol.Get(string(key))
+
 			if err != nil {
 				return nil, err
 			}
@@ -465,7 +490,9 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		}
 
 		// Try to get from PrefixDB
+
 		value, exists, err := d.pdb.Get(key)
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
 		}
@@ -483,7 +510,9 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 			return nil, fmt.Errorf("SSPrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Try to get from SSPrefixDB
+
 		value, exists, err := d.spdb.Get(key)
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to get key %x from SSPrefixDB: %w", key, err)
 		}
@@ -499,7 +528,9 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 	}
 
 	// Try to get from Pebble
+
 	value, err := d.db.Get(key)
+
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return nil, ErrNotFound // Convert to EthStore specific ErrNotFound
@@ -538,17 +569,22 @@ func (d *Database) Put(key []byte, value []byte) error {
 		}
 
 		if foundBlockID {
-			kvs := map[string]string{string(key): string(value)}
+
 			var err error
 			if dataType == TransactionLookupMetadataDataType {
-				err = d.aol.Append(blockID, kvs)
+
+				err = d.aol.PutKV(blockID, string(key), string(value))
+
 				if err != nil {
 					return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
 				}
 				d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
 				return nil // Data stored in AOL
 			} else {
+				kvs := map[string]string{string(key): string(value)}
+
 				err = d.baol.Append(blockID, kvs)
+
 				if err != nil {
 					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
 				}
@@ -563,7 +599,9 @@ func (d *Database) Put(key []byte, value []byte) error {
 			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in PrefixDB
+
 		err := d.pdb.Put(key, value)
+
 		if err != nil {
 			return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -574,7 +612,9 @@ func (d *Database) Put(key []byte, value []byte) error {
 			return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in SSPrefixDB
+
 		err := d.spdb.Put(key, value)
+
 		if err != nil {
 			return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -586,7 +626,9 @@ func (d *Database) Put(key []byte, value []byte) error {
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
 	}
+
 	err := d.db.Put(key, value)
+
 	if err != nil {
 		return fmt.Errorf("pebble put failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
@@ -614,31 +656,24 @@ func (d *Database) Delete(key []byte) error {
 		if d.aol == nil {
 			return fmt.Errorf("AOL is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		var blockID uint64
-		var foundBlockID bool
 
-		// Try to get blockID from key (works for Header, BlockBody, BlockReceipts)
-		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
-
-		if !foundBlockID {
-			d.log.Warn("AOL delete for type not supported as blockID cannot be derived from key alone", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-			return fmt.Errorf("cannot determine blockID from key for AOL-handled type %s (key %x) during delete; AOL delete not supported for this type via this path", DataTypeStrings[dataType], key)
-		}
-
-		kvs := map[string]string{string(key): aolDeleteTombstone}
 		var err error
 		if dataType == TransactionLookupMetadataDataType {
-			err := d.aol.Append(blockID, kvs)
+
+			err := d.aol.Delete(string(key))
+
 			if err != nil {
-				return fmt.Errorf("aol append (delete tombstone) failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				return fmt.Errorf("aol append (delete tombstone) failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 			}
-			d.log.Trace("Stored delete tombstone via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+			d.log.Trace("Stored delete tombstone via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		} else {
-			err = d.baol.Append(blockID, kvs)
+
+			err = d.baol.Delete(string(key))
+
 			if err != nil {
-				return fmt.Errorf("baol append (delete tombstone) failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				return fmt.Errorf("baol append (delete tombstone) failed for key %x (type %s, blockID): %w", key, DataTypeStrings[dataType], err)
 			}
-			d.log.Trace("Stored delete tombstone via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+			d.log.Trace("Stored delete tombstone via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		}
 		// Successfully stored deletion marker in AOL
 		return nil // Deletion marker stored in AOL
@@ -647,7 +682,9 @@ func (d *Database) Delete(key []byte) error {
 			return fmt.Errorf("PrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from PrefixDB
+
 		err := d.pdb.Delete(key)
+
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -658,7 +695,9 @@ func (d *Database) Delete(key []byte) error {
 			return fmt.Errorf("SSPrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from SSPrefixDB
+
 		err := d.spdb.Delete(key)
+
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -670,7 +709,9 @@ func (d *Database) Delete(key []byte) error {
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot delete non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
 	}
+
 	err := d.db.Delete(key)
+
 	if err != nil {
 		return fmt.Errorf("pebble delete failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}

@@ -40,9 +40,11 @@ standalone/svg
 
 standalone/ethstore/workload/workload
 standalone/ethstore/testWorkload/testWorkload
-standalone/ethstore/findKey.py
+
 go-ethereum-1.15.7/ethdb/prefixdb/question.md
 go-ycsb
 go-ycsb/*
 go-ycsb
 standalone/ethstore/workload/monitoe.sh
+standalone/ethstore/tool_script/*
+go-ycsb

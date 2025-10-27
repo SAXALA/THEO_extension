@@ -121,11 +121,12 @@ func main() {
 	}()
 	// buildMemCache()
 
-	// repalyPut()
-	repalyAccountPut()
-	// repPalyAolPut()
-	//repalySSPut()
-	// repalyTrace()
+	// replayPut()
+	replayAccountPut()
+	// replayAolPut()
+	// replaySSPut()
+	// replayTrace()
+	// replayPebble()
 
 	// testPdbPerformance()
 	// testAolPreformance()
@@ -133,7 +134,7 @@ func main() {
 	// TestGetParentKey()
 }
 
-func repalyPut() {
+func replayPut() {
 	tempDir := "/mnt/ssd/ethstore/database"
 	store, err := ethstore.New(tempDir, 10, "put_test", false)
 	if err != nil {
@@ -203,7 +204,7 @@ func repalyPut() {
 	}
 }
 
-func repalyAccountPut() {
+func replayAccountPut() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
 	pdb, err := prefixdb.NewPrefixDB(dirPath)
@@ -231,18 +232,9 @@ func repalyAccountPut() {
 	counter := 0
 	reader := bufio.NewReader(file)
 
-	isSaved := false
+	//isSaveTrie := false
 
 	for {
-		counter++
-		if counter > 375799415 && !isSaved {
-			pdb.SaveTree()
-			isSaved = true
-		}
-
-		if counter > 1966138022 {
-			break
-		}
 
 		line, err := reader.ReadString('\n')
 		if err == io.EOF {
@@ -251,6 +243,23 @@ func repalyAccountPut() {
 
 		// line format: "key: xxxxxx, value: yyyy"
 		line = line[:len(line)-1] // Remove the newline character
+
+		counter++
+
+		if counter < 375799415 {
+			continue
+		}
+
+		// if counter > 375799415 && !isSaveTrie {
+		// 	pdb.SaveTree()
+		// time.Sleep(5 * time.Minute) //make sure all batchs are committed
+		// 	isSaveTrie = true
+		// 	// continue
+		// }
+
+		if counter > 1966138022 {
+			break
+		}
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
@@ -275,27 +284,28 @@ func repalyAccountPut() {
 		}
 
 		switch keyBytes[0] {
-		case 'A', 'O', 'c':
+		case 'A', 'O':
 			// Perform the Put operation
 			startTime := time.Now()
-			err = pdb.Put(keyBytes, valueBytes)
+			// err = pdb.Put(keyBytes, valueBytes)
 
-			//value, ok, err := pdb.Get(keyBytes)
+			value, ok, err := pdb.Get(keyBytes)
 
 			endTime := time.Now()
 			totalTime += endTime.Sub(startTime)
 
-			// if err != nil {
-			// 	log.Fatalf("Get operation failed for key %s: %v", keyPart, err)
-			// }
-			// if !ok {
-			// 	log.Printf("Key %s not found in PrefixDB", keyPart)
-			// 	continue
-			// }
-			// if !bytes.Equal(value, valueBytes) {
-			// 	fmt.Println("counter:", counter)
-			// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
-			// }
+			if err != nil {
+				fmt.Printf("Get operation failed for key %s: %v", keyPart, err)
+				continue
+			}
+			if !ok {
+				fmt.Printf("Key %s not found in PrefixDB", keyPart)
+				continue
+			}
+			if !bytes.Equal(value, valueBytes) {
+				fmt.Println("counter:", counter)
+				// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+			}
 			if err != nil {
 				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
 			}
@@ -319,7 +329,7 @@ func repalyAccountPut() {
 			// 	}
 		}
 
-		// if counter%5000000 == 0 {
+		// if counter%500000 == 0 {
 		// 	break
 		// }
 	}
@@ -332,7 +342,7 @@ func repalyAccountPut() {
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 }
 
-func repalySSPut() {
+func replaySSPut() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
 	pdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
@@ -417,7 +427,7 @@ func repalySSPut() {
 	}
 }
 
-func repPalyAolPut() {
+func repPlayAolPut() {
 
 	tempDir := "/mnt/ssd/ethstore/database"
 	store, err := ethstore.New(tempDir, 200, "put_test", false)
@@ -931,15 +941,15 @@ func TestGetParentKey() {
 	}
 }
 
-func repalyTrace() {
+func replayTrace() {
 	tempDir := "/mnt/ssd/ethstore/database"
-	store, err := ethstore.New(tempDir, 10, "put_test", false)
+	store, err := ethstore.New(tempDir, 1000, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
-	testFilePath := "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000"
+	testFilePath := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -997,9 +1007,15 @@ func repalyTrace() {
 			continue
 		}
 
-		if keyBytes[0] == 'a' && keyBytes[1] == 'o' {
+		if keyBytes[0] == 'A' || keyBytes[0] == 'O' {
+
+		} else {
 			continue
 		}
+
+		// if keyBytes[0] == 'a' || keyBytes[0] == 'o' || keyBytes[0] == 'c' {
+		// 	continue
+		// }
 
 		// keyStr := hex.EncodeToString(keyBytes)
 
@@ -1039,13 +1055,13 @@ func repalyTrace() {
 			opErr = store.Delete(keyBytes)
 		}
 
-		elapsed := time.Since(start)
-		totalTime += elapsed
+		end := time.Now()
+		totalTime += end.Sub(start)
 		counter++
 		if opErr != nil {
 			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
 		}
-		if counter%100000 == 0 {
+		if counter%1000 == 0 {
 			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 		}
 	}
@@ -1070,7 +1086,7 @@ func buildMemCache() error {
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		value := iter.Value()
-		err = mc.Set(&memcache.Item{Key: hex.EncodeToString(key), Value: value})
+		err = mc.Set(&memcache.Item{Key: hex.EncodeToString(key), Value: value, Expiration: 0})
 		if err != nil {
 			return fmt.Errorf("failed to set item in memcache: %v", err)
 		}
@@ -1093,4 +1109,78 @@ func buildMemCache() error {
 	}
 
 	return nil
+}
+
+func replayPebble() {
+	tempDir := "/mnt/tmp/block-20500000-backup/execution/data/geth/chaindata"
+	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	for {
+		counter++
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+
+		// line format: "key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			log.Printf("无法解析行: %s", line)
+			continue
+		}
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+
+		valueBytes := []byte(valuePart)
+		keyBytes, err = hex.DecodeString(string(keyBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode key: %v", err)
+		}
+		valueBytes, err = hex.DecodeString(string(valueBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode value: %v", err)
+		}
+
+		// Perform the Put operation
+		startTime := time.Now()
+		value, err := store.Get(keyBytes)
+		endTime := time.Now()
+
+		totalTime += endTime.Sub(startTime)
+
+		if !bytes.Equal(value, valueBytes) {
+			log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+		}
+		if err != nil {
+			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+		}
+		// Verify the value was stored correctly
+
+		if counter%100000 == 0 {
+			fmt.Printf("\rtest: %d, use time: %d ns", counter, totalTime.Seconds())
+		}
+
+	}
 }

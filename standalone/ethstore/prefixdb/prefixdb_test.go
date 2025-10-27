@@ -107,7 +107,7 @@ func TestStorage(t *testing.T) {
 	//pd.nodeCache.FlushModifiedNodes()
 	pd.nodeCache.Evict(string(keystr1))
 	pd.nodeCache.Evict(string(keystr2))
-	pd.slotCache.FlushModifiedSlots()
+	// pd.slotCache.FlushModifiedSlots()
 	pd.batch.CommitBatch()
 
 	// pd.storeNode(keystr1, &TrieNode{
@@ -150,7 +150,7 @@ func TestStorage(t *testing.T) {
 
 	pd.Delete(SK_1)
 	pd.Delete(SK_2)
-	pd.slotCache.Delete(1023)
+	// pd.slotCache.Delete(1023)
 	pd.batch.CommitBatch()
 	value, got, err = pd.Get(SK_1)
 	if err == nil || got {
