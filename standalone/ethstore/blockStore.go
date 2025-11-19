@@ -23,11 +23,12 @@ import (
 const (
 	dataFileName     = "data.log"
 	indexMapFileName = "index.map"
-	defaultRecentN   = 100 // Default number of recent blocks to keep indexed in memory
-	offsetSize       = 8   // Size of uint64 for offsets
-	blockIDSize      = 8   // Assuming block ID is uint64
-	keyLenSize       = 4   // Size of uint32 for key length
-	valueLenSize     = 4   // Size of uint32 for value length
+
+	defaultRecentN = 100 // Default number of recent blocks to keep indexed in memory
+	offsetSize     = 8   // Size of uint64 for offsets
+	blockIDSize    = 8   // Assuming block ID is uint64
+	keyLenSize     = 4   // Size of uint32 for key length
+	valueLenSize   = 4   // Size of uint32 for value length
 	// TombstoneMarker is a special value to mark deletion
 	TombstoneMarker   = "_D_"
 	initialBufferSize = 4096 // Initial buffer size for writers
@@ -1888,4 +1889,13 @@ func (aol *AppendOnlyLog) loadPendingBlocks() error {
 	}
 	aol.log.Info("Pending restored (pkv3)", "blocks", len(aol.pendingBlocks))
 	return nil
+}
+
+func (aol *AppendOnlyLog) writeLateIndexEntry(w io.Writer, entry blockIndexEntry) error {
+	buf := make([]byte, blockIDSize+offsetSize+offsetSize)
+	binary.BigEndian.PutUint64(buf[0:blockIDSize], entry.BlockID)
+	binary.BigEndian.PutUint64(buf[blockIDSize:blockIDSize+offsetSize], uint64(entry.StartOffset))
+	binary.BigEndian.PutUint64(buf[blockIDSize+offsetSize:], uint64(entry.EndOffset))
+	_, err := w.Write(buf)
+	return err
 }

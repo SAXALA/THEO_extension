@@ -194,15 +194,7 @@ type Database struct {
 	log log.Logger // Contextual logger tracking the database path
 
 	// count tracks the number of operations (Has/Get/Put/Delete)
-	statsAOL    backendStats
-	statsBAOL   backendStats
-	statsPDB    backendStats
-	statsSPDB   backendStats
-	statsPebble backendStats
 
-	opCounter         uint64     // total number of operations
-	reportMu          sync.Mutex // protects the reporting fields
-	lastReportedTotal uint64     // last reported total operations
 }
 
 // New returns a wrapped EthStore object using AppendOnlyLog.

@@ -32,96 +32,14 @@ const (
 )
 
 func main() {
-	// traceFilePath := flag.String("tracefile", "", "Path to the workload trace file. (e.g., /path/to/your/trace.log)")
-	// dbPath := flag.String("dbpath", "./ethstore_data", "Path to the EthStore database directory.")
-	// flag.Parse()
-
-	// if *traceFilePath == "" {
-	// 	log.Fatal("Error: Trace file path must be provided using -tracefile flag.")
-	// }
-	// if *dbPath == "" {
-	// 	log.Fatal("Error: EthStore database directory path must be provided using -dbpath flag.")
-	// }
-
-	// db, err := ethstore.New(*dbPath, 0, "replay_workload", false)
-	// if err != nil {
-	// 	log.Fatalf("Failed to create EthStore instance (path: %s): %v", *dbPath, err)
-	// }
-	// defer func() {
-	// 	log.Println("Closing EthStore...")
-	// 	if errClose := db.Close(); errClose != nil {
-	// 		log.Printf("Failed to close EthStore: %v", errClose)
-	// 	}
-	// }()
-	// log.Printf("EthStore instance initialized at %s", *dbPath)
-
-	// file, err := os.Open(*traceFilePath)
-	// if err != nil {
-	// 	log.Fatalf("Failed to open trace file '%s': %v", *traceFilePath, err)
-	// }
-	// defer file.Close()
-
-	// scanner := bufio.NewScanner(file)
-	// lineNum := 0
-	// opRegex := regexp.MustCompile(`OPType: (\\w+), key: ([0-9a-fA-F]+)`)
-
-	// log.Printf("Starting replay of trace file: %s", *traceFilePath)
-
-	// for scanner.Scan() {
-	// 	lineNum++
-	// 	line := scanner.Text()
-	// 	if strings.Contains(line, "Global log file opened successfully") || !strings.Contains(line, "OPType:") {
-	// 		continue
-	// 	}
-
-	// 	matches := opRegex.FindStringSubmatch(line)
-	// 	if len(matches) < 3 {
-	// 		log.Printf("Warning: Could not parse OPType and key from line %d: %s", lineNum, line)
-	// 		continue
-	// 	}
-
-	// 	opType := matches[1]
-	// 	keyHex := matches[2]
-
-	// 	keyBytes, err := hex.DecodeString(keyHex)
-	// 	if err != nil {
-	// 		log.Printf("Warning: Failed to decode hex key '%s' (line %d): %v", keyHex, lineNum, err)
-	// 		continue
-	// 	}
-
-	// 	switch opType {
-	// 	case "Get":
-	// 		value, errGet := db.Get(keyBytes)
-	// 		if errGet != nil {
-	// 			log.Printf("EthStore Get operation (key: %s): Error: %v", keyHex, errGet)
-	// 		} else {
-	// 			log.Printf("EthStore Get operation (key: %s): Success, value (hex): %s", keyHex, hex.EncodeToString(value))
-	// 		}
-	// 	case "Has":
-	// 		exists, errHas := db.Has(keyBytes)
-	// 		if errHas != nil {
-	// 			log.Printf("EthStore Has operation (key: %s): Error: %v", keyHex, errHas)
-	// 		} else {
-	// 			log.Printf("EthStore Has operation (key: %s): Success, exists: %t", keyHex, exists)
-	// 		}
-	// 	default:
-	// 		log.Printf("Warning: Unknown OPType '%s' (line %d, key: %s)", opType, lineNum, keyHex)
-	// 	}
-	// }
-
-	// if err := scanner.Err(); err != nil {
-	// 	log.Fatalf("Error reading trace file: %v", err)
-	// }
-
-	// log.Println("Trace replay completed.")
 
 	go func() {
 		// Start the HTTP server for pprof profiling
-		log.Println(http.ListenAndServe(":6061", nil))
+		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 	// buildMemCache()
 
-	// replayPut()
+	//loaddata()
 	replayAccountPut()
 	// replayAolPut()
 	// replaySSPut()
@@ -134,9 +52,10 @@ func main() {
 	// TestGetParentKey()
 }
 
-func replayPut() {
-	tempDir := "/mnt/ssd/ethstore/database"
-	store, err := ethstore.New(tempDir, 10, "put_test", false)
+func loaddata() {
+	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
+	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+	// store, err := ethstore.New(tempDir, 10, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -198,7 +117,7 @@ func replayPut() {
 		// Verify the value was stored correctly
 
 		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
+			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
 
 	}
@@ -246,9 +165,9 @@ func replayAccountPut() {
 
 		counter++
 
-		if counter < 375799415 {
-			continue
-		}
+		// if counter < 375799415 {
+		// 	continue
+		// }
 
 		// if counter > 375799415 && !isSaveTrie {
 		// 	pdb.SaveTree()
@@ -287,9 +206,9 @@ func replayAccountPut() {
 		case 'A', 'O':
 			// Perform the Put operation
 			startTime := time.Now()
-			// err = pdb.Put(keyBytes, valueBytes)
+			err = pdb.Put(keyBytes, valueBytes)
 
-			value, ok, err := pdb.Get(keyBytes)
+			// value, ok, err := pdb.Get(keyBytes)
 
 			endTime := time.Now()
 			totalTime += endTime.Sub(startTime)
@@ -298,17 +217,17 @@ func replayAccountPut() {
 				fmt.Printf("Get operation failed for key %s: %v", keyPart, err)
 				continue
 			}
-			if !ok {
-				fmt.Printf("Key %s not found in PrefixDB", keyPart)
-				continue
-			}
-			if !bytes.Equal(value, valueBytes) {
-				fmt.Println("counter:", counter)
-				// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
-			}
-			if err != nil {
-				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-			}
+			// if !ok {
+			// 	fmt.Printf("Key %s not found in PrefixDB", keyPart)
+			// 	continue
+			// }
+			// if !bytes.Equal(value, valueBytes) {
+			// 	fmt.Println("counter:", counter)
+			// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+			// }
+			// if err != nil {
+			// 	log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+			// }
 
 			if counter%100000 == 0 {
 				fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
@@ -965,7 +884,7 @@ func replayTrace() {
 	reader := bufio.NewReader(file)
 
 	for {
-		// 读取一行
+		// read line
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err.Error() == "EOF" {
@@ -1006,8 +925,8 @@ func replayTrace() {
 			// 无效的键，跳过
 			continue
 		}
-
-		if keyBytes[0] == 'A' || keyBytes[0] == 'O' {
+		//|| keyBytes[0] == 'O'
+		if keyBytes[0] == 'O' {
 
 		} else {
 			continue
@@ -1061,7 +980,7 @@ func replayTrace() {
 		if opErr != nil {
 			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
 		}
-		if counter%1000 == 0 {
+		if counter%10000 == 0 {
 			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 		}
 	}

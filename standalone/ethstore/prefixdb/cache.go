@@ -47,6 +47,7 @@ type cacheEntry struct {
 	value         []byte
 	storageFileID uint32 // Storage file ID
 	storageOffset int64  // Storage offset
+	storageSize   uint32 // Storage size
 	modifiedType  ModifiedType
 	refCount      int // Reference count
 }
@@ -108,12 +109,12 @@ func (nc *NodeCache) Has(key string) bool {
 }
 
 // Get retrieves a value from cache
-func (nc *NodeCache) Get(key string) ([]byte, uint32, int64, bool) {
+func (nc *NodeCache) Get(key string) ([]byte, uint32, int64, uint32, bool) {
 	nc.lock.RLock()
 	element, exists := nc.cache[key]
 	if !exists {
 		nc.lock.RUnlock()
-		return nil, 0, 0, false
+		return nil, 0, 0, 0, false
 	}
 
 	// Get entry
@@ -127,17 +128,17 @@ func (nc *NodeCache) Get(key string) ([]byte, uint32, int64, bool) {
 
 	// Ensure element still exists (may have been deleted between read and write locks)
 	if element, exists = nc.cache[key]; !exists {
-		return entry.value, entry.storageFileID, entry.storageOffset, true // Return previously read value
+		return entry.value, entry.storageFileID, entry.storageOffset, entry.storageSize, true // Return previously read value
 	}
 
 	entry = element.Value.(*cacheEntry)
 
 	nc.refLists[refCount].MoveToFront(element)
-	return entry.value, entry.storageFileID, entry.storageOffset, true
+	return entry.value, entry.storageFileID, entry.storageOffset, entry.storageSize, true
 }
 
 // Put adds or updates a value in cache
-func (nc *NodeCache) Put(key string, value []byte, storageFileID uint32, storageOffset int64, modfiedType ModifiedType) {
+func (nc *NodeCache) Put(key string, value []byte, storageFileID uint32, storageOffset int64, storageSize uint32, modfiedType ModifiedType) {
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
 
@@ -153,6 +154,7 @@ func (nc *NodeCache) Put(key string, value []byte, storageFileID uint32, storage
 		entry.storageFileID = storageFileID
 		entry.refCount = newRefCount
 		entry.storageOffset = storageOffset
+		entry.storageSize = storageSize
 
 		// Just Update modifiedType to the highest level
 		if entry.modifiedType < 1 {
@@ -181,6 +183,7 @@ func (nc *NodeCache) Put(key string, value []byte, storageFileID uint32, storage
 		storageFileID: storageFileID,
 		modifiedType:  modfiedType,
 		storageOffset: storageOffset,
+		storageSize:   storageSize,
 		refCount:      1,
 	}
 
@@ -201,7 +204,7 @@ func (nc *NodeCache) evictMinRefCount() {
 			entry := element.Value.(*cacheEntry)
 
 			if entry.modifiedType > 0 && nc.db != nil && nc.db.batch != nil {
-				nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
+				nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.storageSize, entry.modifiedType)
 			}
 
 			delete(nc.cache, entry.key)
@@ -303,6 +306,7 @@ func (nc *NodeCache) CachePathToNode(key string, db *PrefixDB) {
 				value:         nodeValue,
 				storageFileID: node.storageFileID,
 				storageOffset: node.storageOffset,
+				storageSize:   node.storageSize,
 				modifiedType:  0,
 				refCount:      1,
 			}
@@ -348,7 +352,7 @@ func (nc *NodeCache) Evict(key string) {
 
 	if entry.modifiedType > 0 && nc.db != nil && nc.db.batch != nil {
 		// If the node was modified, add it to the batch for writing
-		nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
+		nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.storageSize, entry.modifiedType)
 	}
 
 	// Remove from the appropriate reference count list
@@ -384,19 +388,20 @@ func (nc *NodeCache) Delete(key string) {
 }
 
 // UpdateStoragePointer updates storage file ID and offset for a cached node
-func (nc *NodeCache) UpdateStoragePointer(key string, fileID uint32, offset int64) {
+func (nc *NodeCache) UpdateStoragePointer(key string, fileID uint32, offset int64, storageSize uint32) {
 	nc.lock.Lock()
 
 	if el, ok := nc.cache[key]; ok {
 		ent := el.Value.(*cacheEntry)
 		ent.storageFileID = fileID
 		ent.storageOffset = offset
+		ent.storageSize = storageSize
 	}
 	nc.lock.Unlock()
 
 	// check in batch
 	if nc.db != nil && nc.db.batch != nil {
-		nc.db.batch.updateStoragePointer([]byte(key), fileID, offset)
+		nc.db.batch.updateStoragePointer([]byte(key), fileID, offset, storageSize)
 	}
 }
 
@@ -411,7 +416,7 @@ func (nc *NodeCache) FlushModifiedNodes() {
 			entry := e.Value.(*cacheEntry)
 			if entry.modifiedType > 0 {
 				if nc.db != nil && nc.db.batch != nil {
-					nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.modifiedType)
+					nc.db.batch.add([]byte(entry.key), entry.value, entry.storageFileID, entry.storageOffset, entry.storageSize, entry.modifiedType)
 				}
 				entry.modifiedType = None // Reset modified status after flushing
 			}
