@@ -39,11 +39,13 @@ func main() {
 	}()
 	// buildMemCache()
 
-	//loaddata()
-	replayAccountPut()
+	//	loadbaseline()
+	// repalybaseline()
+
+	// replayAccountPut()
 	// replayAolPut()
 	// replaySSPut()
-	// replayTrace()
+	replayTrace()
 	// replayPebble()
 
 	// testPdbPerformance()
@@ -52,7 +54,7 @@ func main() {
 	// TestGetParentKey()
 }
 
-func loaddata() {
+func loadbaseline() {
 	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
 	// store, err := ethstore.New(tempDir, 10, "put_test", false)
@@ -123,6 +125,132 @@ func loaddata() {
 	}
 }
 
+func repalybaseline() {
+	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
+	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	testFilePath := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	for {
+		// read line
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err.Error() == "EOF" {
+				fmt.Println("End of file reached")
+			}
+			fmt.Errorf("error reading trace file: %v", err)
+		}
+
+		line = strings.TrimSpace(line)
+
+		// 跳过非操作行
+		if strings.Contains(line, "Global log file opened successfully") ||
+			!strings.Contains(line, "OPType:") {
+			continue
+		}
+
+		matches := opRegex.FindStringSubmatch(line)
+		if len(matches) < 4 {
+			// 无法解析的行，跳过
+			continue
+		}
+
+		opTypeStr := matches[1]
+		keyHex := matches[2]
+		keySize := 0
+		fmt.Sscanf(matches[3], "%d", &keySize)
+
+		// 检查是否有值部分
+		var valueHex string
+		var valueSize int
+		if len(matches) >= 6 && matches[4] != "" {
+			valueHex = matches[4]
+			fmt.Sscanf(matches[5], "%d", &valueSize)
+		}
+
+		keyBytes, err := hex.DecodeString(keyHex)
+		if err != nil {
+			// 无效的键，跳过
+			continue
+		}
+		//|| keyBytes[0] == 'O'
+		if keyBytes[0] == 'A' || keyBytes[0] == 'O' {
+
+		} else {
+			continue
+		}
+
+		// if keyBytes[0] == 'a' || keyBytes[0] == 'o' || keyBytes[0] == 'c' {
+		// 	continue
+		// }
+
+		// keyStr := hex.EncodeToString(keyBytes)
+
+		var op opType
+		switch opTypeStr {
+		case "Get":
+			op = opGet
+		case "Has":
+			op = opHas
+		case "Put", "BatchPut":
+			op = opPut
+		case "Delete", "BatchDelete":
+			op = opDelete
+		default:
+			// 未知操作，跳过
+			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			continue
+		}
+		valueBytes, decodeErr := hex.DecodeString(valueHex)
+		if decodeErr != nil && valueHex != "" {
+			// 无效的值，跳过
+			continue
+		}
+
+		// 执行操作并计时
+		start := time.Now()
+		var opErr error
+
+		switch op {
+		case opGet:
+			_, opErr = store.Get(keyBytes)
+		case opHas:
+			_, opErr = store.Has(keyBytes)
+		case opPut:
+			opErr = store.Put(keyBytes, valueBytes)
+		case opDelete:
+			opErr = store.Delete(keyBytes)
+		}
+
+		end := time.Now()
+		totalTime += end.Sub(start)
+		counter++
+		if opErr != nil {
+			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+		}
+		if counter%10000 == 0 {
+			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
+		}
+	}
+}
+
 func replayAccountPut() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
@@ -165,9 +293,9 @@ func replayAccountPut() {
 
 		counter++
 
-		// if counter < 375799415 {
-		// 	continue
-		// }
+		if counter < 375799415 {
+			continue
+		}
 
 		// if counter > 375799415 && !isSaveTrie {
 		// 	pdb.SaveTree()
@@ -206,9 +334,9 @@ func replayAccountPut() {
 		case 'A', 'O':
 			// Perform the Put operation
 			startTime := time.Now()
-			err = pdb.Put(keyBytes, valueBytes)
+			// err = pdb.Put(keyBytes, valueBytes)
 
-			// value, ok, err := pdb.Get(keyBytes)
+			value, ok, err := pdb.Get(keyBytes)
 
 			endTime := time.Now()
 			totalTime += endTime.Sub(startTime)
@@ -217,14 +345,14 @@ func replayAccountPut() {
 				fmt.Printf("Get operation failed for key %s: %v", keyPart, err)
 				continue
 			}
-			// if !ok {
-			// 	fmt.Printf("Key %s not found in PrefixDB", keyPart)
-			// 	continue
-			// }
-			// if !bytes.Equal(value, valueBytes) {
-			// 	fmt.Println("counter:", counter)
-			// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
-			// }
+			if !ok {
+				fmt.Printf("Key %s not found in PrefixDB", keyPart)
+				continue
+			}
+			if !bytes.Equal(value, valueBytes) {
+				fmt.Println("counter:", counter)
+				// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+			}
 			// if err != nil {
 			// 	log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
 			// }

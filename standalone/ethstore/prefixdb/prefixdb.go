@@ -1231,51 +1231,78 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	p, isHot, _ := db.storagePathByFileID(fileID)
 	if isHot {
 		lock := db.getHotFileLock(fileID)
-		lock.Lock()
-		defer lock.Unlock()
+		lock.RLock()
+		defer lock.RUnlock()
 	}
+
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	out := make(map[string][]byte)
+	if size == 0 {
+		return map[string][]byte{}, nil
+	}
+
+	// use buffer pool to reduce allocations
+	buf := getDataBuffer(int(size))
+	defer putDataBuffer(buf)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	buf = buf[:n]
+
 	if !isHot {
-		// cold segment:
-		buf := make([]byte, size)
-		if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
-			return nil, err
-		}
+		// cold: [kvCount u32] [klen u16][vlen u32][key][val]...
 		if len(buf) < 4 {
 			return nil, fmt.Errorf("segment too small")
 		}
 		kvCount := binary.BigEndian.Uint32(buf[:4])
 		data := buf[4:]
-		for i := uint32(0); i < kvCount; i++ {
-			if len(data) < 6 {
+
+		// first pass: count parsed entries and total value size
+		var parsed uint32
+		var totalV int
+		tmp := data
+		for parsed = 0; parsed < kvCount; parsed++ {
+			if len(tmp) < 6 {
 				break
 			}
+			klen := int(binary.BigEndian.Uint16(tmp[:2]))
+			vlen := int(binary.BigEndian.Uint32(tmp[2:6]))
+			tmp = tmp[6:]
+			if len(tmp) < klen+vlen {
+				break
+			}
+			tmp = tmp[klen+vlen:]
+			totalV += vlen
+		}
+
+		out := make(map[string][]byte, int(parsed))
+		arena := make([]byte, totalV)
+		ap := 0
+
+		// second pass: copy values to arena and build map
+		for i := uint32(0); i < parsed; i++ {
 			klen := int(binary.BigEndian.Uint16(data[:2]))
 			vlen := int(binary.BigEndian.Uint32(data[2:6]))
 			data = data[6:]
-			if len(data) < klen+vlen {
-				break
-			}
 			k := string(data[:klen])
-			val := make([]byte, vlen)
-			copy(val, data[klen:klen+vlen])
+			data = data[klen:]
+
+			copy(arena[ap:ap+vlen], data[:vlen])
+			val := arena[ap : ap+vlen : ap+vlen] // cap==len, avoid future realloc
 			out[k] = val
-			data = data[klen+vlen:]
+
+			ap += vlen
+			data = data[vlen:]
 		}
 		return out, nil
-
 	}
 
-	buf := make([]byte, size)
-	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
-		return nil, err
-	}
+	// hot: [magic u32][acctLen u16][kvCount u32][acctKey][kvs...]
 	if len(buf) < 10 {
 		return nil, io.ErrUnexpectedEOF
 	}
@@ -1284,27 +1311,52 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	}
 	acctLen := int(binary.BigEndian.Uint16(buf[4:6]))
 	kvCount := binary.BigEndian.Uint32(buf[6:10])
+
 	cur := 10 + acctLen
-	for i := uint32(0); i < kvCount; i++ {
-		if cur+6 > len(buf) {
+	if cur > len(buf) {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	// first pass: count parsed entries and total value size
+	var parsed uint32
+	var totalV int
+	scan := cur
+	for parsed = 0; parsed < kvCount; parsed++ {
+		if scan+6 > len(buf) {
 			break
 		}
+		klen := int(binary.BigEndian.Uint16(buf[scan : scan+2]))
+		vlen := int(binary.BigEndian.Uint32(buf[scan+2 : scan+6]))
+		scan += 6
+		if scan+klen+vlen > len(buf) {
+			break
+		}
+		scan += klen + vlen
+		totalV += vlen
+	}
+
+	out := make(map[string][]byte, int(parsed))
+	arena := make([]byte, totalV)
+	ap := 0
+
+	// second pass: copy values to arena and build map
+	for i := uint32(0); i < parsed; i++ {
 		klen := int(binary.BigEndian.Uint16(buf[cur : cur+2]))
 		vlen := int(binary.BigEndian.Uint32(buf[cur+2 : cur+6]))
 		cur += 6
-		if cur+klen+vlen > len(buf) {
-			break
-		}
+
 		k := string(buf[cur : cur+klen])
 		cur += klen
-		val := make([]byte, vlen)
-		copy(val, buf[cur:cur+vlen])
-		cur += vlen
+
+		copy(arena[ap:ap+vlen], buf[cur:cur+vlen])
+		val := arena[ap : ap+vlen : ap+vlen] // cap==len
 		out[k] = val
+
+		ap += vlen
+		cur += vlen
 	}
 	return out, nil
 }
-
 func isShortRead(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
@@ -1549,14 +1601,14 @@ func (db *PrefixDB) appendHotStorageSegment(accountKey string, kvs map[string][]
 }
 
 // getHotFileLock retrieves or creates a mutex for synchronizing access to a specific hot storage file.
-func (db *PrefixDB) getHotFileLock(fileID uint32) *sync.Mutex {
+func (db *PrefixDB) getHotFileLock(fileID uint32) *sync.RWMutex {
 	realID := fileID & ^hotFileIDMask
 	if v, ok := db.hotFileLocks.Load(realID); ok {
-		return v.(*sync.Mutex)
+		return v.(*sync.RWMutex)
 	}
-	mu := &sync.Mutex{}
+	mu := &sync.RWMutex{}
 	actual, _ := db.hotFileLocks.LoadOrStore(realID, mu)
-	return actual.(*sync.Mutex)
+	return actual.(*sync.RWMutex)
 }
 
 // hotGCWorker is a background goroutine that periodically performs garbage collection on hot storage files.
