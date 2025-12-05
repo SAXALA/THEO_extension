@@ -1054,8 +1054,7 @@ func replayTrace() {
 			continue
 		}
 		//|| keyBytes[0] == 'O'
-		if keyBytes[0] == 'O' {
-
+		if keyBytes[0] == 'O' || keyBytes[0] == 'A' {
 		} else {
 			continue
 		}

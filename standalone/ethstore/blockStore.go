@@ -535,45 +535,30 @@ func (aol *AppendOnlyLog) Append(blockID uint64, kvs map[string]string) error {
 
 // updateRecentBlocks adds the new block ID and removes the oldest if the limit is exceeded.
 func (aol *AppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
-	ids := make([]uint64, 0, len(aol.blockIndex))
-	for id := range aol.blockIndex {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	start := 0
-	if len(ids) > aol.recentN {
-		start = len(ids) - aol.recentN
-	}
-	wanted := ids[start:]
-
-	// Build new indexedBlocks set
-	newIndexed := make(map[uint64]struct{}, len(wanted))
-	for _, id := range wanted {
-		newIndexed[id] = struct{}{}
+	if aol.recentN <= 0 {
+		aol.persistIndexIfNeeded(newBlockID)
+		return
 	}
 
-	same := len(newIndexed) == len(aol.indexedBlocks)
-	if same {
-		for id := range newIndexed {
-			if _, ok := aol.indexedBlocks[id]; !ok {
-				same = false
-				break
-			}
+	lastIdx := len(aol.recentBlocks) - 1
+	isMonotonic := lastIdx < 0 || newBlockID > aol.recentBlocks[lastIdx]
+	if isMonotonic {
+		if aol.indexedBlocks == nil {
+			aol.indexedBlocks = make(map[uint64]struct{}, aol.recentN)
 		}
-	}
+		aol.recentBlocks = append(aol.recentBlocks, newBlockID)
+		aol.indexedBlocks[newBlockID] = struct{}{}
 
-	aol.recentBlocks = append(aol.recentBlocks[:0], wanted...)
-	aol.indexedBlocks = newIndexed
-
-	if !same {
-		// Rebuild skiplist only if the set of indexed blocks has changed
-		if err := aol.rebuildSkiplist(); err != nil {
-			aol.log.Error("Failed to rebuild skiplist after updating recent blocks", "error", err)
+		if len(aol.recentBlocks) > aol.recentN {
+			evicted := aol.recentBlocks[0]
+			aol.recentBlocks = aol.recentBlocks[1:]
+			delete(aol.indexedBlocks, evicted)
+			aol.evictOldBlockFromSkiplist(evicted)
 		}
-	}
 
-	aol.persistIndexIfNeeded(newBlockID)
+		aol.persistIndexIfNeeded(newBlockID)
+		return
+	}
 }
 
 // evictOldEntries is called after new data is appended and recent blocks are updated.

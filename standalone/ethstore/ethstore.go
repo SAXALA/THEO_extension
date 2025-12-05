@@ -228,14 +228,14 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	}
 	logger.Info("Initializing AppendOnlyLog store", "recentN", recentN) // recentN will be default if <= 0
 
-	appendLog, err := NewAppendOnlyLog(dirPath, recentN, logger)
+	appendLog, err := NewAppendOnlyLog(dirPath+"/aol", recentN, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize append-only log: %w", err)
 	}
 	db.aol = appendLog
 
 	// Initialize BlockAppendOnlyLog
-	baol, err := NewBlockAppendOnlyLog(dirPath, recentN, logger)
+	baol, err := NewBlockAppendOnlyLog(dirPath+"/aol", recentN, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
 	}

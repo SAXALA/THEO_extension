@@ -1226,7 +1226,40 @@ func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) (map[string][]
 	return empty, nil
 }
 
-// readStorageSegmentToMap reads a storage segment file and returns all key-value pairs as a map.
+// valueArenaBuckets defines byte slice pools for different size buckets.
+var valueArenaBuckets = []struct {
+	max  int
+	pool sync.Pool
+}{
+	{8 << 10, sync.Pool{New: func() interface{} { return make([]byte, 8<<10) }}},
+	{64 << 10, sync.Pool{New: func() interface{} { return make([]byte, 64<<10) }}},
+	{512 << 10, sync.Pool{New: func() interface{} { return make([]byte, 512<<10) }}},
+}
+
+// getValueArena retrieves a byte slice of at least 'need' bytes from the appropriate pool.
+func getValueArena(need int) ([]byte, func([]byte)) {
+	if need == 0 {
+		return nil, func([]byte) {}
+	}
+	for i := range valueArenaBuckets {
+		if need <= valueArenaBuckets[i].max {
+			buf := valueArenaBuckets[i].pool.Get().([]byte)
+			idx := i
+			return buf[:need], func(b []byte) {
+				if b == nil {
+					return
+				}
+				max := valueArenaBuckets[idx].max
+				if cap(b) < max {
+					max = cap(b)
+				}
+				valueArenaBuckets[idx].pool.Put(b[:max])
+			}
+		}
+	}
+	return make([]byte, need), func([]byte) {}
+}
+
 func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint32) (map[string][]byte, error) {
 	p, isHot, _ := db.storagePathByFileID(fileID)
 	if isHot {
@@ -1245,7 +1278,6 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		return map[string][]byte{}, nil
 	}
 
-	// use buffer pool to reduce allocations
 	buf := getDataBuffer(int(size))
 	defer putDataBuffer(buf)
 	n, err := f.ReadAt(buf, offset)
@@ -1255,14 +1287,12 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	buf = buf[:n]
 
 	if !isHot {
-		// cold: [kvCount u32] [klen u16][vlen u32][key][val]...
 		if len(buf) < 4 {
 			return nil, fmt.Errorf("segment too small")
 		}
 		kvCount := binary.BigEndian.Uint32(buf[:4])
 		data := buf[4:]
 
-		// first pass: count parsed entries and total value size
 		var parsed uint32
 		var totalV int
 		tmp := data
@@ -1281,10 +1311,10 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		}
 
 		out := make(map[string][]byte, int(parsed))
-		arena := make([]byte, totalV)
+		arena, release := getValueArena(totalV)
+		defer release(arena)
 		ap := 0
 
-		// second pass: copy values to arena and build map
 		for i := uint32(0); i < parsed; i++ {
 			klen := int(binary.BigEndian.Uint16(data[:2]))
 			vlen := int(binary.BigEndian.Uint32(data[2:6]))
@@ -1293,7 +1323,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 			data = data[klen:]
 
 			copy(arena[ap:ap+vlen], data[:vlen])
-			val := arena[ap : ap+vlen : ap+vlen] // cap==len, avoid future realloc
+			val := arena[ap : ap+vlen : ap+vlen]
 			out[k] = val
 
 			ap += vlen
@@ -1302,7 +1332,6 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		return out, nil
 	}
 
-	// hot: [magic u32][acctLen u16][kvCount u32][acctKey][kvs...]
 	if len(buf) < 10 {
 		return nil, io.ErrUnexpectedEOF
 	}
@@ -1317,7 +1346,6 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		return nil, io.ErrUnexpectedEOF
 	}
 
-	// first pass: count parsed entries and total value size
 	var parsed uint32
 	var totalV int
 	scan := cur
@@ -1336,10 +1364,10 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	}
 
 	out := make(map[string][]byte, int(parsed))
-	arena := make([]byte, totalV)
+	arena, release := getValueArena(totalV)
+	defer release(arena)
 	ap := 0
 
-	// second pass: copy values to arena and build map
 	for i := uint32(0); i < parsed; i++ {
 		klen := int(binary.BigEndian.Uint16(buf[cur : cur+2]))
 		vlen := int(binary.BigEndian.Uint32(buf[cur+2 : cur+6]))
@@ -1349,7 +1377,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		cur += klen
 
 		copy(arena[ap:ap+vlen], buf[cur:cur+vlen])
-		val := arena[ap : ap+vlen : ap+vlen] // cap==len
+		val := arena[ap : ap+vlen : ap+vlen]
 		out[k] = val
 
 		ap += vlen
