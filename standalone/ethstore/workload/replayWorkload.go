@@ -19,7 +19,6 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
-	"github.com/tinoryj/EthStore/standalone/ethstore/ssPrefixdb"
 )
 
 type opType int
@@ -260,7 +259,7 @@ func replayAccountPut() {
 	}
 	defer pdb.Close()
 
-	// spdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
+	// spdb, err := prefixdb.NewPrefixDB(dirPath)
 	// if err != nil {
 	// 	log.Fatalf("Failed to create EthStore instance: %v", err)
 	// }
@@ -392,7 +391,7 @@ func replayAccountPut() {
 func replaySSPut() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
-	pdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
+	pdb, err := prefixdb.NewPrefixDB(dirPath)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -959,7 +958,7 @@ func TestPebblePreformance() {
 
 func TestGetParentKey() {
 	dirpath := "/mnt/ssd/ethstore/database"
-	pd, err := ssPrefixdb.NewSSPrefixDB(dirpath)
+	pd, err := prefixdb.NewPrefixDB(dirpath)
 	if err != nil {
 		fmt.Printf("Failed to create PrefixDB: %v", err)
 	}
@@ -1225,7 +1224,7 @@ func replayPebble() {
 		// Verify the value was stored correctly
 
 		if counter%100000 == 0 {
-			fmt.Printf("\rtest: %d, use time: %d ns", counter, totalTime.Seconds())
+			fmt.Printf("\rtest: %d, use time: %d ns", counter, totalTime.Nanoseconds())
 		}
 
 	}

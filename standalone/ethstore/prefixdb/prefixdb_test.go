@@ -191,23 +191,23 @@ func TestPrefixDBAccountHash(t *testing.T) {
 	}
 	defer pd.Close()
 
-	AK_1 := []byte("410000000000010907")
+	AK_1 := []byte("410000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e")
 	AK_1, _ = hex.DecodeString(string(AK_1))
 	AV_1 := []byte("f8669d31d1daa0ba2662877f4fff747d528318c1b343a7575d4429170f40d031b846f8440180a02e90fa6e0dd972de88c3d7365b293f8fb67afadb98ba5c58cac1e1ee8ce47d12a0bafa57ebfbfd24de79a762fec12871b565cd7da7206993a55cae3f2a3476aae3")
 	AV_1, _ = hex.DecodeString(string(AV_1))
 	err = pd.Put(AK_1, AV_1)
 
-	// SK_1 := []byte("4f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e01")
-	// SK_1, _ = hex.DecodeString(string(SK_1))
-	// SV_1 := []byte("SV_1_value")
+	SK_1 := []byte("4f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e01")
+	SK_1, _ = hex.DecodeString(string(SK_1))
+	SV_1 := []byte("SV_1_value")
 
-	// pd.Put(SK_1, SV_1)
+	pd.Put(SK_1, SV_1)
 
-	// key := pd.getParentAccountKey(SK_1)
-	// if key == nil {
-	// 	t.Fatalf("Failed to get parent account key for %x", SK_1)
-	// }
-	// fmt.Printf("Parent account key for %x: %x\n", SK_1, key)
+	key := pd.GetParentAccountKey(SK_1)
+	if key == nil {
+		t.Fatalf("Failed to get parent account key for %x", SK_1)
+	}
+	fmt.Printf("Parent account key for %x: %x\n", SK_1, key)
 }
 
 func TestMemCache(t *testing.T) {
@@ -217,19 +217,25 @@ func TestMemCache(t *testing.T) {
 		t.Fatalf("Failed to create PrefixDB: %v", err)
 	}
 	defer pd.Close()
-	// SK_1 := []byte("4f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e01")
-	// SK_1, _ = hex.DecodeString(string(SK_1))
-	// // SV_1 := []byte("SV_1_value")
+	AK_1 := []byte("410000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e")
+	AK_1, _ = hex.DecodeString(string(AK_1))
+	AV_1 := []byte("val")
+	pd.Put(AK_1, AV_1)
 
-	// pd.getParentAccountKey(SK_1)
-	// value, got, err := pd.Get(SK_1)
-	// if err != nil || !got {
-	// 	t.Fatalf("Failed to get SK_1: %v", err)
-	// }
-	// if value == nil {
-	// 	t.Fatalf("Expected value for SK_1, got nil")
-	// }
-	// fmt.Printf("Value for SK_1: %x\n", value)
+	SK_1 := []byte("4f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e01")
+	SK_1, _ = hex.DecodeString(string(SK_1))
+	SV_1 := []byte("SV_1_value")
+	pd.Put(SK_1, SV_1)
+
+	pd.GetParentAccountKey(SK_1)
+	value, got, err := pd.Get(SK_1)
+	if err != nil || !got {
+		t.Fatalf("Failed to get SK_1: %v", err)
+	}
+	if value == nil {
+		t.Fatalf("Expected value for SK_1, got nil")
+	}
+	fmt.Printf("Value for SK_1: %x\n", value)
 }
 
 func TestReadFile(t *testing.T) {

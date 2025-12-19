@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"errors"
 	"sync"
 	"unsafe"
 )
@@ -421,4 +422,36 @@ func StringToBytes(s string) []byte {
 			Cap int
 		}{s, len(s)},
 	))
+}
+
+// Define custom errors to replace ethdb's if they are undefined
+var (
+	ErrClosed     = errors.New("database closed")
+	ErrNotFound   = errors.New("not found")
+	ErrCompaction = errors.New("compaction error") // Example, if you need more
+)
+
+// logEntry represents a single key-value pair within a block in the data log.
+// Format on disk: blockID (uint64) | keyLen (uint32) | valueLen (uint32) | key (bytes) | value (bytes)
+type logEntry struct {
+	BlockID uint64
+	Key     string
+	Value   string // Can be TombstoneMarker for deletion
+	Offset  int64  // Offset in the data file where this entry starts
+}
+
+// blockIndexEntry stores the start and end offset for all entries belonging to a block.
+// Format on disk: blockID (uint64) | startOffset (uint64) | endOffset (uint64)
+type blockIndexEntry struct {
+	BlockID     uint64
+	StartOffset int64
+	EndOffset   int64 // Offset *after* the last byte of the last entry for this block
+}
+
+// kvPointer stores the location of a specific key's value in the data log.
+// Used as the value in the skiplist.
+type kvPointer struct {
+	Offset   int64 // Offset of the logEntry start
+	ValueLen uint32
+	BlockID  uint64 // The block ID this entry belongs to
 }

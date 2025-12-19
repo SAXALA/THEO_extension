@@ -3,7 +3,6 @@ package prefixdb
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +46,8 @@ const (
 	TrieAccount KeyType = iota // TrieAccount
 	TrieStorage                // TrieStorage
 	TrieCode                   // Code
+	TASnapshot 				   // SnapshotAccount
+	TSSnapshot                 // SnapshotStorage
 )
 
 type AccountType int
@@ -71,7 +72,6 @@ type PrefixDB struct {
 	indexfile   string
 	nodeCache   *NodeCache
 	slotCache   *SlotCache
-	slotManager *SlotManager
 	batch       *WriteBatch
 	// triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *PebbleStore // pebble store for account hash key index
@@ -153,7 +153,6 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 		accountFile:         accountFile,
 		trieFile:            trieFile,
 		batch:               NewWriteBatch(cfg.WriteBatchSize),
-		slotManager:         NewSlotManager(SLOT_NUM, SLOT_SIZE),
 		writeMutex:          sync.Mutex{},
 		indexfile:           slotIndexFile,
 		accountHashKeyIndex: sync.Map{},
@@ -239,7 +238,7 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 		return value, true, nil
 
 	case TrieStorage:
-		accountKey := db.getParentAccountKey(key)
+		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			fmt.Printf("Parent account key not found for %x\n", key)
 			return nil, false, nil
@@ -303,8 +302,17 @@ func (db *PrefixDB) Put(key, value []byte) error {
 		db.nodeCache.Put(string(key), value, storageFileID, storageOffset, storageSize, 1)
 		// db.nodeCache.AsyncCachePathToNode(string(key), db)
 
+		if len(key) >= 33 {
+			accountHash := key[1:33]
+			if db.accountHashKeyPebble != nil {
+				if err := db.accountHashKeyPebble.Put(accountHash, key); err != nil {
+					return fmt.Errorf("failed to update account hash key index: %w", err)
+				}
+			}
+		}
+
 	case TrieStorage:
-		accountKey := db.getParentAccountKey(key)
+		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			fmt.Printf("Parent account key not found for %x\n", key)
 			return nil
@@ -358,7 +366,7 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 		db.nodeCache.AsyncCachePathToNode(string(key), db)
 		return true, nil
 	case TrieStorage:
-		accountKey := db.getParentAccountKey(key)
+		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			return false, nil
 		}
@@ -409,7 +417,7 @@ func (db *PrefixDB) Delete(key []byte) error {
 		// db.accountIndex.delete(string(key))
 
 	case TrieStorage:
-		accountKey := db.getParentAccountKey(key)
+		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			return nil
 		}
@@ -636,6 +644,7 @@ func (db *PrefixDB) Close() error {
 		if err := db.accountHashKeyPebble.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
 		}
+		db.accountHashKeyPebble = nil
 	}
 	return nil
 }
@@ -648,25 +657,6 @@ func (db *PrefixDB) SaveSlotIndex() error {
 		return fmt.Errorf("failed to create the prefix tree file: %v", err)
 	}
 	defer file.Close()
-
-	encoder := gob.NewEncoder(file)
-
-	// save slot manager state
-	db.slotManager.lock.Lock()
-	defer db.slotManager.lock.Unlock()
-
-	if err := encoder.Encode(db.slotManager.slotNum); err != nil {
-		return fmt.Errorf("failed to encode slot num: %v", err)
-	}
-	if err := encoder.Encode(db.slotManager.slotSize); err != nil {
-		return fmt.Errorf("failed to encode slot size: %v", err)
-	}
-	if err := encoder.Encode(db.slotManager.usedSlots); err != nil {
-		return fmt.Errorf("failed to encode used slots: %v", err)
-	}
-	if err := encoder.Encode(db.slotManager.freeSlots); err != nil {
-		return fmt.Errorf("failed to encode free slots: %v", err)
-	}
 
 	return nil
 }
@@ -687,38 +677,6 @@ func (db *PrefixDB) LoadSlotIndex() error {
 	if fileInfo.Size() == 0 {
 		// empty file, nothing to load
 		return errors.New("empty prefix tree file")
-	}
-
-	decoder := gob.NewDecoder(file)
-
-	slotInfoLoaded := false
-
-	var slotNum int
-	if err := decoder.Decode(&slotNum); err == nil {
-		var slotSize int
-		if err := decoder.Decode(&slotSize); err == nil {
-			if slotSize == db.slotManager.slotSize {
-				db.slotManager.lock.Lock()
-
-				var usedSlots map[int]struct{}
-				if err := decoder.Decode(&usedSlots); err == nil {
-					var freeSlots map[int]struct{}
-					if err := decoder.Decode(&freeSlots); err == nil {
-						db.slotManager.slotNum = slotNum
-						db.slotManager.usedSlots = usedSlots
-						db.slotManager.freeSlots = freeSlots
-						slotInfoLoaded = true
-					}
-				}
-
-				db.slotManager.lock.Unlock()
-			}
-		}
-	}
-
-	if !slotInfoLoaded {
-		//fmt.Println("slot manager state not loaded, reinitializing from trie file")
-		// db.markUsedSlots()
 	}
 
 	return nil
@@ -974,13 +932,17 @@ func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
 		return TrieStorage, nil
 	case 'c':
 		return TrieCode, nil
+	case 'a':
+		return TASnapshot, nil
+	case 'o':
+		return TSSnapshot, nil
 	default:
 	}
 	return -1, errors.New("unknown key type")
 }
 
-// getParentAccountKey retrieves the parent account key from a given (code or storage)key.
-func (db *PrefixDB) getParentAccountKey(key []byte) []byte {
+// GetParentAccountKey retrieves the parent account key from a given (code or storage)key.
+func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
 	if len(key) < 21 {
 		return nil
 	}
