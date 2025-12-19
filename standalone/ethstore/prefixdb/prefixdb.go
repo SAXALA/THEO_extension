@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	memcache "github.com/bradfitz/gomemcache/memcache"
 	"github.com/cockroachdb/pebble"
@@ -104,38 +105,60 @@ type SerializedTrieNode struct {
  * NewPrefixDB creates a new PrefixDB instance.
  */
 func NewPrefixDB(dirpath string) (*PrefixDB, error) {
+	// Try to load config from config.json in dirpath
+	configPath := filepath.Join(dirpath, "config.json")
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		// If config file doesn't exist or fails to load, use default config
+		cfg = DefaultConfig(dirpath)
+	} else {
+		// If BaseDir is not set in config, use dirpath
+		if cfg.BaseDir == "" {
+			cfg.BaseDir = dirpath
+		}
+	}
 
-	accountFilePath := filepath.Join(dirpath, "prefixdb", "na")
-	//storageFIlePath := filepath.Join(dirpath, "prefixdb", "storage")
-	triePath := filepath.Join(dirpath, "prefixdb", "trie")
-	pebblePath := "/mnt/ssd/ethstore/index/accountHash_key_pebble"
+	// Ensure base directory exists
+	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create base dir: %v", err)
+	}
+
+	// Resolve paths
+	accountFilePath := resolvePath(cfg.BaseDir, cfg.AccountDir)
+	triePath := resolvePath(cfg.BaseDir, cfg.TrieDir)
+	pebblePath := resolvePath(cfg.BaseDir, cfg.PebblePath)
+	storageDir := resolvePath(cfg.BaseDir, cfg.StorageDir)
+	hotStorageDir := resolvePath(cfg.BaseDir, cfg.HotStorageDir)
+	slotIndexFile := resolvePath(cfg.BaseDir, cfg.SlotIndexFile)
+
+	// Ensure directories exist
+	if err := os.MkdirAll(filepath.Dir(accountFilePath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create account dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(triePath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create trie dir: %v", err)
+	}
 
 	accountFile, err := os.OpenFile(accountFilePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, errors.New("failed to open normal account file")
 	}
-	// slotFile, err := os.OpenFile(storageFIlePath, os.O_RDWR|os.O_CREATE, 0644)
-	// if err != nil {
-	// 	return nil, errors.New("failed to open contract account file")
-	// }
+
 	trieFile, err := os.OpenFile(triePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, errors.New("failed to open prefix tree file")
 	}
 
-	// get the path for the prefix tree file (same directory as normal account file)
-
 	db := &PrefixDB{
-		accountFile: accountFile,
-		// slotFile:            slotFile,
+		accountFile:         accountFile,
 		trieFile:            trieFile,
-		batch:               NewWriteBatch(4096),
+		batch:               NewWriteBatch(cfg.WriteBatchSize),
 		slotManager:         NewSlotManager(SLOT_NUM, SLOT_SIZE),
 		writeMutex:          sync.Mutex{},
-		indexfile:           filepath.Join(dirpath, "prefixdb", "slotIndex"),
+		indexfile:           slotIndexFile,
 		accountHashKeyIndex: sync.Map{},
-		storageDir:          filepath.Join(dirpath, "prefixdb", "storagefiles"),
-		hotStorageDir:       filepath.Join(dirpath, "prefixdb", "storagefiles", "hotstorage"),
+		storageDir:          storageDir,
+		hotStorageDir:       hotStorageDir,
 		hotGCStop:           make(chan struct{}),
 	}
 
@@ -153,8 +176,8 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 		return nil, fmt.Errorf("failed to init hot storage shard: %v", err)
 	}
 
-	db.nodeCache = NewNodeCache(MAX_CACHE_SIZE, db)
-	db.slotCache = NewSlotCache(1024, db)
+	db.nodeCache = NewNodeCache(cfg.MaxCacheSize, db)
+	db.slotCache = NewSlotCache(cfg.SlotCacheSize, db)
 
 	prefixTree, err := NewPrefixTree(db, dirpath)
 	if err != nil {
@@ -168,19 +191,10 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 		return nil, fmt.Errorf("failed to create PebbleStore: %v", err)
 	}
 
-	db.memcache = memcache.New("127.0.0.1:11211")
-	// err = db.buildMemCache()
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to build memcache: %v", err)
-	// }
+	db.memcache = memcache.New(cfg.MemcacheAddr)
 
 	db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
-	// try to load the persisted prefix tree
-	// if err := db.LoadSlotIndex(); err != nil {
-	// 	// if loading fails, use an empty prefix tree (already initialized in the constructor)
-	// 	fmt.Printf("unable to load slotIndex: %v\n", err)
-	// }
 	go db.hotGCWorker(2 * time.Minute)
 
 	return db, nil
@@ -195,7 +209,7 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 	switch keyType {
 	case TrieAccount:
 		// check in cache
-		if value, _, _, _, ok := db.nodeCache.Get(string(key)); ok {
+		if value, _, _, _, ok := db.nodeCache.Get(bytesToString(key)); ok {
 			return value, true, nil
 		}
 
@@ -232,8 +246,8 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			// return nil, false, errors.New("parent account not found")
 		}
 
-		if data, ok := db.slotCache.GetAccount(string(accountKey)); ok {
-			if value, exists := data[string(key)]; exists {
+		if data, ok := db.slotCache.GetAccount(bytesToString(accountKey)); ok {
+			if value, exists := data[bytesToString(key)]; exists {
 				return value, true, nil
 			} else {
 				return nil, false, nil
@@ -245,7 +259,7 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			fmt.Println("Error ensuring account storage cached:", err)
 			return nil, false, err
 		}
-		if value, exists := m[string(key)]; exists {
+		if value, exists := m[bytesToString(key)]; exists {
 			return value, true, nil
 		}
 	default:
@@ -268,7 +282,7 @@ func (db *PrefixDB) Put(key, value []byte) error {
 		var storageOffset int64 = 0
 		var storageSize uint32 = 0
 		var ok bool
-		if _, storageFileID, storageOffset, storageSize, ok = db.nodeCache.Get(string(key)); !ok {
+		if _, storageFileID, storageOffset, storageSize, ok = db.nodeCache.Get(bytesToString(key)); !ok {
 			if _, storageFileID, storageOffset, storageSize, ok = db.batch.get(key); !ok {
 				// not found in cache or batch, get from prefix tree
 				// node, err := db.getNode(key)
@@ -315,7 +329,7 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 	switch keyType {
 	case TrieAccount:
 		// check in cache
-		if _, _, _, _, ok := db.nodeCache.Get(string(key)); ok {
+		if _, _, _, _, ok := db.nodeCache.Get(bytesToString(key)); ok {
 			return true, nil
 		}
 
@@ -352,7 +366,7 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, ok := m[string(key)]
+		_, ok := m[bytesToString(key)]
 		return ok, nil
 
 	default:
@@ -369,7 +383,7 @@ func (db *PrefixDB) Delete(key []byte) error {
 	switch keyType {
 	case TrieAccount:
 		var ok bool
-		if _, _, _, _, ok = db.nodeCache.Get(string(key)); !ok {
+		if _, _, _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
 			if _, _, _, _, ok = db.batch.get(key); !ok {
 				node, err := db.getNode(key)
 				if err != nil {
@@ -383,7 +397,7 @@ func (db *PrefixDB) Delete(key []byte) error {
 				db.batch.delete(key)
 			}
 		} else {
-			db.nodeCache.Delete(string(key))
+			db.nodeCache.Delete(bytesToString(key))
 		}
 
 		// delete node
@@ -532,8 +546,12 @@ func (db *PrefixDB) Close() error {
 		db.slotCache.FlushAll()
 	}
 
-	db.nodeCache.Close()
-	db.slotCache.Close()
+	if db.nodeCache != nil {
+		db.nodeCache.Close()
+	}
+	if db.slotCache != nil {
+		db.slotCache.Close()
+	}
 
 	// forbid further writes to the database
 	if db.batch != nil {
@@ -554,7 +572,12 @@ func (db *PrefixDB) Close() error {
 	}
 
 	if db.hotGCStop != nil {
-		close(db.hotGCStop)
+		select {
+		case <-db.hotGCStop:
+			// already closed
+		default:
+			close(db.hotGCStop)
+		}
 	}
 	if db.hotCurFile != nil {
 		_ = db.hotCurFile.Sync()
@@ -573,7 +596,10 @@ func (db *PrefixDB) Close() error {
 	errs := []error{}
 
 	if err := db.accountFile.Sync(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to sync account file: %v", err))
+		// Check if file is already closed
+		if !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, fmt.Errorf("failed to sync account file: %v", err))
+		}
 	}
 
 	// if err := db.slotFile.Sync(); err != nil {
@@ -581,7 +607,9 @@ func (db *PrefixDB) Close() error {
 	// }
 
 	if err := db.accountFile.Close(); err != nil {
-		errs = append(errs, err)
+		if !errors.Is(err, os.ErrClosed) {
+			errs = append(errs, err)
+		}
 	}
 
 	// if err := db.slotFile.Close(); err != nil {
@@ -1295,6 +1323,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 
 		var parsed uint32
 		var totalV int
+		var totalK int
 		tmp := data
 		for parsed = 0; parsed < kvCount; parsed++ {
 			if len(tmp) < 6 {
@@ -1308,6 +1337,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 			}
 			tmp = tmp[klen+vlen:]
 			totalV += vlen
+			totalK += klen
 		}
 
 		out := make(map[string][]byte, int(parsed))
@@ -1315,11 +1345,17 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		defer release(arena)
 		ap := 0
 
+		keyArena := make([]byte, totalK)
+		kp := 0
+
 		for i := uint32(0); i < parsed; i++ {
 			klen := int(binary.BigEndian.Uint16(data[:2]))
 			vlen := int(binary.BigEndian.Uint32(data[2:6]))
 			data = data[6:]
-			k := string(data[:klen])
+
+			copy(keyArena[kp:kp+klen], data[:klen])
+			k := bytesToString(keyArena[kp:kp+klen])
+			kp += klen
 			data = data[klen:]
 
 			copy(arena[ap:ap+vlen], data[:vlen])
@@ -1348,6 +1384,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 
 	var parsed uint32
 	var totalV int
+	var totalK int
 	scan := cur
 	for parsed = 0; parsed < kvCount; parsed++ {
 		if scan+6 > len(buf) {
@@ -1361,6 +1398,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		}
 		scan += klen + vlen
 		totalV += vlen
+		totalK += klen
 	}
 
 	out := make(map[string][]byte, int(parsed))
@@ -1368,12 +1406,17 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	defer release(arena)
 	ap := 0
 
+	keyArena := make([]byte, totalK)
+	kp := 0
+
 	for i := uint32(0); i < parsed; i++ {
 		klen := int(binary.BigEndian.Uint16(buf[cur : cur+2]))
 		vlen := int(binary.BigEndian.Uint32(buf[cur+2 : cur+6]))
 		cur += 6
 
-		k := string(buf[cur : cur+klen])
+		copy(keyArena[kp:kp+klen], buf[cur : cur+klen])
+		k := bytesToString(keyArena[kp:kp+klen])
+		kp += klen
 		cur += klen
 
 		copy(arena[ap:ap+vlen], buf[cur:cur+vlen])
@@ -1842,4 +1885,17 @@ func (db *PrefixDB) gcHotFileInPlace(realID uint32) error {
 	}
 	_ = f.Sync()
 	return nil
+}
+
+func bytesToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func stringToBytes(s string) []byte {
+	return *(*[]byte)(unsafe.Pointer(
+&struct {
+			string
+			Cap int
+		}{s, len(s)},
+	))
 }

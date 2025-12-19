@@ -536,7 +536,12 @@ func (pt *PrefixTree) startMergeWorker() {
 
 // Close closes the prefix tree and stops the merge worker
 func (pt *PrefixTree) Close() error {
-	close(pt.mergeStop)
+	select {
+	case <-pt.mergeStop:
+		// already closed
+	default:
+		close(pt.mergeStop)
+	}
 	pt.mergeWait.Wait()
 
 	pt.ForceMerge()

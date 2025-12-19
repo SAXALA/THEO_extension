@@ -2,6 +2,7 @@ package ethstore
 
 import (
 	"sync"
+	"unsafe"
 )
 
 // DataType defines the type of data identified by a key prefix.
@@ -401,4 +402,23 @@ func getDefaultKeyMatcher() *KeyDataTypeMatcher {
 func GetDataTypeFromKey(key []byte) DataType { // Return type changed to DataType
 	matcher := getDefaultKeyMatcher()
 	return matcher.GetDataType(key) // Call the method on the instance
+}
+
+// BytesToString converts a byte slice to a string without memory allocation.
+// Note: The string refers to the same memory as the byte slice.
+// The byte slice must not be modified while the string is in use.
+func BytesToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// StringToBytes converts a string to a byte slice without memory allocation.
+// Note: The byte slice refers to the same memory as the string.
+// The byte slice must not be modified.
+func StringToBytes(s string) []byte {
+	return *(*[]byte)(unsafe.Pointer(
+		&struct {
+			string
+			Cap int
+		}{s, len(s)},
+	))
 }

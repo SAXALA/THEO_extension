@@ -48,3 +48,4 @@ go-ycsb
 standalone/ethstore/workload/monitoe.sh
 standalone/ethstore/tool_script/*
 go-ycsb
+*.DS_Store

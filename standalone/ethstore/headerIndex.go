@@ -678,7 +678,7 @@ func (baol *BlockAppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
 		for key, ptr := range oldHeaderKeys {
 			if baol.skiplistIndex.Get(key) == nil {
 				valueBytes, err := baol.readValueBytesFromPointer(ptr)
-				if err == nil && string(valueBytes) != TombstoneMarker {
+				if err == nil && BytesToString(valueBytes) != TombstoneMarker {
 					baol.headerIndex.Set(key, ptr)
 					baol.modifiedHeaders[key] = struct{}{} // Track modified header keys
 					baol.log.Debug("Moved evicted header key to headerIndex", "key", key)
@@ -747,7 +747,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 			return "", false, fmt.Errorf("failed to read entry for key %s: %w", key, err)
 		}
 
-		value := string(valueBytes)
+		value := BytesToString(valueBytes)
 		if value == TombstoneMarker {
 			return "", true, nil // Key was explicitly deleted
 		}
@@ -768,7 +768,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 				return "", false, fmt.Errorf("failed to read header entry for key %s: %w", key, err)
 			}
 
-			value := string(valueBytes)
+			value := BytesToString(valueBytes)
 			if value == TombstoneMarker {
 				return "", true, nil
 			}

@@ -641,7 +641,7 @@ func (aol *AppendOnlyLog) Get(key string) (string, bool, error) {
 			return "", false, fmt.Errorf("failed to read value for key %s: %w", key, err)
 		}
 
-		value := string(valueBytes)
+		value := BytesToString(valueBytes)
 		if value == TombstoneMarker {
 			return "", true, nil // Key was explicitly deleted
 		}
@@ -1742,7 +1742,7 @@ func (aol *AppendOnlyLog) ensurePendingHeader(keyLen int, valLen int) error {
 		if _, err := aol.pendingFile.ReadAt(buf, 0); err != nil {
 			return err
 		}
-		if string(buf[:4]) != pendingMagic {
+		if BytesToString(buf[:4]) != pendingMagic {
 			return fmt.Errorf("unknown pending file magic")
 		}
 		aol.pendingKeyLen = binary.BigEndian.Uint16(buf[4:6])
