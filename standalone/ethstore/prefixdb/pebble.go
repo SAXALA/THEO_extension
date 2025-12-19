@@ -1,7 +1,8 @@
-package ethstore
+package prefixdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -179,6 +180,11 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 
 // Close implements the Store interface
 func (d *PebbleStore) Close() error {
+	if d.db == nil {
+		fmt.Println("PebbleStore already closed or never opened")
+		return nil // Already closed or never opened
+	}
+
 	if d.quitChan != nil {
 		errc := make(chan error)
 		d.quitChan <- errc
@@ -207,7 +213,7 @@ func (d *PebbleStore) Has(key []byte) (bool, error) {
 func (d *PebbleStore) Get(key []byte) ([]byte, error) {
 	value, closer, err := d.db.Get(key)
 	if err == pebble.ErrNotFound {
-		return nil, ErrNotFound
+		return nil, errors.New("key not found")
 	}
 	if err != nil {
 		return nil, err
@@ -477,8 +483,3 @@ func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 // 	// However, for large ranges, providing an UpperBound to Pebble is much more efficient.
 // 	return nil // Returning nil means iterate to the end (if no other bounds) or rely on Next filtering.
 // }
-
-func (d *PebbleStore) GetIterator() (*pebble.Iterator, error) {
-	iter, err := d.db.NewIter(nil)
-	return iter, err
-}

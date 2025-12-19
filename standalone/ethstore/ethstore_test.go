@@ -17,12 +17,23 @@
 package ethstore
 
 import (
+	// For profiling
+	"bufio"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"net/http" // For profiling
+	_ "net/http/pprof"
 	"os" // Added for os.MkdirTemp or t.TempDir()
+	"strings"
+
 	// For path manipulation
 	"testing"
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/dbtest"
+
 	"github.com/stretchr/testify/assert"  // Popular assertion library
 	"github.com/stretchr/testify/require" // For assertions that should fail the test immediately
 )
@@ -120,4 +131,112 @@ func TestEthStore_SpecificBlockOperations(t *testing.T) {
 	t.Run("StoreAndRetrieveBlock", func(t *testing.T) {
 		t.Log("Skipping TestEthStore_SpecificBlockOperations/StoreAndRetrieveBlock: Implement this test with actual block operation methods from ethstore.Database.")
 	})
+}
+
+func TestPutAndGet(t *testing.T) {
+
+	go func() {
+		// Start the HTTP server for pprof profiling
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
+	tempDir := "/mnt/tmp/ethstore"
+	store, err := New(tempDir, 10, "put_test", false)
+	require.NoError(t, err)
+	require.NotNil(t, store)
+	defer store.Close()
+
+	testFilePath := "/mnt/tmp/20500000_key_value_pairs.txt"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	require.NoError(t, err, "Failed to open test file")
+	defer file.Close()
+
+	counter := 0
+	reader := bufio.NewReader(file)
+	for {
+		counter++
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+		require.NoError(t, err, "Error reading line from test file")
+
+		// line format: "key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			t.Logf("无法解析行: %s", line)
+			continue
+		}
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		require.NotEmpty(t, keyPart, "Key should not be empty")
+		require.NotEmpty(t, valuePart, "Value should not be empty")
+
+		require.NoError(t, err, "Error parsing line from test file")
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+		valueBytes := []byte(valuePart)
+		// Perform the Put operation
+		err = store.Put(keyBytes, valueBytes)
+		require.NoError(t, err, "Put operation should not fail")
+		// Verify the value was stored correctly
+		// fmt.Printf("\rPut test: %d", counter)
+
+		if err != nil {
+			t.Fatalf("Get operation failed for key %s: %v", keyPart, err)
+		}
+	}
+	require.NoError(t, err, "Error scanning test file")
+	t.Log("Put test completed successfully")
+}
+
+func TestOther(t *testing.T) {
+	tempDir := "/mnt/tmp/ethstore"
+	store, err := New(tempDir, 10, "put_test", false)
+	require.NoError(t, err)
+	require.NotNil(t, store)
+	defer store.Close()
+
+	key := []byte("48000000708550f340a1297eefe721a3b0631d8dc4cc5a3462abaeef1a79726f6b")
+	value := []byte("0000000000547d05")
+
+	value, err = hex.DecodeString(string(value))
+	if err != nil {
+		t.Fatalf("Failed to decode value: %v", err)
+	}
+
+	err = store.Put(key, value)
+	if err != nil {
+		t.Fatalf("Put operation failed for key %s: %v", key, err)
+	}
+	retrievedValue, err := store.Get(key)
+	if err != nil {
+		t.Fatalf("Get operation failed for key %s: %v", key, err)
+	}
+	if string(retrievedValue) != string(value) {
+		t.Fatalf("Retrieved value does not match: got %s, want %s", retrievedValue, value)
+	}
+}
+
+func TestPraseBlockID(t *testing.T) {
+	key1 := []byte("6cfffffffc657b6c0441aafe2ef195d1828d23c133828713edb9e88ba8f931092a")
+	value1 := []byte("0137ead2")
+
+	key1, _ = hex.DecodeString(string(key1))
+	value1, _ = hex.DecodeString(string(value1))
+
+	dataType := GetDataTypeFromKey(key1)
+
+	blockID, foundBlockID := parseBlockNumberFromKey(key1, dataType)
+
+	// If not found in key, try from value (for HeaderNumber, TxLookup)
+	if !foundBlockID {
+		blockID, foundBlockID = ParseBlockNumberFromValue(value1, dataType)
+	}
+
+	fmt.Print("blockID: ", blockID, " foundBlockID: ", foundBlockID, " dataType: ", DataTypeStrings[dataType], "\n")
 }

@@ -15,7 +15,15 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
+	"github.com/tinoryj/EthStore/standalone/ethstore/ssPrefixdb"
 )
+
+// backendStats tracks operation counts and durations
+type backendStats struct {
+	ops   uint64
+	durNs uint64
+}
 
 // Define custom errors to replace ethdb's if they are undefined
 var (
@@ -68,12 +76,23 @@ func (b *errorBatch) Reset() {}
 // Replay implements ethdb.Batch and returns the predefined error.
 func (b *errorBatch) Replay(w ethdb.KeyValueWriter) error { return b.err }
 
-var aolHandledDataTypes = map[DataType]bool{
+var AolHandledDataTypes = map[DataType]bool{
 	HeaderDataType:                    true,
 	HeaderNumberDataType:              true,
 	BlockBodyDataType:                 true,
 	BlockReceiptsDataType:             true,
 	TransactionLookupMetadataDataType: true,
+}
+
+var prefixDBHandledDataTypes = map[DataType]bool{
+	TrieNodeAccountDataType: true,
+	TrieNodeStorageDataType: true,
+	CodeDataType:            true,
+}
+
+var ssPrefixdbHandledDataTypes = map[DataType]bool{
+	SnapshotAccountDataType: true,
+	SnapshotStorageDataType: true,
 }
 
 const aolDeleteTombstone = "__AOL_DELETED__"
@@ -85,7 +104,20 @@ type txLookupRLP struct {
 	TxIndex     uint64
 }
 
-// parseBlockNumberFromKey tries to parse the block number from the key structure
+// ParseBlockNumberFromKey tries to parse the block number from the key structure
+// for data types where it's expected (e.g., Header, BlockBody, BlockReceipts).
+// Key format is assumed to be: prefix (1 byte) + num (8 bytes) + ...
+func ParseBlockNumberFromKey(key []byte, dataType DataType) (uint64, bool) {
+	switch dataType {
+	case HeaderDataType, BlockBodyDataType, BlockReceiptsDataType:
+		if len(key) >= 9 { // 1 byte prefix + 8 bytes for uint64
+			return binary.BigEndian.Uint64(key[1:9]), true
+		}
+	}
+	return 0, false
+}
+
+// ParseBlockNumberFromKey tries to parse the block number from the key structure
 // for data types where it's expected (e.g., Header, BlockBody, BlockReceipts).
 // Key format is assumed to be: prefix (1 byte) + num (8 bytes) + ...
 func parseBlockNumberFromKey(key []byte, dataType DataType) (uint64, bool) {
@@ -93,6 +125,27 @@ func parseBlockNumberFromKey(key []byte, dataType DataType) (uint64, bool) {
 	case HeaderDataType, BlockBodyDataType, BlockReceiptsDataType:
 		if len(key) >= 9 { // 1 byte prefix + 8 bytes for uint64
 			return binary.BigEndian.Uint64(key[1:9]), true
+		}
+	}
+	return 0, false
+}
+
+// parseBlockNumberFromValue tries to parse the block number from the value structure
+// for data types like HeaderNumber (value is block number) or TransactionLookupMetadata (value is RLP encoded).
+func ParseBlockNumberFromValue(value []byte, dataType DataType) (uint64, bool) {
+	switch dataType {
+	case HeaderNumberDataType: // Value is num (uint64 big endian)
+		if len(value) == 8 { // Must be exactly 8 bytes for uint64
+			return binary.BigEndian.Uint64(value), true
+		}
+
+	case TransactionLookupMetadataDataType: // Value is rlp([blockhash, blocknum, txindex])
+		if len(value) == 4 {
+			return uint64(binary.BigEndian.Uint32(value)), true
+		}
+		var entry txLookupRLP
+		if err := rlp.DecodeBytes(value, &entry); err == nil {
+			return entry.BlockNumber, true
 		}
 	}
 	return 0, false
@@ -110,6 +163,9 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 			logger.Warn("Invalid value length for HeaderNumber to parse blockID", "len", len(value))
 		}
 	case TransactionLookupMetadataDataType: // Value is rlp([blockhash, blocknum, txindex])
+		if len(value) == 4 {
+			return uint64(binary.BigEndian.Uint32(value)), true
+		}
 		var entry txLookupRLP
 		if err := rlp.DecodeBytes(value, &entry); err == nil {
 			return entry.BlockNumber, true
@@ -122,9 +178,12 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 
 // Database is a persistent key-value store based on the append-only log store.
 type Database struct {
-	fn  string         // filename/directory for reporting
-	aol *AppendOnlyLog // Underlying append-only log store
-	db  *PebbleStore   // Pebble store for non-AOL data
+	fn   string                 // filename/directory for reporting
+	aol  *AppendOnlyLog         // Underlying append-only log store
+	db   *PebbleStore           // Pebble store for non-AOL data
+	pdb  *prefixdb.PrefixDB     // PrefixDB for handling prefixed keys
+	spdb *ssPrefixdb.SSPrefixDB // ssPrefixDB for handling prefixed keys with specific logic
+	baol *BlockAppendOnlyLog
 
 	diskSizeGauge *metrics.Gauge // Gauge for tracking the size of all the data in the database
 
@@ -133,6 +192,9 @@ type Database struct {
 	closed   bool            // keep track of whether we're Closed
 
 	log log.Logger // Contextual logger tracking the database path
+
+	// count tracks the number of operations (Has/Get/Put/Delete)
+
 }
 
 // New returns a wrapped EthStore object using AppendOnlyLog.
@@ -142,10 +204,21 @@ type Database struct {
 func New(dirPath string, recentN int, namespace string, readonly bool) (*Database, error) {
 	logger := log.New("database", dirPath)
 
+	prefixdb, err := prefixdb.NewPrefixDB(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+	}
+
+	ssPrefixdb, err := ssPrefixdb.NewSSPrefixDB(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize ssPrefixdb: %w", err)
+	}
 	db := &Database{
 		fn:       dirPath, // Use directory path now
 		log:      logger,
-		quitChan: make(chan chan error),
+		quitChan: make(chan chan error, 1),
+		pdb:      prefixdb, // Initialize PrefixDB with the directory path
+		spdb:     ssPrefixdb,
 	}
 
 	// Initialize the AppendOnlyLog store
@@ -155,21 +228,32 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	}
 	logger.Info("Initializing AppendOnlyLog store", "recentN", recentN) // recentN will be default if <= 0
 
-	appendLog, err := NewAppendOnlyLog(dirPath, recentN, logger)
+	appendLog, err := NewAppendOnlyLog(dirPath+"/aol", recentN, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize append-only log: %w", err)
 	}
 	db.aol = appendLog
+
+	// Initialize BlockAppendOnlyLog
+	baol, err := NewBlockAppendOnlyLog(dirPath+"/aol", recentN, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
+	}
+	db.baol = baol
 
 	// Initialize Pebble store for non-AOL data
 	pebblePath := filepath.Join(dirPath, "pebble")
 	logger.Info("Initializing Pebble store", "path", pebblePath)
 	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
 	// Pass through namespace and readonly from the New function's parameters.
+
 	pebbleStore, err := NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
 	if err != nil {
 		// Close AOL if Pebble initialization fails
+		db.pdb.Close()
+		db.spdb.Close()
 		appendLog.Close()
+		baol.Close()
 		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
 	}
 	db.db = pebbleStore
@@ -177,11 +261,19 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	// Initialize metrics
 	db.diskSizeGauge = metrics.GetOrRegisterGauge(namespace+"disk/size", nil)
 
+	// go func() {
+	// 	for errc := range db.quitChan {
+	// 		errc <- nil
+	// 		return
+	// 	}
+	// }()
+
 	return db, nil
 }
 
 // Close stops the metrics collection and closes all io accesses to the underlying key-value store.
 func (d *Database) Close() error {
+
 	d.quitLock.Lock()
 	defer d.quitLock.Unlock()
 	if d.closed {
@@ -203,6 +295,33 @@ func (d *Database) Close() error {
 		close(d.quitChan) // Close the channel itself
 		d.quitChan = nil
 	}
+
+	if d.pdb != nil {
+		if err := d.pdb.Close(); err != nil {
+			d.log.Error("Failed to close PrefixDB", "err", err)
+		}
+	}
+
+	if d.spdb != nil {
+		if err := d.spdb.Close(); err != nil {
+			d.log.Error("Failed to close SSPrefixDB", "err", err)
+		}
+	}
+
+	// Close the AppendOnlyLog store
+	if d.aol != nil {
+		if err := d.aol.Close(); err != nil {
+			d.log.Error("Failed to close AppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close AppendOnlyLog: %w", err)
+		}
+	}
+	// Close the BlockAppendOnlyLog
+	if d.baol != nil {
+		if err := d.baol.Close(); err != nil {
+			d.log.Error("Failed to close BlockAppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close BlockAppendOnlyLog: %w", err)
+		}
+	}
 	// First close Pebble store
 	if d.db != nil {
 		if err := d.db.Close(); err != nil {
@@ -211,11 +330,15 @@ func (d *Database) Close() error {
 			if aolErr := d.aol.Close(); aolErr != nil {
 				return fmt.Errorf("failed to close stores: pebble: %v, aol: %v", err, aolErr)
 			}
+
+			if baolErr := d.baol.Close(); baolErr != nil {
+				return fmt.Errorf("failed to close BlockAppendOnlyLog: %v", baolErr)
+			}
 			return fmt.Errorf("failed to close Pebble store: %v", err)
 		}
 	}
 	// Then close AOL
-	return d.aol.Close()
+	return nil
 }
 
 // Has retrieves if a key is present in the key-value store.
@@ -225,31 +348,75 @@ func (d *Database) Has(key []byte) (bool, error) {
 	if d.closed {
 		return false, ErrClosed
 	}
-	
 	dataType := GetDataTypeFromKey(key)
 
-	if aolHandledDataTypes[dataType] {
+	if AolHandledDataTypes[dataType] {
 		if d.aol == nil {
 			return false, fmt.Errorf("AOL is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
-			}
-		
-			// First check if the key exists in AOL
-		valStr, exists, err := d.aol.Get(string(key))
-		if err != nil {
-			return false, err
 		}
-		if exists {
-			// If it's a deletion marker, consider the key non-existent
-			if valStr == aolDeleteTombstone {
-				return false, nil
+		var valStr string
+		var exists bool
+		var err error
+		if dataType == TransactionLookupMetadataDataType {
+			// First check if the key exists in AOL
+			valStr, exists, err = d.aol.Get(string(key))
+			if err != nil {
+				return false, err
 			}
-			return true, nil
+			if exists {
+				// If it's a deletion marker, consider the key non-existent
+				if valStr == aolDeleteTombstone {
+					return false, nil
+				}
+				return true, nil
+			}
+		} else {
+
+			valStr, exists, err = d.baol.Get(string(key))
+
+			if err != nil {
+				return false, err
+			}
+			if exists {
+				// If it's a deletion marker, consider the key non-existent
+				if valStr == aolDeleteTombstone {
+					return false, nil
+				}
+				return true, nil
+			}
 		}
 		// If the key doesn't exist in AOL, continue to look in Pebble
+	} else if prefixDBHandledDataTypes[dataType] {
+		if d.pdb == nil {
+			return false, fmt.Errorf("PrefixDB is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+
+		// Check if the key exists in PrefixDB
+
+		exists, err := d.pdb.Has(key)
+
+		if err != nil {
+			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
+		}
+		return exists, nil
+	} else if ssPrefixdbHandledDataTypes[dataType] {
+		if d.spdb == nil {
+			return false, fmt.Errorf("SSPrefixDB is not initialized, cannot check key %x(type %s)", key, DataTypeStrings[dataType])
+		}
+		// Check if the key exists in SSPrefixDB
+
+		exists, err := d.spdb.Has(key)
+
+		if err != nil {
+			return false, fmt.Errorf("failed to check key %x in SSPrefixDB: %w", key, err)
+		}
+		return exists, nil
 	}
 
 	// Check if the key exists in Pebble
+
 	_, err := d.db.Get(key)
+
 	if err == nil {
 		return true, nil // Key exists
 	} else if err == pebble.ErrNotFound {
@@ -265,33 +432,97 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 	if d.closed {
 		return nil, ErrClosed
 	}
-	
+
 	dataType := GetDataTypeFromKey(key)
 
-	if aolHandledDataTypes[dataType] {
+	if AolHandledDataTypes[dataType] {
 		if d.aol == nil {
 			return nil, fmt.Errorf("AOL is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
-			}
-		
-			// First try to get from AOL
-		valStr, exists, err := d.aol.Get(string(key))
-		if err != nil {
-			return nil, err
 		}
-		if exists {
-			// If it's a deletion marker, return not found error
-			if valStr == aolDeleteTombstone {
-				return nil, ErrNotFound
+
+		var valStr string
+		var exists bool
+		var err error
+
+		if dataType == TransactionLookupMetadataDataType {
+
+			valStr, exists, err = d.aol.Get(string(key))
+			if err != nil {
+				return nil, err
 			}
-			// Return the found value
-			return []byte(valStr), nil
+			if exists {
+				// If it's a deletion marker, return not found error
+				if valStr == aolDeleteTombstone {
+					return nil, ErrNotFound
+				}
+				// Return the found value
+				return []byte(valStr), nil
+			}
+		} else {
+
+			valStr, exists, err = d.baol.Get(string(key))
+
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				// If it's a deletion marker, return not found error
+				if valStr == aolDeleteTombstone {
+					return nil, ErrNotFound
+				}
+				// Return the found value
+				return []byte(valStr), nil
+			}
 		}
 		// Key doesn't exist in AOL, continue to look in Pebble
 		d.log.Trace("Key not found in AOL, checking Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	} else if prefixDBHandledDataTypes[dataType] {
+		if d.pdb == nil {
+			return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+
+		// Try to get from PrefixDB
+
+		value, exists, err := d.pdb.Get(key)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
+		}
+		if !exists {
+			return nil, ErrNotFound // Key not found in PrefixDB
+		}
+		if value == nil {
+			return nil, fmt.Errorf("key %x found in PrefixDB but value is nil", key)
+		}
+		// Log the found key in PrefixDB
+		d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return value, nil // Return the found value
+	} else if ssPrefixdbHandledDataTypes[dataType] {
+		if d.spdb == nil {
+			return nil, fmt.Errorf("SSPrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Try to get from SSPrefixDB
+
+		value, exists, err := d.spdb.Get(key)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get key %x from SSPrefixDB: %w", key, err)
+		}
+		if !exists {
+			return nil, ErrNotFound // Key not found in SSPrefixDB
+		}
+		if value == nil {
+			return nil, fmt.Errorf("key %x found in SSPrefixDB but value is nil", key)
+		}
+		// Log the found key in SSPrefixDB
+		d.log.Trace("Key found in SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return value, nil // Return the found value
 	}
 
 	// Try to get from Pebble
+
 	value, err := d.db.Get(key)
+
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			return nil, ErrNotFound // Convert to EthStore specific ErrNotFound
@@ -314,7 +545,7 @@ func (d *Database) Put(key []byte, value []byte) error {
 
 	dataType := GetDataTypeFromKey(key)
 
-	if aolHandledDataTypes[dataType] {
+	if AolHandledDataTypes[dataType] {
 		if d.aol == nil {
 			return fmt.Errorf("AOL is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
@@ -330,23 +561,66 @@ func (d *Database) Put(key []byte, value []byte) error {
 		}
 
 		if foundBlockID {
-			kvs := map[string]string{string(key): string(value)}
-			err := d.aol.Append(blockID, kvs)
-			if err != nil {
-				return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+
+			var err error
+			if dataType == TransactionLookupMetadataDataType {
+
+				err = d.aol.PutKV(blockID, string(key), string(value))
+
+				if err != nil {
+					return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				}
+				d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
+			} else {
+				kvs := map[string]string{string(key): string(value)}
+
+				err = d.baol.Append(blockID, kvs)
+
+				if err != nil {
+					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				}
+				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
 			}
-			d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-			return nil // Data stored in AOL
 		}
 		// If blockID couldn't be determined for an AOL-handled type.
 		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
+	} else if prefixDBHandledDataTypes[dataType] {
+		if d.pdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in PrefixDB
+
+		err := d.pdb.Put(key, value)
+
+		if err != nil {
+			return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data stored in PrefixDB
+	} else if ssPrefixdbHandledDataTypes[dataType] {
+		if d.spdb == nil {
+			return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in SSPrefixDB
+
+		err := d.spdb.Put(key, value)
+
+		if err != nil {
+			return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data stored in SSPrefixDB
 	}
 
 	// Default: store non-AOL data in Pebble
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
 	}
+
 	err := d.db.Put(key, value)
+
 	if err != nil {
 		return fmt.Errorf("pebble put failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
@@ -363,42 +637,73 @@ func (d *Database) Put(key []byte, value []byte) error {
 func (d *Database) Delete(key []byte) error {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
-	
+
 	if d.closed {
 		return ErrClosed
 	}
-	
+
 	dataType := GetDataTypeFromKey(key)
 
-	if aolHandledDataTypes[dataType] {
+	if AolHandledDataTypes[dataType] {
 		if d.aol == nil {
 			return fmt.Errorf("AOL is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		var blockID uint64
-		var foundBlockID bool
 
-		// Try to get blockID from key (works for Header, BlockBody, BlockReceipts)
-		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+		var err error
+		if dataType == TransactionLookupMetadataDataType {
 
-		if !foundBlockID {
-			d.log.Warn("AOL delete for type not supported as blockID cannot be derived from key alone", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-			return fmt.Errorf("cannot determine blockID from key for AOL-handled type %s (key %x) during delete; AOL delete not supported for this type via this path", DataTypeStrings[dataType], key)
+			err := d.aol.Delete(string(key))
+
+			if err != nil {
+				return fmt.Errorf("aol append (delete tombstone) failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+			}
+			d.log.Trace("Stored delete tombstone via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		} else {
+
+			err = d.baol.Delete(string(key))
+
+			if err != nil {
+				return fmt.Errorf("baol append (delete tombstone) failed for key %x (type %s, blockID): %w", key, DataTypeStrings[dataType], err)
+			}
+			d.log.Trace("Stored delete tombstone via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		}
-
-		kvs := map[string]string{string(key): aolDeleteTombstone}
-		err := d.aol.Append(blockID, kvs)
-		if err != nil {
-			return fmt.Errorf("aol append (delete tombstone) failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
-		}
-		d.log.Trace("Stored delete tombstone via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+		// Successfully stored deletion marker in AOL
 		return nil // Deletion marker stored in AOL
+	} else if prefixDBHandledDataTypes[dataType] {
+		if d.pdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Delete from PrefixDB
+
+		err := d.pdb.Delete(key)
+
+		if err != nil {
+			return fmt.Errorf("failed to delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data deleted from PrefixDB
+	} else if ssPrefixdbHandledDataTypes[dataType] {
+		if d.spdb == nil {
+			return fmt.Errorf("SSPrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Delete from SSPrefixDB
+
+		err := d.spdb.Delete(key)
+
+		if err != nil {
+			return fmt.Errorf("failed to delete key %x from SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Deleted key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data deleted from SSPrefixDB
 	}
 
 	// Default: delete from Pebble
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot delete non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
 	}
+
 	err := d.db.Delete(key)
+
 	if err != nil {
 		return fmt.Errorf("pebble delete failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
@@ -432,11 +737,11 @@ func (d *Database) Path() string {
 
 // ethdbIterator is a wrapper implementing the ethdb.Iterator interface for Pebble iterator
 type ethdbIterator struct {
-	iter      *pebble.Iterator
+	iter       *pebble.Iterator
 	typePrefix byte
-	prefixLen int
-	valid     bool
-	err       error
+	prefixLen  int
+	valid      bool
+	err        error
 }
 
 // Next moves to the next entry
@@ -508,7 +813,7 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 
 	dataType := GetDataTypeFromKey(prefix) // Assuming GetDataTypeFromKey is defined elsewhere
 
-	if aolHandledDataTypes[dataType] {
+	if AolHandledDataTypes[dataType] {
 		// This is an AOL-handled type, use the 'iterator' struct.
 		d.log.Trace("Creating new iterator for AOL", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
 		iter := &iterator{
@@ -546,12 +851,12 @@ func (it *iterator) init() {
 		it.err = errors.New("iterator: database not initialized")
 		return
 	}
-    // The RLock/RUnlock for db.closed and aol access should be managed here if init performs direct aol operations.
-    // For now, we assume NewIterator holds the lock during this call.
-    // If init becomes asynchronous or complex, it needs its own locking.
+	// The RLock/RUnlock for db.closed and aol access should be managed here if init performs direct aol operations.
+	// For now, we assume NewIterator holds the lock during this call.
+	// If init becomes asynchronous or complex, it needs its own locking.
 
 	// If this iterator is for AOL:
-	if aolHandledDataTypes[GetDataTypeFromKey(it.prefix)] {
+	if AolHandledDataTypes[GetDataTypeFromKey(it.prefix)] {
 		if it.db.aol == nil {
 			it.err = errors.New("iterator: AOL not initialized in database for AOL-specific iterator")
 			it.keys = make([][]byte, 0)
@@ -633,7 +938,9 @@ func (it *iterator) Value() []byte { // Receiver changed to *iterator
 	}
 	key := it.keys[it.pos]
 	if key == nil {
-	    if(it.err == nil) { it.err = errors.New("iterator: current key is nil"); }
+		if it.err == nil {
+			it.err = errors.New("iterator: current key is nil")
+		}
 		return nil
 	}
 	// Fetches from the main Database.Get, which handles AOL/Pebble dispatch
@@ -703,4 +1010,25 @@ func (d *Database) Stat() (string, error) {
 func (d *Database) Compact(start []byte, limit []byte) error {
 	d.log.Warn("Compact operation may not be applicable or is handled differently by AppendOnlyLog")
 	return nil // Or return an error if not supported
+}
+
+func (d *Database) CloseAol() error {
+	d.quitLock.Lock()
+	defer d.quitLock.Unlock()
+	if d.aol != nil {
+		if err := d.aol.Close(); err != nil {
+			d.log.Error("Failed to close AppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close AppendOnlyLog: %w", err)
+		}
+		d.aol = nil // Clear the reference after closing
+	}
+	if d.baol != nil {
+		if err := d.baol.Close(); err != nil {
+			d.log.Error("Failed to close BlockAppendOnlyLog", "err", err)
+			return fmt.Errorf("failed to close BlockAppendOnlyLog: %w", err)
+		}
+		d.baol = nil // Clear the reference after closing
+	}
+
+	return nil
 }
