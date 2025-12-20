@@ -172,11 +172,6 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 	return pt, nil
 }
 
-func (pt *PrefixTree) getFileNodePath(prefix []byte) string {
-	fileName := fmt.Sprintf("%x.node", prefix)
-	return filepath.Join(pt.fileNodeDir, fileName)
-}
-
 // getBucketID returns the bucket ID for a given key
 func (pt *PrefixTree) getBucketID(key []byte) string {
 	if len(key) < pt.bucketPrefixLength {

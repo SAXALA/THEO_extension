@@ -288,7 +288,7 @@ func (nc *NodeCache) CachePathToNode(key string, db *PrefixDB) {
 				continue // Skip if key not found
 			}
 
-			nodeValue, err := db.readFromFile(node.offset, TrieAccount)
+			nodeValue, err := db.readFromFile(node.offset)
 			if err != nil {
 				continue // Skip on error
 			}
@@ -703,7 +703,7 @@ func (nc *NodeCache) batchCachePathNodes(nodes map[string]struct{}, db *PrefixDB
 				// fmt.Printf("Account key %s not found in index\n", currentKey)
 				continue
 			}
-			nodeValue, err := db.readFromFile(node.offset, TrieAccount)
+			nodeValue, err := db.readFromFile(node.offset)
 			if err != nil {
 				// fmt.Printf("Error reading node %s from file: %v\n", currentKey, err)
 				continue

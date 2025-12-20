@@ -46,7 +46,7 @@ const (
 	TrieAccount KeyType = iota // TrieAccount
 	TrieStorage                // TrieStorage
 	TrieCode                   // Code
-	TASnapshot 				   // SnapshotAccount
+	TASnapshot                 // SnapshotAccount
 	TSSnapshot                 // SnapshotStorage
 )
 
@@ -68,11 +68,11 @@ type PrefixDB struct {
 	prefixTree  *PrefixTree
 	accountFile *os.File
 	// slotFile    *os.File
-	trieFile    *os.File
-	indexfile   string
-	nodeCache   *NodeCache
-	slotCache   *SlotCache
-	batch       *WriteBatch
+	trieFile  *os.File
+	indexfile string
+	nodeCache *NodeCache
+	slotCache *SlotCache
+	batch     *WriteBatch
 	// triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *PebbleStore // pebble store for account hash key index
 	// hashIndex  hashIndex to aviod hash collision
@@ -227,14 +227,14 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			fmt.Printf("Account key %s not found in index\n", string(key))
 			return nil, false, nil
 		}
-		value, err := db.readFromFile(node.offset, TrieAccount)
+		value, err := db.readFromFile(node.offset)
 		if err != nil {
 			return nil, false, err
 		}
 
 		// add to cache and cache path of the node
 		db.nodeCache.Put(string(key), value, node.storageFileID, node.storageOffset, node.storageSize, 0)
-		db.nodeCache.AsyncCachePathToNode(string(key), db)
+		// db.nodeCache.AsyncCachePathToNode(string(key), db)
 		return value, true, nil
 
 	case TrieStorage:
@@ -356,7 +356,7 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 			fmt.Printf("Account key %s not found in index\n", string(key))
 			return false, nil
 		}
-		value, err := db.readFromFile(node.offset, TrieAccount)
+		value, err := db.readFromFile(node.offset)
 		if err != nil {
 			return false, err
 		}
@@ -440,23 +440,6 @@ func (db *PrefixDB) Delete(key []byte) error {
 	return nil
 }
 
-// func (db *PrefixDB) createNode(key []byte) (*TrieNode, error) {
-// 	db.nodesMutex.Lock()
-// 	defer db.nodesMutex.Unlock()
-
-// 	keyStr := string(key)
-// 	if _, exists := db.nodes[keyStr]; !exists {
-// 		db.nodes[keyStr] = &TrieNode{
-// 			children:    make(map[byte]*TrieNode), // 可以保留为空映射
-// 			slotIndices: nil,
-// 			offset:      0,
-// 			isValid:     false,
-// 		}
-// 	}
-
-// 	return db.nodes[keyStr], nil
-// }
-
 var (
 	headerPool = sync.Pool{
 		New: func() interface{} {
@@ -480,7 +463,7 @@ var (
 	}
 )
 
-// getDataBuffer返回适当大小的缓冲区
+// getDataBuffer returns a byte slice of the requested size from the appropriate buffer pool.
 func getDataBuffer(size int) []byte {
 	var buffer []byte
 	if size <= 1024 {
@@ -512,7 +495,7 @@ func putDataBuffer(buf []byte) {
 	}
 }
 
-func (db *PrefixDB) readFromFile(offset int64, keyType KeyType) ([]byte, error) {
+func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 	var file *os.File
 	file = db.accountFile
 	header := headerPool.Get().([]byte)
@@ -1316,7 +1299,7 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 			data = data[6:]
 
 			copy(keyArena[kp:kp+klen], data[:klen])
-			k := bytesToString(keyArena[kp:kp+klen])
+			k := bytesToString(keyArena[kp : kp+klen])
 			kp += klen
 			data = data[klen:]
 
@@ -1376,8 +1359,8 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		vlen := int(binary.BigEndian.Uint32(buf[cur+2 : cur+6]))
 		cur += 6
 
-		copy(keyArena[kp:kp+klen], buf[cur : cur+klen])
-		k := bytesToString(keyArena[kp:kp+klen])
+		copy(keyArena[kp:kp+klen], buf[cur:cur+klen])
+		k := bytesToString(keyArena[kp : kp+klen])
 		kp += klen
 		cur += klen
 
@@ -1460,7 +1443,24 @@ func (db *PrefixDB) openOrCreateHotFile() error {
 // ensureHotCapacity ensures that there is enough space in the current hot storage file, creating a new one if necessary.
 func (db *PrefixDB) ensureHotCapacity(need int64) error {
 	if need > hotStorageMaxFileSize-int64(binary.Size(hotFileHeader{})) {
-		return errors.New("need size larger than hotStorageMaxFileSize")
+		// create new file directly
+		_ = db.hotCurFile.Close()
+		db.hotCurFile = nil
+		db.hotCurSize = 0
+		db.hotCurFileID++
+		p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", db.hotCurFileID))
+		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			return err
+		}
+		hdr := hotFileHeader{Magic: hotFileMagic, Version: 1, Flags: 0}
+		if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to write hot header: %v", err)
+		}
+		db.hotCurFile = f
+		db.hotCurSize = int64(binary.Size(hotFileHeader{}))
+		return nil
 	}
 	if db.hotCurFile == nil {
 		return db.openOrCreateHotFile()
@@ -1855,7 +1855,7 @@ func bytesToString(b []byte) string {
 
 func stringToBytes(s string) []byte {
 	return *(*[]byte)(unsafe.Pointer(
-&struct {
+		&struct {
 			string
 			Cap int
 		}{s, len(s)},

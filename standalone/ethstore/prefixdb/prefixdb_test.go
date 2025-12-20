@@ -246,7 +246,7 @@ func TestReadFile(t *testing.T) {
 	}
 	defer pd.Close()
 
-	value, _ := pd.readFromFile(117*8, TrieAccount)
+	value, _ := pd.readFromFile(117 * 8)
 	decodedValue := hex.EncodeToString(value)
 	fmt.Printf("Read value from file: %x\n", decodedValue)
 }
