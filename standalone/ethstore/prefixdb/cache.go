@@ -437,9 +437,10 @@ type SlotCache struct {
 // Data structure stored in slot cache entries
 type slotCacheEntry struct {
 	accountKey string
-	data       map[string][]byte
+	data       []kvPair
 	// timestamp int64
 	modified bool // Track if slot has been modified
+	backing  []byte
 }
 
 // NewSlotCache creates a new slot cache
@@ -453,7 +454,7 @@ func NewSlotCache(capacity int, db *PrefixDB) *SlotCache {
 }
 
 // GetAccount returns the cached storage map for an account
-func (sc *SlotCache) GetAccount(accountKey string) (map[string][]byte, bool) {
+func (sc *SlotCache) GetAccount(accountKey string) ([]kvPair, bool) {
 	sc.lock.RLock()
 	defer sc.lock.RUnlock()
 
@@ -465,13 +466,17 @@ func (sc *SlotCache) GetAccount(accountKey string) (map[string][]byte, bool) {
 }
 
 // PutAccount inserts or replaces an account's storage map into cache
-func (sc *SlotCache) PutAccount(accountKey string, data map[string][]byte) {
+func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte) {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
 	if el, ok := sc.cache[accountKey]; ok {
 		entry := el.Value.(*slotCacheEntry)
+		if entry.backing != nil {
+			putDataBuffer(entry.backing)
+		}
 		entry.data = data
+		entry.backing = backing
 		entry.modified = false
 		sc.lruList.MoveToFront(el)
 		return
@@ -486,22 +491,47 @@ func (sc *SlotCache) PutAccount(accountKey string, data map[string][]byte) {
 		accountKey: accountKey,
 		data:       data,
 		modified:   false,
+		backing:    backing,
 	}
 	el := sc.lruList.PushFront(entry)
 	sc.cache[accountKey] = el
 }
 
+// releaseEntry releases pooled resources tied to the cache entry.
+func (sc *SlotCache) releaseEntry(entry *slotCacheEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.backing != nil {
+		putDataBuffer(entry.backing)
+		entry.backing = nil
+	}
+}
+
 // UpdateKey updates one storage key under an account in cache
-func (sc *SlotCache) UpdateKey(accountKey string, key string, value []byte) bool {
+func (sc *SlotCache) UpdateKey(accountKey string, key []byte, value []byte) bool {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
 	if el, ok := sc.cache[accountKey]; ok {
 		entry := el.Value.(*slotCacheEntry)
-		entry.data[key] = value
-		entry.modified = true
-		sc.lruList.MoveToFront(el)
-		return true
+		index, ok := binarySearchKVPairs(entry.data, key)
+		if ok {
+			entry.data[index].val = value
+			entry.modified = true
+			sc.lruList.MoveToFront(el)
+			return true
+		} else {
+			// insert new key-value pair
+			newKVP := kvPair{key: key, val: value}
+			entry.data = append(entry.data, kvPair{}) // extend slice
+			copy(entry.data[index+1:], entry.data[index:])
+			entry.data[index] = newKVP
+			entry.modified = true
+			sc.lruList.MoveToFront(el)
+			return true
+		}
+
 	}
 	return false
 }
@@ -517,6 +547,7 @@ func (sc *SlotCache) DeleteAccount(accountKey string) {
 		if entry.modified && sc.db != nil {
 			_ = sc.db.flushAccountEntry(accountKey, entry.data)
 		}
+		sc.releaseEntry(entry)
 		sc.lruList.Remove(el)
 		delete(sc.cache, accountKey)
 	}
@@ -547,6 +578,7 @@ func (sc *SlotCache) evictLRU() {
 			fmt.Printf("Error flushing modified account %s during eviction: %v\n", entry.accountKey, err)
 		}
 	}
+	sc.releaseEntry(entry)
 	delete(sc.cache, entry.accountKey)
 	sc.lruList.Remove(el)
 }

@@ -50,6 +50,38 @@ const (
 	TSSnapshot                 // SnapshotStorage
 )
 
+type kvPair struct {
+	key []byte
+	val []byte
+}
+
+// binarySearchKVPairs locates key in a sorted kvPair slice using bytes.Compare.
+// Returns the index and true when found, or the insertion point and false otherwise.
+func binarySearchKVPairs(pairs []kvPair, key []byte) (int, bool) {
+	low, high := 0, len(pairs)-1
+	for low <= high {
+		mid := (low + high) >> 1
+		cmp := bytes.Compare(pairs[mid].key, key)
+		switch {
+		case cmp == 0:
+			return mid, true
+		case cmp < 0:
+			low = mid + 1
+		default:
+			high = mid - 1
+		}
+	}
+	return low, false
+
+	// // use for
+	// for i, pair := range pairs {
+	// 	if bytes.Equal(pair.key, key) {
+	// 		return i, true
+	// 	}
+	// }
+	// return -1, false
+}
+
 type AccountType int
 
 const (
@@ -122,6 +154,8 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create base dir: %v", err)
 	}
+
+	// pebblePath := filepath.Join("/mnt/ssd/ethstore/index/accountHash_key_pebble")
 
 	// Resolve paths
 	accountFilePath := resolvePath(cfg.BaseDir, cfg.AccountDir)
@@ -246,20 +280,19 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 		}
 
 		if data, ok := db.slotCache.GetAccount(bytesToString(accountKey)); ok {
-			if value, exists := data[bytesToString(key)]; exists {
-				return value, true, nil
-			} else {
-				return nil, false, nil
+			if index, found := binarySearchKVPairs(data, key); found {
+				return data[index].val, true, nil
 			}
+			return nil, false, nil
 		}
 
-		m, err := db.ensureAccountStorageCached(accountKey)
+		data, err := db.ensureAccountStorageCached(accountKey)
 		if err != nil {
 			fmt.Println("Error ensuring account storage cached:", err)
 			return nil, false, err
 		}
-		if value, exists := m[bytesToString(key)]; exists {
-			return value, true, nil
+		if index, found := binarySearchKVPairs(data, key); found {
+			return data[index].val, true, nil
 		}
 	default:
 		return nil, false, errors.New("unknown key type")
@@ -322,7 +355,7 @@ func (db *PrefixDB) Put(key, value []byte) error {
 			return err
 		}
 		// update in slot cache
-		db.slotCache.UpdateKey(string(accountKey), string(key), value)
+		db.slotCache.UpdateKey(string(accountKey), key, value)
 		return nil
 	}
 	return nil
@@ -374,8 +407,10 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, ok := m[bytesToString(key)]
-		return ok, nil
+		if _, found := binarySearchKVPairs(m, key); found {
+			return true, nil
+		}
+		return false, nil
 
 	default:
 		return false, errors.New("unknown key type")
@@ -421,16 +456,16 @@ func (db *PrefixDB) Delete(key []byte) error {
 		if accountKey == nil {
 			return nil
 		}
-		m, err := db.ensureAccountStorageCached(accountKey)
+		data, err := db.ensureAccountStorageCached(accountKey)
 		if err != nil {
 			return err
 		}
-		if _, ok := m[string(key)]; ok {
+		if index, found := binarySearchKVPairs(data, key); found {
 			// delete
-			delete(m, string(key))
-			db.slotCache.UpdateKey(string(accountKey), string(key), nil)
-			delete(m, string(key))
+			data = append(data[:index], data[index+1:]...)
+			db.slotCache.UpdateKey(string(accountKey), key, nil)
 		}
+
 		return nil
 
 	default:
@@ -495,6 +530,26 @@ func putDataBuffer(buf []byte) {
 	}
 }
 
+func readUint16BE(b []byte) uint16 {
+	return uint16(b[0])<<8 | uint16(b[1])
+}
+
+func readUint32BE(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func writeUint16BE(b []byte, v uint16) {
+	b[0] = byte(v >> 8)
+	b[1] = byte(v)
+}
+
+func writeUint32BE(b []byte, v uint32) {
+	b[0] = byte(v >> 24)
+	b[1] = byte(v >> 16)
+	b[2] = byte(v >> 8)
+	b[3] = byte(v)
+}
+
 func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 	var file *os.File
 	file = db.accountFile
@@ -512,8 +567,8 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read header at offset %d: %v", offset, err)
 	}
 
-	keySize := int(binary.BigEndian.Uint16(header[0:2]))
-	valueSize := int(binary.BigEndian.Uint16(header[2:4]))
+	keySize := int(uint16(header[0])<<8 | uint16(header[1]))
+	valueSize := int(uint16(header[2])<<8 | uint16(header[3]))
 
 	totalSize := keySize + valueSize
 
@@ -1047,32 +1102,32 @@ func (db *PrefixDB) ensureStorageCapacity(need int64) error {
 }
 
 // [kvCount u32] [keyLen u16][valLen u32][key][val]...
-func (db *PrefixDB) serializeStorageSegment(kvs map[string][]byte) ([]byte, error) {
+func (db *PrefixDB) serializeStorageSegment(kvs []kvPair) ([]byte, error) {
 	est := 4
-	for k, v := range kvs {
-		est += 4 + len(k) + len(v)
+	for _, v := range kvs {
+		est += 6 + len(v.key) + len(v.val)
 	}
 
 	buf := make([]byte, 0, est)
 	tmp := make([]byte, 6)
 	//kv count
-	binary.BigEndian.PutUint32(tmp[0:4], uint32(len(kvs)))
+	writeUint32BE(tmp[0:4], uint32(len(kvs)))
 	buf = append(buf, tmp[0:4]...)
-	for k, v := range kvs {
-		if len(k) > 0xFFFF {
-			return nil, fmt.Errorf("key too large: %d", len(k))
+	for _, v := range kvs {
+		if len(v.key) > 0xFFFF {
+			return nil, fmt.Errorf("key too large: %d", len(v.key))
 		}
-		binary.BigEndian.PutUint16(tmp[:2], uint16(len(k)))
-		binary.BigEndian.PutUint32(tmp[2:6], uint32(len(v)))
+		writeUint16BE(tmp[:2], uint16(len(v.key)))
+		writeUint32BE(tmp[2:6], uint32(len(v.val)))
 		buf = append(buf, tmp[:6]...)
-		buf = append(buf, []byte(k)...)
-		buf = append(buf, v...)
+		buf = append(buf, []byte(v.key)...)
+		buf = append(buf, v.val...)
 	}
 	return buf, nil
 }
 
 // appendStorageSegment appends a serialized storage segment to the storage file and returns its file ID, offset, and size.
-func (db *PrefixDB) appendStorageSegment(kvs map[string][]byte) (fileID uint32, offset int64, size uint32, err error) {
+func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset int64, size uint32, err error) {
 	seg, err := db.serializeStorageSegment(kvs)
 	if err != nil {
 		return 0, 0, 0, err
@@ -1090,7 +1145,7 @@ func (db *PrefixDB) appendStorageSegment(kvs map[string][]byte) (fileID uint32, 
 }
 
 // flushAccountEntry writes one account's storage map as a contiguous segment and updates PrefixTree
-func (db *PrefixDB) flushAccountEntry(accountKey string, data map[string][]byte) error {
+func (db *PrefixDB) flushAccountEntry(accountKey string, data []kvPair) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -1157,22 +1212,30 @@ func (db *PrefixDB) flushAccountEntry(accountKey string, data map[string][]byte)
 }
 
 // ensureAccountStorageCached ensures that the storage map for an account is loaded into the slot cache.
-func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) (map[string][]byte, error) {
+
+func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) ([]kvPair, error) {
 	ak := string(accountKey)
 	if data, ok := db.slotCache.GetAccount(ak); ok {
 		return data, nil
 	}
 
-	tryRead := func(fid uint32, off int64, sz uint32) (map[string][]byte, error) {
+	tryRead := func(fid uint32, off int64, sz uint32) ([]kvPair, []byte, error) {
 		if fid == 0 {
-			return map[string][]byte{}, nil
+			return nil, nil, nil
 		}
-		return db.readStorageSegmentToMap(fid, off, sz)
+		pairs, backing, err := db.readStorageSegmentToMap(fid, off, sz)
+		if err != nil {
+			if backing != nil {
+				putDataBuffer(backing)
+			}
+			return nil, nil, err
+		}
+		return pairs, backing, nil
 	}
 
 	if _, fid, off, sz, ok := db.nodeCache.Get(ak); ok && fid != 0 {
-		if m, err := tryRead(fid, off, sz); err == nil {
-			db.slotCache.PutAccount(ak, m)
+		if m, backing, err := tryRead(fid, off, sz); err == nil {
+			db.slotCache.PutAccount(ak, m, backing)
 			return m, nil
 		} else if !isShortRead(err) {
 			return nil, err
@@ -1186,54 +1249,19 @@ func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) (map[string][]
 
 	if node != nil && node.storageFileID != 0 {
 		db.nodeCache.UpdateStoragePointer(ak, node.storageFileID, node.storageOffset, node.storageSize)
-		if m, err := tryRead(node.storageFileID, node.storageOffset, node.storageSize); err == nil {
-			db.slotCache.PutAccount(ak, m)
+		if m, backing, err := tryRead(node.storageFileID, node.storageOffset, node.storageSize); err == nil {
+			db.slotCache.PutAccount(ak, m, backing)
 			return m, nil
 		} else if !isShortRead(err) {
 			return nil, err
 		}
 	}
 
-	empty := map[string][]byte{}
-	db.slotCache.PutAccount(ak, empty)
-	return empty, nil
+	db.slotCache.PutAccount(ak, nil, nil)
+	return nil, nil
 }
 
-// valueArenaBuckets defines byte slice pools for different size buckets.
-var valueArenaBuckets = []struct {
-	max  int
-	pool sync.Pool
-}{
-	{8 << 10, sync.Pool{New: func() interface{} { return make([]byte, 8<<10) }}},
-	{64 << 10, sync.Pool{New: func() interface{} { return make([]byte, 64<<10) }}},
-	{512 << 10, sync.Pool{New: func() interface{} { return make([]byte, 512<<10) }}},
-}
-
-// getValueArena retrieves a byte slice of at least 'need' bytes from the appropriate pool.
-func getValueArena(need int) ([]byte, func([]byte)) {
-	if need == 0 {
-		return nil, func([]byte) {}
-	}
-	for i := range valueArenaBuckets {
-		if need <= valueArenaBuckets[i].max {
-			buf := valueArenaBuckets[i].pool.Get().([]byte)
-			idx := i
-			return buf[:need], func(b []byte) {
-				if b == nil {
-					return
-				}
-				max := valueArenaBuckets[idx].max
-				if cap(b) < max {
-					max = cap(b)
-				}
-				valueArenaBuckets[idx].pool.Put(b[:max])
-			}
-		}
-	}
-	return make([]byte, need), func([]byte) {}
-}
-
-func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint32) (map[string][]byte, error) {
+func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint32) ([]kvPair, []byte, error) {
 	p, isHot, _ := db.storagePathByFileID(fileID)
 	if isHot {
 		lock := db.getHotFileLock(fileID)
@@ -1243,135 +1271,93 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 
 	f, err := os.Open(p)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 
 	if size == 0 {
-		return map[string][]byte{}, nil
+		return []kvPair{}, nil, nil
 	}
 
 	buf := getDataBuffer(int(size))
-	defer putDataBuffer(buf)
+
 	n, err := f.ReadAt(buf, offset)
 	if err != nil && err != io.EOF {
-		return nil, err
+		putDataBuffer(buf)
+		return nil, nil, err
 	}
 	buf = buf[:n]
 
+	var payload []byte
+	var kvCount int
+
 	if !isHot {
 		if len(buf) < 4 {
-			return nil, fmt.Errorf("segment too small")
+			putDataBuffer(buf)
+			return nil, nil, fmt.Errorf("segment too small")
 		}
-		kvCount := binary.BigEndian.Uint32(buf[:4])
-		data := buf[4:]
-
-		var parsed uint32
-		var totalV int
-		var totalK int
-		tmp := data
-		for parsed = 0; parsed < kvCount; parsed++ {
-			if len(tmp) < 6 {
-				break
-			}
-			klen := int(binary.BigEndian.Uint16(tmp[:2]))
-			vlen := int(binary.BigEndian.Uint32(tmp[2:6]))
-			tmp = tmp[6:]
-			if len(tmp) < klen+vlen {
-				break
-			}
-			tmp = tmp[klen+vlen:]
-			totalV += vlen
-			totalK += klen
+		kvCount = int(readUint32BE(buf[:4]))
+		payload = buf[4:]
+	} else {
+		if len(buf) < 10 {
+			putDataBuffer(buf)
+			return nil, nil, io.ErrUnexpectedEOF
 		}
-
-		out := make(map[string][]byte, int(parsed))
-		arena, release := getValueArena(totalV)
-		defer release(arena)
-		ap := 0
-
-		keyArena := make([]byte, totalK)
-		kp := 0
-
-		for i := uint32(0); i < parsed; i++ {
-			klen := int(binary.BigEndian.Uint16(data[:2]))
-			vlen := int(binary.BigEndian.Uint32(data[2:6]))
-			data = data[6:]
-
-			copy(keyArena[kp:kp+klen], data[:klen])
-			k := bytesToString(keyArena[kp : kp+klen])
-			kp += klen
-			data = data[klen:]
-
-			copy(arena[ap:ap+vlen], data[:vlen])
-			val := arena[ap : ap+vlen : ap+vlen]
-			out[k] = val
-
-			ap += vlen
-			data = data[vlen:]
+		if readUint32BE(buf[0:4]) != hotSegMagic {
+			putDataBuffer(buf)
+			return nil, nil, fmt.Errorf("invalid hot segment magic")
 		}
-		return out, nil
+		acctLen := int(readUint16BE(buf[4:6]))
+		kvCount = int(readUint32BE(buf[6:10]))
+		cursor := 10 + acctLen
+		if cursor > len(buf) {
+			putDataBuffer(buf)
+			return nil, nil, io.ErrUnexpectedEOF
+		}
+		payload = buf[cursor:]
 	}
 
-	if len(buf) < 10 {
-		return nil, io.ErrUnexpectedEOF
+	if kvCount < 0 {
+		putDataBuffer(buf)
+		return nil, nil, fmt.Errorf("invalid kv count: %d", kvCount)
 	}
-	if binary.BigEndian.Uint32(buf[0:4]) != hotSegMagic {
-		return nil, fmt.Errorf("invalid hot segment magic")
-	}
-	acctLen := int(binary.BigEndian.Uint16(buf[4:6]))
-	kvCount := binary.BigEndian.Uint32(buf[6:10])
-
-	cur := 10 + acctLen
-	if cur > len(buf) {
-		return nil, io.ErrUnexpectedEOF
+	if kvCount == 0 {
+		return []kvPair{}, buf, nil
 	}
 
-	var parsed uint32
-	var totalV int
-	var totalK int
-	scan := cur
-	for parsed = 0; parsed < kvCount; parsed++ {
-		if scan+6 > len(buf) {
+	entries := make([]kvPair, 0, kvCount)
+	cursor := 0
+	remaining := len(payload)
+	for i := 0; i < kvCount; i++ {
+		if remaining < 6 {
 			break
 		}
-		klen := int(binary.BigEndian.Uint16(buf[scan : scan+2]))
-		vlen := int(binary.BigEndian.Uint32(buf[scan+2 : scan+6]))
-		scan += 6
-		if scan+klen+vlen > len(buf) {
+		klen := int(readUint16BE(payload[cursor : cursor+2]))
+		vlen := int(readUint32BE(payload[cursor+2 : cursor+6]))
+		cursor += 6
+		remaining -= 6
+		if klen < 0 || vlen < 0 {
+			putDataBuffer(buf)
+			return nil, nil, fmt.Errorf("invalid kv lens: k=%d v=%d", klen, vlen)
+		}
+		need := klen + vlen
+		if remaining < need {
 			break
 		}
-		scan += klen + vlen
-		totalV += vlen
-		totalK += klen
+		key := payload[cursor : cursor+klen]
+		cursor += klen
+		remaining -= klen
+		val := payload[cursor : cursor+vlen]
+		cursor += vlen
+		remaining -= vlen
+		entries = append(entries, kvPair{key: key, val: val})
 	}
 
-	out := make(map[string][]byte, int(parsed))
-	arena, release := getValueArena(totalV)
-	defer release(arena)
-	ap := 0
+	sort.Slice(entries, func(i, j int) bool {
+		return bytes.Compare(entries[i].key, entries[j].key) < 0
+	})
 
-	keyArena := make([]byte, totalK)
-	kp := 0
-
-	for i := uint32(0); i < parsed; i++ {
-		klen := int(binary.BigEndian.Uint16(buf[cur : cur+2]))
-		vlen := int(binary.BigEndian.Uint32(buf[cur+2 : cur+6]))
-		cur += 6
-
-		copy(keyArena[kp:kp+klen], buf[cur:cur+klen])
-		k := bytesToString(keyArena[kp : kp+klen])
-		kp += klen
-		cur += klen
-
-		copy(arena[ap:ap+vlen], buf[cur:cur+vlen])
-		val := arena[ap : ap+vlen : ap+vlen]
-		out[k] = val
-
-		ap += vlen
-		cur += vlen
-	}
-	return out, nil
+	return entries, buf, nil
 }
 func isShortRead(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
@@ -1586,37 +1572,37 @@ func (db *PrefixDB) markHotFileNeedsGC(fileID uint32) error {
 }
 
 // serializeHotStorageSegment serializes a hot storage segment with an account key and key-value pairs.
-func (db *PrefixDB) serializeHotStorageSegment(accountKey string, kvs map[string][]byte) ([]byte, error) {
+func (db *PrefixDB) serializeHotStorageSegment(accountKey string, kvs []kvPair) ([]byte, error) {
 	acct := []byte(accountKey)
 	if len(acct) > 0xFFFF {
 		return nil, fmt.Errorf("account key too large: %d", len(acct))
 	}
 	est := 4 + 2 + 4 + len(acct)
-	for k, v := range kvs {
-		est += 6 + len(k) + len(v)
+	for _, v := range kvs {
+		est += 6 + len(v.key) + len(v.val)
 	}
 	buf := make([]byte, 0, est)
 	tmp := make([]byte, 10)
-	binary.BigEndian.PutUint32(tmp[0:4], hotSegMagic)
-	binary.BigEndian.PutUint16(tmp[4:6], uint16(len(acct)))
-	binary.BigEndian.PutUint32(tmp[6:10], uint32(len(kvs)))
+	writeUint32BE(tmp[0:4], hotSegMagic)
+	writeUint16BE(tmp[4:6], uint16(len(acct)))
+	writeUint32BE(tmp[6:10], uint32(len(kvs)))
 	buf = append(buf, tmp[:10]...)
 	buf = append(buf, acct...)
-	for k, v := range kvs {
-		if len(k) > 0xFFFF {
-			return nil, fmt.Errorf("key too large: %d", len(k))
+	for _, v := range kvs {
+		if len(v.key) > 0xFFFF {
+			return nil, fmt.Errorf("key too large: %d", len(v.key))
 		}
-		binary.BigEndian.PutUint16(tmp[:2], uint16(len(k)))
-		binary.BigEndian.PutUint32(tmp[2:6], uint32(len(v)))
+		writeUint16BE(tmp[:2], uint16(len(v.key)))
+		writeUint32BE(tmp[2:6], uint32(len(v.val)))
 		buf = append(buf, tmp[:6]...)
-		buf = append(buf, []byte(k)...)
-		buf = append(buf, v...)
+		buf = append(buf, []byte(v.key)...)
+		buf = append(buf, v.val...)
 	}
 	return buf, nil
 }
 
 // appendHotStorageSegment appends a serialized hot storage segment to the hot storage file and returns its file ID, offset, and size.
-func (db *PrefixDB) appendHotStorageSegment(accountKey string, kvs map[string][]byte) (fileID uint32, offset int64, size uint32, err error) {
+func (db *PrefixDB) appendHotStorageSegment(accountKey string, kvs []kvPair) (fileID uint32, offset int64, size uint32, err error) {
 	seg, err := db.serializeHotStorageSegment(accountKey, kvs)
 	if err != nil {
 		return 0, 0, 0, err
@@ -1740,12 +1726,12 @@ func (db *PrefixDB) gcHotFileInPlace(realID uint32) error {
 		if pos+10 > len(data) {
 			break
 		}
-		magic := binary.BigEndian.Uint32(data[pos : pos+4])
+		magic := readUint32BE(data[pos : pos+4])
 		if magic != hotSegMagic {
 			break
 		}
-		acctLen := int(binary.BigEndian.Uint16(data[pos+4 : pos+6]))
-		kvCount := binary.BigEndian.Uint32(data[pos+6 : pos+10])
+		acctLen := int(readUint16BE(data[pos+4 : pos+6]))
+		kvCount := readUint32BE(data[pos+6 : pos+10])
 		segStartAbs := headerSize + int64(pos)
 
 		cur := pos + 10
@@ -1763,8 +1749,8 @@ func (db *PrefixDB) gcHotFileInPlace(realID uint32) error {
 				cur = len(data)
 				break
 			}
-			klen := int(binary.BigEndian.Uint16(data[cur : cur+2]))
-			vlen := int(binary.BigEndian.Uint32(data[cur+2 : cur+6]))
+			klen := int(readUint16BE(data[cur : cur+2]))
+			vlen := int(readUint32BE(data[cur+2 : cur+6]))
 			cur += 6
 			if cur+klen+vlen > len(data) {
 				cur = len(data)

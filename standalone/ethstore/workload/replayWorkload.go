@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -31,29 +32,33 @@ const (
 )
 
 func main() {
+	mode := flag.String("mode", "re", "Mode of operation: ld (load data), re (replay trace), o (other), lb (load baseline), rb (replay baseline)")
+	flag.Parse()
+
+	otherRunner := TestGetParentKey // change here when you need a different 'o' workload
 
 	go func() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
-	// buildMemCache()
 
-	//	loadbaseline()
-	// repalybaseline()
-
-	// replayAccountPut()
-	// replayAolPut()
-	// replaySSPut()
-	replayTrace()
-	// replayPebble()
-
-	// testPdbPerformance()
-	// testAolPreformance()
-	// TestPebblePreformance()
-	// TestGetParentKey()
+	switch *mode {
+	case "ld":
+		loadData()
+	case "re":
+		replayTrace()
+	case "o":
+		otherRunner()
+	case "lb":
+		loadbaselineData()
+	case "rb":
+		replaybaseline()
+	default:
+		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
+	}
 }
 
-func loadbaseline() {
+func loadbaselineData() {
 	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
 	// store, err := ethstore.New(tempDir, 10, "put_test", false)
@@ -124,9 +129,9 @@ func loadbaseline() {
 	}
 }
 
-func repalybaseline() {
-	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
-	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+func replaybaseline() {
+	baselinePebbleDir := "/mnt/ssd/ethstore/baseline/pebble"
+	store, err := ethstore.NewPebbleStore(baselinePebbleDir, 0, 0, "", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -250,7 +255,76 @@ func repalybaseline() {
 	}
 }
 
-func replayAccountPut() {
+// load all data from the key-value file into EthStore
+func loadData() {
+	// ethStoreDir := "/mnt/ssd/ethstore/database/prefixdb"
+	ethStoreDir := "/mnt/ssd/ethstore/database"
+	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	//isSaveTrie := false
+
+	for {
+
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+
+		// line format: "key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			log.Printf("无法解析行: %s", line)
+			continue
+		}
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+
+		valueBytes := []byte(valuePart)
+
+		keyBytes, err = hex.DecodeString(string(keyBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode key: %v", err)
+		}
+		valueBytes, err = hex.DecodeString(string(valueBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode value: %v", err)
+		}
+		start := time.Now()
+		store.Put(keyBytes, valueBytes)
+		end := time.Now()
+
+		totalTime += end.Sub(start)
+		counter++
+		if counter%100000 == 0 {
+			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
+		}
+	}
+	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+}
+
+func loadAccount() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
 	pdb, err := prefixdb.NewPrefixDB(dirPath)
@@ -341,6 +415,7 @@ func replayAccountPut() {
 			totalTime += endTime.Sub(startTime)
 
 			if err != nil {
+				err = pdb.Put(keyBytes, valueBytes)
 				fmt.Printf("Get operation failed for key %s: %v", keyPart, err)
 				continue
 			}
@@ -349,6 +424,7 @@ func replayAccountPut() {
 				continue
 			}
 			if !bytes.Equal(value, valueBytes) {
+
 				fmt.Println("counter:", counter)
 				// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
 			}
@@ -964,14 +1040,14 @@ func TestGetParentKey() {
 	}
 	defer pd.Close()
 
-	SK_1 := []byte("610000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e")
-	SV_1 := []byte("f8440180a0665081a76be9ad792eec7ba0b7819e48a97cd6ab5210cae849c1ea4777ba9b6aa029164acf9a06c22bbe9da20100d94116c6ef93f44a5b58ebd6e1954c3bf436df")
-	SK_1, err = hex.DecodeString(string(SK_1))
-	SV_1, err = hex.DecodeString(string(SV_1))
+	// SK_1 := []byte("610000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e")
+	// SV_1 := []byte("f8440180a0665081a76be9ad792eec7ba0b7819e48a97cd6ab5210cae849c1ea4777ba9b6aa029164acf9a06c22bbe9da20100d94116c6ef93f44a5b58ebd6e1954c3bf436df")
+	// SK_1, err = hex.DecodeString(string(SK_1))
+	// SV_1, err = hex.DecodeString(string(SV_1))
 
-	pd.Put(SK_1, SV_1)
+	// pd.Put(SK_1, SV_1)
 
-	Key1 := []byte("6f0000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563")
+	Key1 := []byte("4f37d65eaa92c6bc4c13a5ec45527f0c18ea8932588728769ec7aecfe6d9f32e42")
 	Value1 := []byte("f91111111")
 
 	parentKey1 := pd.GetParentAccountKey(Key1)
