@@ -42,24 +42,35 @@ func main() {
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
+	databaseDir := "/mnt/ssd/ethstore/database"
+	loadDataDir := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+
+	baselinepebbledir := "/mnt/ssd/ethstore/baseline/pebble"
+	traceFile := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
+
 	switch *mode {
 	case "ld":
-		loadData()
+
+		loadData(databaseDir, loadDataDir)
+		notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
+		txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
+		loadAol(databaseDir, notxFile, txFile)
+
 	case "re":
-		replayTrace()
+		replayTrace(databaseDir, traceFile)
 	case "o":
 		otherRunner()
 	case "lb":
-		loadbaselineData()
+		loadbaselineData(baselinepebbledir, loadDataDir)
 	case "rb":
-		replaybaseline()
+		replaybaselineTrace(baselinepebbledir, traceFile)
 	default:
 		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
 	}
 }
 
-func loadbaselineData() {
-	tempDir := "/mnt/ssd/ethstore/baseline/pebble"
+func loadbaselineData(pebbleDir string, dataFile string) {
+	tempDir := pebbleDir
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
 	// store, err := ethstore.New(tempDir, 10, "put_test", false)
 	if err != nil {
@@ -67,7 +78,7 @@ func loadbaselineData() {
 	}
 	defer store.Close()
 
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+	testFilePath := dataFile
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -129,15 +140,14 @@ func loadbaselineData() {
 	}
 }
 
-func replaybaseline() {
-	baselinePebbleDir := "/mnt/ssd/ethstore/baseline/pebble"
+func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 	store, err := ethstore.NewPebbleStore(baselinePebbleDir, 0, 0, "", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
-	testFilePath := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
+	testFilePath := traceFile
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -256,19 +266,17 @@ func replaybaseline() {
 }
 
 // load all data from the key-value file into EthStore
-func loadData() {
+func loadData(dataBaseDir string, dataFile string) {
 	// ethStoreDir := "/mnt/ssd/ethstore/database/prefixdb"
-	ethStoreDir := "/mnt/ssd/ethstore/database"
+	ethStoreDir := dataBaseDir
 	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
-
 	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
+	file, err := os.Open(dataFile)
 	if err != nil {
 		log.Fatalf("Failed to open test file: %v", err)
 	}
@@ -307,6 +315,11 @@ func loadData() {
 		if err != nil {
 			log.Fatalf("Failed to decode key: %v", err)
 		}
+
+		if keyBytes[0] == 'a' && keyBytes[0] == 'o' {
+			continue
+		}
+
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
 			log.Fatalf("Failed to decode value: %v", err)
@@ -549,17 +562,14 @@ func replaySSPut() {
 	}
 }
 
-func repPlayAolPut() {
+func loadAol(dataBaseDir string, notxFile string, txFile string) {
 
-	tempDir := "/mnt/ssd/ethstore/database"
-	store, err := ethstore.New(tempDir, 200, "put_test", false)
+	store, err := ethstore.New(dataBaseDir, 200, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 	fmt.Println("Start aol put test...")
-	notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
-	txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
 
 	// Read key-value pairs from the test file
 	notxfile, err := os.Open(notxFile)
@@ -1063,15 +1073,15 @@ func TestGetParentKey() {
 	}
 }
 
-func replayTrace() {
-	tempDir := "/mnt/ssd/ethstore/database"
+func replayTrace(dataBaseDir string, traceFileDir string) {
+	tempDir := dataBaseDir
 	store, err := ethstore.New(tempDir, 1000, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
-	testFilePath := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
+	testFilePath := traceFileDir
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -1128,7 +1138,12 @@ func replayTrace() {
 			// 无效的键，跳过
 			continue
 		}
-		//|| keyBytes[0] == 'O'
+		// keyBytes[0] == 'O' storagekvs
+		// keyBytes[0] == 'A' accountkvs
+		// keyBytes[0] == 'a' accountsnapshotkvs
+		// keyBytes[0] == 'o' storagesnapshotkvs
+		// keyBytes[0] == 'c' codekvs
+
 		if keyBytes[0] == 'O' {
 		} else {
 			continue

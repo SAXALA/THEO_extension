@@ -5,7 +5,8 @@ set -e
 
 APP_NAME="workload"
 MAIN_FILE="replayWorkload.go"
-RESULT_DIR="./vtune_results_$(date +%Y%m%d_%H%M%S)"
+RESULT_BASE_DIR="./vtuneOut"
+RESULT_DIR="$RESULT_BASE_DIR/vtune_results_$(date +%Y%m%d_%H%M%S)"
 DURATION=30
 
 echo "=== Go 程序 VTune 分析 ==="
@@ -22,6 +23,7 @@ fi
 
 echo "✅ 编译成功: $(ls -lh $APP_NAME)"
 echo
+
 
 # 2. 创建结果目录
 mkdir -p "$RESULT_DIR"

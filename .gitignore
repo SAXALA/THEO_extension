@@ -49,3 +49,6 @@ standalone/ethstore/workload/monitoe.sh
 standalone/ethstore/tool_script/*
 go-ycsb
 *.DS_Store
+standalone/ethstore/workload/vtuneAna.sh
+standalone/ethstore/workload/vtuneOut/
+
