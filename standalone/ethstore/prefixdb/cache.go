@@ -47,18 +47,14 @@ type cacheEntry struct {
 	storageFileID uint32 // Storage file ID
 	storageOffset int64  // Storage offset
 	storageSize   uint64 // Storage size
-	hotOffset     uint64 // Hot storage offset
-	hotSize       uint32 // Hot storage size
 	modifiedType  ModifiedType
 	refCount      int // Reference count
 }
 
 type CacheInfo struct {
-	storageFileID    uint32 // Storage file ID
-	storageOffset    int64  // Storage offset
-	storageSize      uint64 // Storage size
-	hotStorageOffset uint64 // Hot storage offset
-	hotStorageSize   uint32 // Hot storage size
+	storageFileID uint32 // Storage file ID
+	storageOffset int64  // Storage offset
+	storageSize   uint64 // Storage size
 }
 
 // NewNodeCache creates a new node cache
@@ -138,11 +134,9 @@ func (nc *NodeCache) Get(key string) ([]byte, CacheInfo, bool) {
 	// Ensure element still exists (may have been deleted between read and write locks)
 	if element, exists = nc.cache[key]; !exists {
 		return entry.value, CacheInfo{
-			storageFileID:    entry.storageFileID,
-			storageOffset:    entry.storageOffset,
-			storageSize:      entry.storageSize,
-			hotStorageOffset: entry.hotOffset,
-			hotStorageSize:   entry.hotSize,
+			storageFileID: entry.storageFileID,
+			storageOffset: entry.storageOffset,
+			storageSize:   entry.storageSize,
 		}, true // Return previously read value
 	}
 
@@ -150,11 +144,9 @@ func (nc *NodeCache) Get(key string) ([]byte, CacheInfo, bool) {
 
 	nc.refLists[refCount].MoveToFront(element)
 	return entry.value, CacheInfo{
-		storageFileID:    entry.storageFileID,
-		storageOffset:    entry.storageOffset,
-		storageSize:      entry.storageSize,
-		hotStorageOffset: entry.hotOffset,
-		hotStorageSize:   entry.hotSize,
+		storageFileID: entry.storageFileID,
+		storageOffset: entry.storageOffset,
+		storageSize:   entry.storageSize,
 	}, true
 }
 
@@ -177,8 +169,6 @@ func (nc *NodeCache) Put(key string, value []byte, cacheInfo CacheInfo, modfiedT
 		entry.storageFileID = cacheInfo.storageFileID
 		entry.storageOffset = cacheInfo.storageOffset
 		entry.storageSize = cacheInfo.storageSize
-		entry.hotOffset = cacheInfo.hotStorageOffset
-		entry.hotSize = cacheInfo.hotStorageSize
 
 		// Just Update modifiedType to the highest level
 		if entry.modifiedType < 1 {
@@ -208,8 +198,6 @@ func (nc *NodeCache) Put(key string, value []byte, cacheInfo CacheInfo, modfiedT
 		modifiedType:  modfiedType,
 		storageOffset: cacheInfo.storageOffset,
 		storageSize:   cacheInfo.storageSize,
-		hotOffset:     cacheInfo.hotStorageOffset,
-		hotSize:       cacheInfo.hotStorageSize,
 		refCount:      1,
 	}
 
@@ -422,8 +410,6 @@ func (nc *NodeCache) UpdateStoragePointer(key string, cacheInfo CacheInfo) {
 		ent.storageFileID = cacheInfo.storageFileID
 		ent.storageOffset = cacheInfo.storageOffset
 		ent.storageSize = cacheInfo.storageSize
-		ent.hotOffset = cacheInfo.hotStorageOffset
-		ent.hotSize = cacheInfo.hotStorageSize
 	}
 	nc.lock.Unlock()
 
@@ -626,18 +612,6 @@ func (sc *SlotCache) evictLRU() {
 		return
 	}
 	entry := el.Value.(*slotCacheEntry)
-
-	// flush accessed kvs to hotfile when data size is large enough
-	if len(entry.data) >= 8192 {
-		accessedKvs := make([]kvPair, 0, len(entry.accessedIndex))
-		for _, idx := range entry.accessedIndex {
-			if idx >= 0 && idx < len(entry.data) {
-				accessedKvs = append(accessedKvs, entry.data[idx])
-			}
-		}
-		// write accessed kvs to  hotfile
-		sc.db.flushAccessedStorageEntries([]byte(entry.accountKey), accessedKvs)
-	}
 
 	sc.releaseEntry(entry)
 	delete(sc.cache, entry.accountKey)

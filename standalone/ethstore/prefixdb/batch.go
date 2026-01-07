@@ -23,13 +23,11 @@ type WriteBatch struct {
 }
 
 type WriteOperation struct {
-	value            []byte
-	modifiedType     ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
-	storageFileID    uint32       // ID of the storage file for the account
-	storageOffset    int64        // offset in the file for the account
-	storageSize      uint64       // size of the stored data
-	hotStorageOffset uint64
-	hotStorageSize   uint32
+	value         []byte
+	modifiedType  ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
+	storageFileID uint32       // ID of the storage file for the account
+	storageOffset int64        // offset in the file for the account
+	storageSize   uint64       // size of the stored data
 }
 
 func NewWriteBatch(threshold int) *WriteBatch {
@@ -240,11 +238,9 @@ func (wb *WriteBatch) get(key []byte) ([]byte, CacheInfo, bool) {
 		return nil, CacheInfo{}, false
 	}
 	return op.value, CacheInfo{
-		storageFileID:    op.storageFileID,
-		storageOffset:    op.storageOffset,
-		storageSize:      op.storageSize,
-		hotStorageOffset: op.hotStorageOffset,
-		hotStorageSize:   op.hotStorageSize,
+		storageFileID: op.storageFileID,
+		storageOffset: op.storageOffset,
+		storageSize:   op.storageSize,
 	}, exists
 }
 
@@ -260,8 +256,6 @@ func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo CacheInfo) erro
 	op.storageFileID = cacheInfo.storageFileID
 	op.storageOffset = cacheInfo.storageOffset
 	op.storageSize = cacheInfo.storageSize
-	op.hotStorageOffset = cacheInfo.hotStorageOffset
-	op.hotStorageSize = cacheInfo.hotStorageSize
 	wb.operations[string(key)] = op
 	return nil
 }

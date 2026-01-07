@@ -61,24 +61,20 @@ type TrieNode struct {
 
 	offset int64 // in the account file
 
-	storageFileID    uint32
-	storageOffset    int64
-	storageSize      uint64
-	hotStorageOffset uint64
-	hotStorageSize   uint32
-	storageKVCount   uint32
+	storageFileID  uint32
+	storageOffset  int64
+	storageSize    uint64
+	storageKVCount uint32
 
 	fileID string // file name
 }
 
 type NodeInfo struct {
-	key              []byte
-	accountOffset    int64
-	storageFileID    uint32
-	storageOffset    int64
-	storageSize      uint64
-	hotStorageOffset uint64
-	hotStorageSize   uint32
+	key           []byte
+	accountOffset int64
+	storageFileID uint32
+	storageOffset int64
+	storageSize   uint64
 }
 
 // PrefixTree
@@ -210,8 +206,6 @@ func (pt *PrefixTree) getBucketID(key []byte) string {
 // [41..44]   : storageFileID (4B)
 // [45..52]   : storageOffset (8B)
 // [53..60]	  : storageSize (8B)
-// [61..68]   : hotStorageOffset (8B)
-// [69..72]   : hotStorageSize (4B)
 // [73..75]   : reserved (3B)
 func encodeNodeEntry(nodeInfo NodeInfo) []byte {
 	entry := make([]byte, NodeEntrySize)
@@ -231,10 +225,6 @@ func encodeNodeEntry(nodeInfo NodeInfo) []byte {
 	binary.BigEndian.PutUint64(entry[45:53], uint64(nodeInfo.storageOffset))
 	// storage size
 	binary.BigEndian.PutUint64(entry[53:61], nodeInfo.storageSize)
-	// hot storage offset
-	binary.BigEndian.PutUint64(entry[61:69], nodeInfo.hotStorageOffset)
-	// hot storage size
-	binary.BigEndian.PutUint32(entry[69:73], nodeInfo.hotStorageSize)
 
 	return entry
 }
@@ -255,9 +245,6 @@ func decodeNodeEntry(entry []byte) NodeInfo {
 	res.storageFileID = binary.BigEndian.Uint32(entry[41:45])
 	res.storageOffset = int64(binary.BigEndian.Uint64(entry[45:53]))
 	res.storageSize = binary.BigEndian.Uint64(entry[53:61])
-	res.hotStorageOffset = binary.BigEndian.Uint64(entry[61:69])
-	res.hotStorageSize = binary.BigEndian.Uint32(entry[69:73])
-
 	return res
 }
 
@@ -283,13 +270,11 @@ func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error)
 	if len(key) == pt.maxDepth || depth == len(key) {
 		if currentNode.isLeaf {
 			return NodeInfo{
-				key:              key,
-				accountOffset:    currentNode.offset,
-				storageFileID:    currentNode.storageFileID,
-				storageOffset:    currentNode.storageOffset,
-				storageSize:      currentNode.storageSize,
-				hotStorageOffset: currentNode.hotStorageOffset,
-				hotStorageSize:   currentNode.hotStorageSize,
+				key:           key,
+				accountOffset: currentNode.offset,
+				storageFileID: currentNode.storageFileID,
+				storageOffset: currentNode.storageOffset,
+				storageSize:   currentNode.storageSize,
 			}, true, nil
 		}
 		return NodeInfo{}, false, nil
@@ -301,7 +286,7 @@ func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error)
 }
 
 // Put inserts or updates a key in the prefix tree
-func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64, hotOffset uint64, hotSize uint32) error {
+func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
 	pt.lock.Lock()
 	defer pt.lock.Unlock()
 	if len(key) == 0 {
@@ -311,7 +296,7 @@ func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32,
 	depth := 0
 	for depth < len(key) && depth < pt.maxDepth {
 		if currentNode.nodeType == FileNode {
-			return pt.putIntoFileNode(currentNode.fileID, key[depth:], accountOffset, storageFileID, storageOffset, storageSize, hotOffset, hotSize)
+			return pt.putIntoFileNode(currentNode.fileID, key[depth:], accountOffset, storageFileID, storageOffset, storageSize)
 		}
 		if _, exists := currentNode.children[key[depth]]; !exists {
 			currentNode.children[key[depth]] = &TrieNode{
@@ -336,11 +321,9 @@ func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32,
 				currentNode.storageFileID = storageFileID
 				currentNode.storageOffset = storageOffset
 				currentNode.storageSize = storageSize
-				currentNode.hotStorageOffset = hotOffset
-				currentNode.hotStorageSize = hotSize
 			}
 		}
-		return pt.putIntoFileNode(currentNode.fileID, key, accountOffset, storageFileID, storageOffset, storageSize, hotOffset, hotSize)
+		return pt.putIntoFileNode(currentNode.fileID, key, accountOffset, storageFileID, storageOffset, storageSize)
 	}
 	currentNode.isLeaf = true
 	currentNode.offset = accountOffset
@@ -352,7 +335,7 @@ func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32,
 	return nil
 }
 
-func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64, hotOffset uint64, hotSize uint32) error {
+func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
 	fl.Lock()
 	defer fl.Unlock()
@@ -393,13 +376,11 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset i
 
 	writeOffset := int64(binary.Size(header)) + int64(header.SortedEntryCount+header.UnsortedEntryCount)*NodeEntrySize
 	entryData := encodeNodeEntry(NodeInfo{
-		key:              key,
-		accountOffset:    accountOffset,
-		storageFileID:    storageFileID,
-		storageOffset:    storageOffset,
-		storageSize:      storageSize,
-		hotStorageOffset: hotOffset,
-		hotStorageSize:   hotSize,
+		key:           key,
+		accountOffset: accountOffset,
+		storageFileID: storageFileID,
+		storageOffset: storageOffset,
+		storageSize:   storageSize,
 	})
 	if _, err := file.WriteAt(entryData, writeOffset); err != nil {
 		return fmt.Errorf("write entry failed: %w", err)
@@ -530,13 +511,11 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	}
 	for _, e := range entries {
 		entryData := encodeNodeEntry(NodeInfo{
-			key:              e.key,
-			accountOffset:    e.accountOffset,
-			storageFileID:    e.storageFileID,
-			storageOffset:    e.storageOffset,
-			storageSize:      e.storageSize,
-			hotStorageOffset: e.hotStorageOffset,
-			hotStorageSize:   e.hotStorageSize,
+			key:           e.key,
+			accountOffset: e.accountOffset,
+			storageFileID: e.storageFileID,
+			storageOffset: e.storageOffset,
+			storageSize:   e.storageSize,
 		})
 		if _, err := file.Write(entryData); err != nil {
 			return false, fmt.Errorf("failed to write entry: %w", err)
@@ -652,13 +631,11 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 							return dec, true, nil
 						}
 						return NodeInfo{
-							key:              dec.key,
-							accountOffset:    zeroHit.accountOffset,
-							storageFileID:    dec.storageFileID,
-							storageOffset:    dec.storageOffset,
-							storageSize:      dec.storageSize,
-							hotStorageOffset: dec.hotStorageOffset,
-							hotStorageSize:   dec.hotStorageSize,
+							key:           dec.key,
+							accountOffset: zeroHit.accountOffset,
+							storageFileID: dec.storageFileID,
+							storageOffset: dec.storageOffset,
+							storageSize:   dec.storageSize,
 						}, true, nil
 					}
 					if zeroHit == nil {
@@ -832,13 +809,11 @@ func (pt *PrefixTree) mergeFileNode(filePath string) error {
 	}
 	for _, e := range entries {
 		if _, err := tf.Write(encodeNodeEntry(NodeInfo{
-			key:              e.key,
-			accountOffset:    e.accountOffset,
-			storageFileID:    e.storageFileID,
-			storageOffset:    e.storageOffset,
-			storageSize:      e.storageSize,
-			hotStorageOffset: e.hotStorageOffset,
-			hotStorageSize:   e.hotStorageSize,
+			key:           e.key,
+			accountOffset: e.accountOffset,
+			storageFileID: e.storageFileID,
+			storageOffset: e.storageOffset,
+			storageSize:   e.storageSize,
 		})); err != nil {
 			tf.Close()
 			return fmt.Errorf("write tmp entry failed: %w", err)
