@@ -52,3 +52,4 @@ go-ycsb
 standalone/ethstore/workload/vtuneAna.sh
 standalone/ethstore/workload/vtuneOut/
 
+standalone/ethstore/toolScript/*

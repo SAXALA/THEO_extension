@@ -43,7 +43,7 @@ func DefaultConfig(dirpath string) *Config {
 		MemcacheAddr:   "127.0.0.1:11211",
 		MaxCacheSize:   65535,
 		WriteBatchSize: 4096,
-		SlotCacheSize:  512,
+		SlotCacheSize:  64,
 	}
 }
 

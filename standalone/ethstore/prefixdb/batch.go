@@ -23,11 +23,13 @@ type WriteBatch struct {
 }
 
 type WriteOperation struct {
-	value         []byte
-	modifiedType  ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
-	storageFileID uint32       // ID of the storage file for the account
-	storageOffset int64        // offset in the file for the account
-	storageSize   uint32       // size of the stored data
+	value            []byte
+	modifiedType     ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
+	storageFileID    uint32       // ID of the storage file for the account
+	storageOffset    int64        // offset in the file for the account
+	storageSize      uint64       // size of the stored data
+	hotStorageOffset uint64
+	hotStorageSize   uint32
 }
 
 func NewWriteBatch(threshold int) *WriteBatch {
@@ -207,9 +209,9 @@ func (wb *WriteBatch) CommitBatch() error {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, storageFileID uint32, storageOffset int64, storageSzie uint32, modifiedType ModifiedType) {
+func (wb *WriteBatch) add(key, value []byte, storageFileID uint32, storageOffset int64, storageSize uint64, modifiedType ModifiedType) {
 	wb.lock.Lock()
-	wb.operations[string(key)] = WriteOperation{value: value, storageFileID: storageFileID, storageOffset: storageOffset, storageSize: storageSzie, modifiedType: modifiedType}
+	wb.operations[string(key)] = WriteOperation{value: value, storageFileID: storageFileID, storageOffset: storageOffset, storageSize: storageSize, modifiedType: modifiedType}
 	wb.lock.Unlock()
 
 	wb.checkAndCommit()
@@ -230,17 +232,23 @@ func (wb *WriteBatch) delete(key []byte) {
 	wb.checkAndCommit()
 }
 
-func (wb *WriteBatch) get(key []byte) ([]byte, uint32, int64, uint32, bool) {
+func (wb *WriteBatch) get(key []byte) ([]byte, CacheInfo, bool) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 	op, exists := wb.operations[string(key)]
 	if exists && op.value == nil {
-		return nil, 0, 0, 0, false
+		return nil, CacheInfo{}, false
 	}
-	return op.value, op.storageFileID, op.storageOffset, op.storageSize, exists
+	return op.value, CacheInfo{
+		storageFileID:    op.storageFileID,
+		storageOffset:    op.storageOffset,
+		storageSize:      op.storageSize,
+		hotStorageOffset: op.hotStorageOffset,
+		hotStorageSize:   op.hotStorageSize,
+	}, exists
 }
 
-func (wb *WriteBatch) updateStoragePointer(key []byte, fileID uint32, offset int64, storageSize uint32) error {
+func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo CacheInfo) error {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 
@@ -249,9 +257,25 @@ func (wb *WriteBatch) updateStoragePointer(key []byte, fileID uint32, offset int
 		return errors.New("key not found in batch or marked for deletion")
 	}
 
-	op.storageFileID = fileID
-	op.storageOffset = offset
-	op.storageSize = storageSize
+	op.storageFileID = cacheInfo.storageFileID
+	op.storageOffset = cacheInfo.storageOffset
+	op.storageSize = cacheInfo.storageSize
+	op.hotStorageOffset = cacheInfo.hotStorageOffset
+	op.hotStorageSize = cacheInfo.hotStorageSize
+	wb.operations[string(key)] = op
+	return nil
+}
+
+func (wb *WriteBatch) updateValue(key []byte, value []byte) error {
+	wb.lock.Lock()
+	defer wb.lock.Unlock()
+
+	op, exists := wb.operations[string(key)]
+	if !exists || op.value == nil {
+		return errors.New("key not found in batch or marked for deletion")
+	}
+
+	op.value = value
 	wb.operations[string(key)] = op
 	return nil
 }

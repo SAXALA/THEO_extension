@@ -30,7 +30,6 @@ const storageMaxFileSize int64 = 1 << 30      // 1GB
 const hotStorageMaxFileSize int64 = 128 << 20 // 128MB
 const hotFileIDMask uint32 = 0x80000000       // fileID with highest bit set
 const hotFileMagic uint32 = 0x48535446        // 'HSTF' for hot storage files
-const hotFlagNeedsGC uint16 = 0x0001          // flag indicating the file needs garbage collection
 const hotSegMagic uint32 = 0x48534753         // 'HGSS' for hot storage segments
 
 type hotFileHeader struct {
@@ -73,13 +72,6 @@ func binarySearchKVPairs(pairs []kvPair, key []byte) (int, bool) {
 	}
 	return low, false
 
-	// // use for
-	// for i, pair := range pairs {
-	// 	if bytes.Equal(pair.key, key) {
-	// 		return i, true
-	// 	}
-	// }
-	// return -1, false
 }
 
 type AccountType int
@@ -94,6 +86,15 @@ type StateAccount struct {
 	Balance  *big.Int
 	Root     common.Hash
 	CodeHash []byte
+}
+
+type storageOpBuffer struct {
+	accountKey     string
+	payload        []byte
+	payloadBacking []byte
+	payloadCount   int
+	pending        []byte
+	pendingCount   int
 }
 
 type PrefixDB struct {
@@ -116,13 +117,22 @@ type PrefixDB struct {
 	storageCurFile   *os.File
 	storageCurFileID uint32
 	storageCurSize   int64
+	storageBuf       storageOpBuffer
 
 	hotStorageDir string
+	hotCurMu      sync.Mutex
 	hotCurFile    *os.File
 	hotCurFileID  uint32
 	hotCurSize    int64 // current size of the hot storage file
 	hotGCStop     chan struct{}
 	hotFileLocks  sync.Map // key: real hot file id(uint32), val: *sync.Mutex
+
+	// for debug
+	totalOps   uint64
+	cachedOps  uint64
+	timeOnRead time.Duration
+	readCount  uint64
+	sortedOps  int
 }
 
 // SerializedTrieNode修改为直接存储完整路径
@@ -228,8 +238,6 @@ func NewPrefixDB(dirpath string) (*PrefixDB, error) {
 
 	db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
-	go db.hotGCWorker(2 * time.Minute)
-
 	return db, nil
 }
 
@@ -242,13 +250,15 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 	switch keyType {
 	case TrieAccount:
 		// check in cache
-		if value, _, _, _, ok := db.nodeCache.Get(bytesToString(key)); ok {
+		var value []byte
+		var ok bool
+		if value, _, ok = db.nodeCache.Get(bytesToString(key)); ok {
 			return value, true, nil
 		}
 
 		// check in batch
 		if db.batch != nil {
-			if value, _, _, _, ok := db.batch.get(key); ok {
+			if value, _, ok = db.batch.get(key); ok {
 				return value, true, nil
 			}
 		}
@@ -261,43 +271,67 @@ func (db *PrefixDB) Get(key []byte) ([]byte, bool, error) {
 			fmt.Printf("Account key %s not found in index\n", string(key))
 			return nil, false, nil
 		}
-		value, err := db.readFromFile(node.offset)
+		value, err = db.readFromFile(node.offset)
 		if err != nil {
 			return nil, false, err
 		}
 
 		// add to cache and cache path of the node
-		db.nodeCache.Put(string(key), value, node.storageFileID, node.storageOffset, node.storageSize, 0)
+		db.nodeCache.Put(string(key), value, CacheInfo{
+			storageFileID:    node.storageFileID,
+			storageOffset:    node.storageOffset,
+			storageSize:      node.storageSize,
+			hotStorageOffset: node.hotStorageOffset,
+			hotStorageSize:   node.hotStorageSize,
+		}, 0)
 		// db.nodeCache.AsyncCachePathToNode(string(key), db)
 		return value, true, nil
 
 	case TrieStorage:
+		// db.totalOps++
+
+		// if db.totalOps%10000 == 0 {
+		// 	fmt.Printf("Total Ops: %d, Cached Ops: %d, Sorted Ops: %d, Read Count: %d, Time on Read: %s\n",
+		// 		db.totalOps, db.cachedOps, db.sortedOps, db.readCount, db.timeOnRead)
+		// }
+
 		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			fmt.Printf("Parent account key not found for %x\n", key)
 			return nil, false, nil
-			// return nil, false, errors.New("parent account not found")
 		}
 
-		if data, ok := db.slotCache.GetAccount(bytesToString(accountKey)); ok {
-			if index, found := binarySearchKVPairs(data, key); found {
-				return data[index].val, true, nil
-			}
-			return nil, false, nil
-		}
+		// if data, ok := db.slotCache.GetAccount(bytesToString(accountKey)); ok {
+		// 	if index, found := binarySearchKVPairs(data, key); found {
+		// 		db.cachedOps++
+		// 		return data[index].val, true, nil
+		// 	}
+		// 	return nil, false, nil
+		// }
 
-		data, err := db.ensureAccountStorageCached(accountKey)
+		readType, err := db.ensureAccountStorageCached(accountKey, false)
 		if err != nil {
 			fmt.Println("Error ensuring account storage cached:", err)
 			return nil, false, err
 		}
-		if index, found := binarySearchKVPairs(data, key); found {
-			return data[index].val, true, nil
+		if value, ok := db.slotCache.Get(bytesToString(accountKey), key); ok {
+			return value, true, nil
+		} else {
+			if readType != readFileTypeCold {
+				_, err := db.ensureAccountStorageCached(accountKey, true)
+				if err != nil {
+					fmt.Println("Error ensuring account storage cached from hot:", err)
+					return nil, false, err
+				}
+				if value, ok := db.slotCache.Get(bytesToString(accountKey), key); ok {
+					return value, true, nil
+				}
+			}
+			return nil, false, nil
 		}
 	default:
 		return nil, false, errors.New("unknown key type")
 	}
-	return nil, false, errors.New("key not found")
 }
 
 func (db *PrefixDB) Put(key, value []byte) error {
@@ -310,53 +344,40 @@ func (db *PrefixDB) Put(key, value []byte) error {
 	case TrieAccount:
 		// isContract := db.isContractAccount(value)
 		// check accountIndex
-		var storageFileID uint32 = 0
-		var storageOffset int64 = 0
-		var storageSize uint32 = 0
-		var ok bool
-		if _, storageFileID, storageOffset, storageSize, ok = db.nodeCache.Get(bytesToString(key)); !ok {
-			if _, storageFileID, storageOffset, storageSize, ok = db.batch.get(key); !ok {
-				// not found in cache or batch, get from prefix tree
-				// node, err := db.getNode(key)
-				// if err != nil {
-				// 	return fmt.Errorf("failed to get node for key %s: %v", string(key), err)
-				// }
-				// if node == nil {
-				// 	// new account
-				// 	storageFileID = 0
-				// 	storageOffset = 0
-				// 	storageSize = 0
-				// }
-				// storageFileID = node.storageFileID
-				// storageOffset = node.storageOffset
-				// storageSize = node.storageSize
-			}
-		}
-		db.nodeCache.Put(string(key), value, storageFileID, storageOffset, storageSize, 1)
+		// var ok bool
+		// if _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
+		// 	if _, _, ok = db.batch.get(key); !ok {
+		// 		// node, err := db.getNode(key)
+		// 		// if err != nil {
+		// 		// 	return err
+		// 		// }
+		// 		// if node != nil {
+		// 		// 	cacheInfo = CacheInfo{
+		// 		// 		storageFileID:    node.storageFileID,
+		// 		// 		storageOffset:    node.storageOffset,
+		// 		// 		storageSize:      node.storageSize,
+		// 		// 		hotStorageOffset: node.hotStorageOffset,
+		// 		// 		hotStorageSize:   node.hotStorageSize,
+		// 		// 	}
+		// 		// }
+		// 	}
+		// }
+
+		db.nodeCache.UpdateValue(bytesToString(key), value, 1)
 		// db.nodeCache.AsyncCachePathToNode(string(key), db)
 
-		if len(key) >= 33 {
-			accountHash := key[1:33]
-			if db.accountHashKeyPebble != nil {
-				if err := db.accountHashKeyPebble.Put(accountHash, key); err != nil {
-					return fmt.Errorf("failed to update account hash key index: %w", err)
-				}
-			}
-		}
-
 	case TrieStorage:
+		// db.totalOps++
+		// if db.totalOps%10000 == 0 {
+		// 	fmt.Printf("Total Ops: %d, Cached Ops: %d, Sorted Ops: %d, Read Count: %d, Time on Read: %s\n",
+		// 		db.totalOps, db.cachedOps, db.sortedOps, db.readCount, db.timeOnRead)
+		// }
 		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			fmt.Printf("Parent account key not found for %x\n", key)
 			return nil
 		}
-		// ensure the account's storage is cached
-		if _, err := db.ensureAccountStorageCached(accountKey); err != nil {
-			return err
-		}
-		// update in slot cache
-		db.slotCache.UpdateKey(string(accountKey), key, value)
-		return nil
+		return db.bufferStorageMutation(accountKey, key, value)
 	}
 	return nil
 }
@@ -370,13 +391,16 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 	switch keyType {
 	case TrieAccount:
 		// check in cache
-		if _, _, _, _, ok := db.nodeCache.Get(bytesToString(key)); ok {
+		var value []byte
+		var cacheInfo CacheInfo
+		var ok bool
+		if value, cacheInfo, ok = db.nodeCache.Get(bytesToString(key)); ok {
 			return true, nil
 		}
 
 		// check in batch
 		if db.batch != nil {
-			if _, _, _, _, ok := db.batch.get(key); ok {
+			if value, cacheInfo, ok = db.batch.get(key); ok {
 				return true, nil
 			}
 		}
@@ -389,29 +413,49 @@ func (db *PrefixDB) Has(key []byte) (bool, error) {
 			fmt.Printf("Account key %s not found in index\n", string(key))
 			return false, nil
 		}
-		value, err := db.readFromFile(node.offset)
+		// return true, nil
+		value, err = db.readFromFile(node.offset)
 		if err != nil {
 			return false, err
 		}
 
 		// add to cache and cache path of the node
-		db.nodeCache.Put(string(key), value, node.storageFileID, node.storageOffset, node.storageSize, 0)
-		db.nodeCache.AsyncCachePathToNode(string(key), db)
+		db.nodeCache.Put(string(key), value, cacheInfo, 0)
+		// db.nodeCache.AsyncCachePathToNode(string(key), db)
 		return true, nil
 	case TrieStorage:
+		// db.totalOps++
+		// if db.totalOps%10000 == 0 {
+		// 	fmt.Printf("Total Ops: %d, Cached Ops: %d, Sorted Ops: %d, Read Count: %d, Time on Read: %s\n",
+		// 		db.totalOps, db.cachedOps, db.sortedOps, db.readCount, db.timeOnRead)
+		// }
+
 		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
+			fmt.Printf("Parent account key not found for %x\n", key)
 			return false, nil
 		}
-		m, err := db.ensureAccountStorageCached(accountKey)
+
+		readtype, err := db.ensureAccountStorageCached(accountKey, false)
 		if err != nil {
+			fmt.Println("Error ensuring account storage cached:", err)
 			return false, err
 		}
-		if _, found := binarySearchKVPairs(m, key); found {
+		if _, ok := db.slotCache.Get(bytesToString(accountKey), key); ok {
 			return true, nil
+		} else {
+			if readtype == readFileTypeHot {
+				_, err := db.ensureAccountStorageCached(accountKey, true)
+				if err != nil {
+					fmt.Println("Error ensuring account storage cached from hot:", err)
+					return false, err
+				}
+				if _, ok := db.slotCache.Get(bytesToString(accountKey), key); ok {
+					return true, nil
+				}
+			}
+			return false, nil
 		}
-		return false, nil
-
 	default:
 		return false, errors.New("unknown key type")
 	}
@@ -426,8 +470,8 @@ func (db *PrefixDB) Delete(key []byte) error {
 	switch keyType {
 	case TrieAccount:
 		var ok bool
-		if _, _, _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
-			if _, _, _, _, ok = db.batch.get(key); !ok {
+		if _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
+			if _, _, ok = db.batch.get(key); !ok {
 				node, err := db.getNode(key)
 				if err != nil {
 					return err
@@ -445,34 +489,227 @@ func (db *PrefixDB) Delete(key []byte) error {
 
 		// delete node
 		db.storeNode(key, &TrieNode{
-			storageFileID: 0,
-			storageOffset: 0,
-			offset:        0,
+			storageFileID:    0,
+			storageOffset:    0,
+			offset:           0,
+			storageSize:      0,
+			hotStorageOffset: 0,
+			hotStorageSize:   0,
 		})
 		// db.accountIndex.delete(string(key))
 
 	case TrieStorage:
+		db.totalOps++
+		if db.totalOps%10000 == 0 {
+			fmt.Printf("Total Ops: %d, Cached Ops: %d, Sorted Ops: %d, Read Count: %d, Time on Read: %s\n",
+				db.totalOps, db.cachedOps, db.sortedOps, db.readCount, db.timeOnRead)
+		}
+
 		accountKey := db.GetParentAccountKey(key)
 		if accountKey == nil {
 			return nil
 		}
-		data, err := db.ensureAccountStorageCached(accountKey)
-		if err != nil {
-			return err
-		}
-		if index, found := binarySearchKVPairs(data, key); found {
-			// delete
-			data = append(data[:index], data[index+1:]...)
-			db.slotCache.UpdateKey(string(accountKey), key, nil)
-		}
-
-		return nil
+		return db.bufferStorageMutation(accountKey, key, nil)
 
 	default:
 		return errors.New("unknown key type")
 	}
 
 	return nil
+}
+
+func (db *PrefixDB) bufferStorageMutation(accountKey, storageKey, value []byte) error {
+
+	if err := db.ensureStorageBuffer(accountKey); err != nil {
+		return err
+	}
+	return db.storageBuf.appendOperation(storageKey, value)
+}
+
+func (db *PrefixDB) ensureStorageBuffer(accountKey []byte) error {
+	accountStr := string(accountKey)
+	if db.storageBuf.accountKey == accountStr {
+		return nil
+	}
+	if db.storageBuf.accountKey != "" {
+		if err := db.flushStorageBuffer(); err != nil {
+			return err
+		}
+	}
+	db.storageBuf.reset()
+	db.storageBuf.accountKey = accountStr
+	return db.populateStoragePayload(accountStr, accountKey)
+}
+
+func (db *PrefixDB) populateStoragePayload(accountStr string, accountKey []byte) error {
+	if len(accountStr) == 0 {
+		return nil
+	}
+	var fileID uint32
+	var offset int64
+	var size uint64
+	if _, cacheInfo, ok := db.nodeCache.Get(accountStr); ok {
+		fileID = cacheInfo.storageFileID
+		offset = cacheInfo.storageOffset
+		size = cacheInfo.storageSize
+	} else {
+		node, err := db.getNode(accountKey)
+		if err != nil {
+			return err
+		}
+		if node != nil {
+			fileID = node.storageFileID
+			offset = node.storageOffset
+			size = node.storageSize
+		}
+	}
+	if fileID == 0 || size == 0 {
+		return nil
+	}
+	payload, count, backing, err := db.readStorageSegmentPayload(fileID, offset, size)
+	if err != nil {
+		return err
+	}
+	db.storageBuf.payload = payload
+	db.storageBuf.payloadBacking = backing
+	db.storageBuf.payloadCount = count
+	return nil
+}
+
+func (db *PrefixDB) flushStorageBuffer() error {
+	buf := &db.storageBuf
+	if buf.accountKey == "" {
+		return nil
+	}
+	node, err := db.getNode([]byte(buf.accountKey))
+	if err != nil {
+		return err
+	}
+	var accOff int64
+	if node != nil {
+		accOff = node.offset
+	}
+	total := buf.payloadCount + buf.pendingCount
+	var final []kvPair
+	if total > 0 {
+		rawEntries := kvPairEntryPool.Get().([]kvPair)
+		if cap(rawEntries) < total {
+			kvPairEntryPool.Put(rawEntries[:0])
+			rawEntries = make([]kvPair, 0, total)
+		}
+		entries := rawEntries[:0]
+		defer kvPairEntryPool.Put(entries[:0])
+		appendStream := func(data []byte, count int, zeroIsDelete bool) error {
+			if count == 0 || len(data) == 0 {
+				return nil
+			}
+			return walkKVStream(data, count, func(k, v []byte) error {
+				if zeroIsDelete && len(v) == 0 {
+					entries = append(entries, kvPair{key: k, val: nil})
+					return nil
+				}
+				entries = append(entries, kvPair{key: k, val: v})
+				return nil
+			})
+		}
+		if err := appendStream(buf.payload, buf.payloadCount, false); err != nil {
+			return err
+		}
+		if err := appendStream(buf.pending, buf.pendingCount, true); err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			sortKVPairs(entries)
+			write := 0
+			for i := 0; i < len(entries); {
+				j := i + 1
+				for ; j < len(entries) && bytes.Equal(entries[i].key, entries[j].key); j++ {
+				}
+				last := entries[j-1]
+				if last.val != nil {
+					entries[write] = last
+					write++
+				}
+				i = j
+			}
+			if write > 0 {
+				final = entries[:write]
+			}
+		}
+	}
+	if len(final) == 0 {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0, 0, 0); err != nil {
+			return err
+		}
+		db.nodeCache.UpdateStoragePointer(buf.accountKey, CacheInfo{})
+	} else {
+		fileID, off, sz, err := db.appendStorageSegment(final)
+		if err != nil {
+			return err
+		}
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, fileID, off, sz, 0, 0); err != nil {
+			return err
+		}
+		db.nodeCache.UpdateStoragePointer(buf.accountKey, CacheInfo{
+			storageFileID:    fileID,
+			storageOffset:    off,
+			storageSize:      sz,
+			hotStorageOffset: 0, // hot storage is unvalidated on storage update
+			hotStorageSize:   0,
+		})
+	}
+	if db.slotCache != nil {
+		db.slotCache.Invalidate(buf.accountKey)
+	}
+	buf.reset()
+	return nil
+}
+
+func walkKVStream(data []byte, count int, fn func(key, val []byte) error) error {
+	cursor := 0
+	for i := 0; i < count; i++ {
+		if cursor+6 > len(data) {
+			return io.ErrUnexpectedEOF
+		}
+		klen := int(readUint16BE(data[cursor : cursor+2]))
+		vlen := int(readUint32BE(data[cursor+2 : cursor+6]))
+		cursor += 6
+		if klen < 0 || vlen < 0 || cursor+klen+vlen > len(data) {
+			return io.ErrUnexpectedEOF
+		}
+		key := data[cursor : cursor+klen]
+		cursor += klen
+		val := data[cursor : cursor+vlen]
+		cursor += vlen
+		if err := fn(key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (sb *storageOpBuffer) appendOperation(key, value []byte) error {
+	if len(key) > 0xFFFF {
+		return fmt.Errorf("storage key too large: %d", len(key))
+	}
+	if len(value) > 0xFFFFFFFF {
+		return fmt.Errorf("storage value too large: %d", len(value))
+	}
+	var hdr [6]byte
+	writeUint16BE(hdr[0:2], uint16(len(key)))
+	writeUint32BE(hdr[2:6], uint32(len(value)))
+	sb.pending = append(sb.pending, hdr[:]...)
+	sb.pending = append(sb.pending, key...)
+	sb.pending = append(sb.pending, value...)
+	sb.pendingCount++
+	return nil
+}
+
+func (sb *storageOpBuffer) reset() {
+	if sb.payloadBacking != nil {
+		putDataBuffer(sb.payloadBacking)
+	}
+	*sb = storageOpBuffer{}
 }
 
 var (
@@ -496,7 +733,84 @@ var (
 			return make([]byte, 1024*1024) // 1MB
 		},
 	}
+	kvPairScratchPool = sync.Pool{
+		New: func() interface{} {
+			return make([]kvPair, 0)
+		},
+	}
+	kvPairEntryPool = sync.Pool{
+		New: func() interface{} {
+			return make([]kvPair, 0, 64)
+		},
+	}
 )
+
+// sortKVPairs performs a stable merge sort on the provided kvPair slice using a pooled buffer.
+func sortKVPairs(entries []kvPair) {
+	if len(entries) < 2 {
+		return
+	}
+
+	if len(entries) <= 65536 {
+		sort.Slice(entries, func(i, j int) bool {
+			return bytes.Compare(entries[i].key, entries[j].key) < 0
+		})
+		return
+	}
+	buf := kvPairScratchPool.Get().([]kvPair)
+	if cap(buf) < len(entries) {
+		buf = make([]kvPair, len(entries))
+	}
+	buf = buf[:len(entries)]
+	copy(buf, entries)
+
+	src := buf
+	dst := entries
+	srcIsEntries := false
+	for width := 1; width < len(entries); width <<= 1 {
+		for start := 0; start < len(entries); start += 2 * width {
+			mid := start + width
+			if mid > len(entries) {
+				mid = len(entries)
+			}
+			end := start + 2*width
+			if end > len(entries) {
+				end = len(entries)
+			}
+			left := start
+			right := mid
+			pos := start
+			for left < mid && right < end {
+				if bytes.Compare(src[left].key, src[right].key) <= 0 {
+					dst[pos] = src[left]
+					left++
+				} else {
+					dst[pos] = src[right]
+					right++
+				}
+				pos++
+			}
+			for left < mid {
+				dst[pos] = src[left]
+				left++
+				pos++
+			}
+			for right < end {
+				dst[pos] = src[right]
+				right++
+				pos++
+			}
+
+		}
+		src, dst = dst, src
+		srcIsEntries = !srcIsEntries
+	}
+
+	if !srcIsEntries {
+		copy(entries, src)
+	}
+	kvPairScratchPool.Put(buf[:0])
+}
 
 // getDataBuffer returns a byte slice of the requested size from the appropriate buffer pool.
 func getDataBuffer(size int) []byte {
@@ -527,6 +841,8 @@ func putDataBuffer(buf []byte) {
 		mediumBufferPool.Put(buf[:capacity])
 	case capacity <= 1024*1024:
 		largeBufferPool.Put(buf[:capacity])
+	default:
+		// do nothing for large buffers
 	}
 }
 
@@ -587,9 +903,10 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 }
 
 func (db *PrefixDB) Close() error {
+	errs := []error{}
 
-	if db.slotCache != nil {
-		db.slotCache.FlushAll()
+	if err := db.flushStorageBuffer(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to flush storage buffer: %v", err))
 	}
 
 	if db.nodeCache != nil {
@@ -638,8 +955,6 @@ func (db *PrefixDB) Close() error {
 	// if err := db.SaveSlotIndex(); err != nil {
 	// 	return fmt.Errorf("failed to save prefix tree: %v", err)
 	// }
-
-	errs := []error{}
 
 	if err := db.accountFile.Sync(); err != nil {
 		// Check if file is already closed
@@ -885,78 +1200,6 @@ func (db *PrefixDB) ConvertKV(key, value []byte) ([]byte, error) {
 	return formattedData, nil
 }
 
-// isContractAccount checks if the value represents a contract account
-func (db *PrefixDB) isContractAccount(value []byte) bool {
-	if len(value) == 0 {
-		return false
-	}
-
-	var rawNode []interface{}
-	if err := rlp.DecodeBytes(value, &rawNode); err != nil {
-		var account StateAccount
-		if err := rlp.DecodeBytes(value, &account); err == nil {
-			emptyCodeHash := make([]byte, common.HashLength)
-			return !bytes.Equal(account.CodeHash, emptyCodeHash)
-		}
-		return false
-	}
-	var accountRLP []byte
-	switch len(rawNode) {
-	case 2:
-		firstItem, ok := rawNode[0].([]byte)
-		if !ok || len(firstItem) == 0 {
-			// fmt.Println("无效的节点格式")
-			return false
-		}
-		prefix := firstItem[0] >> 4
-		if prefix == 2 || prefix == 3 {
-			if valBytes, ok := rawNode[1].([]byte); ok {
-				accountRLP = valBytes
-			} else {
-				return false
-			}
-		} else {
-			return false
-		}
-
-	case 17:
-		if valBytes, ok := rawNode[16].([]byte); ok && len(valBytes) > 0 {
-			accountRLP = valBytes
-		} else {
-			return false
-		}
-
-	default:
-		// fmt.Printf("未知节点格式: %d个元素\n", len(rawNode))
-		return false
-	}
-
-	if len(accountRLP) == 0 {
-		// fmt.Println("节点中没有账户数据")
-		return false
-	}
-
-	kind, _, _, err := rlp.Split(accountRLP)
-	if err != nil || kind != rlp.List {
-		// fmt.Printf("账户数据不是有效的RLP列表: %v\n", err)
-		return false
-	}
-
-	var account StateAccount
-	if err := db.decodeAccountRLP(accountRLP, &account); err != nil {
-		// fmt.Printf("解码账户数据失败: %v\n", err)
-		return false
-	}
-
-	emptyCodeHash := make([]byte, common.HashLength)
-	if !bytes.Equal(account.CodeHash, emptyCodeHash) {
-		return true
-	}
-
-	emptyRoot := common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
-	return account.Root != emptyRoot
-}
-
 // getKeyType determines the type of key based on its prefix.
 func (db *PrefixDB) getKeyType(key []byte) (KeyType, error) {
 	if len(key) == 0 {
@@ -1007,11 +1250,11 @@ func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
 }
 
 func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
-	return db.prefixTree.Put(key, node.offset, node.storageFileID, node.storageOffset, node.storageSize)
+	return db.prefixTree.Put(key, node.offset, node.storageFileID, node.storageOffset, node.storageSize, node.hotStorageOffset, node.hotStorageSize)
 }
 
 func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
-	offset, storageFileID, storageOffset, storageSize, found, err := db.prefixTree.Get(key)
+	nodeInfo, found, err := db.prefixTree.Get(key)
 	if err != nil {
 		return nil, err
 	}
@@ -1019,10 +1262,12 @@ func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 		return nil, nil
 	}
 	return &TrieNode{
-		storageFileID: storageFileID,
-		storageOffset: storageOffset,
-		storageSize:   storageSize,
-		offset:        offset,
+		storageFileID:    nodeInfo.storageFileID,
+		storageOffset:    nodeInfo.storageOffset,
+		storageSize:      nodeInfo.storageSize,
+		offset:           nodeInfo.accountOffset,
+		hotStorageOffset: nodeInfo.hotStorageOffset,
+		hotStorageSize:   nodeInfo.hotStorageSize,
 	}, nil
 }
 
@@ -1127,7 +1372,7 @@ func (db *PrefixDB) serializeStorageSegment(kvs []kvPair) ([]byte, error) {
 }
 
 // appendStorageSegment appends a serialized storage segment to the storage file and returns its file ID, offset, and size.
-func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset int64, size uint32, err error) {
+func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset int64, size uint64, err error) {
 	seg, err := db.serializeStorageSegment(kvs)
 	if err != nil {
 		return 0, 0, 0, err
@@ -1141,89 +1386,88 @@ func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset in
 		return 0, 0, 0, err
 	}
 	db.storageCurSize += need
-	return db.storageCurFileID, offset, uint32(need), nil
+	return db.storageCurFileID, offset, uint64(need), nil
 }
 
-// flushAccountEntry writes one account's storage map as a contiguous segment and updates PrefixTree
-func (db *PrefixDB) flushAccountEntry(accountKey string, data []kvPair) error {
-	if len(data) == 0 {
-		return nil
-	}
+// // flushAccountEntry writes one account's storage map as a contiguous segment and updates PrefixTree
+// func (db *PrefixDB) flushAccountEntry(accountKey string, data []kvPair) error {
+// 	var node *TrieNode
+// 	var err error
 
-	var node *TrieNode
-	var err error
-	node, err = db.getNode([]byte(accountKey))
+// 	node, err = db.getNode([]byte(accountKey))
+// 	if err != nil {
+// 		return err
+// 	}
+// 	var accOff int64
+// 	if node != nil {
+// 		accOff = node.offset
+// 	}
 
-	if err != nil {
-		return err
-	}
-	var accOff int64
-	var prevFileID uint32
-	if node != nil {
-		accOff = node.offset
-		prevFileID = node.storageFileID
-	}
+// 	if len(data) == 0 {
+// 		if err := db.prefixTree.Put([]byte(accountKey), accOff, 0, 0, 0); err != nil {
+// 			return err
+// 		}
+// 		db.nodeCache.UpdateStoragePointer(accountKey, 0, 0, 0)
+// 		return nil
+// 	}
 
-	isUpdate := (node != nil && (node.storageFileID != 0 || node.storageOffset != 0))
+// 	fileID, off, sz, err := db.appendStorageSegment(data)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if err := db.prefixTree.Put([]byte(accountKey), accOff, fileID, off, sz); err != nil {
+// 		return err
+// 	}
+// 	db.nodeCache.UpdateStoragePointer(accountKey, fileID, off, sz)
+// 	return nil
+// }
 
-	// cold segment: new account or no previous segment
-	if !isUpdate || (prevFileID == 0) {
-		fileID, off, sz, err := db.appendStorageSegment(data)
-		if err != nil {
-			return err
-		}
-		if err := db.prefixTree.Put([]byte(accountKey), accOff, fileID, off, sz); err != nil {
-			return err
-		}
-		db.nodeCache.UpdateStoragePointer(accountKey, fileID, off, sz)
-		return nil
-	}
+type readFileType int
 
-	// update existing segment in hot storage
-	seg, err := db.serializeHotStorageSegment(accountKey, data)
-	if err != nil {
-		return err
-	}
-
-	if (prevFileID & hotFileIDMask) == 0 {
-		// if old segment is in cold file: append new hot file
-		newFID, newOff, sz, err := db.appendHotStorageSegment(accountKey, data)
-		if err != nil {
-			return err
-		}
-		_ = db.markHotFileNeedsGC(newFID)
-		if err := db.prefixTree.Put([]byte(accountKey), accOff, newFID, newOff, sz); err != nil {
-			return err
-		}
-		db.nodeCache.UpdateStoragePointer(accountKey, newFID, newOff, sz)
-		return nil
-	}
-
-	// old segment is in hot file: append to the same file
-	newFID, newOff, sz, err := db.appendHotToSameFile(prevFileID, seg)
-	if err != nil {
-		return err
-	}
-	if err := db.prefixTree.Put([]byte(accountKey), accOff, newFID, newOff, sz); err != nil {
-		return err
-	}
-	db.nodeCache.UpdateStoragePointer(accountKey, newFID, newOff, sz)
-	return nil
-}
+const (
+	other readFileType = iota
+	readFileTypeCold
+	readFileTypeHot
+)
 
 // ensureAccountStorageCached ensures that the storage map for an account is loaded into the slot cache.
+func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte, readColdForce bool) (readFileType, error) {
 
-func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) ([]kvPair, error) {
+	var readType readFileType
+
 	ak := string(accountKey)
-	if data, ok := db.slotCache.GetAccount(ak); ok {
-		return data, nil
+	if _, ok := db.slotCache.GetAccount(ak); ok && !readColdForce {
+		return 0, nil
 	}
 
-	tryRead := func(fid uint32, off int64, sz uint32) ([]kvPair, []byte, error) {
-		if fid == 0 {
-			return nil, nil, nil
+	tryRead := func(cacheInfo CacheInfo) ([]kvPair, []byte, error) {
+		_, isHot, _ := db.storagePathByFileID(cacheInfo.storageFileID)
+
+		start := time.Now()
+
+		var pairs []kvPair
+		var backing []byte
+		var err error
+		if !isHot {
+			readType = readFileTypeCold
+			pairs, backing, err = db.readStorageSegmentToMap(cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize)
+		} else {
+			if readColdForce {
+				readType = readFileTypeCold
+				cacheInfo.storageFileID = cacheInfo.storageFileID & ^hotFileIDMask // force read from cold storage
+				pairs, backing, err = db.readStorageSegmentToMap(cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize)
+				if err == nil {
+					return pairs, backing, nil
+				}
+			}
+			readType = readFileTypeHot
+			pairs, backing, err = db.readStorageSegmentToMap(cacheInfo.storageFileID, int64(cacheInfo.hotStorageOffset), uint64(cacheInfo.hotStorageSize))
 		}
-		pairs, backing, err := db.readStorageSegmentToMap(fid, off, sz)
+
+		end := time.Now()
+		db.readCount++
+		db.timeOnRead += end.Sub(start)
+		fmt.Println("read time: "+end.Sub(start).String()+"sorted ops:", len(pairs))
 		if err != nil {
 			if backing != nil {
 				putDataBuffer(backing)
@@ -1233,40 +1477,49 @@ func (db *PrefixDB) ensureAccountStorageCached(accountKey []byte) ([]kvPair, err
 		return pairs, backing, nil
 	}
 
-	if _, fid, off, sz, ok := db.nodeCache.Get(ak); ok && fid != 0 {
-		if m, backing, err := tryRead(fid, off, sz); err == nil {
+	if _, cacheInfo, ok := db.nodeCache.Get(ak); ok && cacheInfo.storageFileID != 0 {
+		if m, backing, err := tryRead(cacheInfo); err == nil {
 			db.slotCache.PutAccount(ak, m, backing)
-			return m, nil
-		} else if !isShortRead(err) {
-			return nil, err
+			return readType, nil
+		} else {
+			return readType, err
 		}
 	}
 
 	node, err := db.getNode(accountKey)
 	if err != nil {
-		return nil, err
+		return readType, err
 	}
 
 	if node != nil && node.storageFileID != 0 {
-		db.nodeCache.UpdateStoragePointer(ak, node.storageFileID, node.storageOffset, node.storageSize)
-		if m, backing, err := tryRead(node.storageFileID, node.storageOffset, node.storageSize); err == nil {
+		db.nodeCache.UpdateStoragePointer(ak, CacheInfo{
+			storageFileID:    node.storageFileID,
+			storageOffset:    node.storageOffset,
+			storageSize:      node.storageSize,
+			hotStorageOffset: node.hotStorageOffset,
+			hotStorageSize:   node.hotStorageSize,
+		})
+		if m, backing, err := tryRead(CacheInfo{
+			storageFileID:    node.storageFileID,
+			storageOffset:    node.storageOffset,
+			storageSize:      node.storageSize,
+			hotStorageOffset: node.hotStorageOffset,
+			hotStorageSize:   node.hotStorageSize,
+		}); err == nil {
 			db.slotCache.PutAccount(ak, m, backing)
-			return m, nil
-		} else if !isShortRead(err) {
-			return nil, err
+			return readType, nil
+		} else {
+			return readType, err
 		}
 	}
 
 	db.slotCache.PutAccount(ak, nil, nil)
-	return nil, nil
+	return readType, nil
 }
 
-func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint32) ([]kvPair, []byte, error) {
+func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint64) ([]kvPair, []byte, error) {
 	p, isHot, _ := db.storagePathByFileID(fileID)
 	if isHot {
-		lock := db.getHotFileLock(fileID)
-		lock.RLock()
-		defer lock.RUnlock()
 	}
 
 	f, err := os.Open(p)
@@ -1279,43 +1532,36 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		return []kvPair{}, nil, nil
 	}
 
-	buf := getDataBuffer(int(size))
-
-	n, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		putDataBuffer(buf)
-		return nil, nil, err
+	total := int(size)
+	buf := getDataBuffer(total)
+	read := 0
+	for read < total {
+		n, err := f.ReadAt(buf[read:total], offset+int64(read))
+		if err != nil {
+			if err == io.EOF && read+n == total {
+				read += n
+				break
+			}
+			putDataBuffer(buf)
+			return nil, nil, err
+		}
+		read += n
 	}
-	buf = buf[:n]
+	if read != total {
+		putDataBuffer(buf)
+		return nil, nil, io.ErrUnexpectedEOF
+	}
+	buf = buf[:total]
 
 	var payload []byte
 	var kvCount int
 
-	if !isHot {
-		if len(buf) < 4 {
-			putDataBuffer(buf)
-			return nil, nil, fmt.Errorf("segment too small")
-		}
-		kvCount = int(readUint32BE(buf[:4]))
-		payload = buf[4:]
-	} else {
-		if len(buf) < 10 {
-			putDataBuffer(buf)
-			return nil, nil, io.ErrUnexpectedEOF
-		}
-		if readUint32BE(buf[0:4]) != hotSegMagic {
-			putDataBuffer(buf)
-			return nil, nil, fmt.Errorf("invalid hot segment magic")
-		}
-		acctLen := int(readUint16BE(buf[4:6]))
-		kvCount = int(readUint32BE(buf[6:10]))
-		cursor := 10 + acctLen
-		if cursor > len(buf) {
-			putDataBuffer(buf)
-			return nil, nil, io.ErrUnexpectedEOF
-		}
-		payload = buf[cursor:]
+	if len(buf) < 4 {
+		putDataBuffer(buf)
+		return nil, nil, fmt.Errorf("segment too small")
 	}
+	kvCount = int(readUint32BE(buf[:4]))
+	payload = buf[4:]
 
 	if kvCount < 0 {
 		putDataBuffer(buf)
@@ -1330,7 +1576,8 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 	remaining := len(payload)
 	for i := 0; i < kvCount; i++ {
 		if remaining < 6 {
-			break
+			putDataBuffer(buf)
+			return nil, nil, io.ErrUnexpectedEOF
 		}
 		klen := int(readUint16BE(payload[cursor : cursor+2]))
 		vlen := int(readUint32BE(payload[cursor+2 : cursor+6]))
@@ -1342,7 +1589,8 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		}
 		need := klen + vlen
 		if remaining < need {
-			break
+			putDataBuffer(buf)
+			return nil, nil, io.ErrUnexpectedEOF
 		}
 		key := payload[cursor : cursor+klen]
 		cursor += klen
@@ -1353,14 +1601,85 @@ func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size ui
 		entries = append(entries, kvPair{key: key, val: val})
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return bytes.Compare(entries[i].key, entries[j].key) < 0
-	})
+	// sortKVPairs(entries)
+	db.sortedOps += len(entries)
 
 	return entries, buf, nil
 }
-func isShortRead(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+
+func (db *PrefixDB) readStorageSegmentPayload(fileID uint32, offset int64, size uint64) ([]byte, int, []byte, error) {
+	p, isHot, _ := db.storagePathByFileID(fileID)
+	if isHot {
+		return nil, 0, nil, fmt.Errorf("readStorageSegmentPayload not supported for hot storage")
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer f.Close()
+	if size == 0 {
+		return nil, 0, nil, nil
+	}
+	total := int(size)
+	buf := getDataBuffer(total)
+	read := 0
+	for read < total {
+		n, err := f.ReadAt(buf[read:total], offset+int64(read))
+		if err != nil {
+			if err == io.EOF && read+n == total {
+				read += n
+				break
+			}
+			putDataBuffer(buf)
+			return nil, 0, nil, err
+		}
+		read += n
+	}
+	if read != total {
+		putDataBuffer(buf)
+		return nil, 0, nil, io.ErrUnexpectedEOF
+	}
+	buf = buf[:total]
+
+	if len(buf) < 4 {
+		putDataBuffer(buf)
+		return nil, 0, nil, io.ErrUnexpectedEOF
+	}
+	kvCount := int(readUint32BE(buf[:4]))
+	payload := buf[4:]
+	return payload, kvCount, buf, nil
+
+}
+
+func (db *PrefixDB) GetStorageCount(accountKey []byte) (uint32, error) {
+	node, err := db.getNode(accountKey)
+	if err != nil {
+		return 0, err
+	}
+	if node == nil || node.storageFileID == 0 {
+		return 0, nil
+	}
+
+	if node.storageSize == 0 {
+		return 0, nil
+	}
+
+	// read segment head to get kvcount without loading entire payload
+	p, _, _ := db.storagePathByFileID(node.storageFileID)
+	f, err := os.Open(p)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	offset := node.storageOffset
+
+	head := make([]byte, 4)
+	if _, err := f.ReadAt(head, offset); err != nil {
+		return 0, err
+	}
+	return readUint32BE(head), nil
+
 }
 
 // storagePathByFileID returns the storage file path, whether it's hot storage, and the real file ID.
@@ -1426,415 +1745,6 @@ func (db *PrefixDB) openOrCreateHotFile() error {
 	return nil
 }
 
-// ensureHotCapacity ensures that there is enough space in the current hot storage file, creating a new one if necessary.
-func (db *PrefixDB) ensureHotCapacity(need int64) error {
-	if need > hotStorageMaxFileSize-int64(binary.Size(hotFileHeader{})) {
-		// create new file directly
-		_ = db.hotCurFile.Close()
-		db.hotCurFile = nil
-		db.hotCurSize = 0
-		db.hotCurFileID++
-		p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", db.hotCurFileID))
-		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			return err
-		}
-		hdr := hotFileHeader{Magic: hotFileMagic, Version: 1, Flags: 0}
-		if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-			f.Close()
-			return fmt.Errorf("failed to write hot header: %v", err)
-		}
-		db.hotCurFile = f
-		db.hotCurSize = int64(binary.Size(hotFileHeader{}))
-		return nil
-	}
-	if db.hotCurFile == nil {
-		return db.openOrCreateHotFile()
-	}
-	if db.hotCurSize+need > hotStorageMaxFileSize {
-		_ = db.hotCurFile.Close()
-		db.hotCurFile = nil
-		db.hotCurSize = 0
-		db.hotCurFileID++
-		p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", db.hotCurFileID))
-		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			return err
-		}
-		hdr := hotFileHeader{Magic: hotFileMagic, Version: 1, Flags: 0}
-		if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-			f.Close()
-			return fmt.Errorf("failed to write hot header: %v", err)
-		}
-		db.hotCurFile = f
-		db.hotCurSize = int64(binary.Size(hotFileHeader{}))
-	}
-	return nil
-}
-
-// appendHotSegment appends a segment to the hot storage file and returns its file ID, offset, and size.
-func (db *PrefixDB) appendHotToSameFile(targetFileID uint32, seg []byte) (fileID uint32, offset int64, size uint32, err error) {
-	if (targetFileID & hotFileIDMask) == 0 {
-		return 0, 0, 0, errors.New("target is not hot file")
-	}
-	lock := db.getHotFileLock(targetFileID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	_, _, realID := db.storagePathByFileID(targetFileID)
-	p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", realID))
-	f, err := os.OpenFile(p, os.O_RDWR, 0644)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	defer f.Close()
-
-	hdrSize := int64(binary.Size(hotFileHeader{}))
-	fi, err := f.Stat()
-	if err != nil {
-		return 0, 0, 0, err
-	}
-
-	var hdr hotFileHeader
-	if fi.Size() < hdrSize {
-		// init header
-		hdr = hotFileHeader{Magic: hotFileMagic, Version: 1, Flags: 0}
-		hdr.Flags |= hotFlagNeedsGC
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return 0, 0, 0, err
-		}
-		if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-			return 0, 0, 0, fmt.Errorf("failed to init hot header: %v", err)
-		}
-		offset = hdrSize
-	} else {
-		// read header, check magic and set needsGC flag
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return 0, 0, 0, err
-		}
-		if err := binary.Read(f, binary.BigEndian, &hdr); err != nil {
-			return 0, 0, 0, fmt.Errorf("read hot header failed: %v", err)
-		}
-		if hdr.Magic != hotFileMagic {
-			return 0, 0, 0, fmt.Errorf("invalid hot file magic")
-		}
-		if (hdr.Flags & hotFlagNeedsGC) == 0 {
-			hdr.Flags |= hotFlagNeedsGC
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return 0, 0, 0, err
-			}
-			if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-				return 0, 0, 0, err
-			}
-		}
-		// get end offset
-		if off, err := f.Seek(0, io.SeekEnd); err != nil {
-			return 0, 0, 0, err
-		} else {
-			offset = off
-		}
-	}
-
-	// append segment
-	if _, err := f.WriteAt(seg, offset); err != nil {
-		return 0, 0, 0, err
-	}
-	return targetFileID, offset, uint32(len(seg)), nil
-}
-
-// markHotFileNeedsGC marks a hot storage file as needing garbage collection by setting a flag in its header.
-func (db *PrefixDB) markHotFileNeedsGC(fileID uint32) error {
-	if (fileID & hotFileIDMask) == 0 {
-		return nil
-	}
-	_, _, realID := db.storagePathByFileID(fileID)
-	p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", realID))
-	f, err := os.OpenFile(p, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	var hdr hotFileHeader
-	if err := binary.Read(f, binary.BigEndian, &hdr); err != nil {
-		return fmt.Errorf("read hot header failed: %v", err)
-	}
-	if hdr.Magic != hotFileMagic {
-		return fmt.Errorf("invalid hot file magic")
-	}
-	if (hdr.Flags & hotFlagNeedsGC) != 0 {
-		return nil
-	}
-	hdr.Flags |= hotFlagNeedsGC
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return binary.Write(f, binary.BigEndian, &hdr)
-}
-
-// serializeHotStorageSegment serializes a hot storage segment with an account key and key-value pairs.
-func (db *PrefixDB) serializeHotStorageSegment(accountKey string, kvs []kvPair) ([]byte, error) {
-	acct := []byte(accountKey)
-	if len(acct) > 0xFFFF {
-		return nil, fmt.Errorf("account key too large: %d", len(acct))
-	}
-	est := 4 + 2 + 4 + len(acct)
-	for _, v := range kvs {
-		est += 6 + len(v.key) + len(v.val)
-	}
-	buf := make([]byte, 0, est)
-	tmp := make([]byte, 10)
-	writeUint32BE(tmp[0:4], hotSegMagic)
-	writeUint16BE(tmp[4:6], uint16(len(acct)))
-	writeUint32BE(tmp[6:10], uint32(len(kvs)))
-	buf = append(buf, tmp[:10]...)
-	buf = append(buf, acct...)
-	for _, v := range kvs {
-		if len(v.key) > 0xFFFF {
-			return nil, fmt.Errorf("key too large: %d", len(v.key))
-		}
-		writeUint16BE(tmp[:2], uint16(len(v.key)))
-		writeUint32BE(tmp[2:6], uint32(len(v.val)))
-		buf = append(buf, tmp[:6]...)
-		buf = append(buf, []byte(v.key)...)
-		buf = append(buf, v.val...)
-	}
-	return buf, nil
-}
-
-// appendHotStorageSegment appends a serialized hot storage segment to the hot storage file and returns its file ID, offset, and size.
-func (db *PrefixDB) appendHotStorageSegment(accountKey string, kvs []kvPair) (fileID uint32, offset int64, size uint32, err error) {
-	seg, err := db.serializeHotStorageSegment(accountKey, kvs)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	need := int64(len(seg))
-	if err := db.ensureHotCapacity(need); err != nil {
-		return 0, 0, 0, err
-	}
-	offset = db.hotCurSize
-	if _, err := db.hotCurFile.WriteAt(seg, offset); err != nil {
-		return 0, 0, 0, err
-	}
-	db.hotCurSize += need
-	return (db.hotCurFileID | hotFileIDMask), offset, uint32(need), nil
-}
-
-// getHotFileLock retrieves or creates a mutex for synchronizing access to a specific hot storage file.
-func (db *PrefixDB) getHotFileLock(fileID uint32) *sync.RWMutex {
-	realID := fileID & ^hotFileIDMask
-	if v, ok := db.hotFileLocks.Load(realID); ok {
-		return v.(*sync.RWMutex)
-	}
-	mu := &sync.RWMutex{}
-	actual, _ := db.hotFileLocks.LoadOrStore(realID, mu)
-	return actual.(*sync.RWMutex)
-}
-
-// hotGCWorker is a background goroutine that periodically performs garbage collection on hot storage files.
-func (db *PrefixDB) hotGCWorker(interval time.Duration) {
-	tk := time.NewTicker(interval)
-	defer tk.Stop()
-	for {
-		select {
-		case <-db.hotGCStop:
-			return
-		case <-tk.C:
-			_ = db.gcHotFilesOnce()
-		}
-	}
-}
-
-// gcHotFilesOnce performs garbage collection on all hot storage files that are marked as needing GC.
-func (db *PrefixDB) gcHotFilesOnce() error {
-	entries, err := os.ReadDir(db.hotStorageDir)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		var id uint32
-		n, _ := fmt.Sscanf(e.Name(), "hot_%08d.dat", &id)
-		if n != 1 {
-			continue
-		}
-		if err := db.gcHotFileInPlace(id); err != nil {
-			fmt.Printf("hot in-place GC error for %08d: %v\n", id, err)
-		}
-	}
-	return nil
-}
-
-// gcHotFileInPlace performs in-place garbage collection on a specific hot storage file.
-func (db *PrefixDB) gcHotFileInPlace(realID uint32) error {
-	fileID := realID | hotFileIDMask
-	lock := db.getHotFileLock(fileID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	p := filepath.Join(db.hotStorageDir, fmt.Sprintf("hot_%08d.dat", realID))
-	f, err := os.OpenFile(p, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	var hdr hotFileHeader
-	if err := binary.Read(f, binary.BigEndian, &hdr); err != nil {
-		return fmt.Errorf("read hot header failed: %v", err)
-	}
-	if hdr.Magic != hotFileMagic {
-		return fmt.Errorf("invalid hot file magic")
-	}
-	if (hdr.Flags & hotFlagNeedsGC) == 0 {
-		return nil
-	}
-
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	headerSize := int64(binary.Size(hdr))
-	if fi.Size() < headerSize {
-		return fmt.Errorf("hot file truncated")
-	}
-	totalDataSize := fi.Size() - headerSize
-	if totalDataSize == 0 {
-		hdr.Flags &^= hotFlagNeedsGC
-		if _, err := f.Seek(0, io.SeekStart); err == nil {
-			_ = binary.Write(f, binary.BigEndian, &hdr)
-		}
-		return nil
-	}
-
-	data := make([]byte, totalDataSize)
-	if _, err := f.ReadAt(data, headerSize); err != nil && err != io.EOF {
-		return fmt.Errorf("bulk read failed: %v", err)
-	}
-
-	type segMeta struct {
-		accountKey string
-		start      int64
-		size       int64
-	}
-	lastSeg := make(map[string]segMeta, 1024)
-
-	pos := 0
-	for pos < len(data) {
-		//read segment header
-		if pos+10 > len(data) {
-			break
-		}
-		magic := readUint32BE(data[pos : pos+4])
-		if magic != hotSegMagic {
-			break
-		}
-		acctLen := int(readUint16BE(data[pos+4 : pos+6]))
-		kvCount := readUint32BE(data[pos+6 : pos+10])
-		segStartAbs := headerSize + int64(pos)
-
-		cur := pos + 10
-		if cur+acctLen > len(data) {
-			break
-		}
-		accountKeyBytes := data[cur : cur+acctLen]
-		cur += acctLen
-
-		segSize := int64(10 + acctLen)
-
-		// skip kvs
-		for i := uint32(0); i < kvCount; i++ {
-			if cur+6 > len(data) {
-				cur = len(data)
-				break
-			}
-			klen := int(readUint16BE(data[cur : cur+2]))
-			vlen := int(readUint32BE(data[cur+2 : cur+6]))
-			cur += 6
-			if cur+klen+vlen > len(data) {
-				cur = len(data)
-				break
-			}
-			cur += klen + vlen
-			segSize += int64(6 + klen + vlen)
-		}
-
-		acctKey := string(accountKeyBytes)
-		lastSeg[acctKey] = segMeta{
-			accountKey: acctKey,
-			start:      segStartAbs,
-			size:       segSize,
-		}
-
-		// move to next segment
-		pos += int(segSize)
-	}
-
-	// compact segments
-	keeps := make([]segMeta, 0, len(lastSeg))
-	for _, s := range lastSeg {
-		keeps = append(keeps, s)
-	}
-	sort.Slice(keeps, func(i, j int) bool { return keeps[i].start < keeps[j].start })
-
-	writePos := headerSize
-	for _, s := range keeps {
-		if s.start == writePos {
-			// already in place, just update index
-			accNode, _ := db.getNode([]byte(s.accountKey))
-			var accOff int64
-			if accNode != nil {
-				accOff = accNode.offset
-			}
-			if err := db.prefixTree.Put([]byte(s.accountKey), accOff, fileID, writePos, uint32(s.size)); err != nil {
-				return fmt.Errorf("update prefix tree failed: %v", err)
-			}
-			db.nodeCache.UpdateStoragePointer(s.accountKey, fileID, writePos, uint32(s.size))
-			writePos += s.size
-			continue
-		}
-
-		// move segment data
-		segBuf := make([]byte, s.size)
-		if _, err := f.ReadAt(segBuf, s.start); err != nil {
-			return fmt.Errorf("read segment failed: %v", err)
-		}
-		if _, err := f.WriteAt(segBuf, writePos); err != nil {
-			return fmt.Errorf("write segment failed: %v", err)
-		}
-
-		// update index
-		accNode, _ := db.getNode([]byte(s.accountKey))
-		var accOff int64
-		if accNode != nil {
-			accOff = accNode.offset
-		}
-		if err := db.prefixTree.Put([]byte(s.accountKey), accOff, fileID, writePos, uint32(s.size)); err != nil {
-			return fmt.Errorf("update prefix tree failed: %v", err)
-		}
-		db.nodeCache.UpdateStoragePointer(s.accountKey, fileID, writePos, uint32(s.size))
-
-		writePos += s.size
-	}
-
-	// truncate file
-	if err := f.Truncate(writePos); err != nil {
-		return fmt.Errorf("truncate hot file failed: %v", err)
-	}
-
-	// clear needsGC flag
-	hdr.Flags &^= hotFlagNeedsGC
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-		return fmt.Errorf("write header failed: %v", err)
-	}
-	_ = f.Sync()
-	return nil
-}
-
 func bytesToString(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
@@ -1846,4 +1756,98 @@ func stringToBytes(s string) []byte {
 			Cap int
 		}{s, len(s)},
 	))
+}
+
+func (pdb *PrefixDB) flushAccessedStorageEntries(accountKey []byte, kvs []kvPair) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+
+	// locate trie node to update storage metadata
+	node, err := pdb.getNode(accountKey)
+	if err != nil {
+		return fmt.Errorf("failed to get trie node: %w", err)
+	}
+	if node == nil {
+		return fmt.Errorf("trie node not found for key %x", accountKey)
+	}
+
+	baseFileID := node.storageFileID & ^hotFileIDMask
+	hotFileID := baseFileID | hotFileIDMask
+	filePath := filepath.Join(pdb.hotStorageDir, fmt.Sprintf("hot_%08d.dat", baseFileID))
+
+	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open hot storage file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	// ensure file has a valid header before appending data
+	fi, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat hot storage file %s: %w", filePath, err)
+	}
+	if fi.Size() == 0 {
+		hdr := hotFileHeader{Magic: hotFileMagic, Version: 1, Flags: 0}
+		if err := binary.Write(file, binary.BigEndian, &hdr); err != nil {
+			return fmt.Errorf("failed to initialize hot storage file %s: %w", filePath, err)
+		}
+	}
+
+	// serialize data into [kvCount][keyLen][valLen][key][val]...
+	est := 4
+	for _, v := range kvs {
+		est += 6 + len(v.key) + len(v.val)
+	}
+
+	buf := make([]byte, 0, est)
+	tmp := make([]byte, 6)
+	writeUint32BE(tmp[0:4], uint32(len(kvs)))
+	buf = append(buf, tmp[0:4]...)
+	for _, v := range kvs {
+		if len(v.key) > 0xFFFF {
+			return fmt.Errorf("key too large: %d", len(v.key))
+		}
+		writeUint16BE(tmp[:2], uint16(len(v.key)))
+		writeUint32BE(tmp[2:6], uint32(len(v.val)))
+		buf = append(buf, tmp[:6]...)
+		buf = append(buf, v.key...)
+		buf = append(buf, v.val...)
+	}
+
+	offset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("failed to seek to end of hot storage file %s: %w", filePath, err)
+	}
+	if offset+int64(len(buf)) > hotStorageMaxFileSize {
+		return fmt.Errorf("hot storage file %s exceeded max size", filePath)
+	}
+	if _, err := file.Write(buf); err != nil {
+		return fmt.Errorf("failed to write to hot storage file %s: %w", filePath, err)
+	}
+
+	node.storageFileID = hotFileID
+	node.hotStorageOffset = uint64(offset)
+	node.hotStorageSize = uint32(len(buf))
+
+	// get from nodecache and update
+	// if _, cacheInfo, ok := pdb.nodeCache.Get(string(accountKey));ok{
+
+	// }
+
+	if err := pdb.prefixTree.Put(accountKey, node.offset, node.storageFileID, node.storageOffset, node.storageSize, node.hotStorageOffset, node.hotStorageSize); err != nil {
+		return fmt.Errorf("failed to update prefix tree with hot storage pointer: %w", err)
+	}
+
+	if pdb.nodeCache != nil {
+		pdb.nodeCache.UpdateStoragePointer(string(accountKey), CacheInfo{
+			storageFileID:    node.storageFileID,
+			storageOffset:    node.storageOffset,
+			storageSize:      node.storageSize,
+			hotStorageOffset: node.hotStorageOffset,
+			hotStorageSize:   node.hotStorageSize,
+		})
+	}
+
+	return nil
 }

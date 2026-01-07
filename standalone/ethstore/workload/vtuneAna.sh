@@ -4,6 +4,7 @@
 set -e
 
 APP_NAME="workload"
+APP_ARGS="-mode=re"
 MAIN_FILE="replayWorkload.go"
 RESULT_BASE_DIR="./vtuneOut"
 RESULT_DIR="$RESULT_BASE_DIR/vtune_results_$(date +%Y%m%d_%H%M%S)"
@@ -37,22 +38,22 @@ vtune -collect hotspots \
   -duration $DURATION \
   -knob sampling-mode=hw \
   -knob enable-stack-collection=true \
-  -knob stack-size=0.5 \
-  -- "./$APP_NAME" 2>&1 | tee "$RESULT_DIR/hotspots.log"
+  -knob stack-size=1024 \
+  -- "./$APP_NAME" $APP_ARGS 2>&1 | tee "$RESULT_DIR/hotspots.log"
 
 echo "✅ Hotspots 分析完成"
 echo
 
-# 4. 运行 Memory Access 分析
-echo "4. 运行 Memory Access 分析..."
-vtune -collect memory-access \
-  -result-dir "$RESULT_DIR/memory" \
-  -duration $DURATION \
-  -knob analyze-mem-objects=true \
-  -- "./$APP_NAME" 2>&1 | tee "$RESULT_DIR/memory.log"
+# # 4. 运行 Memory Access 分析
+# echo "4. 运行 Memory Access 分析..."
+# vtune -collect memory-access \
+#   -result-dir "$RESULT_DIR/memory" \
+#   -duration $DURATION \
+#   -knob analyze-mem-objects=true \
+#   -- "./$APP_NAME" $APP_ARGS 2>&1 | tee "$RESULT_DIR/memory.log"
 
-echo "✅ Memory Access 分析完成"
-echo
+# echo "✅ Memory Access 分析完成"
+# echo
 
 # 5. 生成报告
 echo "5. 生成分析报告..."
