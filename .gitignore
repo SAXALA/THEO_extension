@@ -53,3 +53,4 @@ standalone/ethstore/workload/vtuneAna.sh
 standalone/ethstore/workload/vtuneOut/
 
 standalone/ethstore/toolScript/*
+standalone/ethstore/workload/vtuneAna.sh

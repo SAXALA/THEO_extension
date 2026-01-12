@@ -170,12 +170,12 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 
 // Database is a persistent key-value store based on the append-only log store.
 type Database struct {
-	fn   string                 // filename/directory for reporting
-	txIndexAol  *TxIndexAppendOnlyLog         // Underlying append-only log store
-	db   *PebbleStore           // Pebble store for non-AOL data
-	statepdb  *prefixdb.PrefixDB     // world state PrefixDB
-	snappdb *prefixdb.PrefixDB // snapshot PrefixDB
-	blockAol *BlockAppendOnlyLog
+	fn         string                // filename/directory for reporting
+	txIndexAol *TxIndexAppendOnlyLog // Underlying append-only log store
+	db         *PebbleStore          // Pebble store for non-AOL data
+	statepdb   *prefixdb.PrefixDB    // world state PrefixDB
+	snappdb    *prefixdb.PrefixDB    // snapshot PrefixDB
+	blockAol   *BlockAppendOnlyLog
 
 	diskSizeGauge *metrics.Gauge // Gauge for tracking the size of all the data in the database
 
@@ -211,8 +211,8 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 		fn:       dirPath, // Use directory path now
 		log:      logger,
 		quitChan: make(chan chan error, 1),
-		statepdb:      statePrefixdb,
-		snappdb:     snapshotPrefixdb,
+		statepdb: statePrefixdb,
+		snappdb:  snapshotPrefixdb,
 	}
 
 	// Initialize the TxIndexAppendOnlyLog store
@@ -472,6 +472,7 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		d.log.Trace("Key not found in AOL, checking Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 	} else if prefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
+
 			return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 

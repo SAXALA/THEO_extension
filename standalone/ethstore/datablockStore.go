@@ -452,13 +452,13 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 	// }
 	// 2. If blockID is not 0 (or it is 0 and isFirstAppend), it must be greater than the current latestBlockID.
 	//    (The case blockID == 0 && isFirstAppend means latestBlockID is also 0, so 0 <= 0 is true, but it's allowed).
-	// if !(blockID == 0 && isFirstAppend) && blockID <= baol.latestBlockID {
-	// 	return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", baol.latestBlockID, blockID)
-	// }
-
-	if !(blockID == 0 && isFirstAppend) {
+	if !(blockID == 0 && isFirstAppend) && blockID < baol.latestBlockID {
 		return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", baol.latestBlockID, blockID)
 	}
+
+	// if blockID == 0 && isFirstAppend {
+	// 	return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", baol.latestBlockID, blockID)
+	// }
 	if len(kvs) == 0 {
 		// If kvs is empty, this append operation should generally be a no-op
 		// in terms of advancing the log or writing data.

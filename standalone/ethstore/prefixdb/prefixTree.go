@@ -13,17 +13,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bits-and-blooms/bloom/v3"
 	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
-	MaxPrefixDepth      = 6                                  // the maximum depth of the prefix tree
-	NodeEntrySize       = 76                                 // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
-	FileNodeMagic       = 0x50544E46                         // "PTNF" - file node magic number
-	MaxKeySize          = 32                                 // maximum key size in bytes
-	FilterSize          = 16 * (MaxKeySize - MaxPrefixDepth) // bloom filter size
-	TreeFileMagic       = 0x50545246                         // "PTRF" - prefix tree file magic number
+	MaxPrefixDepth      = 6          // the maximum depth of the prefix tree
+	NodeEntrySize       = 76         // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
+	FileNodeMagic       = 0x50544E46 // "PTNF" - file node magic number
+	MaxKeySize          = 32         // maximum key size in bytes
+	TreeFileMagic       = 0x50545246 // "PTRF" - prefix tree file magic number
 	maxCacheFiles       = 1024
 	maxPooledBufferSize = 1024 * 1024 // 1MB
 )
@@ -88,11 +86,6 @@ type PrefixTree struct {
 
 	bucketPrefixLength int
 
-	//for bloom filter
-	filterLock  sync.RWMutex
-	filterCache map[string]*bloom.BloomFilter
-	bloomFile   string
-
 	// for background merging
 	mergeLock     sync.Mutex
 	mergeStop     chan struct{}
@@ -153,11 +146,9 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		db:          db,
 		fileNodeDir: fileNodeDir,
 		// bucketPrefixLength: MaxPrefixDepth - 1,
-		filterCache:   make(map[string]*bloom.BloomFilter),
 		mergeStop:     make(chan struct{}),
 		mergeInterval: 10 * time.Minute,
 		fileCache:     fileCache,
-		bloomFile:     filepath.Join(dirPath, "prefixdb", "filters.bf"),
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, NodeEntrySize*64)
@@ -176,13 +167,6 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 	}
 	pt.bucketPrefixLength = pt.maxDepth
 
-	// load existing file node filters
-	// if err := pt.loadAllFiltersFromSingleFile(); err != nil {
-	// 	// pt.loadAllFileNodeFilters()
-
-	// 	// pt.saveAllFiltersToSingleFile()
-
-	// }
 	fmt.Println("Prefix Tree initialized.")
 	return pt, nil
 }
@@ -490,14 +474,6 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	if !found {
 		return false, nil
 	}
-	// rebuild filter, sort
-	filter := bloom.NewWithEstimates(FilterSize, 0.05)
-	for _, e := range entries {
-		filter.Add(e.key)
-	}
-	pt.filterLock.Lock()
-	pt.filterCache[fileID] = filter
-	pt.filterLock.Unlock()
 
 	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
 
@@ -565,17 +541,9 @@ func (pt *PrefixTree) Close() error {
 		pt.fileCache.Purge()
 	}
 
-	// if err := pt.saveAllFiltersToSingleFile(); err != nil {
-	// 	fmt.Printf("Warning: Failed to save bloom filters: %v\n", err)
-	// }
-
 	if err := pt.SaveToFile(pt.trieFile); err != nil {
 		fmt.Printf("Warning: Failed to save prefix tree to file: %v\n", err)
 	}
-
-	pt.filterLock.Lock()
-	pt.filterCache = nil
-	pt.filterLock.Unlock()
 
 	return nil
 }
@@ -606,7 +574,8 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 	if header.Magic != FileNodeMagic {
 		return NodeInfo{}, false, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", header.Magic, fileID)
 	}
-	isNonZero := func(fid uint32, off int64) bool { return fid != 0 && off != 0 }
+	// segmented storage keeps offset 0, so treat fileID alone as validity signal
+	isNonZero := func(fid uint32) bool { return fid != 0 }
 
 	var zeroHit *NodeInfo
 	if header.UnsortedEntryCount > 0 {
@@ -626,7 +595,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 				}
 				dec := decodeNodeEntry(unsortedBuf[offsetInBuf : offsetInBuf+NodeEntrySize])
 				if bytes.Equal(dec.key, remainingKey) {
-					if isNonZero(dec.storageFileID, dec.storageOffset) {
+					if isNonZero(dec.storageFileID) {
 						if zeroHit == nil {
 							return dec, true, nil
 						}
@@ -677,7 +646,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 				if cmp == 0 {
 					start := int(mid) * NodeEntrySize
 					dec := decodeNodeEntry(sortedBuf[start : start+NodeEntrySize])
-					if isNonZero(dec.storageFileID, dec.storageOffset) {
+					if isNonZero(dec.storageFileID) {
 						return dec, true, nil
 					}
 					if zeroHit != nil {
@@ -785,10 +754,8 @@ func (pt *PrefixTree) mergeFileNode(filePath string) error {
 	}
 
 	entries := make([]NodeInfo, 0, len(m))
-	filter := bloom.NewWithEstimates(uint(FilterSize), 0.05)
 	for _, e := range m {
 		entries = append(entries, e)
-		filter.Add(e.key)
 	}
 
 	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
@@ -835,9 +802,6 @@ func (pt *PrefixTree) mergeFileNode(filePath string) error {
 		_ = dirf.Close()
 	}
 
-	pt.filterLock.Lock()
-	pt.filterCache[fileID] = filter
-	pt.filterLock.Unlock()
 	pt.dropFileHandles(fileID)
 	return nil
 }
@@ -1126,7 +1090,6 @@ func (pt *PrefixTree) LoadFromFile(filePath string) error {
 			if childRecord.FileIDLength > 0 {
 				childNode.fileID = string(childRecord.FileID[:childRecord.FileIDLength])
 				if childRecord.NodeType == byte(FileNode) {
-					// go pt.getOrCreateFilter(childNode.fileID)
 				}
 			}
 
@@ -1148,9 +1111,6 @@ func (pt *PrefixTree) LoadFromFile(filePath string) error {
 			processedNodes++
 		}
 	}
-
-	// go pt.loadAllFileNodeFilters()
-
 	return nil
 }
 
@@ -1172,147 +1132,4 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 	// add to cache
 	pt.fileCache.Add(cacheKey, file)
 	return file, nil
-}
-
-// saveAllFiltersToSingleFile saves all bloom filters to a single file
-func (pt *PrefixTree) saveAllFiltersToSingleFile() error {
-	pt.filterLock.RLock()
-	defer pt.filterLock.RUnlock()
-
-	if pt.bloomFile == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(pt.bloomFile), 0755); err != nil {
-		return err
-	}
-	tmp := pt.bloomFile + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// initialize and write file header
-	hdr := bloomsFileHeader{
-		Magic:   BloomFileMagic,
-		Version: BloomFileVersion,
-		Count:   uint32(len(pt.filterCache)),
-	}
-	if err := binary.Write(f, binary.BigEndian, &hdr); err != nil {
-		return err
-	}
-
-	// write each bloom filter entry(fileID + data)
-	for fileID, bf := range pt.filterCache {
-		if bf == nil {
-			continue
-		}
-		data, err := marshalBloom(bf)
-		if err != nil {
-			// 跳过无法序列化的条目
-			continue
-		}
-		entryHdr := bloomEntryHeader{
-			FileIDLen: uint16(len(fileID)),
-			DataLen:   uint32(len(data)),
-		}
-		if err := binary.Write(f, binary.BigEndian, &entryHdr); err != nil {
-			return err
-		}
-		if _, err := f.Write([]byte(fileID)); err != nil {
-			return err
-		}
-		if _, err := f.Write(data); err != nil {
-			return err
-		}
-	}
-
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, pt.bloomFile)
-}
-
-func (pt *PrefixTree) loadAllFiltersFromSingleFile() error {
-	if pt.bloomFile == "" {
-		return fmt.Errorf("bloom file not set")
-	}
-	f, err := os.Open(pt.bloomFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	var hdr bloomsFileHeader
-	if err := binary.Read(f, binary.BigEndian, &hdr); err != nil {
-		return err
-	}
-	if hdr.Magic != BloomFileMagic || hdr.Version != BloomFileVersion {
-		return fmt.Errorf("invalid bloom file header")
-	}
-
-	cache := make(map[string]*bloom.BloomFilter, hdr.Count)
-	for i := uint32(0); i < hdr.Count; i++ {
-		var eh bloomEntryHeader
-		if err := binary.Read(f, binary.BigEndian, &eh); err != nil {
-			return err
-		}
-		if eh.FileIDLen == 0 || eh.DataLen == 0 {
-			return fmt.Errorf("invalid entry header")
-		}
-		idBuf := make([]byte, eh.FileIDLen)
-		if _, err := io.ReadFull(f, idBuf); err != nil {
-			return err
-		}
-		data := make([]byte, eh.DataLen)
-		if _, err := io.ReadFull(f, data); err != nil {
-			return err
-		}
-		bf, err := unmarshalBloom(data)
-		if err != nil {
-			// skip invalid entries
-			continue
-		}
-		cache[string(idBuf)] = bf
-	}
-
-	pt.filterLock.Lock()
-	pt.filterCache = cache
-	pt.filterLock.Unlock()
-	return nil
-}
-
-func marshalBloom(bf *bloom.BloomFilter) ([]byte, error) {
-	// use WriteTo if available
-	if wt, ok := interface{}(bf).(interface {
-		WriteTo(io.Writer) (int64, error)
-	}); ok {
-		var buf bytes.Buffer
-		_, err := wt.WriteTo(&buf)
-		return buf.Bytes(), err
-	}
-	// fallback to MarshalBinary
-	if mb, ok := interface{}(bf).(interface{ MarshalBinary() ([]byte, error) }); ok {
-		return mb.MarshalBinary()
-	}
-	return nil, fmt.Errorf("bloom filter does not support serialization")
-}
-
-func unmarshalBloom(data []byte) (*bloom.BloomFilter, error) {
-	bf := &bloom.BloomFilter{}
-	// use ReadFrom if available
-	if rf, ok := interface{}(bf).(interface {
-		ReadFrom(io.Reader) (int64, error)
-	}); ok {
-		_, err := rf.ReadFrom(bytes.NewReader(data))
-		return bf, err
-	}
-	// fallback to UnmarshalBinary
-	if ub, ok := interface{}(bf).(interface{ UnmarshalBinary([]byte) error }); ok {
-		if err := ub.UnmarshalBinary(data); err != nil {
-			return nil, err
-		}
-		return bf, nil
-	}
-	return nil, fmt.Errorf("bloom filter does not support deserialization")
 }

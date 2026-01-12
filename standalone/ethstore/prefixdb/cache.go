@@ -1,6 +1,7 @@
 package prefixdb
 
 import (
+	"bytes"
 	"container/list"
 	"fmt"
 	"sync"
@@ -482,7 +483,16 @@ type slotCacheEntry struct {
 	data          []kvPair
 	accessedIndex []int // index kvs which have been accessed
 	// timestamp int64
-	backing []byte
+	backing   []byte
+	segmented bool
+	keyStart  []byte
+	keyEnd    []byte
+}
+
+type SlotCacheMeta struct {
+	Segmented bool
+	KeyStart  []byte
+	KeyEnd    []byte
 }
 
 // NewSlotCache creates a new slot cache
@@ -508,7 +518,7 @@ func (sc *SlotCache) GetAccount(accountKey string) ([]kvPair, bool) {
 }
 
 // PutAccount inserts or replaces an account's storage map into cache
-func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte) {
+func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte, meta *SlotCacheMeta) {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
@@ -519,6 +529,7 @@ func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte
 		}
 		entry.data = data
 		entry.backing = backing
+		sc.applyMeta(entry, meta)
 		sc.lruList.MoveToFront(el)
 		return
 	}
@@ -533,8 +544,52 @@ func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte
 		data:       data,
 		backing:    backing,
 	}
+	sc.applyMeta(entry, meta)
 	el := sc.lruList.PushFront(entry)
 	sc.cache[accountKey] = el
+}
+
+func (sc *SlotCache) UpdateAccount(accountKey string, data []kvPair, backing []byte, meta *SlotCacheMeta) {
+	sc.lock.Lock()
+	defer sc.lock.Unlock()
+
+	if el, ok := sc.cache[accountKey]; ok {
+		entry := el.Value.(*slotCacheEntry)
+		if entry.backing != nil {
+			putDataBuffer(entry.backing)
+		}
+		entry.data = data
+		entry.backing = backing
+		sc.applyMeta(entry, meta)
+		sc.lruList.MoveToFront(el)
+		return
+	}
+	sc.PutAccount(accountKey, data, backing, meta)
+}
+
+func (sc *SlotCache) applyMeta(entry *slotCacheEntry, meta *SlotCacheMeta) {
+	entry.segmented = false
+	entry.keyStart = nil
+	entry.keyEnd = nil
+	if meta == nil {
+		return
+	}
+	entry.segmented = meta.Segmented
+	if len(meta.KeyStart) > 0 {
+		entry.keyStart = cloneBytes(meta.KeyStart)
+	}
+	if len(meta.KeyEnd) > 0 {
+		entry.keyEnd = cloneBytes(meta.KeyEnd)
+	}
+}
+
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dup := make([]byte, len(src))
+	copy(dup, src)
+	return dup
 }
 
 func (sc *SlotCache) Get(accountKey string, key []byte) ([]byte, bool) {
@@ -547,13 +602,34 @@ func (sc *SlotCache) Get(accountKey string, key []byte) ([]byte, bool) {
 		if len(entry.data) == 0 {
 			return nil, false
 		}
-		index, ok := binarySearchKVPairs(entry.data, key)
-		if ok {
-			entry.accessedIndex = append(entry.accessedIndex, index)
+		if index, ok := binarySearchKVPairs(entry.data, key); ok {
 			return entry.data[index].val, true
 		}
+
 	}
 	return nil, false
+}
+
+// AccountHasKey reports whether the cached chunk for the account already covers the key range.
+func (sc *SlotCache) AccountHasKey(accountKey string, key []byte) bool {
+	sc.lock.RLock()
+	defer sc.lock.RUnlock()
+
+	el, ok := sc.cache[accountKey]
+	if !ok {
+		return false
+	}
+	entry := el.Value.(*slotCacheEntry)
+	if len(entry.data) == 0 || !entry.segmented || len(key) == 0 {
+		sc.lruList.MoveToFront(el)
+		return true
+	}
+	if (len(entry.keyStart) == 0 || bytes.Compare(key, entry.keyStart) >= 0) &&
+		(len(entry.keyEnd) == 0 || bytes.Compare(key, entry.keyEnd) <= 0) {
+		sc.lruList.MoveToFront(el)
+		return true
+	}
+	return false
 }
 
 // releaseEntry releases pooled resources tied to the cache entry.
@@ -565,6 +641,9 @@ func (sc *SlotCache) releaseEntry(entry *slotCacheEntry) {
 		putDataBuffer(entry.backing)
 		entry.backing = nil
 	}
+	entry.segmented = false
+	entry.keyStart = nil
+	entry.keyEnd = nil
 }
 
 // DeleteAccount removes an account entry (flush if modified)

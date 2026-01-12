@@ -1639,7 +1639,7 @@ func (aol *TxIndexAppendOnlyLog) PutKV(blockID uint64, key, value string) error 
 	if blockID > aol.nextSecondBlockID {
 		for id := aol.nextSecondBlockID; id < blockID; id++ {
 			if _, ok := aol.pendingBlocks[id]; !ok {
-				aol.mu.Unlock()
+				continue
 			}
 			toFlush = append(toFlush, id)
 		}
