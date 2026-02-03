@@ -144,20 +144,6 @@ func TestDeleteByPrefixInBlock(t *testing.T) {
 	assert.Equal(t, "value3", val)
 }
 
-func TestPutKV(t *testing.T) {
-	aol, _ := setupTestAOL(t, 10)
-	defer aol.Close()
-
-	err := aol.PutKV(1, "key1", "value1")
-	require.NoError(t, err)
-
-	// PutKV writes to pending log. Get should be able to retrieve it.
-	val, found, err := aol.Get("key1")
-	require.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, "value1", val)
-}
-
 func TestReopen(t *testing.T) {
 	dir := t.TempDir()
 	logger := log.New()

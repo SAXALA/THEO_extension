@@ -25,7 +25,6 @@ type Config struct {
 	// Cache sizes and other parameters
 	MaxCacheSize   int `json:"max_cache_size"`
 	WriteBatchSize int `json:"write_batch_size"`
-	SlotCacheSize  int `json:"slot_cache_size"`
 }
 
 // DefaultConfig returns a configuration with default values.
@@ -39,11 +38,9 @@ func DefaultConfig(dirpath string) *Config {
 		PebblePath:     filepath.Join(prefixDBDir, "accountHash_key_pebble"),
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
 		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
-		SlotIndexFile:  filepath.Join(prefixDBDir, "slotIndex"),
 		MemcacheAddr:   "127.0.0.1:11211",
 		MaxCacheSize:   65535,
 		WriteBatchSize: 4096,
-		SlotCacheSize:  64,
 	}
 }
 

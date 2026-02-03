@@ -194,19 +194,20 @@ func (d *PebbleStore) Close() error {
 }
 
 // Has implements the Store interface
-func (d *PebbleStore) Has(key []byte) (bool, error) {
+func (d *PebbleStore) Has(key []byte) (int, bool, error) {
 	if d.quitChan == nil {
-		return false, ErrClosed
+		return -1, false, ErrClosed
 	}
-	_, closer, err := d.db.Get(key)
+	value, closer, err := d.db.Get(key)
 	if err == pebble.ErrNotFound {
-		return false, nil
+		return -1, false, nil
 	}
 	if err != nil {
-		return false, err
+		return -1, false, err
 	}
 	closer.Close()
-	return true, nil
+
+	return len(value), true, nil
 }
 
 // Get implements the Store interface

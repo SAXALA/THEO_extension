@@ -468,118 +468,200 @@ func (nc *NodeCache) FlushModifiedNodes() {
 
 }
 
-// SlotCache manages slot LRU caching
-type SlotCache struct {
-	capacity int                      // Cache capacity
-	cache    map[string]*list.Element // Map from slot indices to list nodes
-	lruList  *list.List               // List ordered by access time
-	lock     sync.RWMutex
-	db       *PrefixDB // Reference to PrefixDB for batch operations
+const defaultStorageBufferChunks = 16
+const defaultStorageEntryPool = 8192 * 2
+
+type storageChunkEntry struct {
+	keyStart   []byte
+	keyEnd     []byte
+	entries    []kvPair
+	backing    []byte
+	lastAccess uint64
 }
 
-// Data structure stored in slot cache entries
-type slotCacheEntry struct {
+type storageChunkBuffer struct {
 	accountKey    string
-	data          []kvPair
-	accessedIndex []int // index kvs which have been accessed
-	// timestamp int64
-	backing   []byte
-	segmented bool
-	keyStart  []byte
-	keyEnd    []byte
+	chunks        []*storageChunkEntry
+	maxChunks     int
+	accessCounter uint64
+	entryPool     [][]kvPair
+	maxEntryPool  int
 }
 
-type SlotCacheMeta struct {
-	Segmented bool
-	KeyStart  []byte
-	KeyEnd    []byte
-}
-
-// NewSlotCache creates a new slot cache
-func NewSlotCache(capacity int, db *PrefixDB) *SlotCache {
-	return &SlotCache{
-		capacity: capacity,
-		cache:    make(map[string]*list.Element),
-		lruList:  list.New(),
-		db:       db,
+func (b *storageChunkBuffer) ensureLimits() {
+	if b.maxChunks <= 0 {
+		b.maxChunks = defaultStorageBufferChunks
 	}
 }
 
-// GetAccount returns the cached storage map for an account
-func (sc *SlotCache) GetAccount(accountKey string) ([]kvPair, bool) {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
+func (b *storageChunkBuffer) ensureEntryPoolLimits() {
+	if b.maxEntryPool <= 0 {
+		b.maxEntryPool = defaultStorageEntryPool
+	}
+}
 
-	if el, ok := sc.cache[accountKey]; ok {
-		sc.lruList.MoveToFront(el)
-		return el.Value.(*slotCacheEntry).data, true
+func (b *storageChunkBuffer) borrowEntries(size int) []kvPair {
+	if size <= 0 {
+		return nil
+	}
+	b.ensureEntryPoolLimits()
+	for i := len(b.entryPool) - 1; i >= 0; i-- {
+		buf := b.entryPool[i]
+		if cap(buf) >= size {
+			entries := buf[:size]
+			b.entryPool = append(b.entryPool[:i], b.entryPool[i+1:]...)
+			return entries
+		}
+	}
+	return make([]kvPair, size)
+}
+
+func (b *storageChunkBuffer) returnEntries(entries []kvPair) {
+	if entries == nil {
+		return
+	}
+	if cap(entries) == 0 {
+		return
+	}
+	for i := range entries {
+		entries[i] = kvPair{}
+	}
+	entries = entries[:0]
+	b.ensureEntryPoolLimits()
+	if len(b.entryPool) >= b.maxEntryPool {
+		return
+	}
+	b.entryPool = append(b.entryPool, entries)
+}
+
+func (b *storageChunkBuffer) releaseChunk(chunk *storageChunkEntry) {
+	if chunk == nil {
+		return
+	}
+	if len(chunk.entries) > 0 {
+		b.returnEntries(chunk.entries)
+		chunk.entries = nil
+	}
+	if chunk.backing != nil {
+		putDataBuffer(chunk.backing)
+		chunk.backing = nil
+	}
+}
+
+func (b *storageChunkBuffer) reset() {
+	for _, chunk := range b.chunks {
+		b.releaseChunk(chunk)
+	}
+	b.chunks = nil
+	b.accountKey = ""
+	b.accessCounter = 0
+}
+
+func (b *storageChunkBuffer) covers(accountKey string, key []byte) bool {
+	if b.accountKey != accountKey {
+		return false
+	}
+	if len(b.chunks) == 0 {
+		return true
+	}
+	if len(key) == 0 {
+		return true
+	}
+	for _, chunk := range b.chunks {
+		if len(chunk.keyStart) > 0 && bytes.Compare(key, chunk.keyStart) < 0 {
+			continue
+		}
+		if len(chunk.keyEnd) > 0 && bytes.Compare(key, chunk.keyEnd) > 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing []byte) {
+	b.ensureLimits()
+	if accountKey == "" {
+		if len(entries) > 0 {
+			b.returnEntries(entries)
+		}
+		if backing != nil {
+			putDataBuffer(backing)
+		}
+		b.reset()
+		return
+	}
+	if b.accountKey != accountKey {
+		b.reset()
+		b.accountKey = accountKey
+	}
+	if len(entries) == 0 {
+		if backing != nil {
+			putDataBuffer(backing)
+		}
+		return
+	}
+	chunk := &storageChunkEntry{
+		keyStart: entries[0].key,
+		keyEnd:   entries[len(entries)-1].key,
+		entries:  entries,
+		backing:  backing,
+	}
+	b.accessCounter++
+	chunk.lastAccess = b.accessCounter
+	for i, existing := range b.chunks {
+		if bytes.Equal(existing.keyStart, chunk.keyStart) && bytes.Equal(existing.keyEnd, chunk.keyEnd) {
+			b.releaseChunk(existing)
+			b.chunks[i] = chunk
+			return
+		}
+	}
+	b.chunks = append(b.chunks, chunk)
+	b.evictIfNeeded()
+}
+
+func (b *storageChunkBuffer) evictIfNeeded() {
+	b.ensureLimits()
+	for len(b.chunks) > b.maxChunks {
+		idx := 0
+		oldest := b.chunks[0].lastAccess
+		for i := 1; i < len(b.chunks); i++ {
+			if b.chunks[i].lastAccess < oldest {
+				oldest = b.chunks[i].lastAccess
+				idx = i
+			}
+		}
+		victim := b.chunks[idx]
+		b.releaseChunk(victim)
+		b.chunks = append(b.chunks[:idx], b.chunks[idx+1:]...)
+	}
+}
+
+func (b *storageChunkBuffer) lookup(key []byte) ([]byte, bool) {
+	if len(b.chunks) == 0 || len(key) == 0 {
+		return nil, false
+	}
+	for _, chunk := range b.chunks {
+		if len(chunk.keyStart) > 0 && bytes.Compare(key, chunk.keyStart) < 0 {
+			continue
+		}
+		if len(chunk.keyEnd) > 0 && bytes.Compare(key, chunk.keyEnd) > 0 {
+			continue
+		}
+		idx, ok := binarySearchKVPairs(chunk.entries, key)
+		if !ok {
+			continue
+		}
+		b.accessCounter++
+		chunk.lastAccess = b.accessCounter
+		return chunk.entries[idx].val, true
 	}
 	return nil, false
 }
 
-// PutAccount inserts or replaces an account's storage map into cache
-func (sc *SlotCache) PutAccount(accountKey string, data []kvPair, backing []byte, meta *SlotCacheMeta) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	if el, ok := sc.cache[accountKey]; ok {
-		entry := el.Value.(*slotCacheEntry)
-		if entry.backing != nil {
-			putDataBuffer(entry.backing)
-		}
-		entry.data = data
-		entry.backing = backing
-		sc.applyMeta(entry, meta)
-		sc.lruList.MoveToFront(el)
-		return
-	}
-
-	// evict if full
-	if len(sc.cache) >= sc.capacity {
-		sc.evictLRU()
-	}
-
-	entry := &slotCacheEntry{
-		accountKey: accountKey,
-		data:       data,
-		backing:    backing,
-	}
-	sc.applyMeta(entry, meta)
-	el := sc.lruList.PushFront(entry)
-	sc.cache[accountKey] = el
-}
-
-func (sc *SlotCache) UpdateAccount(accountKey string, data []kvPair, backing []byte, meta *SlotCacheMeta) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	if el, ok := sc.cache[accountKey]; ok {
-		entry := el.Value.(*slotCacheEntry)
-		if entry.backing != nil {
-			putDataBuffer(entry.backing)
-		}
-		entry.data = data
-		entry.backing = backing
-		sc.applyMeta(entry, meta)
-		sc.lruList.MoveToFront(el)
-		return
-	}
-	sc.PutAccount(accountKey, data, backing, meta)
-}
-
-func (sc *SlotCache) applyMeta(entry *slotCacheEntry, meta *SlotCacheMeta) {
-	entry.segmented = false
-	entry.keyStart = nil
-	entry.keyEnd = nil
-	if meta == nil {
-		return
-	}
-	entry.segmented = meta.Segmented
-	if len(meta.KeyStart) > 0 {
-		entry.keyStart = cloneBytes(meta.KeyStart)
-	}
-	if len(meta.KeyEnd) > 0 {
-		entry.keyEnd = cloneBytes(meta.KeyEnd)
+func (b *storageChunkBuffer) invalidate(accountKey string) {
+	if b.accountKey == accountKey {
+		b.reset()
 	}
 }
 
@@ -590,123 +672,6 @@ func cloneBytes(src []byte) []byte {
 	dup := make([]byte, len(src))
 	copy(dup, src)
 	return dup
-}
-
-func (sc *SlotCache) Get(accountKey string, key []byte) ([]byte, bool) {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
-
-	if el, ok := sc.cache[accountKey]; ok {
-		sc.lruList.MoveToFront(el)
-		entry := el.Value.(*slotCacheEntry)
-		if len(entry.data) == 0 {
-			return nil, false
-		}
-		if index, ok := binarySearchKVPairs(entry.data, key); ok {
-			return entry.data[index].val, true
-		}
-
-	}
-	return nil, false
-}
-
-// AccountHasKey reports whether the cached chunk for the account already covers the key range.
-func (sc *SlotCache) AccountHasKey(accountKey string, key []byte) bool {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
-
-	el, ok := sc.cache[accountKey]
-	if !ok {
-		return false
-	}
-	entry := el.Value.(*slotCacheEntry)
-	if len(entry.data) == 0 || !entry.segmented || len(key) == 0 {
-		sc.lruList.MoveToFront(el)
-		return true
-	}
-	if (len(entry.keyStart) == 0 || bytes.Compare(key, entry.keyStart) >= 0) &&
-		(len(entry.keyEnd) == 0 || bytes.Compare(key, entry.keyEnd) <= 0) {
-		sc.lruList.MoveToFront(el)
-		return true
-	}
-	return false
-}
-
-// releaseEntry releases pooled resources tied to the cache entry.
-func (sc *SlotCache) releaseEntry(entry *slotCacheEntry) {
-	if entry == nil {
-		return
-	}
-	if entry.backing != nil {
-		putDataBuffer(entry.backing)
-		entry.backing = nil
-	}
-	entry.segmented = false
-	entry.keyStart = nil
-	entry.keyEnd = nil
-}
-
-// DeleteAccount removes an account entry (flush if modified)
-func (sc *SlotCache) DeleteAccount(accountKey string) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	if el, ok := sc.cache[accountKey]; ok {
-		entry := el.Value.(*slotCacheEntry)
-		// flush before remove if modified
-		sc.releaseEntry(entry)
-		sc.lruList.Remove(el)
-		delete(sc.cache, accountKey)
-	}
-}
-
-// Invalidate removes an account entry without flushing it
-func (sc *SlotCache) Invalidate(accountKey string) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	if el, ok := sc.cache[accountKey]; ok {
-		entry := el.Value.(*slotCacheEntry)
-		sc.releaseEntry(entry)
-		sc.lruList.Remove(el)
-		delete(sc.cache, accountKey)
-	}
-}
-
-// ContainsAccount checks existence
-func (sc *SlotCache) ContainsAccount(accountKey string) bool {
-	sc.lock.RLock()
-	defer sc.lock.RUnlock()
-	_, ok := sc.cache[accountKey]
-	return ok
-}
-
-// evictLRU removes least-recently-used account;
-func (sc *SlotCache) evictLRU() {
-	if sc.lruList.Len() == 0 {
-		return
-	}
-	el := sc.lruList.Back()
-	if el == nil {
-		return
-	}
-	entry := el.Value.(*slotCacheEntry)
-
-	sc.releaseEntry(entry)
-	delete(sc.cache, entry.accountKey)
-	sc.lruList.Remove(el)
-}
-
-// FlushAll writes all modified accounts to disk and updates prefix tree
-
-func (sc *SlotCache) Close() {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-
-	for el := sc.lruList.Front(); el != nil; el = el.Next() {
-		entry := el.Value.(*slotCacheEntry)
-		sc.releaseEntry(entry)
-	}
 }
 
 // startWorker starts the background worker for processing path caching requests

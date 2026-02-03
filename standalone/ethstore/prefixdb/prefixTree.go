@@ -75,6 +75,41 @@ type NodeInfo struct {
 	storageSize   uint64
 }
 
+type FileNodeCache struct {
+	fileID string
+	hdrBuf []byte
+	buf    []byte
+}
+
+func (pt *PrefixTree) invalidateFileNodeCache(fileID string) {
+	pt.fileNodeCacheMu.Lock()
+	defer pt.fileNodeCacheMu.Unlock()
+	if fileID != pt.fileNodeCache.fileID {
+		return
+	}
+	pt.clearFileNodeCacheLocked()
+}
+
+func (pt *PrefixTree) setFileNodeCache(fileID string, hdrBuf []byte, buf []byte) {
+	pt.fileNodeCacheMu.Lock()
+	defer pt.fileNodeCacheMu.Unlock()
+	if pt.fileNodeCache.buf != nil {
+		pt.releaseBuf(pt.fileNodeCache.buf)
+	}
+	pt.fileNodeCache.fileID = fileID
+	pt.fileNodeCache.hdrBuf = hdrBuf
+	pt.fileNodeCache.buf = buf
+}
+
+func (pt *PrefixTree) clearFileNodeCacheLocked() {
+	if pt.fileNodeCache.buf != nil {
+		pt.releaseBuf(pt.fileNodeCache.buf)
+	}
+	pt.fileNodeCache.fileID = ""
+	pt.fileNodeCache.hdrBuf = nil
+	pt.fileNodeCache.buf = nil
+}
+
 // PrefixTree
 type PrefixTree struct {
 	root        *TrieNode // root
@@ -92,11 +127,14 @@ type PrefixTree struct {
 	mergeWait     sync.WaitGroup
 	mergeInterval time.Duration // merging interval
 
-	fileCache *lru.Cache
-
+	fileCache       *lru.Cache
+	fileNodeCache   FileNodeCache
+	fileNodeCacheMu sync.RWMutex
 	fileStripeLocks stripedRWLocks // striped locks for file operations
 
 	bufPool sync.Pool
+
+	gcCount int
 }
 
 // FileNodeHeader  file node header structure
@@ -108,21 +146,9 @@ type FileNodeHeader struct {
 	Reserved           [8]byte
 }
 
-type bloomsFileHeader struct {
-	Magic    uint32
-	Version  uint16
-	Count    uint32
-	Reserved [8]byte
-}
-
-type bloomEntryHeader struct {
-	FileIDLen uint16
-	DataLen   uint32
-}
-
 // NewPrefixTree
-func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
-	fmt.Println("Initializing Prefix Tree...")
+func NewPrefixTree(db *PrefixDB, dirPath string, databaseType DatabaseType) (*PrefixTree, error) {
+	fmt.Println("Initializing " + databaseType.String() + " Prefix Tree...")
 	fileNodeDir := filepath.Join(dirPath, "prefixdb", "filenodes")
 	if err := os.MkdirAll(fileNodeDir, 0755); err != nil {
 		return nil, fmt.Errorf("creat node file path failed: %w", err)
@@ -147,11 +173,12 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		fileNodeDir: fileNodeDir,
 		// bucketPrefixLength: MaxPrefixDepth - 1,
 		mergeStop:     make(chan struct{}),
-		mergeInterval: 10 * time.Minute,
+		mergeInterval: 1 * time.Minute,
 		fileCache:     fileCache,
+		fileNodeCache: FileNodeCache{},
 		bufPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, NodeEntrySize*64)
+				return make([]byte, NodeEntrySize*512)
 			},
 		},
 	}
@@ -159,15 +186,25 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 
 	// load existing prefix tree file if exists
 	pt.trieFile = filepath.Join(dirPath, "prefixdb", "trie")
-
 	if _, err := os.Stat(pt.trieFile); err == nil {
 		if err := pt.LoadFromFile(pt.trieFile); err != nil {
 			fmt.Printf("Warning: Failed to load prefix tree from file: %v\n", err)
 		}
 	}
-	pt.bucketPrefixLength = pt.maxDepth
 
-	fmt.Println("Prefix Tree initialized.")
+	switch databaseType {
+	case StateDB:
+		pt.bucketPrefixLength = pt.maxDepth
+	case SnapshotDB:
+		pt.bucketPrefixLength = pt.maxDepth / 2
+		pt.maxDepth = pt.maxDepth / 2
+	default:
+		pt.bucketPrefixLength = pt.maxDepth
+	}
+
+	pt.gcCount = 0
+
+	fmt.Println(databaseType.String() + " Prefix Tree initialized.")
 	return pt, nil
 }
 
@@ -246,7 +283,16 @@ func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error)
 		}
 		nextNode, exists := currentNode.children[key[depth]]
 		if !exists {
-			return NodeInfo{}, false, nil
+			// create child and make sure nextNode references it
+			child := &TrieNode{
+				nodeType:      NormalNode,
+				storageFileID: 0,
+				storageOffset: 0,
+				storageSize:   0,
+				children:      make(map[byte]*TrieNode),
+			}
+			currentNode.children[key[depth]] = child
+			nextNode = child
 		}
 		currentNode = nextNode
 		depth++
@@ -323,6 +369,9 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset i
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
 	fl.Lock()
 	defer fl.Unlock()
+
+	// invalidate cache if it matches
+	pt.invalidateFileNodeCache(fileID)
 
 	filePath := filepath.Join(pt.fileNodeDir, fileID)
 	var file *os.File
@@ -445,6 +494,9 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	fl.Lock()
 	defer fl.Unlock()
 
+	// invalidate cache if it matches
+	pt.invalidateFileNodeCache(fileID)
+
 	file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
 	if err != nil {
 		return false, fmt.Errorf("open node file failed: %w", err)
@@ -553,64 +605,106 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 	fl.RLock()
 	defer fl.RUnlock()
 
-	file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return NodeInfo{}, false, nil
-		}
-		return NodeInfo{}, false, fmt.Errorf("open file failed: %w", err)
-	}
-	// file.Seek(0, io.SeekStart)
-
+	var hdrBuf []byte
+	var bigBuf []byte
 	var header FileNodeHeader
-	headerSize := int64(binary.Size(header))
-	hdrBuf := make([]byte, headerSize)
-	if _, err := file.ReadAt(hdrBuf, 0); err != nil {
-		return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
+	var sortedSlice, unsortedSlice []byte
+
+	cacheLocked := false
+	pt.fileNodeCacheMu.RLock()
+	if pt.fileNodeCache.fileID == fileID && pt.fileNodeCache.hdrBuf != nil {
+		hdrBuf = pt.fileNodeCache.hdrBuf
+		bigBuf = pt.fileNodeCache.buf
+		cacheLocked = true
+	} else {
+		pt.fileNodeCacheMu.RUnlock()
 	}
-	if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
-		return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
+	if cacheLocked {
+		defer pt.fileNodeCacheMu.RUnlock()
 	}
-	if header.Magic != FileNodeMagic {
-		return NodeInfo{}, false, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", header.Magic, fileID)
+
+	if cacheLocked {
+		if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
+			return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
+		}
+		if header.Magic != FileNodeMagic {
+			return NodeInfo{}, false, fmt.Errorf("invalid cached file node magic (got 0x%X, file=%s)", header.Magic, fileID)
+		}
+	} else {
+		file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return NodeInfo{}, false, nil
+			}
+			return NodeInfo{}, false, fmt.Errorf("open file failed: %w", err)
+		}
+
+		headerSize := int64(binary.Size(header))
+		hdrBuf = make([]byte, headerSize)
+		if _, err := file.ReadAt(hdrBuf, 0); err != nil {
+			return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
+		}
+		if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
+			return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
+		}
+		if header.Magic != FileNodeMagic {
+			return NodeInfo{}, false, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", header.Magic, fileID)
+		}
+
+		totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
+		if totalEntries > 0 {
+			totalDataSize := int64(totalEntries) * NodeEntrySize
+			tempBuf := pt.borrowBuf(int(totalDataSize))
+			if tempBuf != nil {
+				if _, err := file.ReadAt(tempBuf[:totalDataSize], headerSize); err != nil && err != io.EOF {
+					pt.releaseBuf(tempBuf)
+					return NodeInfo{}, false, fmt.Errorf("read bulk data failed: %w", err)
+				}
+				bigBuf = tempBuf[:totalDataSize]
+			}
+		}
+
+		pt.setFileNodeCache(fileID, hdrBuf, bigBuf)
 	}
+
+	totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
+	if totalEntries > 0 && bigBuf != nil {
+		sortedBytes := int64(header.SortedEntryCount) * NodeEntrySize
+		sortedSlice = bigBuf[:sortedBytes]
+		unsortedSlice = bigBuf[sortedBytes:]
+	}
+
 	// segmented storage keeps offset 0, so treat fileID alone as validity signal
 	isNonZero := func(fid uint32) bool { return fid != 0 }
 
 	var zeroHit *NodeInfo
-	if header.UnsortedEntryCount > 0 {
-		unsortedBase := headerSize + int64(header.SortedEntryCount)*NodeEntrySize
+
+	// var nodeInfo NodeInfo
+	if header.UnsortedEntryCount > 0 && unsortedSlice != nil {
 		totalSize := int(header.UnsortedEntryCount) * NodeEntrySize
-		unsortedBuf := pt.borrowBuf(totalSize)
-		if unsortedBuf != nil {
-			defer pt.releaseBuf(unsortedBuf)
-			if _, err := file.ReadAt(unsortedBuf[:totalSize], unsortedBase); err != nil && err != io.EOF {
-				return NodeInfo{}, false, fmt.Errorf("read unsorted bulk failed: %w", err)
+		for i := uint32(0); i < header.UnsortedEntryCount; i++ {
+			idx := header.UnsortedEntryCount - 1 - i
+			offsetInBuf := int64(idx) * NodeEntrySize
+			if offsetInBuf+NodeEntrySize > int64(totalSize) {
+				break
 			}
-			for i := uint32(0); i < header.UnsortedEntryCount; i++ {
-				idx := header.UnsortedEntryCount - 1 - i
-				offsetInBuf := int64(idx) * NodeEntrySize
-				if offsetInBuf+NodeEntrySize > int64(totalSize) {
-					break
-				}
-				dec := decodeNodeEntry(unsortedBuf[offsetInBuf : offsetInBuf+NodeEntrySize])
-				if bytes.Equal(dec.key, remainingKey) {
-					if isNonZero(dec.storageFileID) {
-						if zeroHit == nil {
-							return dec, true, nil
-						}
-						return NodeInfo{
-							key:           dec.key,
-							accountOffset: zeroHit.accountOffset,
-							storageFileID: dec.storageFileID,
-							storageOffset: dec.storageOffset,
-							storageSize:   dec.storageSize,
-						}, true, nil
-					}
+			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
+			if bytes.Equal(dec.key, remainingKey) {
+				if isNonZero(dec.storageFileID) {
 					if zeroHit == nil {
-						tmp := dec
-						zeroHit = &tmp
+						return dec, true, nil
 					}
+					return NodeInfo{
+						key:           dec.key,
+						accountOffset: zeroHit.accountOffset,
+						storageFileID: dec.storageFileID,
+						storageOffset: dec.storageOffset,
+						storageSize:   dec.storageSize,
+					}, true, nil
+				}
+				if zeroHit == nil {
+					tmp := dec
+					zeroHit = &tmp
 				}
 			}
 		}
@@ -619,48 +713,38 @@ func (pt *PrefixTree) getFromFileNode(fileID string, remainingKey []byte) (nodeI
 	// 	return zeroHit.accountOffset, zeroHit.storageFileID, zeroHit.storageOffset, zeroHit.storageSize, true, nil
 	// }
 
-	if header.SortedEntryCount > 0 {
-		sortedBase := headerSize
-		sortedSize := int(header.SortedEntryCount) * NodeEntrySize
-		sortedBuf := pt.borrowBuf(sortedSize)
-		if sortedBuf != nil {
-			defer pt.releaseBuf(sortedBuf)
-			if _, err := file.ReadAt(sortedBuf[:sortedSize], sortedBase); err != nil && err != io.EOF {
-				return NodeInfo{}, false, fmt.Errorf("read sorted bulk failed: %w", err)
+	if header.SortedEntryCount > 0 && sortedSlice != nil {
+		getKeyAt := func(idx uint32) []byte {
+			start := int(idx) * NodeEntrySize
+			keyLen := int(sortedSlice[start])
+			if keyLen > MaxKeySize {
+				keyLen = MaxKeySize
 			}
+			return sortedSlice[start+1 : start+1+keyLen]
+		}
 
-			getKeyAt := func(idx uint32) []byte {
-				start := int(idx) * NodeEntrySize
-				keyLen := int(sortedBuf[start])
-				if keyLen > MaxKeySize {
-					keyLen = MaxKeySize
-				}
-				return sortedBuf[start+1 : start+1+keyLen]
-			}
-
-			low, high := uint32(0), header.SortedEntryCount-1
-			for low <= high {
-				mid := (low + high) / 2
-				k := getKeyAt(mid)
-				cmp := bytes.Compare(k, remainingKey)
-				if cmp == 0 {
-					start := int(mid) * NodeEntrySize
-					dec := decodeNodeEntry(sortedBuf[start : start+NodeEntrySize])
-					if isNonZero(dec.storageFileID) {
-						return dec, true, nil
-					}
-					if zeroHit != nil {
-						return *zeroHit, true, nil
-					}
+		low, high := uint32(0), header.SortedEntryCount-1
+		for low <= high {
+			mid := (low + high) / 2
+			k := getKeyAt(mid)
+			cmp := bytes.Compare(k, remainingKey)
+			if cmp == 0 {
+				start := int(mid) * NodeEntrySize
+				dec := decodeNodeEntry(sortedSlice[start : start+NodeEntrySize])
+				if isNonZero(dec.storageFileID) {
 					return dec, true, nil
-				} else if cmp < 0 {
-					low = mid + 1
-				} else {
-					if mid == 0 {
-						break
-					}
-					high = mid - 1
 				}
+				if zeroHit != nil {
+					return *zeroHit, true, nil
+				}
+				return dec, true, nil
+			} else if cmp < 0 {
+				low = mid + 1
+			} else {
+				if mid == 0 {
+					break
+				}
+				high = mid - 1
 			}
 		}
 	}
@@ -692,10 +776,13 @@ func (pt *PrefixTree) mergeAllFileNodes() {
 }
 
 func (pt *PrefixTree) mergeFileNode(filePath string) error {
+
 	fileID := filepath.Base(filePath)
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
 	fl.Lock()
 	defer fl.Unlock()
+
+	pt.invalidateFileNodeCache(fileID)
 
 	f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
 	if err != nil {
@@ -749,6 +836,7 @@ func (pt *PrefixTree) mergeFileNode(filePath string) error {
 			dec.storageFileID = old.storageFileID
 			dec.storageOffset = old.storageOffset
 			dec.storageSize = old.storageSize
+			dec.accountOffset = max(dec.accountOffset, old.accountOffset)
 		}
 		m[k] = dec
 	}

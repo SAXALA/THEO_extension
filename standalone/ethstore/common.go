@@ -9,6 +9,10 @@ import (
 // DataType defines the type of data identified by a key prefix.
 type DataType int
 
+func (DT *DataType) String() {
+
+}
+
 // Define all known data types.
 // Note: The order here defines the integer value. UnknownTypeDataType must be 0.
 const (

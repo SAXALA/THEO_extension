@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"path/filepath"
-
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -70,19 +68,18 @@ func (b *errorBatch) Replay(w ethdb.KeyValueWriter) error { return b.err }
 
 var AolHandledDataTypes = map[DataType]bool{
 	HeaderDataType:                    true,
-	HeaderNumberDataType:              true,
 	BlockBodyDataType:                 true,
 	BlockReceiptsDataType:             true,
 	TransactionLookupMetadataDataType: true,
+	// HeaderNumberDataType:              true,
 }
 
-var prefixDBHandledDataTypes = map[DataType]bool{
+var PrefixDBHandledDataTypes = map[DataType]bool{
 	TrieNodeAccountDataType: true,
 	TrieNodeStorageDataType: true,
-	CodeDataType:            true,
 }
 
-var ssPrefixdbHandledDataTypes = map[DataType]bool{
+var SSPrefixdbHandledDataTypes = map[DataType]bool{
 	SnapshotAccountDataType: true,
 	SnapshotStorageDataType: true,
 }
@@ -185,8 +182,11 @@ type Database struct {
 
 	log log.Logger // Contextual logger tracking the database path
 
-	// count tracks the number of operations (Has/Get/Put/Delete)
-
+	baolkvs            map[string]string // Temporary storage for BlockAppendOnlyLog key-values during operations
+	baolLatestBlock    uint64            // Temporary storage for latest block number during operations
+	txIndexkvs         map[string]string // Temporary storage for TxIndexAppendOnlyLog key-values during operations
+	txIndexLatestBlock uint64            // Temporary storage for latest block number during operations
+	accountKey         []byte            // Temporary storage for account key during operations
 }
 
 // New returns a wrapped EthStore object using TxIndexAppendOnlyLog.
@@ -197,13 +197,13 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState)
+	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, prefixdb.StateDB)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
 
 	dirPathSnapshot := dirPath + "_snapshot"
-	snapshotPrefixdb, err := prefixdb.NewPrefixDB(dirPathSnapshot)
+	snapshotPrefixdb, err := prefixdb.NewPrefixDB(dirPathSnapshot, prefixdb.SnapshotDB)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -227,6 +227,7 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 		return nil, fmt.Errorf("failed to initialize append-only log: %w", err)
 	}
 	db.txIndexAol = appendLog
+	db.txIndexkvs = make(map[string]string)
 
 	// Initialize BlockAppendOnlyLog
 	baol, err := NewBlockAppendOnlyLog(dirPath+"/aol", recentN, logger)
@@ -234,9 +235,10 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
 	}
 	db.blockAol = baol
+	db.baolkvs = make(map[string]string)
 
 	// Initialize Pebble store for non-AOL data
-	pebblePath := filepath.Join(dirPath, "pebble")
+	pebblePath := dirPath + "_pebble"
 	logger.Info("Initializing Pebble store", "path", pebblePath)
 	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
 	// Pass through namespace and readonly from the New function's parameters.
@@ -352,7 +354,9 @@ func (d *Database) Has(key []byte) (bool, error) {
 		var exists bool
 		var err error
 		if dataType == TransactionLookupMetadataDataType {
-			// First check if the key exists in AOL
+			if valStr, exists = d.txIndexkvs[string(key)]; exists {
+				return true, nil
+			}
 			valStr, exists, err = d.txIndexAol.Get(string(key))
 			if err != nil {
 				return false, err
@@ -363,11 +367,14 @@ func (d *Database) Has(key []byte) (bool, error) {
 					return false, nil
 				}
 				return true, nil
+			} else {
+				return false, ErrNotFound
 			}
 		} else {
-
+			if valStr, exists = d.baolkvs[string(key)]; exists {
+				return true, nil
+			}
 			valStr, exists, err = d.blockAol.Get(string(key))
-
 			if err != nil {
 				return false, err
 			}
@@ -378,28 +385,29 @@ func (d *Database) Has(key []byte) (bool, error) {
 				}
 				return true, nil
 			}
+			return false, ErrNotFound
 		}
 		// If the key doesn't exist in AOL, continue to look in Pebble
-	} else if prefixDBHandledDataTypes[dataType] {
+	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 			return false, fmt.Errorf("PrefixDB is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 
 		// Check if the key exists in PrefixDB
 
-		exists, err := d.statepdb.Has(key)
+		exists, err := d.statepdb.Has(key, d.accountKey)
 
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
 		}
 		return exists, nil
-	} else if ssPrefixdbHandledDataTypes[dataType] {
+	} else if SSPrefixdbHandledDataTypes[dataType] {
 		if d.snappdb == nil {
 			return false, fmt.Errorf("SSPrefixDB is not initialized, cannot check key %x(type %s)", key, DataTypeStrings[dataType])
 		}
 		// Check if the key exists in SSPrefixDB
 
-		exists, err := d.snappdb.Has(key)
+		exists, err := d.snappdb.Has(key, d.accountKey)
 
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in SSPrefixDB: %w", key, err)
@@ -433,13 +441,14 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		if d.txIndexAol == nil {
 			return nil, fmt.Errorf("AOL is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-
 		var valStr string
 		var exists bool
 		var err error
-
 		if dataType == TransactionLookupMetadataDataType {
-
+			if valStr, exists = d.txIndexkvs[string(key)]; exists {
+				// Return the found value from temporary storage
+				return []byte(valStr), nil
+			}
 			valStr, exists, err = d.txIndexAol.Get(string(key))
 			if err != nil {
 				return nil, err
@@ -451,11 +460,15 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 				}
 				// Return the found value
 				return []byte(valStr), nil
+			} else {
+				return nil, ErrNotFound
 			}
 		} else {
-
+			if valStr, exists = d.baolkvs[string(key)]; exists {
+				// Return the found value from temporary storage
+				return []byte(valStr), nil
+			}
 			valStr, exists, err = d.blockAol.Get(string(key))
-
 			if err != nil {
 				return nil, err
 			}
@@ -466,11 +479,13 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 				}
 				// Return the found value
 				return []byte(valStr), nil
+			} else {
+				return nil, ErrNotFound
 			}
 		}
 		// Key doesn't exist in AOL, continue to look in Pebble
 		d.log.Trace("Key not found in AOL, checking Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-	} else if prefixDBHandledDataTypes[dataType] {
+	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 
 			return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
@@ -478,7 +493,7 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 
 		// Try to get from PrefixDB
 
-		value, exists, err := d.statepdb.Get(key)
+		value, exists, err := d.statepdb.Get(key, d.accountKey)
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
@@ -492,13 +507,13 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		// Log the found key in PrefixDB
 		d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return value, nil // Return the found value
-	} else if ssPrefixdbHandledDataTypes[dataType] {
+	} else if SSPrefixdbHandledDataTypes[dataType] {
 		if d.snappdb == nil {
 			return nil, fmt.Errorf("SSPrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Try to get from SSPrefixDB
 
-		value, exists, err := d.snappdb.Get(key)
+		value, exists, err := d.snappdb.Get(key, d.accountKey)
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to get key %x from SSPrefixDB: %w", key, err)
@@ -516,7 +531,7 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 
 	// Try to get from Pebble
 
-	fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
+	// fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
 	value, err := d.db.Get(key)
 
 	if err != nil {
@@ -555,53 +570,68 @@ func (d *Database) Put(key []byte, value []byte) error {
 		if !foundBlockID {
 			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
 		}
-
 		if foundBlockID {
-
 			var err error
 			if dataType == TransactionLookupMetadataDataType {
-
-				err = d.txIndexAol.PutKV(blockID, string(key), string(value))
-
-				if err != nil {
-					return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				if blockID > d.txIndexLatestBlock {
+					if d.txIndexLatestBlock != 0 {
+						err = d.txIndexAol.Append(d.txIndexLatestBlock, d.txIndexkvs)
+					}
+					d.txIndexLatestBlock = blockID
+					d.txIndexkvs = make(map[string]string, 4)
+					d.txIndexkvs[string(key)] = string(value)
+					if err != nil {
+						return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+					}
+					d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+					return nil // Data stored in AOL
+				} else {
+					d.txIndexkvs[string(key)] = string(value)
+					return nil // Data queued for AOL
 				}
-				d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-				return nil // Data stored in AOL
+
 			} else {
-				kvs := map[string]string{string(key): string(value)}
-
-				err = d.blockAol.Append(blockID, kvs)
-
-				if err != nil {
-					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID, err)
+				if blockID > d.baolLatestBlock {
+					if d.baolLatestBlock != 0 {
+						err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
+					}
+					d.baolLatestBlock = blockID
+					d.baolkvs = make(map[string]string, 4)
+					d.baolkvs[string(key)] = string(value)
+					if err != nil {
+						return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+					}
+					d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+					return nil // Data stored in AOL
+				} else {
+					d.baolkvs[string(key)] = string(value)
+					return nil // Data queued for AOL
 				}
-				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-				return nil // Data stored in AOL
+
 			}
 		}
 		// If blockID couldn't be determined for an AOL-handled type.
 		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
-	} else if prefixDBHandledDataTypes[dataType] {
+	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in PrefixDB
 
-		err := d.statepdb.Put(key, value)
+		err := d.statepdb.Put(key, value, d.accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
 		d.log.Trace("Stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return nil // Data stored in PrefixDB
-	} else if ssPrefixdbHandledDataTypes[dataType] {
+	} else if SSPrefixdbHandledDataTypes[dataType] {
 		if d.snappdb == nil {
 			return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in SSPrefixDB
 
-		err := d.snappdb.Put(key, value)
+		err := d.snappdb.Put(key, value, d.accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
@@ -616,7 +646,7 @@ func (d *Database) Put(key []byte, value []byte) error {
 	}
 
 	// fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
-	fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
+	// fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
 	err := d.db.Put(key, value)
 
 	if err != nil {
@@ -667,26 +697,26 @@ func (d *Database) Delete(key []byte) error {
 		}
 		// Successfully stored deletion marker in AOL
 		return nil // Deletion marker stored in AOL
-	} else if prefixDBHandledDataTypes[dataType] {
+	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from PrefixDB
 
-		err := d.statepdb.Delete(key)
+		err := d.statepdb.Delete(key, d.accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
 		d.log.Trace("Deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return nil // Data deleted from PrefixDB
-	} else if ssPrefixdbHandledDataTypes[dataType] {
+	} else if SSPrefixdbHandledDataTypes[dataType] {
 		if d.snappdb == nil {
 			return fmt.Errorf("SSPrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from SSPrefixDB
 
-		err := d.snappdb.Delete(key)
+		err := d.snappdb.Delete(key, d.accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
@@ -1034,4 +1064,17 @@ func (d *Database) CloseAol() error {
 	}
 
 	return nil
+}
+
+func (d *Database) SetAccountKey(accountKey []byte) error {
+	d.accountKey = accountKey
+	return nil
+}
+
+func (d *Database) GetParentAccountKey(key []byte) []byte {
+	return d.statepdb.GetParentAccountKey(key)
+}
+
+func (d *Database) InsertAccountHashPebble(key []byte, accounthash []byte) error {
+	return d.statepdb.InsertAccountHashPebble(accounthash, key)
 }

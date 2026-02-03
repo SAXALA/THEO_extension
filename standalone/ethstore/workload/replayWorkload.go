@@ -12,12 +12,15 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	// Please replace "ethstore_module" with the actual module path defined in your ethstore/go.mod file
 
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/ethereum/go-ethereum/rlp"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
@@ -34,9 +37,9 @@ const (
 func main() {
 
 	databaseDir := "/mnt/ssd2/ethstore/database"
-	loadDataDir := "/mnt/ssd2/ethstore/20500000_key_value_pairs.txt"
+	loadDataDir := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
 
-	baselinepebbledir := "/mnt/ssd/ethstore/baseline/pebble"
+	baselinepebbledir := "/mnt/ssd2/ethstore/baseline/pebble"
 	traceFile := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
 	traceFileNocache := "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000"
 	go func() {
@@ -44,13 +47,21 @@ func main() {
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
-	//TestPrefixGet()
+	// TestPrefixGet()
+	// loadPebble()
 	// loadAccount()
+	// repalceAccountHashToAccountKey()
 
-	recordTraceStorage(traceFileNocache)
-	recordTraceBlock(traceFile)
-
+	// recordTraceStorage(traceFile)
+	// recordAccount(traceFileNocache)
+	// recordTraceBlock(traceFile)
+	replayTraceAccount(databaseDir, traceFileNocache)
 	// replayTrace(databaseDir, traceFile)
+
+	// time.Sleep(5 * time.Second)
+	// loadbaselineData(baselinepebbledir, loadDataDir)
+	// replaybaselineTrace(baselinepebbledir, traceFileNocache)
+	// replayTrace(databaseDir, traceFileNocache)
 	return
 
 	mode := flag.String("mode", "re", "Mode of operation: ld (load data), re (replay trace), o (other), lb (load baseline), rb (replay baseline)")
@@ -66,6 +77,7 @@ func main() {
 		// loadAol(databaseDir, notxFile, txFile)
 	case "re":
 		replayTrace(databaseDir, traceFile)
+		replayTrace(databaseDir, traceFileNocache)
 	case "o":
 		otherRunner(traceFile)
 	case "lb":
@@ -80,7 +92,6 @@ func main() {
 func loadbaselineData(pebbleDir string, dataFile string) {
 	tempDir := pebbleDir
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
-	// store, err := ethstore.New(tempDir, 10, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -140,16 +151,15 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
 		}
 		// Verify the value was stored correctly
-
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
-
 	}
 }
 
 func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
-	store, err := ethstore.NewPebbleStore(baselinePebbleDir, 0, 0, "", false)
+	dir := baselinePebbleDir
+	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -170,6 +180,10 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 	counter := 0
 	reader := bufio.NewReader(file)
 
+	var logicReadSize int64 = 0
+	var logicWriteSize int64 = 0
+
+	fmt.Println("Start replaying baseline trace...")
 	for {
 		// read line
 		line, err := reader.ReadString('\n')
@@ -183,14 +197,13 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 		line = strings.TrimSpace(line)
 
 		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") ||
-			!strings.Contains(line, "OPType:") {
+		if strings.Contains(line, "Global log file opened successfully") || !strings.Contains(line, "OPType:") {
 			continue
 		}
 
 		matches := opRegex.FindStringSubmatch(line)
 		if len(matches) < 4 {
-			// 无法解析的行，跳过
+			// fmt.Printf("无法解析行: %s\n", line)
 			continue
 		}
 
@@ -212,18 +225,6 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 			// 无效的键，跳过
 			continue
 		}
-		//|| keyBytes[0] == 'O'
-		if keyBytes[0] == 'A' || keyBytes[0] == 'O' {
-
-		} else {
-			continue
-		}
-
-		// if keyBytes[0] == 'a' || keyBytes[0] == 'o' || keyBytes[0] == 'c' {
-		// 	continue
-		// }
-
-		// keyStr := hex.EncodeToString(keyBytes)
 
 		var op opType
 		switch opTypeStr {
@@ -247,14 +248,17 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 		}
 
 		// 执行操作并计时
+		var value []byte
+		var size int
 		start := time.Now()
 		var opErr error
 
 		switch op {
 		case opGet:
-			_, opErr = store.Get(keyBytes)
+			value, opErr = store.Get(keyBytes)
+			size = len(value)
 		case opHas:
-			_, opErr = store.Has(keyBytes)
+			size, _, opErr = store.Has(keyBytes)
 		case opPut:
 			opErr = store.Put(keyBytes, valueBytes)
 		case opDelete:
@@ -263,14 +267,31 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 
 		end := time.Now()
 		totalTime += end.Sub(start)
-		counter++
+
 		if opErr != nil {
 			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
 		}
+		counter++
+		switch op {
+		case opGet, opHas:
+			logicReadSize += int64(size)
+		case opPut:
+			logicWriteSize += int64(keySize) + int64(valueSize)
+		case opDelete:
+			logicWriteSize += int64(keySize)
+		}
+
 		if counter%10000 == 0 {
-			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
+			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
+			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		if counter == 100*1000*1000 {
+			fmt.Println("Reached 100 million operations, stopping replay.")
+			fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
+			break
 		}
 	}
+
 }
 
 // load all data from the key-value file into EthStore
@@ -346,21 +367,27 @@ func loadData(dataBaseDir string, dataFile string) {
 }
 
 func loadAccount() {
-	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
-	dirPath := "/mnt/ssd2/ethstore/database_state"
-	pdb, err := prefixdb.NewPrefixDB(dirPath)
+	tempDir := "/mnt/ssd2/ethstore/database"
+	//dirPath := "/mnt/ssd2/ethstore/database_snapshot"
+	pdb, err := prefixdb.NewPrefixDB(tempDir, prefixdb.StateDB)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer pdb.Close()
 
+	dbPath := "/mnt/ssd2/pebble"
+	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	if err != nil {
+		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
+		return
+	}
 	// spdb, err := prefixdb.NewPrefixDB(dirPath)
 	// if err != nil {
 	// 	log.Fatalf("Failed to create EthStore instance: %v", err)
 	// }
 	// defer spdb.Close()
 
-	testFilePath := "/mnt/ssd2/ethstore/20500000_key_value_pairs.txt"
+	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -395,14 +422,7 @@ func loadAccount() {
 		// 	continue
 		// }
 
-		// if counter > 375799415 && !isSaveTrie {
-		// 	pdb.SaveTree()
-		// time.Sleep(5 * time.Minute) //make sure all batchs are committed
-		// 	isSaveTrie = true
-		// 	// continue
-		// }
-
-		if counter > 1966138022 {
+		if counter > 2000000000 {
 			break
 		}
 
@@ -427,12 +447,26 @@ func loadAccount() {
 		if err != nil {
 			log.Fatalf("Failed to decode value: %v", err)
 		}
+		var accountKey []byte
 
 		switch keyBytes[0] {
 		case 'A', 'O':
 			// Perform the Put operation
+			if keyBytes[0] == 'O' {
+				accountKey = pdb.GetParentAccountKey(keyBytes)
+				if accountKey == nil {
+					Key, _, err := findKeyValuePair(keyPart[2:66], ps)
+					if Key == "" || err != nil {
+						fmt.Printf("Failed to get parent account key for key %s\n", keyPart)
+						continue
+					}
+					accountKey = []byte(Key)
+					pdb.InsertAccountHashPebble(keyBytes[1:33], accountKey)
+				}
+				// accountKey = nil
+			}
 			startTime := time.Now()
-			err = pdb.Put(keyBytes, valueBytes)
+			err = pdb.Put(keyBytes, valueBytes, accountKey)
 
 			//value, ok, err := pdb.Get(keyBytes)
 
@@ -492,7 +526,7 @@ func loadAccount() {
 func replaySSPut() {
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
 	dirPath := "/mnt/ssd/ethstore/database"
-	pdb, err := prefixdb.NewPrefixDB(dirPath)
+	pdb, err := prefixdb.NewPrefixDB(dirPath, prefixdb.SnapshotDB)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -557,9 +591,14 @@ func replaySSPut() {
 		// 	isstore = true
 		// }
 
+		var accountKey []byte
+		if keyBytes[0] == 'o' {
+			accountKey = pdb.GetParentAccountKey(keyBytes)
+		}
+
 		// Perform the Put operation
 		startTime := time.Now()
-		err = pdb.Put(keyBytes, valueBytes)
+		err = pdb.Put(keyBytes, valueBytes, accountKey)
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
 		if err != nil {
@@ -710,7 +749,7 @@ func loadAol(dataBaseDir string, notxFile string, txFile string) {
 
 func TestPrefixGet() {
 	dirPath := "/mnt/ssd2/ethstore/database_state"
-	pd, err := prefixdb.NewPrefixDB(dirPath)
+	pd, err := prefixdb.NewPrefixDB(dirPath, prefixdb.StateDB)
 	if err != nil {
 		log.Fatalf("Failed to create PrefixDB: %v", err)
 	}
@@ -723,8 +762,13 @@ func TestPrefixGet() {
 		log.Fatalf("Failed to decode key hex: %v", err)
 	}
 
+	var accountKey []byte
+	if pdkey[0] == 'O' {
+		accountKey = pd.GetParentAccountKey(pdkey)
+	}
+
 	startTime := time.Now()
-	value, ok, err := pd.Get(pdkey)
+	value, ok, err := pd.Get(pdkey, accountKey)
 	endTime := time.Now()
 	if err != nil {
 		log.Fatalf("Get operation failed: %v", err)
@@ -1004,7 +1048,7 @@ func TestPebblePreformance() {
 
 func TestGetParentKey() {
 	dirpath := "/mnt/ssd/ethstore/database"
-	pd, err := prefixdb.NewPrefixDB(dirpath)
+	pd, err := prefixdb.NewPrefixDB(dirpath, prefixdb.StateDB)
 	if err != nil {
 		fmt.Printf("Failed to create PrefixDB: %v", err)
 	}
@@ -1024,7 +1068,7 @@ func TestGetParentKey() {
 
 	Key1, err = hex.DecodeString(string(Key1))
 	Value1, err = hex.DecodeString(string(Value1))
-	pd.Put(Key1, Value1)
+	pd.Put(Key1, Value1, parentKey1)
 	fmt.Print("Parent Key1: ", hex.EncodeToString(parentKey1), "\n")
 	if !bytes.Equal(parentKey1, Key1[:len(Key1)-2]) {
 		fmt.Printf("Expected parent key for Key1 to be %x, got %x\n", Key1[:len(Key1)-2], parentKey1)
@@ -1035,11 +1079,19 @@ func TestGetParentKey() {
 
 func replayTrace(dataBaseDir string, traceFileDir string) {
 	tempDir := dataBaseDir
-	store, err := ethstore.New(tempDir, 1000, "put_test", false)
+	store, err := ethstore.New(tempDir, 8000, "put_test", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
+
+	dbPath := "/mnt/ssd2/pebble"
+
+	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	if err != nil {
+		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
+		return
+	}
 
 	testFilePath := traceFileDir
 
@@ -1099,6 +1151,12 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 			// 无效的键，跳过
 			continue
 		}
+
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		if !ethstore.AolHandledDataTypes[dataType] {
+			continue
+		}
+
 		// keyBytes[0] == 'O' storagekvs
 		// keyBytes[0] == 'A' accountkvs
 		// keyBytes[0] == 'a' accountsnapshotkvs
@@ -1106,15 +1164,25 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 		// keyBytes[0] == 'c' codekvs
 
 		if keyBytes[0] == 'O' {
-		} else {
-			continue
+			accountKey := store.GetParentAccountKey(keyBytes)
+			if accountKey == nil {
+				Key, _, err := findKeyValuePair(keyHex[2:66], ps)
+				if Key == "" || err != nil {
+					fmt.Printf("Failed to get parent account key for key %s\n", keyHex)
+					continue
+				}
+				accountKey = []byte(Key)
+				store.InsertAccountHashPebble(accountKey, keyBytes[1:33])
+			}
+			if err := store.SetAccountKey(accountKey); err != nil {
+				fmt.Printf("SetAccountKey failed for key %s: %v\n", keyHex, err)
+				break
+			}
 		}
 
 		// if keyBytes[0] == 'a' || keyBytes[0] == 'o' || keyBytes[0] == 'c' {
 		// 	continue
 		// }
-
-		// keyStr := hex.EncodeToString(keyBytes)
 
 		var op opType
 		switch opTypeStr {
@@ -1155,13 +1223,19 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 		end := time.Now()
 		totalTime += end.Sub(start)
 		if opErr != nil {
-			fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
-			// fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+			//fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
+			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
 		}
 		counter++
 		if counter%10000 == 0 {
 			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 		}
+
+		if counter == 100*1000*1000 {
+			fmt.Println("Reached 100 million operations, stopping replay.")
+			break
+		}
+
 	}
 }
 
@@ -1284,113 +1358,155 @@ func replayPebble() {
 }
 
 func recordTraceStorage(traceFileDir string) {
-	fmt.Println("Start replay trace store Get test...")
 
-	testFilePath := traceFileDir
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
+	file, err := os.Open(traceFileDir)
 	if err != nil {
 		log.Fatalf("Failed to open test file: %v", err)
 	}
 	defer file.Close()
 
-	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
+	baseDir := "traceNoCache"
+	if strings.Contains(traceFileDir, "withcache") {
+		baseDir = "traceCache"
+	}
+	fmt.Println("Start recode trace storage data...", baseDir)
+
+	createBufferedCSV := func(name string) (*os.File, *bufio.Writer) {
+		f, err := os.Create("/mnt/ssd2/ethstore/motivationdata/" + baseDir + "_" + name + ".csv")
+		if err != nil {
+			log.Fatalf("Failed to create file: %v", err)
+		}
+		writer := bufio.NewWriter(f)
+		writer.WriteString("linecount,Key,count\n") //
+		return f, writer
+	}
+
+	fTA, wTA := createBufferedCSV("trieNodeAccount")
+	defer fTA.Close()
+	defer wTA.Flush()
+
+	fStorage, wStorage := createBufferedCSV("storage")
+	defer fStorage.Close()
+	defer wStorage.Flush()
+
+	fSA, wSA := createBufferedCSV("snapshotAccount")
+	defer fSA.Close()
+	defer wSA.Flush()
+
+	fSS, wSS := createBufferedCSV("snapshotStorage")
+	defer fSS.Close()
+	defer wSS.Flush()
+
+	// var oldOp string
+	var oldStorageAccountHash string
+	var storageOpsCount int
+	var storageLineStart int
+
+	var oldSnapshotAccountHash string
+	var SnapshotopsCount int
+	var snapshotLineStart int
+	linecount := 0
+
+	var blockID uint64
 	reader := bufio.NewReader(file)
 
-	var oldOp string
-	var oldAccountHash []byte
-	deferstorage := 0
-	var opsCount int
-
-	outFileGet, err := os.Create("../log/traceWithoutCache_storage_get_account_ops.csv")
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outFileGet.Close()
-	fmt.Fprintf(outFileGet, "account_hash,defer_storage,ops_count\n")
-
-	outFilePut, err := os.Create("../log/traceWithoutCache_storage_put_account_ops.csv")
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outFilePut.Close()
-	fmt.Fprintf(outFilePut, "account_hash,defer_storage,ops_count\n")
-
-	var outFile *os.File
-
 	for {
-		// read line
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if err.Error() == "EOF" {
-				fmt.Println("End of file reached")
+			if err == io.EOF {
 				break
 			}
-			fmt.Errorf("error reading trace file: %v", err)
+			fmt.Printf("Error reading file: %v\n", err)
+			break
 		}
+		linecount++
 
-		line = strings.TrimSpace(line)
-
-		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") ||
-			!strings.Contains(line, "OPType:") {
+		if !strings.Contains(line, "OPType: ") {
 			continue
 		}
 
-		matches := opRegex.FindStringSubmatch(line)
-		if len(matches) < 4 {
-			// 无法解析的行，跳过
+		opIdx := strings.Index(line, "OPType: ")
+		if opIdx == -1 {
 			continue
 		}
-
-		opTypeStr := matches[1]
-		keyHex := matches[2]
-		keySize := 0
-		fmt.Sscanf(matches[3], "%d", &keySize)
-
-		// 检查是否有值部分
-		// var valueHex string
-		// var valueSize int
-		if len(matches) >= 6 && matches[4] != "" {
-			// valueHex = matches[4]
-			// fmt.Sscanf(matches[5], "%d", &valueSize)
+		opPart := line[opIdx+8:]
+		commaIdx := strings.Index(opPart, ",")
+		if commaIdx == -1 {
+			continue
 		}
+		opTypeStr := opPart[:commaIdx]
 
+		keyIdx := strings.Index(line, "key: ")
+		if keyIdx == -1 {
+			continue
+		}
+		keyPart := line[keyIdx+5:]
+		commaIdx = strings.Index(keyPart, ",")
+		if commaIdx == -1 {
+			continue
+		}
+		keyHex := keyPart[:commaIdx]
 		keyBytes, err := hex.DecodeString(keyHex)
 		if err != nil {
-			// 无效的键，跳过
 			continue
 		}
 
-		if keyBytes[0] == 'O' {
-		} else {
-			continue
-		}
-
-		if opTypeStr != "" && oldOp != opTypeStr {
-			oldOp = opTypeStr
-			// fmt.Println("op changed to " + opTypeStr)
-			switch opTypeStr {
-			case "Get", "Has":
-				outFile = outFileGet
-			case "Put", "BatchPut", "Delete", "BatchDelete":
-				outFile = outFilePut
+		switch keyBytes[0] {
+		case 'A':
+			wTA.WriteString(fmt.Sprintf("%d,%s,%d\n", linecount, keyHex, 1))
+		case 'O':
+			storageAccountHash := keyHex[2:66]
+			if oldStorageAccountHash == storageAccountHash {
+				storageOpsCount++
+			} else {
+				if oldStorageAccountHash != "" {
+					wStorage.WriteString(fmt.Sprintf("%d,%s,%d\n", storageLineStart, oldStorageAccountHash, storageOpsCount))
+				}
+				storageOpsCount = 1
+				storageLineStart = linecount
 			}
+			oldStorageAccountHash = storageAccountHash
+		case 'a':
+			wSA.WriteString(fmt.Sprintf("%d,%s,%d\n", linecount, keyHex[2:66], 1))
+		case 'o':
+			snapshotAccountHash := keyHex[2:66]
+			if oldSnapshotAccountHash == snapshotAccountHash {
+				SnapshotopsCount++
+			} else {
+				if oldSnapshotAccountHash != "" {
+					wSS.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotLineStart, oldSnapshotAccountHash, SnapshotopsCount))
+				}
+				SnapshotopsCount = 1
+				snapshotLineStart = linecount
+			}
+			oldSnapshotAccountHash = snapshotAccountHash
+		default:
+			if opTypeStr == "Put" || opTypeStr == "BatchPut" {
+				dataType := ethstore.GetDataTypeFromKey(keyBytes)
+				if ethstore.AolHandledDataTypes[dataType] {
+					var ok bool
+					blockID, ok = ethstore.ParseBlockNumberFromKey(keyBytes, dataType)
+					if ok {
+						if blockID%10000 == 0 {
+							fmt.Printf("Reached blockID milestone: %d at line %d\n", blockID, linecount)
+						}
+
+					}
+				}
+			}
+			continue
 		}
 
-		accountHash := keyBytes[1:33]
-		if accountHash != nil && !bytes.Equal(oldAccountHash, accountHash) {
-			oldAccountHash = make([]byte, len(accountHash))
-			copy(oldAccountHash, accountHash)
-			deferstorage++
-			// fmt.Printf("%x, %d, %d\n", keyHex[2:66], deferstorage, opsCount)
-			outFile.WriteString(fmt.Sprintf("%s, %d\n", keyHex[2:66], opsCount))
-			opsCount = 1
-		} else {
-			opsCount++
-		}
 	}
+	if oldStorageAccountHash != "" && storageOpsCount > 0 {
+		wStorage.WriteString(fmt.Sprintf("%d,%s,%d\n", storageLineStart, oldStorageAccountHash, storageOpsCount))
+	}
+	if oldSnapshotAccountHash != "" && SnapshotopsCount > 0 {
+		wSS.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotLineStart, oldSnapshotAccountHash, SnapshotopsCount))
+	}
+
+	fmt.Printf("Total lines processed: %d\n", linecount)
+
 }
 
 func recordTraceBlock(traceFileDir string) {
@@ -1404,17 +1520,24 @@ func recordTraceBlock(traceFileDir string) {
 	}
 	defer file.Close()
 
+	var baseDir string
+	if strings.Contains(traceFileDir, "withcache") {
+		baseDir = "traceWithCache"
+	} else {
+		baseDir = "traceNoCache"
+	}
+
 	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
 	reader := bufio.NewReader(file)
 
-	outFileGet, err := os.Create("../log/trace_store_get_block_ops.csv")
+	outFileGet, err := os.Create("../log/" + baseDir + "_get_tx_ops.csv")
 	if err != nil {
 		log.Fatalf("Failed to create output file: %v", err)
 	}
 	defer outFileGet.Close()
-	fmt.Fprintf(outFileGet, "block_data_key,distance\n")
+	fmt.Fprintf(outFileGet, "opType,block_data_key,lastPutID,opID,distance,dataType\n")
 
-	outFilePut, err := os.Create("../log/trace_store_put_block_ops.csv")
+	outFilePut, err := os.Create("../log/" + baseDir + "_put_tx_ops.csv")
 	if err != nil {
 		log.Fatalf("Failed to create output file: %v", err)
 	}
@@ -1422,7 +1545,8 @@ func recordTraceBlock(traceFileDir string) {
 	fmt.Fprintf(outFilePut, "block_data_key,distance\n")
 
 	//newBlockID := uint64(20500009)
-	newBlockID := uint64(0)
+	// newBlockID := uint64(20499865) //noCache
+	newBlockID := uint64(20499568) // Cache
 	for {
 		// read line
 		line, err := reader.ReadString('\n')
@@ -1475,13 +1599,13 @@ func recordTraceBlock(traceFileDir string) {
 
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		if ethstore.AolHandledDataTypes[dataType] {
-			if dataType == ethstore.TransactionLookupMetadataDataType {
+			if dataType != ethstore.TransactionLookupMetadataDataType {
 				continue
 			} else {
 				var blockID uint64
 				var ok bool
 				blockID, ok = ethstore.ParseBlockNumberFromKey(keyBytes, dataType)
-				if ok != true && valueBytes != nil {
+				if ok != true && len(valueBytes) > 0 {
 					blockID, ok = ethstore.ParseBlockNumberFromValue(valueBytes, dataType)
 					if err != nil {
 						continue
@@ -1490,15 +1614,16 @@ func recordTraceBlock(traceFileDir string) {
 					continue
 				}
 				switch opTypeStr {
-				case "Get", "Has", "Delete", "BatchDelete":
-					// distance := int64(newBlockID - blockID)
-					// fmt.Fprintf(outFileGet, "%s,%d\n", keyHex, distance)
+				case "Delete", "BatchDelete":
+					distance := int64(newBlockID - blockID)
+					fmt.Fprintf(outFileGet, "%s,%s,%d,%d,%d,%s\n", opTypeStr, keyHex, newBlockID, blockID, distance, ethstore.DataTypeStrings[dataType])
 				case "Put", "BatchPut":
 					if blockID > newBlockID {
 						newBlockID = blockID
-						fmt.Fprintf(outFilePut, "%d, ", blockID)
+						// fmt.Fprintf(outFilePut, "%d, ", blockID)
 					} else if blockID < newBlockID {
-						fmt.Fprintf(outFilePut, "put old block")
+						// fmt.Fprintf(outFilePut, "put old block")
+						// fmt.Println("put old block")
 					}
 
 				}
@@ -1507,4 +1632,665 @@ func recordTraceBlock(traceFileDir string) {
 
 	}
 
+}
+
+func replayTraceAccount(dataBaseDir string, traceFileDir string) {
+	tempDir := dataBaseDir + "_state"
+	store, err := prefixdb.NewPrefixDB(tempDir, prefixdb.StateDB)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	testFilePath := traceFileDir
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	var memStats runtime.MemStats
+
+	var oldop string
+
+	fmt.Println("start replay")
+	for {
+		// read line
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err.Error() == "EOF" {
+				fmt.Println("End of file reached")
+			}
+			fmt.Errorf("error reading trace file: %v", err)
+		}
+
+		line = strings.TrimSpace(line)
+
+		// 跳过非操作行
+		if strings.Contains(line, "Global log file opened successfully") ||
+			!strings.Contains(line, "OPType:") {
+			continue
+		}
+
+		matches := opRegex.FindStringSubmatch(line)
+		if len(matches) < 4 {
+			// 无法解析的行，跳过
+			continue
+		}
+
+		opTypeStr := matches[1]
+		keyHex := matches[2]
+		keySize := 0
+		fmt.Sscanf(matches[3], "%d", &keySize)
+		// 检查是否有值部分
+		// var valueHex string
+		// var valueSize int
+		keyBytes, err := hex.DecodeString(keyHex)
+		if err != nil {
+			// 无效的键，跳过
+			continue
+		}
+		// keyBytes[0] == 'O' storagekvs
+		// keyBytes[0] == 'A' accountkvs
+		// keyBytes[0] == 'a' accountsnapshotkvs
+		// keyBytes[0] == 'o' storagesnapshotkvs
+		// keyBytes[0] == 'c' codekvs
+		if keyBytes[0] == 'O' || keyBytes[0] == 'A' {
+		} else {
+			continue
+		}
+
+		var accountKey []byte
+		if keyBytes[0] == 'O' {
+			if accountKey = store.GetParentAccountKey(keyBytes); accountKey == nil {
+				fmt.Printf("SetAccountKey failed for key %s: %v\n", keyHex, err)
+				continue
+			}
+		}
+
+		var valueBytes []byte
+		if len(matches) >= 6 && matches[4] != "" {
+			valueHex := matches[4]
+			valueBytes, err = hex.DecodeString(valueHex)
+			if err != nil {
+				// 无效的值，跳过
+				continue
+			}
+		}
+
+		if oldop != opTypeStr && (oldop == "Get" || oldop == "") {
+			oldop = opTypeStr
+			fmt.Println("op changed to " + opTypeStr)
+		}
+
+		// Perform the operation
+		startTime := time.Now()
+		var opErr error
+		var ok bool
+		switch opTypeStr {
+		case "Get":
+			_, ok, opErr = store.Get(keyBytes, accountKey)
+		case "Has":
+			_, opErr = store.Has(keyBytes, accountKey)
+		case "Put", "BatchPut":
+			opErr = store.Put(keyBytes, valueBytes, accountKey)
+		case "Delete", "BatchDelete":
+			opErr = store.Delete(keyBytes, accountKey)
+		default:
+			// 未知操作，跳过
+			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			continue
+		}
+
+		endTime := time.Now()
+		totalTime += endTime.Sub(startTime)
+		if !ok && opTypeStr == "Get" {
+			fmt.Printf("Get operation: key %s not found\n", keyHex)
+		}
+		if opErr != nil {
+			fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
+			// fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+		}
+		counter++
+		if counter%10000 == 0 {
+			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
+			runtime.ReadMemStats(&memStats)
+			fmt.Printf("GC 次数: %d", memStats.NumGC)
+		}
+	}
+}
+
+func loadPebble() {
+	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
+	dirPath := "/mnt/ssd2/ethstore/database_pebble"
+	pdb, err := ethstore.NewPebbleStore(dirPath, 0, 0, "pebble_load", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer pdb.Close()
+
+	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+
+	// Read key-value pairs from the test file
+	file, err := os.Open(testFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	var totalTime time.Duration
+	counter := 0
+	reader := bufio.NewReader(file)
+
+	fmt.Println("start load pebble")
+	for {
+
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break // End of file reached
+		}
+
+		// line format: "key: xxxxxx, value: yyyy"
+		line = line[:len(line)-1] // Remove the newline character
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			log.Printf("无法解析行: %s", line)
+			continue
+		}
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+
+		// Convert key and value to byte slices
+		keyBytes := []byte(keyPart)
+
+		valueBytes := []byte(valuePart)
+
+		keyBytes, err = hex.DecodeString(string(keyBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode key: %v", err)
+		}
+		valueBytes, err = hex.DecodeString(string(valueBytes))
+		if err != nil {
+			log.Fatalf("Failed to decode value: %v", err)
+		}
+		DataType := ethstore.GetDataTypeFromKey(keyBytes)
+		if !ethstore.AolHandledDataTypes[DataType] && !ethstore.PrefixDBHandledDataTypes[DataType] && !ethstore.SSPrefixdbHandledDataTypes[DataType] {
+			// Perform the Put operation
+			startTime := time.Now()
+			err = pdb.Put(keyBytes, valueBytes)
+			endTime := time.Now()
+			totalTime += endTime.Sub(startTime)
+			counter++
+			if err != nil {
+				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+			}
+			if counter%100000 == 0 {
+				fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
+			}
+		}
+
+	}
+	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+}
+
+func repalceAccountHashToAccountKey() {
+	fmt.Println("Start replace account hash to account key...")
+	PebblePath := "/mnt/ssd/ethstore/index/accountHash_key_pebble"
+	store, err := ethstore.NewPebbleStore(PebblePath, 0, 0, "replace_accounthash_to_accountkey", false)
+	if err != nil {
+		log.Fatalf("Failed to create EthStore instance: %v", err)
+	}
+	defer store.Close()
+
+	dbPath := "/mnt/ssd2/pebble"
+
+	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	if err != nil {
+		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
+		return
+	}
+	defer ps.Close()
+
+	inputFilePath := "/mnt/ssd2/ethstore/motivationdata/merged_traceCache_counts.csv"
+
+	inputFile, err := os.Open(inputFilePath)
+	if err != nil {
+		log.Fatalf("Failed to open input file: %v", err)
+	}
+	defer inputFile.Close()
+
+	outputFilePath := "/mnt/ssd2/ethstore/motivationdata/merged_traceCache_counts_accountKey.csv"
+
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		log.Fatalf("Failed to create output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	reader := bufio.NewReader(inputFile)
+	// file: accountHash,avg,other...
+	for {
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
+			break
+		}
+
+		//skip first line
+		if strings.HasPrefix(line, "Key") {
+			_, err = outputFile.WriteString(line)
+			if err != nil {
+				log.Fatalf("Failed to write to output file: %v", err)
+			}
+			continue
+		}
+		accountHashHex := strings.Split(line, ",")[0]
+		accountHash, err := hex.DecodeString(accountHashHex)
+		if err != nil {
+			log.Fatalf("Failed to decode account hash: %v", err)
+		}
+		key, err := store.Get(accountHash)
+		var accountKey []byte
+		if err != nil {
+			Key, _, err := findKeyValuePair(accountHashHex, ps)
+			if err != nil {
+				accountKey = accountHash
+			} else {
+				accountKey, err = hex.DecodeString(Key)
+				if err != nil {
+					log.Fatalf("Failed to decode account key from DB key: %v", err)
+				}
+				// store into pebble
+				err = store.Put(accountHash, accountKey)
+				if err != nil {
+					log.Fatalf("Failed to put account hash and key into pebble: %v", err)
+				}
+			}
+		} else {
+			accountKey = key
+		}
+		newLine := strings.Replace(line, accountHashHex, hex.EncodeToString(accountKey), 1)
+		_, err = outputFile.WriteString(newLine)
+		if err != nil {
+			log.Fatalf("Failed to write to output file: %v", err)
+		}
+	}
+}
+
+func recordAccount(traceFileDir string) {
+	fmt.Println("Start replay trace store Account test...")
+
+	file, err := os.Open(traceFileDir)
+	if err != nil {
+		log.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	baseDir := "traceNoCache"
+	if strings.Contains(traceFileDir, "withcache") {
+		baseDir = "traceCache"
+	}
+
+	createBufferedCSV := func(name string) (*os.File, *bufio.Writer) {
+		f, err := os.Create("../log/" + baseDir + "_" + name + ".csv")
+		if err != nil {
+			log.Fatalf("Failed to create file: %v", err)
+		}
+		writer := bufio.NewWriter(f)
+		writer.WriteString("accountKey\n")
+		return f, writer
+	}
+
+	fGet, wGet := createBufferedCSV("account_get_ops")
+	fPut, wPut := createBufferedCSV("account_put_ops")
+
+	defer func() {
+		wGet.Flush()
+		wPut.Flush()
+		fGet.Close()
+		fPut.Close()
+	}()
+
+	reader := bufio.NewReader(file)
+	linecount := 0
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Printf("Error reading at line %d: %v\n", linecount, err)
+			break
+		}
+		linecount++
+
+		if !strings.Contains(line, "OPType: ") {
+			continue
+		}
+
+		opIdx := strings.Index(line, "OPType: ")
+		keyIdx := strings.Index(line, "key: ")
+		if opIdx == -1 || keyIdx == -1 {
+			continue
+		}
+
+		// 解析 OPType (截取到逗号)
+		opPart := line[opIdx+8:]
+		opEnd := strings.Index(opPart, ",")
+		if opEnd == -1 {
+			continue
+		}
+		opTypeStr := opPart[:opEnd]
+
+		// 解析 Key (截取到逗号)
+		keyPart := line[keyIdx+5:]
+		keyEnd := strings.Index(keyPart, ",")
+		var keyHex string
+		if keyEnd == -1 {
+
+			keyHex = strings.TrimSpace(keyPart)
+		} else {
+			keyHex = keyPart[:keyEnd]
+		}
+
+		if len(keyHex) < 2 || keyHex[0] != '4' || keyHex[1] != '1' {
+			continue
+		}
+
+		var target *bufio.Writer
+		switch opTypeStr {
+		case "Has", "Get", "Delete", "BatchDelete":
+			target = wGet
+		case "Put", "BatchPut":
+			target = wPut
+		default:
+			continue
+		}
+
+		target.WriteString(keyHex)
+		target.WriteByte('\n')
+	}
+
+	fmt.Printf("Finished. Total lines processed: %d\n", linecount)
+}
+
+const TrieNodeAccountPrefix = "41"
+
+type node interface {
+	isNode()
+}
+
+type fullNode struct {
+	Children [16]node
+}
+
+type shortNode struct {
+	Key    []byte
+	Val    node
+	isLeaf bool
+}
+
+type valueNode []byte
+
+func (f fullNode) isNode()  {}
+func (s shortNode) isNode() {}
+func (v valueNode) isNode() {}
+
+func findKeyValuePair(accountHashHex string, ps *ethstore.PebbleStore) (string, string, error) {
+	targetPath, err := hexToNibbles(accountHashHex)
+	if err != nil {
+		return "", "", fmt.Errorf("无效的十六进制哈希: %v", err)
+	}
+
+	finalPath, finalValue, err := findRecursive(targetPath, 0, ps)
+	if err != nil {
+		return "", "", err
+	}
+
+	finalDBKey := accountTrieNodeKey(finalPath)
+	// decodedValue, err := decodeAccountValue(finalValue)
+	// if err != nil {
+	// 	return finalDBKey, finalValue, fmt.Errorf("找到键值对，但解码失败: %v", err)
+	// }
+	// finalValue = fmt.Sprintf("%s (解码: %s)", finalValue, decodedValue)
+	return finalDBKey, finalValue, nil
+}
+
+func hexToNibbles(h string) ([]byte, error) {
+	if len(h)%2 != 0 {
+		h = "0" + h
+	}
+	bytes, err := hex.DecodeString(h)
+	if err != nil {
+		return nil, err
+	}
+	nibbles := make([]byte, 0, len(bytes)*2)
+	for _, b := range bytes {
+		nibbles = append(nibbles, b>>4)
+		nibbles = append(nibbles, b&0x0F)
+	}
+	return nibbles, nil
+}
+
+func findRecursive(path []byte, pos int, ps *ethstore.PebbleStore) ([]byte, string, error) {
+	// fmt.Printf("递归步骤:\n")
+	// fmt.Printf("  - 当前已走路径 (逻辑): %x\n", path[:pos])
+	// fmt.Printf("  - 剩余待查路径: %x\n", path[pos:])
+	if pos > len(path) {
+		// fmt.Println("  - 到达路径末尾，返回空结果")
+		return nil, "", fmt.Errorf("到达路径末尾，没有指定分支")
+	}
+
+	dbKey := accountTrieNodeKey(path[:pos])
+
+	decode, err := hex.DecodeString(dbKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("无法解码数据库键 %s: %v", dbKey, err)
+	}
+
+	value, err := ps.Get(decode)
+	if err != nil {
+		// fmt.Printf("无法从数据库中获取键 %s: %v\n", dbKey, err)
+		return nil, "", fmt.Errorf("无法从数据库中获取键 %s: %v", dbKey, err)
+		return findRecursive(path, pos+1, ps)
+	}
+
+	n, err := decodeNode(value)
+	if err != nil {
+		return nil, "", err
+	}
+	// fmt.Printf("  - 解码节点为: %T\n", n)
+
+	switch node := n.(type) {
+	case *shortNode:
+		if !node.isLeaf {
+			// fmt.Printf("  - ShortNode不是叶子节点，继续查找...\n")
+			if pos+len(node.Key) >= len(path) {
+				return nil, "", fmt.Errorf("到达ShortNode但路径已耗尽，没有指定分支,accountHash: %s", encodePath(path, true))
+			}
+			// 继续查找剩余路径
+			return findRecursive(path, pos+len(node.Key), ps)
+		}
+		remainBytes := encodePath(path[pos:], true)
+		if _, isValue := node.Val.(valueNode); isValue && len(remainBytes) == len(node.Key) {
+			// fmt.Printf(" 节点key(字节) %x, 待查询的剩余路径 %x\n", node.Key, remainBytes)
+			// fmt.Println("  - ShortNode包含ValueNode，路径完全匹配。查找成功!")
+
+			return path[:pos], "", nil //暂时不返回value
+			// return path[:pos], value, nil
+		}
+
+		if len(remainBytes) < len(node.Key) || !bytes.Equal(remainBytes[:len(node.Key)], node.Key) {
+			return nil, "", fmt.Errorf("路径不匹配: 节点key(字节) %x, 待查询的剩余路径  %x", node.Key, path[pos:])
+		}
+		// fmt.Printf("  - ShortNode匹配路径前缀(字节): %x\n", node.Key)
+		return findRecursive(path, pos+len(node.Key), ps)
+
+	case *fullNode:
+		if pos >= len(path) {
+			return nil, "", fmt.Errorf("到达FullNode但路径已耗尽，没有指定分支")
+		}
+		// nibble := path[pos]
+		// fmt.Printf("  - FullNode选择分支: %x\n", nibble)
+		return findRecursive(path, pos+1, ps)
+	}
+
+	return nil, "", fmt.Errorf("未知的节点类型或逻辑错误")
+}
+
+func accountTrieNodeKey(path []byte) string {
+	return TrieNodeAccountPrefix + hex.EncodeToString(path)
+}
+
+func decodeNode(value []byte) (node, error) {
+	valBytes := value
+	trimmed := bytes.TrimSpace(value)
+	if len(trimmed) >= 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X') {
+		trimmed = trimmed[2:]
+	}
+	if len(trimmed) > 0 && isHexBytes(trimmed) {
+		decoded := make([]byte, hex.DecodedLen(len(trimmed)))
+		if _, err := hex.Decode(decoded, trimmed); err == nil {
+			valBytes = decoded
+		}
+	}
+
+	var decoded []interface{}
+	if err := rlp.DecodeBytes(valBytes, &decoded); err != nil {
+		return valueNode(valBytes), nil
+	}
+
+	switch len(decoded) {
+	case 2:
+		keyBytes, ok := decoded[0].([]byte)
+		if !ok {
+			return nil, fmt.Errorf("无效的shortNode键类型")
+		}
+
+		_, isLeaf := decodePath(keyBytes)
+
+		// fmt.Printf("  - 解码为: shortNode (是叶子节点: %v)\n", isLeaf)
+
+		var value node
+		switch v := decoded[1].(type) {
+		case []byte:
+			value = valueNode(v)
+		case []interface{}:
+			if len(v) == 17 {
+				value = &fullNode{}
+			} else if len(v) == 2 {
+				value = &shortNode{}
+			}
+		}
+
+		return &shortNode{Key: keyBytes, Val: value, isLeaf: isLeaf}, nil
+
+	case 17:
+		// fmt.Println("  - 解码为: fullNode")
+		// 检查fullNode第17个元素是否有value
+		if len(decoded) == 17 {
+			if val, ok := decoded[16].([]byte); ok && len(val) > 0 {
+				fmt.Printf("  - fullNode第17项为value: %x\n", val)
+			}
+		}
+		return &fullNode{}, nil
+	}
+
+	return nil, fmt.Errorf("未知的节点编码格式，解码后长度为 %d", len(decoded))
+}
+
+func isHexBytes(data []byte) bool {
+	if len(data)%2 != 0 {
+		return false
+	}
+	for _, b := range data {
+		switch {
+		case b >= '0' && b <= '9':
+		case b >= 'a' && b <= 'f':
+		case b >= 'A' && b <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// encodePath 将 nibble 路径编码为压缩的字节数组
+func encodePath(nibbles []byte, terminator bool) []byte {
+	oddLen := len(nibbles)%2 != 0
+
+	// 构造 prefix
+	var flags byte
+	if terminator {
+		flags |= 0x20
+	}
+	if oddLen {
+		flags |= 0x10
+	}
+
+	var encoded []byte
+	if oddLen {
+		// 前缀低4位放入第一个 nibble
+		prefix := flags | (nibbles[0] & 0x0F)
+		encoded = append([]byte{prefix}, packNibbles(nibbles[1:])...)
+	} else {
+		// 低4位为0
+		prefix := flags
+		encoded = append([]byte{prefix}, packNibbles(nibbles)...)
+	}
+
+	return encoded
+}
+
+// packNibbles 将 nibble 数组每两个合并成一个 byte
+func packNibbles(nibbles []byte) []byte {
+	out := make([]byte, (len(nibbles)+1)/2)
+	for i := 0; i < len(nibbles); i++ {
+		if i%2 == 0 {
+			out[i/2] = nibbles[i] << 4
+		} else {
+			out[i/2] |= nibbles[i] & 0x0F
+		}
+	}
+	return out
+}
+
+// decodePath 将编码后的字节数组解码为 nibble 路径和 terminator 标志
+func decodePath(encoded []byte) (nibbles []byte, terminator bool) {
+	if len(encoded) == 0 {
+		return nil, false
+	}
+
+	prefix := encoded[0]
+	terminator = (prefix & 0x20) != 0
+	oddLen := (prefix & 0x10) != 0
+
+	unpacked := unpackToNibbles(encoded[1:])
+
+	if oddLen {
+		// 低4位是第一个 nibble
+		nibbles = append([]byte{prefix & 0x0F}, unpacked...)
+	} else {
+		nibbles = unpacked
+	}
+	return
+}
+
+// unpackToNibbles 将字节数组还原为 nibble 数组
+func unpackToNibbles(bytes []byte) []byte {
+	nibbles := make([]byte, 0, len(bytes)*2)
+	for _, b := range bytes {
+		nibbles = append(nibbles, b>>4)
+		nibbles = append(nibbles, b&0x0F)
+	}
+	return nibbles
 }

@@ -130,63 +130,63 @@ func TestEthStore_SpecificBlockOperations(t *testing.T) {
 func TestPutAndGet(t *testing.T) {
 	t.Skip("Skipping TestPutAndGet because it requires an external file")
 	/*
-	go func() {
-		// Start the HTTP server for pprof profiling
-		log.Println(http.ListenAndServe(":6060", nil))
-	}()
-	tempDir := t.TempDir()
-	store, err := New(tempDir, 10, "put_test", false)
-	require.NoError(t, err)
-	require.NotNil(t, store)
-	defer store.Close()
+		go func() {
+			// Start the HTTP server for pprof profiling
+			log.Println(http.ListenAndServe(":6060", nil))
+		}()
+		tempDir := t.TempDir()
+		store, err := New(tempDir, 10, "put_test", false)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
 
-	testFilePath := "/mnt/tmp/20500000_key_value_pairs.txt"
+		testFilePath := "/mnt/tmp/20500000_key_value_pairs.txt"
 
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	require.NoError(t, err, "Failed to open test file")
-	defer file.Close()
+		// Read key-value pairs from the test file
+		file, err := os.Open(testFilePath)
+		require.NoError(t, err, "Failed to open test file")
+		defer file.Close()
 
-	counter := 0
-	reader := bufio.NewReader(file)
-	for {
-		counter++
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
+		counter := 0
+		reader := bufio.NewReader(file)
+		for {
+			counter++
+			line, err := reader.ReadString('\n')
+			if err == io.EOF {
+				break // End of file reached
+			}
+			require.NoError(t, err, "Error reading line from test file")
+
+			// line format: "key: xxxxxx, value: yyyy"
+			line = line[:len(line)-1] // Remove the newline character
+
+			parts := strings.Split(line, ", Value :")
+			if len(parts) != 2 {
+				t.Logf("无法解析行: %s", line)
+				continue
+			}
+			keyPart := strings.TrimPrefix(parts[0], "Key: ")
+			valuePart := strings.TrimSpace(parts[1])
+
+			require.NotEmpty(t, keyPart, "Key should not be empty")
+			require.NotEmpty(t, valuePart, "Value should not be empty")
+
+			require.NoError(t, err, "Error parsing line from test file")
+			// Convert key and value to byte slices
+			keyBytes := []byte(keyPart)
+			valueBytes := []byte(valuePart)
+			// Perform the Put operation
+			err = store.Put(keyBytes, valueBytes)
+			require.NoError(t, err, "Put operation should not fail")
+			// Verify the value was stored correctly
+			// fmt.Printf("\rPut test: %d", counter)
+
+			if err != nil {
+				t.Fatalf("Get operation failed for key %s: %v", keyPart, err)
+			}
 		}
-		require.NoError(t, err, "Error reading line from test file")
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value :")
-		if len(parts) != 2 {
-			t.Logf("无法解析行: %s", line)
-			continue
-		}
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		require.NotEmpty(t, keyPart, "Key should not be empty")
-		require.NotEmpty(t, valuePart, "Value should not be empty")
-
-		require.NoError(t, err, "Error parsing line from test file")
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-		valueBytes := []byte(valuePart)
-		// Perform the Put operation
-		err = store.Put(keyBytes, valueBytes)
-		require.NoError(t, err, "Put operation should not fail")
-		// Verify the value was stored correctly
-		// fmt.Printf("\rPut test: %d", counter)
-
-		if err != nil {
-			t.Fatalf("Get operation failed for key %s: %v", keyPart, err)
-		}
-	}
-	require.NoError(t, err, "Error scanning test file")
-	t.Log("Put test completed successfully")
+		require.NoError(t, err, "Error scanning test file")
+		t.Log("Put test completed successfully")
 	*/
 }
 
