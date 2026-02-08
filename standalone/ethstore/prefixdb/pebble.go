@@ -240,7 +240,7 @@ type pebbleIterator struct {
 	iter    *pebble.Iterator // The underlying Pebble iterator
 	prefix  []byte           // The prefix for iteration, if any
 	initErr error            // Error that occurred during iterator creation
-	// start []byte          // The start key for iteration (handled by IterOptions.LowerBound)
+	// start   []byte           // The start key for iteration (handled by IterOptions.LowerBound)
 	// No explicit 'valid' field; pebble.Iterator manages its own validity.
 }
 
@@ -451,7 +451,7 @@ func (d *PebbleStore) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 		db:     d,
 		iter:   underlyingIter,
 		prefix: prefix,
-		// start: start, // Storing start is not strictly needed as LowerBound handles it
+		//start:  start, // Storing start is not strictly needed as LowerBound handles it
 	}
 }
 

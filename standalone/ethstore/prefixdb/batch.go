@@ -7,6 +7,13 @@ import (
 	"sync"
 )
 
+type ModifiedType int
+
+const (
+	None ModifiedType = iota
+	ValueModified
+)
+
 type WriteBatch struct {
 	operations map[string]WriteOperation
 	// slotBatch  map[int]map[string][]byte
@@ -24,7 +31,7 @@ type WriteBatch struct {
 
 type WriteOperation struct {
 	value         []byte
-	modifiedType  ModifiedType // type of modification (0: None, 1: value changed, 2: slotIndices changed)
+	modifiedType  ModifiedType // type of modification (0: None, 1: value changed)
 	storageFileID uint32       // ID of the storage file for the account
 	storageOffset int64        // offset in the file for the account
 	storageSize   uint64       // size of the stored data
@@ -63,7 +70,7 @@ func (wb *WriteBatch) EnableBackgroundCommit(db *PrefixDB) {
 		wb.bgCommit = true
 		wb.wg.Add(1)
 
-		// 启动后台处理线程
+		// start background commit goroutine
 		go wb.processCommitQueue()
 	}
 }
@@ -99,7 +106,7 @@ func (wb *WriteBatch) processCommitQueue() {
 				}
 			}
 		case <-wb.quitCh:
-			// 处理剩余的任务
+			// operation to perform during shutdown
 			for {
 				select {
 				case batch := <-wb.commitQueue:
@@ -224,27 +231,27 @@ func (wb *WriteBatch) delete(key []byte) {
 		wb.lock.Unlock()
 		return
 	}
-	wb.operations[string(key)] = WriteOperation{value: nil, storageFileID: 0, storageOffset: 0, storageSize: 0, modifiedType: 0}
+	wb.operations[string(key)] = WriteOperation{value: nil, storageFileID: 0, storageOffset: 0, storageSize: 0, modifiedType: 1}
 	wb.lock.Unlock()
 
 	wb.checkAndCommit()
 }
 
-func (wb *WriteBatch) get(key []byte) ([]byte, CacheInfo, bool) {
+func (wb *WriteBatch) get(key []byte) ([]byte, StorageInfo, bool) {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 	op, exists := wb.operations[string(key)]
 	if exists && op.value == nil {
-		return nil, CacheInfo{}, false
+		return nil, StorageInfo{}, false
 	}
-	return op.value, CacheInfo{
+	return op.value, StorageInfo{
 		storageFileID: op.storageFileID,
 		storageOffset: op.storageOffset,
 		storageSize:   op.storageSize,
 	}, exists
 }
 
-func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo CacheInfo) error {
+func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo StorageInfo) error {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 
@@ -317,6 +324,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 			if err := db.storeNode(keyBytes, node); err != nil {
 				return err
 			}
+			db.nodeCache.UpdateAccountOffset(key, trieAccountOffset-int64(len(entry)))
 		}
 	}
 

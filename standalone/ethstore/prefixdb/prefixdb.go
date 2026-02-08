@@ -30,21 +30,20 @@ const METADATA_SPACE = 1024 * 1024
 const storageMaxFileSize int64 = 1 << 30 // 1GB
 
 const (
-	storageSegmentThreshold = 1 * 256 * 1024 // per account before folder split
-	storageChunkSize        = 1 * 256 * 1024 // target size of each chunk file
-	segmentedChunkHardLimit = 1 * 512 * 1024 // hard cap for individual chunk files
+	storageSegmentThreshold           = 1 * 256 * 1024 // per account before folder split
+	storageChunkSize                  = 1 * 256 * 1024 // target size of each chunk file
+	segmentedChunkHardLimit           = 1 * 512 * 1024 // hard cap for individual chunk files
+	storageGCTriggerSize              = segmentedChunkHardLimit
+	segmentedStorageFlag       uint32 = 1 << 31
+	segmentedDirNamePrefix            = "storage_seg_"
+	segmentIndexFileName              = "index.meta"
+	segmentIndexCacheThreshold        = 1 * 1024 // cache indexes larger than 1KB
+	segmentIndexCacheCapacity         = 64       // number of large index folders retained in memory
 )
 
-const (
-	segmentedStorageFlag   uint32 = 1 << 31
-	segmentedDirNamePrefix        = "storage_seg_"
-	segmentIndexFileName          = "index.meta"
-)
+const chunkNormalizationThreshold uint64 = 256 // chunk files over this size have been appended
 
-const (
-	segmentIndexCacheThreshold = 128 * 1024 // cache indexes larger than 128KB
-	segmentIndexCacheCapacity  = 64         // number of large index folders retained in memory
-)
+const ()
 
 type DatabaseType int
 
@@ -85,6 +84,15 @@ type segmentChunkMeta struct {
 	KeyEnd    []byte
 	KVCount   uint32
 	ChunkSize uint64
+}
+
+type storageGCJob struct {
+	folderID uint32
+	fileName string
+}
+
+func (job storageGCJob) key() string {
+	return fmt.Sprintf("%d:%s", job.folderID, job.fileName)
 }
 
 // binarySearchKVPairs locates key in a sorted kvPair slice using bytes.Compare.
@@ -132,7 +140,6 @@ type PrefixDB struct {
 	prefixTree   *PrefixTree
 	accountFile  *os.File
 	// slotFile    *os.File
-	trieFile *os.File
 
 	nodeCache *NodeCache
 	batch     *WriteBatch
@@ -158,6 +165,12 @@ type PrefixDB struct {
 	storageIndexCache    *lru.Cache
 	storageIndexReusable bool
 	storageIndexArena    []byte
+
+	storageGCQueue    chan storageGCJob
+	storageGCInFlight map[string]struct{}
+	storageGCStop     chan struct{}
+	storageGCWait     sync.WaitGroup
+	storageGCMu       sync.Mutex
 
 	// for debug
 	totalOps   uint64
@@ -219,14 +232,8 @@ func NewPrefixDB(dirpath string, databaseType DatabaseType) (*PrefixDB, error) {
 		return nil, errors.New("failed to open normal account file")
 	}
 
-	trieFile, err := os.OpenFile(triePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, errors.New("failed to open prefix tree file")
-	}
-
 	db := &PrefixDB{
 		accountFile:  accountFile,
-		trieFile:     trieFile,
 		batch:        NewWriteBatch(cfg.WriteBatchSize),
 		writeMutex:   sync.Mutex{},
 		storageDir:   storageDir,
@@ -240,7 +247,11 @@ func NewPrefixDB(dirpath string, databaseType DatabaseType) (*PrefixDB, error) {
 		return nil, fmt.Errorf("failed to init storage shard: %v", err)
 	}
 
-	db.nodeCache = NewNodeCache(cfg.MaxCacheSize, db)
+	nodeCache, err := NewNodeCache(cfg.MaxCacheSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init node cache: %v", err)
+	}
+	db.nodeCache = nodeCache
 
 	prefixTree, err := NewPrefixTree(db, dirpath, db.databaseType)
 	if err != nil {
@@ -261,6 +272,8 @@ func NewPrefixDB(dirpath string, databaseType DatabaseType) (*PrefixDB, error) {
 	}
 	db.storageIndexCache = indexCache
 
+	db.startStorageGCWorker()
+
 	db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
 	fmt.Println(databaseType.String() + " prefixDB Initialized.")
@@ -275,22 +288,18 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 
 	switch keyType {
 	case TrieAccount, TASnapshot:
-		// check in cache
-		var value []byte
-		var ok bool
-		if value, _, ok = db.nodeCache.Get(bytesToString(key)); ok {
-			return value, true, nil
+		cacheKey := bytesToString(key)
+		if entry, ok := db.nodeCache.Get(cacheKey); ok && entry.Value != nil {
+			return entry.Value, true, nil
 		}
 
-		// check in batch
 		if db.batch != nil {
-			if value, _, ok = db.batch.get(key); ok {
+			if value, _, ok := db.batch.get(key); ok {
 				return value, true, nil
 			}
 		}
 
 		node, err := db.getNode(key)
-
 		if err != nil {
 			return nil, false, err
 		}
@@ -299,18 +308,21 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 			fmt.Printf("Account key %s not found in index\n", keyHex)
 			return nil, false, nil
 		}
-		value, err = db.readFromFile(node.offset)
+		value, err := db.readFromFile(node.offset)
 		if err != nil {
 			return nil, false, err
 		}
 
-		// add to cache and cache path of the node
-		db.nodeCache.Put(string(key), value, CacheInfo{
-			storageFileID: node.storageFileID,
-			storageOffset: node.storageOffset,
-			storageSize:   node.storageSize,
-		}, 0)
-		// db.nodeCache.AsyncCachePathToNode(string(key), db)
+		db.nodeCache.Put(NodeCacheEntry{
+			Key:           cacheKey,
+			Value:         value,
+			AccountOffset: node.offset,
+			StorageInfo: StorageInfo{
+				storageFileID: node.storageFileID,
+				storageOffset: node.storageOffset,
+				storageSize:   node.storageSize,
+			},
+		})
 		return value, true, nil
 
 	case TrieStorage, TSSnapshot:
@@ -325,11 +337,12 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 			accountKey = append([]byte{'a'}, accountKey...)
 		}
 
-		if err := db.ensureAccountStorageBuffered(accountKey, key); err != nil {
+		value, ok, err := db.ensureAccountStorageBuffered(accountKey, key)
+		if err != nil {
 			fmt.Println("Error ensuring account storage buffered:", err)
 			return nil, false, err
 		}
-		if value, ok := db.valueFromStorageBuffer(accountKey, key); ok {
+		if ok {
 			return value, true, nil
 		}
 		return nil, false, nil
@@ -346,28 +359,29 @@ func (db *PrefixDB) Put(key, value, accountKey []byte) error {
 
 	switch keyType {
 	case TrieAccount, TASnapshot:
-		// check accountIndex
-		// var ok bool
-		// if _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
-		// 	if _, _, ok = db.batch.get(key); !ok {
-		// 		// node, err := db.getNode(key)
-		// 		// if err != nil {
-		// 		// 	return err
-		// 		// }
-		// 		// if node != nil {
-		// 		// 	cacheInfo = CacheInfo{
-		// 		// 		storageFileID:    node.storageFileID,
-		// 		// 		storageOffset:    node.storageOffset,
-		// 		// 		storageSize:      node.storageSize,
-		// 		// 		hotStorageOffset: node.hotStorageOffset,
-		// 		// 		hotStorageSize:   node.hotStorageSize,
-		// 		// 	}
-		// 		// }
-		// 	}
-		// }
-
-		db.nodeCache.UpdateValue(bytesToString(key), value, 1)
-		// db.nodeCache.AsyncCachePathToNode(string(key), db)
+		cacheKey := bytesToString(key)
+		var stroageInfo StorageInfo
+		if entry, ok := db.nodeCache.Get(cacheKey); ok {
+			stroageInfo = entry.StorageInfo
+			db.nodeCache.UpdateValue(cacheKey, value)
+		} else {
+			node, err := db.getNode(key)
+			if err != nil {
+				return err
+			}
+			if node != nil {
+				stroageInfo = StorageInfo{
+					storageFileID: node.storageFileID,
+					storageOffset: node.storageOffset,
+					storageSize:   node.storageSize,
+				}
+				db.nodeCache.StoreMetadata(cacheKey, node.offset, stroageInfo)
+				db.nodeCache.UpdateValue(cacheKey, value)
+			}
+		}
+		if db.batch != nil {
+			db.batch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
+		}
 
 	case TrieStorage, TSSnapshot:
 		// db.totalOps++
@@ -398,17 +412,13 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 
 	switch keyType {
 	case TrieAccount, TASnapshot:
-		// check in cache
-		var value []byte
-		var cacheInfo CacheInfo
-		var ok bool
-		if value, cacheInfo, ok = db.nodeCache.Get(bytesToString(key)); ok {
+		cacheKey := bytesToString(key)
+		if _, ok := db.nodeCache.Get(cacheKey); ok {
 			return true, nil
 		}
 
-		// check in batch
 		if db.batch != nil {
-			if value, cacheInfo, ok = db.batch.get(key); ok {
+			if _, _, ok := db.batch.get(key); ok {
 				return true, nil
 			}
 		}
@@ -421,15 +431,21 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 			fmt.Printf("Account key %s not found in index\n", string(key))
 			return false, nil
 		}
-		// return true, nil
-		value, err = db.readFromFile(node.offset)
+		value, err := db.readFromFile(node.offset)
 		if err != nil {
 			return false, err
 		}
 
-		// add to cache and cache path of the node
-		db.nodeCache.Put(string(key), value, cacheInfo, 0)
-		// db.nodeCache.AsyncCachePathToNode(string(key), db)
+		db.nodeCache.Put(NodeCacheEntry{
+			Key:           cacheKey,
+			Value:         value,
+			AccountOffset: node.offset,
+			StorageInfo: StorageInfo{
+				storageFileID: node.storageFileID,
+				storageOffset: node.storageOffset,
+				storageSize:   node.storageSize,
+			},
+		})
 		return true, nil
 	case TrieStorage, TSSnapshot:
 		switch db.databaseType {
@@ -442,11 +458,12 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 			accountKey = key[1:33] // first 32 bytes is prefix
 			accountKey = append([]byte{'a'}, accountKey...)
 		}
-		if err := db.ensureAccountStorageBuffered(accountKey, key); err != nil {
+		_, ok, err := db.ensureAccountStorageBuffered(accountKey, key)
+		if err != nil {
 			fmt.Println("Error ensuring account storage buffered:", err)
 			return false, err
 		}
-		if _, ok := db.valueFromStorageBuffer(accountKey, key); ok {
+		if ok {
 			return true, nil
 		}
 		return false, nil
@@ -463,32 +480,18 @@ func (db *PrefixDB) Delete(key []byte, accountKey []byte) error {
 
 	switch keyType {
 	case TrieAccount, TASnapshot:
-		var ok bool
-		if _, _, ok = db.nodeCache.Get(bytesToString(key)); !ok {
-			if _, _, ok = db.batch.get(key); !ok {
-				node, err := db.getNode(key)
-				if err != nil {
-					return err
-				}
-				if node == nil {
-					fmt.Printf("Account key %s not found in index\n", string(key))
-					return nil
-				}
-			} else {
-				db.batch.delete(key)
-			}
-		} else {
+		if db.batch != nil {
+			db.batch.delete(key)
+		}
+		if db.nodeCache != nil {
 			db.nodeCache.Delete(bytesToString(key))
 		}
-
-		// delete node
-		db.storeNode(key, &TrieNode{
+		return db.storeNode(key, &TrieNode{
 			storageFileID: 0,
 			storageOffset: 0,
 			offset:        0,
 			storageSize:   0,
 		})
-		// db.accountIndex.delete(string(key))
 
 	case TrieStorage, TSSnapshot:
 		// db.totalOps++
@@ -512,8 +515,6 @@ func (db *PrefixDB) Delete(key []byte, accountKey []byte) error {
 	default:
 		return errors.New("unknown key type")
 	}
-
-	return nil
 }
 
 func (db *PrefixDB) bufferStorageMutation(accountKey, storageKey, value []byte) error {
@@ -540,10 +541,6 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	if buf.accountKey == "" {
 		return nil
 	}
-	node, err := db.getNode([]byte(buf.accountKey))
-	if err != nil {
-		return err
-	}
 	var (
 		accOff         int64
 		existingFileID uint32
@@ -551,6 +548,10 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		existingSize   uint64
 	)
 
+	node, err := db.getNode([]byte(buf.accountKey))
+	if err != nil {
+		return err
+	}
 	if node != nil {
 		accOff = node.offset
 		existingFileID = node.storageFileID
@@ -562,7 +563,10 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0); err != nil {
 			return err
 		}
-		db.nodeCache.UpdateStoragePointer(buf.accountKey, CacheInfo{})
+		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{})
+		if db.batch != nil {
+			_ = db.batch.updateStoragePointer(stringToBytes(buf.accountKey), StorageInfo{})
+		}
 	} else {
 		fileID, off, sz, err := db.persistStorageEntries(buf.storagekvs, existingFileID, existingOffset, existingSize)
 		if err != nil {
@@ -571,11 +575,18 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, fileID, off, sz); err != nil {
 			return err
 		}
-		db.nodeCache.UpdateStoragePointer(buf.accountKey, CacheInfo{
+		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{
 			storageFileID: fileID,
 			storageOffset: off,
 			storageSize:   sz,
 		})
+		if db.batch != nil {
+			_ = db.batch.updateStoragePointer(stringToBytes(buf.accountKey), StorageInfo{
+				storageFileID: fileID,
+				storageOffset: off,
+				storageSize:   sz,
+			})
+		}
 	}
 	db.invalidateStorageBuffer(buf.accountKey)
 	buf.reset()
@@ -805,6 +816,8 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 
 func (db *PrefixDB) Close() error {
 	errs := []error{}
+
+	db.stopStorageGCWorker()
 
 	if err := db.flushStorageBuffer(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to flush storage buffer: %v", err))
@@ -1106,6 +1119,18 @@ func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
 }
 
 func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
+	cacheKey := bytesToString(key)
+	if entry, ok := db.nodeCache.Get(cacheKey); ok {
+		if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
+			return &TrieNode{
+				storageFileID: entry.StorageInfo.storageFileID,
+				storageOffset: entry.StorageInfo.storageOffset,
+				storageSize:   entry.StorageInfo.storageSize,
+				offset:        entry.AccountOffset,
+			}, nil
+		}
+	}
+
 	nodeInfo, found, err := db.prefixTree.Get(key)
 	if err != nil {
 		return nil, err
@@ -1113,16 +1138,19 @@ func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 	if !found {
 		return nil, nil
 	}
-	return &TrieNode{
+
+	node := &TrieNode{
 		storageFileID: nodeInfo.storageFileID,
 		storageOffset: nodeInfo.storageOffset,
 		storageSize:   nodeInfo.storageSize,
 		offset:        nodeInfo.accountOffset,
-	}, nil
-}
-
-func (pdb *PrefixDB) SaveTree() error {
-	return pdb.prefixTree.SaveToFile(pdb.prefixTree.trieFile)
+	}
+	db.nodeCache.StoreMetadata(cacheKey, node.offset, StorageInfo{
+		storageFileID: node.storageFileID,
+		storageOffset: node.storageOffset,
+		storageSize:   node.storageSize,
+	})
+	return node, nil
 }
 
 func (db *PrefixDB) openOrCreateStorageFile() error {
@@ -1261,9 +1289,6 @@ func (db *PrefixDB) persistStorageEntries(kvs []kvPair, existingFileID uint32, e
 		return 0, 0, 0, nil
 	}
 
-	if len(kvs) == 0 {
-		return 0, 0, 0, nil
-	}
 	if isSegmentedStorage(existingFileID) {
 		kvs = dedupSortedKVPairs(kvs)
 		return db.updateSegmentedStorage(existingFileID, kvs)
@@ -1417,7 +1442,6 @@ func (db *PrefixDB) updateSegmentedStorage(existingFileID uint32, kvs []kvPair) 
 	}
 	buckets := partitionEntriesByChunks(metas, kvs)
 	folderPath := db.segmentedFolderPath(folderID)
-	allocator := newChunkFileAllocator(metas)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
 	for idx, meta := range metas {
 		additions := buckets[idx]
@@ -1425,7 +1449,7 @@ func (db *PrefixDB) updateSegmentedStorage(existingFileID uint32, kvs []kvPair) 
 			updated = append(updated, meta)
 			continue
 		}
-		chunkMetas, err := db.mutateSegmentChunk(folderID, folderPath, meta, additions, allocator)
+		chunkMetas, err := db.mutateSegmentChunk(folderPath, meta, additions)
 		if err != nil {
 			return 0, 0, 0, err
 		}
@@ -1510,37 +1534,24 @@ func parseChunkOrdinal(name string) int {
 	return -1
 }
 
-func (db *PrefixDB) mutateSegmentChunk(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator) ([]segmentChunkMeta, error) {
+func (db *PrefixDB) mutateSegmentChunk(folderPath string, meta segmentChunkMeta, additions []kvPair) ([]segmentChunkMeta, error) {
 	if len(additions) == 0 {
 		return []segmentChunkMeta{meta}, nil
 	}
 	chunkPath := filepath.Join(folderPath, meta.FileName)
 	currentSize := int64(meta.ChunkSize)
 	appendBytes := payloadSize(additions)
-	needRewrite := appendBytes == 0
-	if !needRewrite {
-		predicted := currentSize + appendBytes
-		if predicted > segmentedChunkHardLimit {
-			needRewrite = true
-		}
-		if len(meta.KeyEnd) > 0 && bytes.Compare(additions[0].key, meta.KeyEnd) <= 0 {
-			needRewrite = true
-		}
-		if len(meta.KeyStart) > 0 && bytes.Compare(additions[len(additions)-1].key, meta.KeyStart) < 0 {
-			needRewrite = true
-		}
+	if appendBytes == 0 {
+		return []segmentChunkMeta{meta}, nil
 	}
-	if !needRewrite {
-		metaCopy := meta
-		if err := db.appendChunkFile(chunkPath, metaCopy.KVCount, additions, currentSize); err != nil {
-			return nil, err
-		}
-		metaCopy.KVCount += uint32(len(additions))
-		metaCopy.ChunkSize += uint64(appendBytes)
-		adjustMetaRange(&metaCopy, additions)
-		return []segmentChunkMeta{metaCopy}, nil
+	metaCopy := meta
+	if err := db.appendChunkFile(chunkPath, metaCopy.KVCount, additions, currentSize); err != nil {
+		return nil, err
 	}
-	return db.rewriteChunkWithDedup(folderID, folderPath, meta, additions, allocator)
+	metaCopy.KVCount += uint32(len(additions))
+	metaCopy.ChunkSize += uint64(appendBytes)
+	adjustMetaRange(&metaCopy, additions)
+	return []segmentChunkMeta{metaCopy}, nil
 }
 
 func (db *PrefixDB) appendChunkFile(path string, currentCount uint32, additions []kvPair, currentSize int64) error {
@@ -1969,6 +1980,7 @@ func (db *PrefixDB) readSegmentedChunk(fileID uint32, storageKey []byte) ([]kvPa
 	if meta == nil {
 		return nil, nil, nil, nil
 	}
+	db.maybeScheduleStorageGC(folderID, meta)
 	payload, kvCount, backing, err := db.readSegmentChunkPayload(folderID, meta.FileName)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1980,6 +1992,7 @@ func (db *PrefixDB) readSegmentedChunk(fileID uint32, storageKey []byte) ([]kvPa
 		}
 		return nil, nil, nil, err
 	}
+	entries = db.maybeNormalizeChunkEntries(entries, meta)
 	return entries, backing, meta, nil
 }
 
@@ -2041,25 +2054,40 @@ func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) ([]b
 	return buf[:intSize], nil
 }
 
-// ensureAccountStorageBuffered loads the storage chunk containing storageKey for the given account
-// into the shared buffer so repeated GETs over the same account can reuse memory.
-func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) error {
+func (db *PrefixDB) maybeNormalizeChunkEntries(entries []kvPair, meta *segmentChunkMeta) []kvPair {
+	if len(entries) < 2 || meta == nil {
+		return entries
+	}
+	if meta.ChunkSize <= chunkNormalizationThreshold {
+		return entries
+	}
+	return normalizeStorageEntries(entries)
+}
+
+// ensureAccountStorageBuffered loads (and optionally returns) the storage chunk entry for storageKey
+// so repeated GET/Has calls over the same account avoid redundant chunk scans.
+func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) ([]byte, bool, error) {
 	if len(accountKey) == 0 {
-		return nil
+		return nil, false, nil
 	}
 	ak := bytesToString(accountKey)
-	if db.storageBufferCovers(ak, storageKey) {
-		return nil
+
+	db.storageBufLock.Lock()
+	if db.storageChunk.accountKey == ak && db.storageChunk.covers(ak, storageKey) {
+		value, ok := db.storageChunk.lookup(storageKey)
+		db.storageBufLock.Unlock()
+		return value, ok, nil
 	}
+	db.storageBufLock.Unlock()
 
 	cacheInfo, err := db.resolveAccountStoragePointer(ak, accountKey)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 
 	if cacheInfo.storageFileID == 0 {
 		db.adoptStorageBuffer(ak, nil, nil)
-		return nil
+		return nil, false, nil
 	}
 
 	start := time.Now()
@@ -2079,36 +2107,28 @@ func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) 
 		if backing != nil {
 			putDataBuffer(backing)
 		}
-		return err
+		return nil, false, err
+	}
+
+	var (
+		value []byte
+		found bool
+	)
+	if len(storageKey) > 0 && len(storage) > 0 {
+		if idx, ok := binarySearchKVPairs(storage, storageKey); ok {
+			value = storage[idx].val
+			found = true
+		}
 	}
 
 	db.adoptStorageBuffer(ak, storage, backing)
-	return nil
-}
-
-func (db *PrefixDB) storageBufferCovers(accountKey string, storageKey []byte) bool {
-	db.storageBufLock.Lock()
-	defer db.storageBufLock.Unlock()
-	return db.storageChunk.covers(accountKey, storageKey)
+	return value, found, nil
 }
 
 func (db *PrefixDB) adoptStorageBuffer(accountKey string, entries []kvPair, backing []byte) {
 	db.storageBufLock.Lock()
 	defer db.storageBufLock.Unlock()
 	db.storageChunk.adopt(accountKey, entries, backing)
-}
-
-func (db *PrefixDB) valueFromStorageBuffer(accountKey, storageKey []byte) ([]byte, bool) {
-	if len(accountKey) == 0 {
-		return nil, false
-	}
-	ak := bytesToString(accountKey)
-	db.storageBufLock.Lock()
-	defer db.storageBufLock.Unlock()
-	if db.storageChunk.accountKey != ak {
-		return nil, false
-	}
-	return db.storageChunk.lookup(storageKey)
 }
 
 func (db *PrefixDB) borrowStorageEntries(count int) []kvPair {
@@ -2141,6 +2161,7 @@ func (db *PrefixDB) buildStorageEntries(payload []byte, kvCount int) ([]kvPair, 
 		return nil, err
 	}
 	return decoded, nil
+	// return normalizeStorageEntries(decoded), nil
 }
 
 func (db *PrefixDB) invalidateStorageBuffer(accountKey string) {
@@ -2158,27 +2179,49 @@ func (db *PrefixDB) releaseStorageBuffer() {
 	db.storageBufLock.Unlock()
 }
 
-func (db *PrefixDB) resolveAccountStoragePointer(accountKey string, keyBytes []byte) (CacheInfo, error) {
-	if _, cacheInfo, ok := db.nodeCache.Get(accountKey); ok && cacheInfo.storageFileID != 0 {
-		return cacheInfo, nil
+func normalizeStorageEntries(entries []kvPair) []kvPair {
+	if len(entries) <= 1 {
+		return entries
+	}
+	keys := make([]string, len(entries))
+	lastIdx := make(map[string]int, len(entries))
+	for i := range entries {
+		keyStr := string(entries[i].key)
+		keys[i] = keyStr
+		lastIdx[keyStr] = i
+	}
+	out := entries[:0]
+	for i := range entries {
+		if lastIdx[keys[i]] != i {
+			continue
+		}
+		out = append(out, entries[i])
+	}
+	sortKVPairs(out)
+	return out
+}
+
+func (db *PrefixDB) resolveAccountStoragePointer(accountKey string, keyBytes []byte) (StorageInfo, error) {
+	if entry, ok := db.nodeCache.Get(accountKey); ok && entry.StorageInfo.storageFileID != 0 {
+		return entry.StorageInfo, nil
 	}
 
 	node, err := db.getNode(keyBytes)
 	if err != nil {
-		return CacheInfo{}, err
+		return StorageInfo{}, err
 	}
 
 	if node != nil && node.storageFileID != 0 {
-		cacheInfo := CacheInfo{
+		cacheInfo := StorageInfo{
 			storageFileID: node.storageFileID,
 			storageOffset: node.storageOffset,
 			storageSize:   node.storageSize,
 		}
-		db.nodeCache.UpdateStoragePointer(accountKey, cacheInfo)
+		db.nodeCache.StoreMetadata(accountKey, node.offset, cacheInfo)
 		return cacheInfo, nil
 	}
 
-	return CacheInfo{}, nil
+	return StorageInfo{}, nil
 }
 
 func (db *PrefixDB) readStorageSegmentToMap(fileID uint32, offset int64, size uint64) ([]kvPair, []byte, error) {
@@ -2461,6 +2504,133 @@ func stringToBytes(s string) []byte {
 
 func isSegmentedStorage(fileID uint32) bool {
 	return fileID&segmentedStorageFlag != 0
+}
+
+func (db *PrefixDB) startStorageGCWorker() {
+	if db.storageGCQueue != nil {
+		return
+	}
+	db.storageGCQueue = make(chan storageGCJob, 64)
+	db.storageGCInFlight = make(map[string]struct{})
+	db.storageGCStop = make(chan struct{})
+	db.storageGCWait.Add(1)
+	go func() {
+		defer db.storageGCWait.Done()
+		for {
+			select {
+			case job := <-db.storageGCQueue:
+				db.processStorageGCJob(job)
+			case <-db.storageGCStop:
+				for {
+					select {
+					case job := <-db.storageGCQueue:
+						db.processStorageGCJob(job)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (db *PrefixDB) stopStorageGCWorker() {
+	if db.storageGCStop == nil {
+		return
+	}
+	select {
+	case <-db.storageGCStop:
+	default:
+		close(db.storageGCStop)
+	}
+	db.storageGCWait.Wait()
+	db.storageGCStop = nil
+	db.storageGCQueue = nil
+	db.storageGCInFlight = nil
+}
+
+func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMeta) {
+	if db == nil || meta == nil || meta.FileName == "" {
+		return
+	}
+	if db.storageGCQueue == nil || meta.ChunkSize <= storageGCTriggerSize {
+		return
+	}
+	job := storageGCJob{folderID: folderID, fileName: meta.FileName}
+	key := job.key()
+	db.storageGCMu.Lock()
+	if db.storageGCInFlight == nil {
+		db.storageGCMu.Unlock()
+		return
+	}
+	if _, exists := db.storageGCInFlight[key]; exists {
+		db.storageGCMu.Unlock()
+		return
+	}
+	db.storageGCInFlight[key] = struct{}{}
+	db.storageGCMu.Unlock()
+
+	select {
+	case db.storageGCQueue <- job:
+	default:
+		go db.processStorageGCJob(job)
+	}
+}
+
+func (db *PrefixDB) processStorageGCJob(job storageGCJob) {
+	defer db.finishStorageGCJob(job)
+	if err := db.runStorageGCJob(job); err != nil {
+		fmt.Printf("storage GC failed for folder %d file %s: %v\n", job.folderID, job.fileName, err)
+	}
+}
+
+func (db *PrefixDB) finishStorageGCJob(job storageGCJob) {
+	db.storageGCMu.Lock()
+	if db.storageGCInFlight != nil {
+		delete(db.storageGCInFlight, job.key())
+	}
+	db.storageGCMu.Unlock()
+}
+
+func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+	metas, err := db.readSegmentIndex(job.folderID)
+	if err != nil {
+		return err
+	}
+	if len(metas) == 0 {
+		return nil
+	}
+	idx := -1
+	for i, meta := range metas {
+		if meta.FileName == job.fileName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return nil
+	}
+	folderPath := db.segmentedFolderPath(job.folderID)
+	allocator := newChunkFileAllocator(metas)
+	chunkMetas, err := db.rewriteChunkWithDedup(job.folderID, folderPath, metas[idx], nil, allocator)
+	if err != nil {
+		return err
+	}
+	updated := make([]segmentChunkMeta, 0, len(metas)-1+len(chunkMetas))
+	updated = append(updated, metas[:idx]...)
+	if len(chunkMetas) > 0 {
+		updated = append(updated, chunkMetas...)
+	}
+	if idx+1 < len(metas) {
+		updated = append(updated, metas[idx+1:]...)
+	}
+	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+		return err
+	}
+	db.invalidateSegmentIndexCache(job.folderID)
+	return nil
 }
 
 func (db *PrefixDB) InsertAccountHashPebble(accountHash []byte, pebbleKey []byte) error {

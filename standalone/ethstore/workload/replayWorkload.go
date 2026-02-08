@@ -32,11 +32,13 @@ const (
 	opHas
 	opPut
 	opDelete
+	opNewIterator
+	opIteratorNext
 )
 
 func main() {
 
-	databaseDir := "/mnt/ssd2/ethstore/database"
+	databaseDir := "/mnt/ssd2/ethstore/database_state"
 	loadDataDir := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
 
 	baselinepebbledir := "/mnt/ssd2/ethstore/baseline/pebble"
@@ -50,12 +52,12 @@ func main() {
 	// TestPrefixGet()
 	// loadPebble()
 	// loadAccount()
-	// repalceAccountHashToAccountKey()
+	repalceAccountHashToAccountKey()
 
-	// recordTraceStorage(traceFile)
+	//recordTraceStorage(traceFile)
 	// recordAccount(traceFileNocache)
 	// recordTraceBlock(traceFile)
-	replayTraceAccount(databaseDir, traceFileNocache)
+	// replayTraceAccount(databaseDir, traceFile)
 	// replayTrace(databaseDir, traceFile)
 
 	// time.Sleep(5 * time.Second)
@@ -298,7 +300,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 func loadData(dataBaseDir string, dataFile string) {
 	// ethStoreDir := "/mnt/ssd/ethstore/database/prefixdb"
 	ethStoreDir := dataBaseDir
-	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false)
+	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -367,7 +369,7 @@ func loadData(dataBaseDir string, dataFile string) {
 }
 
 func loadAccount() {
-	tempDir := "/mnt/ssd2/ethstore/database"
+	tempDir := "/mnt/ssd2/ethstore/database_state"
 	//dirPath := "/mnt/ssd2/ethstore/database_snapshot"
 	pdb, err := prefixdb.NewPrefixDB(tempDir, prefixdb.StateDB)
 	if err != nil {
@@ -615,7 +617,7 @@ func replaySSPut() {
 
 func loadAol(dataBaseDir string, notxFile string, txFile string) {
 
-	store, err := ethstore.New(dataBaseDir, 200, "put_test", false)
+	store, err := ethstore.New(dataBaseDir, 200, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -782,7 +784,7 @@ func TestPrefixGet() {
 
 func testPdbPerformance() {
 	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 10, "put_test", false)
+	store, err := ethstore.New(tempDir, 10, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -851,7 +853,7 @@ func testPdbPerformance() {
 
 func testAolPreformance() {
 	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 100, "put_test", false)
+	store, err := ethstore.New(tempDir, 100, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1079,7 +1081,7 @@ func TestGetParentKey() {
 
 func replayTrace(dataBaseDir string, traceFileDir string) {
 	tempDir := dataBaseDir
-	store, err := ethstore.New(tempDir, 8000, "put_test", false)
+	store, err := ethstore.New(tempDir, 8000, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1107,6 +1109,9 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 	var totalTime time.Duration
 	counter := 0
 	reader := bufio.NewReader(file)
+
+	var oldIterationKey []byte
+	IterationCount := 0
 
 	fmt.Println("start replay")
 	for {
@@ -1180,10 +1185,6 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 			}
 		}
 
-		// if keyBytes[0] == 'a' || keyBytes[0] == 'o' || keyBytes[0] == 'c' {
-		// 	continue
-		// }
-
 		var op opType
 		switch opTypeStr {
 		case "Get":
@@ -1194,6 +1195,15 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 			op = opPut
 		case "Delete", "BatchDelete":
 			op = opDelete
+		case "NewIterator":
+			oldIterationKey = keyBytes
+			IterationCount = 0
+		case "IteratorNext":
+			if oldIterationKey == nil {
+				fmt.Printf("IteratorNext without NewIterator at line %d\n", counter)
+				continue
+			}
+			IterationCount++
 		default:
 			// 未知操作，跳过
 			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
@@ -1358,7 +1368,6 @@ func replayPebble() {
 }
 
 func recordTraceStorage(traceFileDir string) {
-
 	file, err := os.Open(traceFileDir)
 	if err != nil {
 		log.Fatalf("Failed to open test file: %v", err)
@@ -1369,54 +1378,109 @@ func recordTraceStorage(traceFileDir string) {
 	if strings.Contains(traceFileDir, "withcache") {
 		baseDir = "traceCache"
 	}
-	fmt.Println("Start recode trace storage data...", baseDir)
+	fmt.Println("Start record trace storage data...", baseDir)
+
+	// 定义操作类型常量
+	const (
+		OpGet    = 0
+		OpPut    = 1
+		OpDelete = 2
+	)
 
 	createBufferedCSV := func(name string) (*os.File, *bufio.Writer) {
-		f, err := os.Create("/mnt/ssd2/ethstore/motivationdata/" + baseDir + "_" + name + ".csv")
+		path := "/mnt/ssd2/ethstore/motivationdata/" + baseDir + "_" + name + ".csv"
+		f, err := os.Create(path)
 		if err != nil {
 			log.Fatalf("Failed to create file: %v", err)
 		}
 		writer := bufio.NewWriter(f)
-		writer.WriteString("linecount,Key,count\n") //
+		writer.WriteString("linecount,Key,count\n")
 		return f, writer
 	}
 
-	fTA, wTA := createBufferedCSV("trieNodeAccount")
-	defer fTA.Close()
-	defer wTA.Flush()
+	// TrieNodeAccount
+	fTAg, wTAg := createBufferedCSV("trieNodeAccount_get")
+	fTAp, wTAp := createBufferedCSV("trieNodeAccount_put")
+	fTAd, wTAd := createBufferedCSV("trieNodeAccount_delete")
+	defer func() {
+		wTAg.Flush()
+		wTAp.Flush()
+		wTAd.Flush()
+		fTAg.Close()
+		fTAp.Close()
+		fTAd.Close()
+	}()
 
-	fStorage, wStorage := createBufferedCSV("storage")
-	defer fStorage.Close()
-	defer wStorage.Flush()
+	// Storage
+	fStorageg, wStorageg := createBufferedCSV("storage_get")
+	fStoragep, wStoragep := createBufferedCSV("storage_put")
+	fStoraged, wStoraged := createBufferedCSV("storage_delete")
+	defer func() {
+		wStorageg.Flush()
+		wStoragep.Flush()
+		wStoraged.Flush()
+		fStorageg.Close()
+		fStoragep.Close()
+		fStoraged.Close()
+	}()
 
-	fSA, wSA := createBufferedCSV("snapshotAccount")
-	defer fSA.Close()
-	defer wSA.Flush()
+	// SnapshotAccount
+	fSAg, wSAg := createBufferedCSV("snapshotAccount_get")
+	fSAp, wSAp := createBufferedCSV("snapshotAccount_put")
+	fSAd, wSAd := createBufferedCSV("snapshotAccount_delete")
+	defer func() {
+		wSAg.Flush()
+		wSAp.Flush()
+		wSAd.Flush()
+		fSAg.Close()
+		fSAp.Close()
+		fSAd.Close()
+	}()
 
-	fSS, wSS := createBufferedCSV("snapshotStorage")
-	defer fSS.Close()
-	defer wSS.Flush()
+	// SnapshotStorage
+	fSSg, wSSg := createBufferedCSV("snapshotStorage_get")
+	fSSp, wSSp := createBufferedCSV("snapshotStorage_put")
+	fSSd, wSSd := createBufferedCSV("snapshotStorage_delete")
+	defer func() {
+		wSSg.Flush()
+		wSSp.Flush()
+		wSSd.Flush()
+		fSSg.Close()
+		fSSp.Close()
+		fSSd.Close()
+	}()
 
-	// var oldOp string
-	var oldStorageAccountHash string
-	var storageOpsCount int
-	var storageLineStart int
+	// 辅助选择函数
+	getWriter := func(op int, g, p, d *bufio.Writer) *bufio.Writer {
+		switch op {
+		case OpPut:
+			return p
+		case OpDelete:
+			return d
+		default:
+			return g
+		}
+	}
 
-	var oldSnapshotAccountHash string
-	var SnapshotopsCount int
-	var snapshotLineStart int
+	// 状态变量
+	var oldStorageHash string
+	var oldStorageOp int
+	var storageCount int
+	var storageStartLine int
+
+	var oldSnapshotHash string
+	var oldSnapshotOp int
+	var snapshotCount int
+	var snapshotStartLine int
+
+	var optypeSet = make(map[string]struct{})
+
 	linecount := 0
-
-	var blockID uint64
 	reader := bufio.NewReader(file)
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			fmt.Printf("Error reading file: %v\n", err)
 			break
 		}
 		linecount++
@@ -1426,9 +1490,6 @@ func recordTraceStorage(traceFileDir string) {
 		}
 
 		opIdx := strings.Index(line, "OPType: ")
-		if opIdx == -1 {
-			continue
-		}
 		opPart := line[opIdx+8:]
 		commaIdx := strings.Index(opPart, ",")
 		if commaIdx == -1 {
@@ -1436,77 +1497,100 @@ func recordTraceStorage(traceFileDir string) {
 		}
 		opTypeStr := opPart[:commaIdx]
 
-		keyIdx := strings.Index(line, "key: ")
-		if keyIdx == -1 {
+		if _, exists := optypeSet[opTypeStr]; !exists {
+			optypeSet[opTypeStr] = struct{}{}
+			// fmt.Printf("Found operation type: %s\n", opTypeStr)
+		}
+
+		var currentOp int
+		switch opTypeStr {
+		case "Put", "BatchPut":
+			currentOp = OpPut
+		case "Delete", "BatchDelete":
+			currentOp = OpDelete
+		case "Get", "Has", "NewIterator", "IteratorNext":
+			currentOp = OpGet
+		default:
 			continue
 		}
-		keyPart := line[keyIdx+5:]
-		commaIdx = strings.Index(keyPart, ",")
-		if commaIdx == -1 {
-			continue
+		var keyHex string
+		// 迭代器可能使用 "prefix: "，普通操作使用 "key: "
+		if opTypeStr == "NewIterator" {
+			if pIdx := strings.Index(line, "prefix: "); pIdx != -1 {
+				keyPart := line[pIdx+8:]
+				keyHex = keyPart[:strings.Index(keyPart, ",")]
+			}
+		} else {
+			if kIdx := strings.Index(line, "key: "); kIdx != -1 {
+				keyPart := line[kIdx+5:]
+				keyHex = keyPart[:strings.Index(keyPart, ",")]
+			}
 		}
-		keyHex := keyPart[:commaIdx]
-		keyBytes, err := hex.DecodeString(keyHex)
-		if err != nil {
-			continue
-		}
+		keyBytes, _ := hex.DecodeString(keyHex[:2])
 
 		switch keyBytes[0] {
-		case 'A':
-			wTA.WriteString(fmt.Sprintf("%d,%s,%d\n", linecount, keyHex, 1))
-		case 'O':
-			storageAccountHash := keyHex[2:66]
-			if oldStorageAccountHash == storageAccountHash {
-				storageOpsCount++
-			} else {
-				if oldStorageAccountHash != "" {
-					wStorage.WriteString(fmt.Sprintf("%d,%s,%d\n", storageLineStart, oldStorageAccountHash, storageOpsCount))
-				}
-				storageOpsCount = 1
-				storageLineStart = linecount
-			}
-			oldStorageAccountHash = storageAccountHash
-		case 'a':
-			wSA.WriteString(fmt.Sprintf("%d,%s,%d\n", linecount, keyHex[2:66], 1))
-		case 'o':
-			snapshotAccountHash := keyHex[2:66]
-			if oldSnapshotAccountHash == snapshotAccountHash {
-				SnapshotopsCount++
-			} else {
-				if oldSnapshotAccountHash != "" {
-					wSS.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotLineStart, oldSnapshotAccountHash, SnapshotopsCount))
-				}
-				SnapshotopsCount = 1
-				snapshotLineStart = linecount
-			}
-			oldSnapshotAccountHash = snapshotAccountHash
-		default:
-			if opTypeStr == "Put" || opTypeStr == "BatchPut" {
-				dataType := ethstore.GetDataTypeFromKey(keyBytes)
-				if ethstore.AolHandledDataTypes[dataType] {
-					var ok bool
-					blockID, ok = ethstore.ParseBlockNumberFromKey(keyBytes, dataType)
-					if ok {
-						if blockID%10000 == 0 {
-							fmt.Printf("Reached blockID milestone: %d at line %d\n", blockID, linecount)
-						}
+		case 'A': // TrieNodeAccount
+			w := getWriter(currentOp, wTAg, wTAp, wTAd)
+			w.WriteString(fmt.Sprintf("%d,%s,1\n", linecount, keyHex))
 
-					}
-				}
+		case 'O': // Storage (MPT)
+			if len(keyHex) < 66 {
+				continue
 			}
-			continue
+			storageHash := keyHex[2:66]
+			if oldStorageHash == storageHash && oldStorageOp == currentOp {
+				storageCount++
+			} else {
+				if oldStorageHash != "" {
+					w := getWriter(oldStorageOp, wStorageg, wStoragep, wStoraged)
+					w.WriteString(fmt.Sprintf("%d,%s,%d\n", storageStartLine, oldStorageHash, storageCount))
+				}
+				storageCount = 1
+				storageStartLine = linecount
+				oldStorageHash = storageHash
+				oldStorageOp = currentOp
+			}
+
+		case 'a': // SnapshotAccount
+			if len(keyHex) < 66 {
+				fmt.Println(line)
+				continue
+			}
+			w := getWriter(currentOp, wSAg, wSAp, wSAd)
+			w.WriteString(fmt.Sprintf("%d,%s,1\n", linecount, keyHex[2:66]))
+
+		case 'o': // SnapshotStorage
+			if len(keyHex) < 66 {
+				continue
+			}
+			snapshotHash := keyHex[2:66]
+			if oldSnapshotHash == snapshotHash && oldSnapshotOp == currentOp {
+				snapshotCount++
+			} else {
+				if oldSnapshotHash != "" {
+					w := getWriter(oldSnapshotOp, wSSg, wSSp, wSSd)
+					w.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotStartLine, oldSnapshotHash, snapshotCount))
+				}
+				snapshotCount = 1
+				snapshotStartLine = linecount
+				oldSnapshotHash = snapshotHash
+				oldSnapshotOp = currentOp
+			}
 		}
-
 	}
-	if oldStorageAccountHash != "" && storageOpsCount > 0 {
-		wStorage.WriteString(fmt.Sprintf("%d,%s,%d\n", storageLineStart, oldStorageAccountHash, storageOpsCount))
-	}
-	if oldSnapshotAccountHash != "" && SnapshotopsCount > 0 {
-		wSS.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotLineStart, oldSnapshotAccountHash, SnapshotopsCount))
+	if oldStorageHash != "" {
+		w := getWriter(oldStorageOp, wStorageg, wStoragep, wStoraged)
+		w.WriteString(fmt.Sprintf("%d,%s,%d\n", storageStartLine, oldStorageHash, storageCount))
 	}
 
-	fmt.Printf("Total lines processed: %d\n", linecount)
-
+	if oldSnapshotHash != "" {
+		w := getWriter(oldSnapshotOp, wSSg, wSSp, wSSd)
+		w.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotStartLine, oldSnapshotHash, snapshotCount))
+	}
+	for opType := range optypeSet {
+		fmt.Printf("Detected operation type: %s\n", opType)
+	}
+	fmt.Println("Trace storage data recording completed.")
 }
 
 func recordTraceBlock(traceFileDir string) {
@@ -1635,12 +1719,19 @@ func recordTraceBlock(traceFileDir string) {
 }
 
 func replayTraceAccount(dataBaseDir string, traceFileDir string) {
-	tempDir := dataBaseDir + "_state"
+	tempDir := dataBaseDir
 	store, err := prefixdb.NewPrefixDB(tempDir, prefixdb.StateDB)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
+
+	dbPath := "/mnt/ssd2/pebble"
+	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	if err != nil {
+		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
+		return
+	}
 
 	testFilePath := traceFileDir
 
@@ -1703,7 +1794,7 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 		// keyBytes[0] == 'a' accountsnapshotkvs
 		// keyBytes[0] == 'o' storagesnapshotkvs
 		// keyBytes[0] == 'c' codekvs
-		if keyBytes[0] == 'O' || keyBytes[0] == 'A' {
+		if keyBytes[0] == 'O' {
 		} else {
 			continue
 		}
@@ -1711,8 +1802,13 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 		var accountKey []byte
 		if keyBytes[0] == 'O' {
 			if accountKey = store.GetParentAccountKey(keyBytes); accountKey == nil {
-				fmt.Printf("SetAccountKey failed for key %s: %v\n", keyHex, err)
-				continue
+				Key, _, err := findKeyValuePair(keyHex[2:66], ps)
+				if Key == "" || err != nil {
+					fmt.Printf("Failed to get parent account key for key %s\n", keyHex)
+					continue
+				}
+				accountKey = []byte(Key)
+				store.InsertAccountHashPebble(accountKey, keyBytes[1:33])
 			}
 		}
 
@@ -1726,9 +1822,13 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 			}
 		}
 
-		if oldop != opTypeStr && (oldop == "Get" || oldop == "") {
-			oldop = opTypeStr
-			fmt.Println("op changed to " + opTypeStr)
+		if oldop != opTypeStr {
+			if oldop == "BatchPut" && opTypeStr == "BatchDelete" {
+
+			} else {
+				oldop = opTypeStr
+				fmt.Println("\nop changed to " + opTypeStr)
+			}
 		}
 
 		// Perform the operation
@@ -1860,7 +1960,7 @@ func repalceAccountHashToAccountKey() {
 	}
 	defer ps.Close()
 
-	inputFilePath := "/mnt/ssd2/ethstore/motivationdata/merged_traceCache_counts.csv"
+	inputFilePath := "/mnt/ssd2/ethstore/motivationdata/26_2_7/traceCache_snapshotStorage_get_ave.csv"
 
 	inputFile, err := os.Open(inputFilePath)
 	if err != nil {
@@ -1868,7 +1968,7 @@ func repalceAccountHashToAccountKey() {
 	}
 	defer inputFile.Close()
 
-	outputFilePath := "/mnt/ssd2/ethstore/motivationdata/merged_traceCache_counts_accountKey.csv"
+	outputFilePath := "/mnt/ssd2/ethstore/motivationdata/26_2_7/traceCache_snapshotStorage_get_ave_accountKey.csv"
 
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {

@@ -23,15 +23,11 @@ import (
 const (
 	BlockdataFileName     = "headerdata.log"
 	BlockindexMapFileName = "blockindex.map"
-	HeaderKeyPrefix       = "h" // the prefix for header keys
-	HeaderIndexFileName   = "headerindex.map"
-	PendingKVFileName     = "pending_kv.tmp"
-
-	defaultRecentN = 100 // Default number of recent blocks to keep indexed in memory
-	offsetSize     = 8   // Size of uint64 for offsets
-	blockIDSize    = 8   // Assuming block ID is uint64
-	keyLenSize     = 4   // Size of uint32 for key length
-	valueLenSize   = 4   // Size of uint32 for value length
+	defaultRecentN        = 100 // Default number of recent blocks to keep indexed in memory
+	offsetSize            = 8   // Size of uint64 for offsets
+	blockIDSize           = 8   // Assuming block ID is uint64
+	keyLenSize            = 4   // Size of uint32 for key length
+	valueLenSize          = 4   // Size of uint32 for value length
 	// TombstoneMarker is a special value to mark deletion
 	TombstoneMarker    = "_D_"
 	initialBufferSize  = 4096  // Initial buffer size for writers
@@ -61,13 +57,6 @@ type BlockAppendOnlyLog struct {
 	indexedBlocks    map[uint64]struct{} // Set of block IDs currently in the skiplist
 	indexedBlockKeys map[uint64][]string // Keys contributed by each indexed block
 
-	headerIndex           *skiplist.SkipList               // Key: string (header key), Value: *kvPointer
-	modifiedHeaders       map[string]struct{}              // Track modified header keys
-	headerPointersByBlock map[uint64]map[string]*kvPointer // Header keys contributed by each indexed block
-	headerKeyRefCounts    map[string]int                   // Active references per header key within recent blocks
-	headerIndexFilePath   string
-	headerIndexFile       *os.File
-
 	indexBuffer      []blockIndexEntry // Buffer for batching index writes
 	indexBufferMu    sync.Mutex        // Mutex for index buffer
 	indexBufferSize  int               // Size threshold for flushing index buffer
@@ -78,11 +67,6 @@ type BlockAppendOnlyLog struct {
 
 	// opCount   uint64 // for debugging
 	// failedOps uint64 // for debugging
-}
-
-// isHeaderKey checks if a key is a header key.
-func isHeaderKey(key string) bool {
-	return strings.HasPrefix(key, HeaderKeyPrefix)
 }
 
 // NewAppendOnlyLog creates or opens an append-only log store.
@@ -100,7 +84,6 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 
 	dataFilePath := filepath.Join(dirPath, BlockdataFileName)
 	indexMapFilePath := filepath.Join(dirPath, BlockindexMapFileName)
-	headerIndexFilePath := filepath.Join(dirPath, HeaderIndexFileName)
 	// Open data file for appending
 	dataFile, err := os.OpenFile(dataFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -120,35 +103,21 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		return nil, fmt.Errorf("failed to open index map file %s: %w", indexMapFilePath, err)
 	}
 
-	headerIndexFile, err := os.OpenFile(headerIndexFilePath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		dataFile.Close()
-		indexMapFile.Close()
-		return nil, fmt.Errorf("failed to open header index file %s: %w", headerIndexFilePath, err)
-	}
-
 	baol := &BlockAppendOnlyLog{
-		dirPath:               dirPath,
-		log:                   logger.New("module", "appendlog", "path", dirPath),
-		dataFilePath:          dataFilePath,
-		dataFile:              dataFile,
-		dataWriter:            bufio.NewWriterSize(dataFile, initialBufferSize),
-		currentOffset:         currentOffset,
-		indexMapFilePath:      indexMapFilePath,
-		indexMapFile:          indexMapFile,
-		blockIndex:            make(map[uint64]blockIndexEntry),
-		recentN:               recentN,
-		recentBlocks:          make([]uint64, 0, recentN), // Initialize empty, will be populated below
-		skiplistIndex:         skiplist.New(skiplist.String),
-		indexedBlocks:         make(map[uint64]struct{}), // Initialize empty, will be populated below
-		indexedBlockKeys:      make(map[uint64][]string),
-		headerIndexFilePath:   headerIndexFilePath,
-		headerIndexFile:       headerIndexFile,
-		headerIndex:           skiplist.New(skiplist.String),
-		modifiedHeaders:       make(map[string]struct{}), // Initialize empty for tracking modified headers
-		headerPointersByBlock: make(map[uint64]map[string]*kvPointer),
-		headerKeyRefCounts:    make(map[string]int),
-
+		dirPath:          dirPath,
+		log:              logger.New("module", "appendlog", "path", dirPath),
+		dataFilePath:     dataFilePath,
+		dataFile:         dataFile,
+		dataWriter:       bufio.NewWriterSize(dataFile, initialBufferSize),
+		currentOffset:    currentOffset,
+		indexMapFilePath: indexMapFilePath,
+		indexMapFile:     indexMapFile,
+		blockIndex:       make(map[uint64]blockIndexEntry),
+		recentN:          recentN,
+		recentBlocks:     make([]uint64, 0, recentN), // Initialize empty, will be populated below
+		skiplistIndex:    skiplist.New(skiplist.String),
+		indexedBlocks:    make(map[uint64]struct{}), // Initialize empty, will be populated below
+		indexedBlockKeys: make(map[uint64][]string),
 		indexBuffer:      make([]blockIndexEntry, 0, recentN/2),
 		indexBufferSize:  recentN / 2,
 		indexBufferFlush: make(chan struct{}, 1),
@@ -163,10 +132,6 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 	if err := baol.loadBlockIndex(); err != nil {
 		baol.Close()
 		return nil, fmt.Errorf("failed to load block index: %w", err)
-	}
-
-	if err := baol.loadHeaderIndex(); err != nil {
-		baol.log.Warn("Failed to load header index, will rebuild", "error", err)
 	}
 
 	// if err := baol.loadSkiplistIndex(); err != nil {
@@ -204,21 +169,8 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		return nil, fmt.Errorf("failed to rebuild skiplist index: %w", err)
 	}
 
-	// Initialize the header index
-	if baol.headerIndex.Len() == 0 {
-		if err := baol.initializeHeaderIndex(); err != nil {
-			baol.Close()
-			return nil, fmt.Errorf("failed to initialize header index: %w", err)
-		}
-
-		if err := baol.persistHeaderIndex(); err != nil {
-			baol.log.Warn("Failed to persist header index after initialization", "error", err)
-		}
-	}
-
 	baol.log.Info("AppendOnlyLog initialized", "dataSize", common.StorageSize(currentOffset),
-		"indexedBlocks", len(baol.indexedBlocks), "recentBlocksTracked", len(baol.recentBlocks),
-		"headerIndexSize", baol.headerIndex.Len())
+		"indexedBlocks", len(baol.indexedBlocks), "recentBlocksTracked", len(baol.recentBlocks))
 	return baol, nil
 }
 
@@ -289,8 +241,6 @@ func (baol *BlockAppendOnlyLog) rebuildSkiplist() error {
 
 	// oldSkiplist := aol.skiplistIndex
 	baol.skiplistIndex = skiplist.New(skiplist.String)
-	baol.headerPointersByBlock = make(map[uint64]map[string]*kvPointer)
-	baol.headerKeyRefCounts = make(map[string]int)
 	baol.indexedBlockKeys = make(map[uint64][]string)
 
 	baol.log.Debug("Rebuilding skiplist index", "blocksToScan", blocksToIndex)
@@ -336,7 +286,7 @@ func (baol *BlockAppendOnlyLog) rebuildSkiplist() error {
 	// }
 
 	baol.log.Debug("Skiplist rebuild complete", "indexedKeys", baol.skiplistIndex.Len(),
-		"currentRecentBlocks", baol.recentBlocks, "headerIndexSize", baol.headerIndex.Len())
+		"currentRecentBlocks", baol.recentBlocks)
 	return nil
 }
 
@@ -379,28 +329,6 @@ func (baol *BlockAppendOnlyLog) readAndIndexBlock(indexEntry blockIndexEntry) er
 	return nil
 }
 
-// trackHeaderPointer records header-key pointers per block to avoid expensive skiplist scans during eviction.
-func (baol *BlockAppendOnlyLog) trackHeaderPointer(blockID uint64, key string, ptr *kvPointer) {
-	if !isHeaderKey(key) {
-		return
-	}
-	if baol.headerPointersByBlock == nil {
-		baol.headerPointersByBlock = make(map[uint64]map[string]*kvPointer)
-	}
-	blockPointers, ok := baol.headerPointersByBlock[blockID]
-	if !ok {
-		blockPointers = make(map[string]*kvPointer)
-		baol.headerPointersByBlock[blockID] = blockPointers
-	}
-	if baol.headerKeyRefCounts == nil {
-		baol.headerKeyRefCounts = make(map[string]int)
-	}
-	if _, tracked := blockPointers[key]; !tracked {
-		baol.headerKeyRefCounts[key]++
-	}
-	blockPointers[key] = ptr
-}
-
 func (baol *BlockAppendOnlyLog) recordIndexedKey(blockID uint64, key string) {
 	if baol.indexedBlockKeys == nil {
 		baol.indexedBlockKeys = make(map[uint64][]string)
@@ -410,52 +338,7 @@ func (baol *BlockAppendOnlyLog) recordIndexedKey(blockID uint64, key string) {
 
 func (baol *BlockAppendOnlyLog) setSkiplistEntry(blockID uint64, key string, ptr *kvPointer) {
 	baol.skiplistIndex.Set(key, ptr)
-	baol.trackHeaderPointer(blockID, key, ptr)
 	baol.recordIndexedKey(blockID, key)
-}
-
-func (baol *BlockAppendOnlyLog) decrementHeaderRefCount(key string) int {
-	if baol.headerKeyRefCounts == nil {
-		return 0
-	}
-	count, ok := baol.headerKeyRefCounts[key]
-	if !ok {
-		return 0
-	}
-	if count <= 1 {
-		delete(baol.headerKeyRefCounts, key)
-		return 0
-	}
-	baol.headerKeyRefCounts[key] = count - 1
-	return count - 1
-}
-
-func (baol *BlockAppendOnlyLog) handleEvictedHeaderPointers(headerPointers map[string]*kvPointer) bool {
-	if len(headerPointers) == 0 {
-		return false
-	}
-	headerIndexModified := false
-	for key, ptr := range headerPointers {
-		if remaining := baol.decrementHeaderRefCount(key); remaining > 0 {
-			continue
-		}
-		if baol.skiplistIndex.Get(key) != nil {
-			continue
-		}
-		valueBytes, err := baol.readValueBytesFromPointer(ptr)
-		if err != nil {
-			baol.log.Warn("Failed to read header value during eviction", "key", key, "error", err)
-			continue
-		}
-		if BytesToString(valueBytes) == TombstoneMarker {
-			continue
-		}
-		baol.headerIndex.Set(key, ptr)
-		baol.modifiedHeaders[key] = struct{}{}
-		baol.log.Debug("Moved evicted header key to headerIndex", "key", key)
-		headerIndexModified = true
-	}
-	return headerIndexModified
 }
 
 // Append adds a batch of key-value pairs for a given block ID.
@@ -603,19 +486,11 @@ func (baol *BlockAppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
 		oldestBlockID := baol.recentBlocks[0]
 		baol.recentBlocks = baol.recentBlocks[1:] // Shift slice
 		delete(baol.indexedBlocks, oldestBlockID)
-		headerPointers := baol.headerPointersByBlock[oldestBlockID]
-		delete(baol.headerPointersByBlock, oldestBlockID)
 
 		baol.log.Debug("Evicting oldest block from skiplist index", "blockID", oldestBlockID)
 
 		// Remove keys belonging *only* to the evicted block from the skiplist.
 		baol.evictOldBlockFromSkiplist(oldestBlockID)
-
-		if baol.handleEvictedHeaderPointers(headerPointers) {
-			if err := baol.persistHeaderIndex(); err != nil {
-				baol.log.Warn("Failed to persist header index after update", "error", err)
-			}
-		}
 	}
 }
 
@@ -679,29 +554,6 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 
 	// Check if the key is in the headerIndex
 	// Header keys are special and stored in a separate skiplist.
-	if isHeaderKey(key) {
-		if blockID, ok := parseBlockNumberFromKey([]byte(key), HeaderDataType); ok {
-			if baol.latestBlockID-blockID > SkipDistanceForGet {
-				return "", true, nil
-			}
-		}
-		headerElement := baol.headerIndex.Get(key)
-		if headerElement != nil {
-			pointer := headerElement.Value.(*kvPointer)
-			valueBytes, err := baol.readValueBytesFromPointer(pointer)
-			if err != nil {
-				baol.log.Error("Get: Failed to read header via pointer", "key", key, "offset", pointer.Offset, "blockID", pointer.BlockID, "error", err)
-				return "", false, fmt.Errorf("failed to read header entry for key %s: %w", key, err)
-			}
-
-			value := BytesToString(valueBytes)
-			if value == TombstoneMarker {
-				return "", true, nil
-			}
-			return value, true, nil
-		}
-	}
-
 	dataType := GetDataTypeFromKey([]byte(key))
 	if blockID, ok := parseBlockNumberFromKey([]byte(key), dataType); ok {
 		if blockID > baol.latestBlockID {
@@ -1336,10 +1188,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 		errs = append(errs, fmt.Errorf("failed to persist index map on close: %w", err))
 	}
 
-	if err := baol.persistHeaderIndex(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to persist header index on close: %w", err))
-	}
-
 	if baol.dataFile != nil {
 		// Sync data file before closing, to ensure all writes are flushed.
 		if err := baol.dataFile.Sync(); err != nil {
@@ -1351,13 +1199,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 		baol.dataFile = nil // Mark as closed
 	}
 
-	if baol.headerIndexFile != nil {
-		if err := baol.headerIndexFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close header index file: %w", err))
-		}
-		baol.headerIndexFile = nil
-	}
-
 	if baol.indexMapFile != nil {
 		if err := baol.indexMapFile.Sync(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to sync index map file on close: %w", err))
@@ -1366,13 +1207,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 			errs = append(errs, fmt.Errorf("failed to close index map file: %w", err))
 		}
 		baol.indexMapFile = nil
-	}
-
-	if baol.headerIndexFile != nil {
-		if err := baol.headerIndexFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close header index file: %w", err))
-		}
-		baol.headerIndexFile = nil
 	}
 
 	if baol.indexMapFile != nil {
@@ -1404,204 +1238,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 		}
 		return errors.New(sb.String())
 	}
-	return nil
-}
-
-// initializeHeaderIndex scans all blocks and builds the header index.
-func (baol *BlockAppendOnlyLog) initializeHeaderIndex() error {
-	allBlockIDs := make([]uint64, 0, len(baol.blockIndex))
-	for id := range baol.blockIndex {
-		allBlockIDs = append(allBlockIDs, id)
-	}
-	sort.Slice(allBlockIDs, func(i, j int) bool {
-		return allBlockIDs[i] < allBlockIDs[j]
-	})
-
-	processedHeaderKeys := make(map[string]struct{})
-
-	for i := len(allBlockIDs) - 1; i >= 0; i-- {
-		blockID := allBlockIDs[i]
-
-		if _, isIndexed := baol.indexedBlocks[blockID]; isIndexed {
-			continue
-		}
-
-		indexEntry, ok := baol.blockIndex[blockID]
-		if !ok {
-			continue
-		}
-
-		size := indexEntry.EndOffset - indexEntry.StartOffset
-		if size <= 0 {
-			continue
-		}
-
-		blockData := make([]byte, size)
-		_, err := baol.dataFile.ReadAt(blockData, indexEntry.StartOffset)
-		if err != nil {
-			return fmt.Errorf("failed to read block data for header index: %w", err)
-		}
-
-		reader := bytes.NewReader(blockData)
-		currentPos := indexEntry.StartOffset
-
-		for reader.Len() > 0 {
-			entryOffset := currentPos
-			entry, bytesRead, err := baol.readLogEntry(reader)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("failed to decode entry for header index: %w", err)
-			}
-			currentPos += bytesRead
-
-			// if the entry is a header key, process it
-			if isHeaderKey(entry.Key) {
-				if _, processed := processedHeaderKeys[entry.Key]; processed {
-					continue
-				}
-				processedHeaderKeys[entry.Key] = struct{}{}
-
-				if entry.Value == TombstoneMarker {
-					continue
-				}
-
-				if baol.skiplistIndex.Get(entry.Key) != nil {
-					continue
-				}
-
-				ptr := &kvPointer{
-					Offset:   entryOffset,
-					ValueLen: uint32(len(entry.Value)),
-					BlockID:  blockID, // Store block ID for reference
-				}
-				baol.headerIndex.Set(entry.Key, ptr)
-				baol.log.Debug("Added header key to headerIndex", "key", entry.Key)
-			}
-		}
-	}
-
-	baol.log.Info("Header index initialized", "headerKeyCount", baol.headerIndex.Len())
-	return nil
-}
-
-// persistHeaderIndex writes the current header index to the header index file.
-// Format per entry: keyLen (uint32) | key (bytes) | offset (int64) | valueLen (uint32)
-func (baol *BlockAppendOnlyLog) persistHeaderIndex() error {
-	if baol.headerIndexFile == nil {
-		return nil
-	}
-
-	if len(baol.modifiedHeaders) == 0 {
-		return nil
-	}
-
-	baol.headerIndexFile.Seek(0, io.SeekEnd)
-	writer := bufio.NewWriter(baol.headerIndexFile)
-
-	count := 0
-	for key := range baol.modifiedHeaders {
-		el := baol.headerIndex.Get(key)
-		if el == nil {
-			continue
-		}
-
-		ptr := el.Value.(*kvPointer)
-		keyBytes := []byte(key)
-		keyLen := uint32(len(keyBytes))
-
-		binary.Write(writer, binary.BigEndian, keyLen)
-		writer.Write(keyBytes)
-		binary.Write(writer, binary.BigEndian, ptr.Offset)
-		binary.Write(writer, binary.BigEndian, ptr.ValueLen)
-		count++
-	}
-
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush header index writer: %w", err)
-	}
-
-	if err := baol.headerIndexFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync header index file: %w", err)
-	}
-
-	modifiedCount := len(baol.modifiedHeaders)
-	baol.modifiedHeaders = make(map[string]struct{})
-
-	baol.log.Info("Header index updated", "appended", count, "modifiedTotal", modifiedCount)
-	return nil
-}
-
-// loadHeaderIndex reads the header index file and populates the header index.
-func (baol *BlockAppendOnlyLog) loadHeaderIndex() error {
-	fileInfo, err := baol.headerIndexFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	if fileInfo.Size() == 0 {
-		baol.log.Debug("Header index file is empty, will rebuild index")
-		return nil
-	}
-
-	baol.headerIndexFile.Seek(0, io.SeekStart)
-	reader := bufio.NewReader(baol.headerIndexFile)
-
-	headerBuf := make([]byte, 4)
-	offsetBuf := make([]byte, 8)
-	valueLenBuf := make([]byte, 4)
-
-	const initialKeyBufSize = 256
-	keyBuf := make([]byte, initialKeyBufSize)
-
-	loadedCount := 0
-
-	for {
-		_, err := io.ReadFull(reader, headerBuf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read key length from header index: %w", err)
-		}
-		keyLen := binary.BigEndian.Uint32(headerBuf)
-
-		if int(keyLen) > cap(keyBuf) {
-			keyBuf = make([]byte, keyLen)
-		} else {
-			keyBuf = keyBuf[:keyLen]
-		}
-
-		_, err = io.ReadFull(reader, keyBuf)
-		if err != nil {
-			return fmt.Errorf("failed to read key content from header index: %w", err)
-		}
-		key := string(keyBuf)
-
-		_, err = io.ReadFull(reader, offsetBuf)
-		if err != nil {
-			return fmt.Errorf("failed to read offset from header index: %w", err)
-		}
-		offset := int64(binary.BigEndian.Uint64(offsetBuf))
-
-		_, err = io.ReadFull(reader, valueLenBuf)
-		if err != nil {
-			return fmt.Errorf("failed to read value length from header index: %w", err)
-		}
-		valueLen := binary.BigEndian.Uint32(valueLenBuf)
-
-		ptr := &kvPointer{
-			Offset:   offset,
-			ValueLen: valueLen,
-			BlockID:  0, // Block ID is not stored in header index
-		}
-		baol.headerIndex.Set(key, ptr)
-
-		loadedCount++
-	}
-
-	baol.log.Info("Header index loaded from file", "entries", loadedCount)
 	return nil
 }
 

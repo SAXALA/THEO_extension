@@ -67,10 +67,10 @@ func (b *errorBatch) Reset() {}
 func (b *errorBatch) Replay(w ethdb.KeyValueWriter) error { return b.err }
 
 var AolHandledDataTypes = map[DataType]bool{
-	HeaderDataType:                    true,
-	BlockBodyDataType:                 true,
-	BlockReceiptsDataType:             true,
-	TransactionLookupMetadataDataType: true,
+	HeaderDataType:        true,
+	BlockBodyDataType:     true,
+	BlockReceiptsDataType: true,
+	// TransactionLookupMetadataDataType: true,
 	// HeaderNumberDataType:              true,
 }
 
@@ -187,13 +187,14 @@ type Database struct {
 	txIndexkvs         map[string]string // Temporary storage for TxIndexAppendOnlyLog key-values during operations
 	txIndexLatestBlock uint64            // Temporary storage for latest block number during operations
 	accountKey         []byte            // Temporary storage for account key during operations
+	enableTxlookupData bool
 }
 
 // New returns a wrapped EthStore object using TxIndexAppendOnlyLog.
 // The namespace is the prefix that the metrics reporting should use.
 // cache and handles parameters might be less relevant for TxIndexAppendOnlyLog,
 // but recentN (number of blocks to index) becomes important.
-func New(dirPath string, recentN int, namespace string, readonly bool) (*Database, error) {
+func New(dirPath string, recentN int, namespace string, readonly bool, enableTxlookupData bool) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
@@ -208,11 +209,12 @@ func New(dirPath string, recentN int, namespace string, readonly bool) (*Databas
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
 	db := &Database{
-		fn:       dirPath, // Use directory path now
-		log:      logger,
-		quitChan: make(chan chan error, 1),
-		statepdb: statePrefixdb,
-		snappdb:  snapshotPrefixdb,
+		fn:                 dirPath, // Use directory path now
+		log:                logger,
+		quitChan:           make(chan chan error, 1),
+		statepdb:           statePrefixdb,
+		snappdb:            snapshotPrefixdb,
+		enableTxlookupData: enableTxlookupData,
 	}
 
 	// Initialize the TxIndexAppendOnlyLog store
@@ -345,6 +347,22 @@ func (d *Database) Has(key []byte) (bool, error) {
 		return false, ErrClosed
 	}
 	dataType := GetDataTypeFromKey(key)
+	if dataType == TransactionLookupMetadataDataType {
+		if !d.enableTxlookupData {
+			return true, nil
+		} else {
+			// fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
+			_, err := d.db.Get(key)
+
+			if err != nil {
+				if err == pebble.ErrNotFound {
+					return false, ErrNotFound // Convert to EthStore specific ErrNotFound
+				}
+				return false, err
+			}
+			return true, nil
+		}
+	}
 
 	if AolHandledDataTypes[dataType] {
 		if d.txIndexAol == nil {
@@ -353,50 +371,29 @@ func (d *Database) Has(key []byte) (bool, error) {
 		var valStr string
 		var exists bool
 		var err error
-		if dataType == TransactionLookupMetadataDataType {
-			if valStr, exists = d.txIndexkvs[string(key)]; exists {
-				return true, nil
-			}
-			valStr, exists, err = d.txIndexAol.Get(string(key))
-			if err != nil {
-				return false, err
-			}
-			if exists {
-				// If it's a deletion marker, consider the key non-existent
-				if valStr == aolDeleteTombstone {
-					return false, nil
-				}
-				return true, nil
-			} else {
-				return false, ErrNotFound
-			}
-		} else {
-			if valStr, exists = d.baolkvs[string(key)]; exists {
-				return true, nil
-			}
-			valStr, exists, err = d.blockAol.Get(string(key))
-			if err != nil {
-				return false, err
-			}
-			if exists {
-				// If it's a deletion marker, consider the key non-existent
-				if valStr == aolDeleteTombstone {
-					return false, nil
-				}
-				return true, nil
-			}
-			return false, ErrNotFound
+
+		if valStr, exists = d.baolkvs[string(key)]; exists {
+			return true, nil
 		}
+		valStr, exists, err = d.blockAol.Get(string(key))
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			// If it's a deletion marker, consider the key non-existent
+			if valStr == aolDeleteTombstone {
+				return false, nil
+			}
+			return true, nil
+		}
+		return false, ErrNotFound
 		// If the key doesn't exist in AOL, continue to look in Pebble
 	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 			return false, fmt.Errorf("PrefixDB is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-
 		// Check if the key exists in PrefixDB
-
 		exists, err := d.statepdb.Has(key, d.accountKey)
-
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
 		}
@@ -406,9 +403,7 @@ func (d *Database) Has(key []byte) (bool, error) {
 			return false, fmt.Errorf("SSPrefixDB is not initialized, cannot check key %x(type %s)", key, DataTypeStrings[dataType])
 		}
 		// Check if the key exists in SSPrefixDB
-
 		exists, err := d.snappdb.Has(key, d.accountKey)
-
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in SSPrefixDB: %w", key, err)
 		}
@@ -416,9 +411,7 @@ func (d *Database) Has(key []byte) (bool, error) {
 	}
 
 	// Check if the key exists in Pebble
-
 	_, err := d.db.Get(key)
-
 	if err == nil {
 		return true, nil // Key exists
 	} else if err == pebble.ErrNotFound {
@@ -436,7 +429,22 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 	}
 
 	dataType := GetDataTypeFromKey(key)
+	if dataType == TransactionLookupMetadataDataType {
+		if !d.enableTxlookupData {
+			return nil, nil
+		} else {
+			// fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
+			value, err := d.db.Get(key)
 
+			if err != nil {
+				if err == pebble.ErrNotFound {
+					return nil, ErrNotFound // Convert to EthStore specific ErrNotFound
+				}
+				return nil, err
+			}
+			return value, nil
+		}
+	}
 	if AolHandledDataTypes[dataType] {
 		if d.txIndexAol == nil {
 			return nil, fmt.Errorf("AOL is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
@@ -444,47 +452,25 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		var valStr string
 		var exists bool
 		var err error
-		if dataType == TransactionLookupMetadataDataType {
-			if valStr, exists = d.txIndexkvs[string(key)]; exists {
-				// Return the found value from temporary storage
-				return []byte(valStr), nil
-			}
-			valStr, exists, err = d.txIndexAol.Get(string(key))
-			if err != nil {
-				return nil, err
-			}
-			if exists {
-				// If it's a deletion marker, return not found error
-				if valStr == aolDeleteTombstone {
-					return nil, ErrNotFound
-				}
-				// Return the found value
-				return []byte(valStr), nil
-			} else {
-				return nil, ErrNotFound
-			}
-		} else {
-			if valStr, exists = d.baolkvs[string(key)]; exists {
-				// Return the found value from temporary storage
-				return []byte(valStr), nil
-			}
-			valStr, exists, err = d.blockAol.Get(string(key))
-			if err != nil {
-				return nil, err
-			}
-			if exists {
-				// If it's a deletion marker, return not found error
-				if valStr == aolDeleteTombstone {
-					return nil, ErrNotFound
-				}
-				// Return the found value
-				return []byte(valStr), nil
-			} else {
-				return nil, ErrNotFound
-			}
+
+		if valStr, exists = d.baolkvs[string(key)]; exists {
+			// Return the found value from temporary storage
+			return []byte(valStr), nil
 		}
-		// Key doesn't exist in AOL, continue to look in Pebble
-		d.log.Trace("Key not found in AOL, checking Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		valStr, exists, err = d.blockAol.Get(string(key))
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			// If it's a deletion marker, return not found error
+			if valStr == aolDeleteTombstone {
+				return nil, ErrNotFound
+			}
+			// Return the found value
+			return []byte(valStr), nil
+		} else {
+			return nil, ErrNotFound
+		}
 	} else if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 
@@ -555,6 +541,19 @@ func (d *Database) Put(key []byte, value []byte) error {
 	}
 
 	dataType := GetDataTypeFromKey(key)
+	if dataType == TransactionLookupMetadataDataType {
+		if !d.enableTxlookupData {
+			return nil
+		} else {
+			// fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
+			err := d.db.Put(key, value)
+			if err != nil {
+				return fmt.Errorf("pebble put failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+			}
+			d.log.Trace("Stored key via Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+			return nil
+		}
+	}
 
 	if AolHandledDataTypes[dataType] {
 		if d.txIndexAol == nil {
@@ -572,42 +571,21 @@ func (d *Database) Put(key []byte, value []byte) error {
 		}
 		if foundBlockID {
 			var err error
-			if dataType == TransactionLookupMetadataDataType {
-				if blockID > d.txIndexLatestBlock {
-					if d.txIndexLatestBlock != 0 {
-						err = d.txIndexAol.Append(d.txIndexLatestBlock, d.txIndexkvs)
-					}
-					d.txIndexLatestBlock = blockID
-					d.txIndexkvs = make(map[string]string, 4)
-					d.txIndexkvs[string(key)] = string(value)
-					if err != nil {
-						return fmt.Errorf("aol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-					}
-					d.log.Trace("Stored key via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-					return nil // Data stored in AOL
-				} else {
-					d.txIndexkvs[string(key)] = string(value)
-					return nil // Data queued for AOL
+			if blockID > d.baolLatestBlock {
+				if d.baolLatestBlock != 0 {
+					err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
 				}
-
+				d.baolLatestBlock = blockID
+				d.baolkvs = make(map[string]string, 4)
+				d.baolkvs[string(key)] = string(value)
+				if err != nil {
+					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+				}
+				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
 			} else {
-				if blockID > d.baolLatestBlock {
-					if d.baolLatestBlock != 0 {
-						err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
-					}
-					d.baolLatestBlock = blockID
-					d.baolkvs = make(map[string]string, 4)
-					d.baolkvs[string(key)] = string(value)
-					if err != nil {
-						return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-					}
-					d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-					return nil // Data stored in AOL
-				} else {
-					d.baolkvs[string(key)] = string(value)
-					return nil // Data queued for AOL
-				}
-
+				d.baolkvs[string(key)] = string(value)
+				return nil // Data queued for AOL
 			}
 		}
 		// If blockID couldn't be determined for an AOL-handled type.
@@ -671,30 +649,30 @@ func (d *Database) Delete(key []byte) error {
 	}
 
 	dataType := GetDataTypeFromKey(key)
+	if dataType == TransactionLookupMetadataDataType {
+		if !d.enableTxlookupData {
+			return nil
+		} else {
+			err := d.db.Delete(key)
+
+			if err != nil {
+				return fmt.Errorf("pebble delete failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+			}
+			d.log.Trace("Deleted key via Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+			return nil
+		}
+	}
 
 	if AolHandledDataTypes[dataType] {
 		if d.txIndexAol == nil {
 			return fmt.Errorf("AOL is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-
 		var err error
-		if dataType == TransactionLookupMetadataDataType {
-
-			err := d.txIndexAol.Delete(string(key))
-
-			if err != nil {
-				return fmt.Errorf("aol append (delete tombstone) failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
-			}
-			d.log.Trace("Stored delete tombstone via AOL", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		} else {
-
-			err = d.blockAol.Delete(string(key))
-
-			if err != nil {
-				return fmt.Errorf("baol append (delete tombstone) failed for key %x (type %s, blockID): %w", key, DataTypeStrings[dataType], err)
-			}
-			d.log.Trace("Stored delete tombstone via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		err = d.blockAol.Delete(string(key))
+		if err != nil {
+			return fmt.Errorf("baol append (delete tombstone) failed for key %x (type %s, blockID): %w", key, DataTypeStrings[dataType], err)
 		}
+		d.log.Trace("Stored delete tombstone via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		// Successfully stored deletion marker in AOL
 		return nil // Deletion marker stored in AOL
 	} else if PrefixDBHandledDataTypes[dataType] {
@@ -702,9 +680,7 @@ func (d *Database) Delete(key []byte) error {
 			return fmt.Errorf("PrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from PrefixDB
-
 		err := d.statepdb.Delete(key, d.accountKey)
-
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -715,9 +691,7 @@ func (d *Database) Delete(key []byte) error {
 			return fmt.Errorf("SSPrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Delete from SSPrefixDB
-
 		err := d.snappdb.Delete(key, d.accountKey)
-
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}

@@ -54,3 +54,8 @@ standalone/ethstore/workload/vtuneOut/
 
 standalone/ethstore/toolScript/*
 standalone/ethstore/workload/vtuneAna.sh
+standalone/ethstore/workload/baseline.log
+standalone/ethstore/workload/baselineIO.log
+standalone/ethstore/workload/ethstore
+standalone/ethstore/workload/ethstore.log
+standalone/ethstore/workload/ethstoreIO.log
