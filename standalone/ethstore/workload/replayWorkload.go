@@ -4,15 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,14 +39,220 @@ const (
 	opIteratorNext
 )
 
+var opTypeNames = map[opType]string{
+	opGet:          "Get",
+	opHas:          "Has",
+	opPut:          "Put",
+	opDelete:       "Delete",
+	opNewIterator:  "NewIterator",
+	opIteratorNext: "IteratorNext",
+}
+
+type latencyHistogram struct {
+	boundsNs   []int64
+	counts     []int64
+	totalCount int64
+	totalNs    int64
+	minNs      int64
+	maxNs      int64
+}
+
+func newLatencyHistogram() *latencyHistogram {
+	boundsNs := []int64{
+		1000, 2000, 5000, 10000, 20000, 50000,
+		100000, 200000, 500000,
+		1000000, 2000000, 5000000,
+		10000000, 20000000, 50000000,
+		100000000, 200000000, 500000000,
+		1000000000, 2000000000, 5000000000,
+		10000000000,
+	}
+	return &latencyHistogram{
+		boundsNs: boundsNs,
+		counts:   make([]int64, len(boundsNs)+1),
+		minNs:    int64(^uint64(0) >> 1),
+		maxNs:    0,
+	}
+}
+
+func (h *latencyHistogram) observe(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	ns := d.Nanoseconds()
+	if ns < h.minNs {
+		h.minNs = ns
+	}
+	if ns > h.maxNs {
+		h.maxNs = ns
+	}
+	h.totalCount++
+	h.totalNs += ns
+	idx := sort.Search(len(h.boundsNs), func(i int) bool {
+		return ns <= h.boundsNs[i]
+	})
+	if idx >= len(h.counts) {
+		idx = len(h.counts) - 1
+	}
+	h.counts[idx]++
+}
+
+func (h *latencyHistogram) avg() time.Duration {
+	if h.totalCount == 0 {
+		return 0
+	}
+	return time.Duration(h.totalNs / h.totalCount)
+}
+
+func (h *latencyHistogram) percentile(p float64) time.Duration {
+	if h.totalCount == 0 {
+		return 0
+	}
+	target := int64(math.Ceil(float64(h.totalCount) * p / 100.0))
+	if target < 1 {
+		target = 1
+	}
+	var cum int64
+	for i, c := range h.counts {
+		cum += c
+		if cum >= target {
+			if i < len(h.boundsNs) {
+				return time.Duration(h.boundsNs[i])
+			}
+			return time.Duration(h.maxNs)
+		}
+	}
+	return time.Duration(h.maxNs)
+}
+
+func (h *latencyHistogram) histogramLines() []string {
+	if h.totalCount == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(h.counts))
+	total := float64(h.totalCount)
+	for i, c := range h.counts {
+		if c == 0 {
+			continue
+		}
+		var label string
+		if i < len(h.boundsNs) {
+			label = "<=" + formatDurationCompact(time.Duration(h.boundsNs[i]))
+		} else {
+			label = ">" + formatDurationCompact(time.Duration(h.boundsNs[len(h.boundsNs)-1]))
+		}
+		pct := float64(c) / total * 100.0
+		lines = append(lines, fmt.Sprintf("%-14s %12d (%.2f%%)", label, c, pct))
+	}
+	return lines
+}
+
+func formatDurationCompact(d time.Duration) string {
+	ns := d.Nanoseconds()
+	switch {
+	case ns < 1000:
+		return fmt.Sprintf("%dns", ns)
+	case ns < 1000000:
+		return fmt.Sprintf("%.3fus", float64(ns)/1000.0)
+	case ns < 1000000000:
+		return fmt.Sprintf("%.3fms", float64(ns)/1000000.0)
+	default:
+		return fmt.Sprintf("%.3fs", float64(ns)/1000000000.0)
+	}
+}
+
+func opTypeName(op opType) string {
+	if name, ok := opTypeNames[op]; ok {
+		return name
+	}
+	return fmt.Sprintf("opType(%d)", op)
+}
+
+func dataTypeName(dt ethstore.DataType) string {
+	if name, ok := ethstore.DataTypeStrings[dt]; ok {
+		return name
+	}
+	return fmt.Sprintf("DataType(%d)", dt)
+}
+
+func reportLatencyStats(stats map[ethstore.DataType]map[opType]*latencyHistogram) {
+	if len(stats) == 0 {
+		return
+	}
+	dataTypes := make([]ethstore.DataType, 0, len(stats))
+	for dt := range stats {
+		dataTypes = append(dataTypes, dt)
+	}
+	sort.Slice(dataTypes, func(i, j int) bool {
+		return dataTypes[i] < dataTypes[j]
+	})
+
+	for _, dt := range dataTypes {
+		opMap := stats[dt]
+		ops := make([]opType, 0, len(opMap))
+		for op := range opMap {
+			ops = append(ops, op)
+		}
+		sort.Slice(ops, func(i, j int) bool {
+			return ops[i] < ops[j]
+		})
+
+		for _, op := range ops {
+			hist := opMap[op]
+			if hist.totalCount == 0 {
+				continue
+			}
+			totalSec := float64(hist.totalNs) / 1000000000.0
+			throughputK := 0.0
+			if totalSec > 0 {
+				throughputK = float64(hist.totalCount) / totalSec / 1000.0
+			}
+			fmt.Printf("\n[Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
+				dataTypeName(dt),
+				opTypeName(op),
+				hist.totalCount,
+				throughputK,
+				formatDurationCompact(hist.avg()),
+				formatDurationCompact(hist.percentile(50.0)),
+				formatDurationCompact(hist.percentile(75.0)),
+				formatDurationCompact(hist.percentile(90.0)),
+				formatDurationCompact(hist.percentile(95.0)),
+				formatDurationCompact(hist.percentile(99.0)),
+				formatDurationCompact(hist.percentile(99.99)),
+			)
+			fmt.Println("Histogram (<= upper bound):")
+			for _, line := range hist.histogramLines() {
+				fmt.Printf("  %s\n", line)
+			}
+		}
+	}
+}
+
+type replayConfig struct {
+	DatabaseDir      string `json:"databaseDir"`
+	LoadDataDir      string `json:"loadDataDir"`
+	BaselinePebbleDir string `json:"baselinePebbleDir"`
+	TraceFile        string `json:"traceFile"`
+	TraceFileNocache string `json:"traceFileNocache"`
+}
+
+func loadReplayConfig(path string) (replayConfig, error) {
+	var cfg replayConfig
+	file, err := os.Open(path)
+	if err != nil {
+		return cfg, err
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
 func main() {
-
-	databaseDir := "/mnt/ssd2/ethstore/database_state"
-	loadDataDir := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
-
-	baselinepebbledir := "/mnt/ssd2/ethstore/baseline/pebble"
-	traceFile := "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000"
-	traceFileNocache := "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000"
+	configPath := flag.String("config", "workload/replay_config.json", "Path to replay config JSON")
 	go func() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
@@ -64,28 +273,32 @@ func main() {
 	// loadbaselineData(baselinepebbledir, loadDataDir)
 	// replaybaselineTrace(baselinepebbledir, traceFileNocache)
 	// replayTrace(databaseDir, traceFileNocache)
-	return
-
 	mode := flag.String("mode", "re", "Mode of operation: ld (load data), re (replay trace), o (other), lb (load baseline), rb (replay baseline)")
+	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	flag.Parse()
+
+	cfg, err := loadReplayConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config %s: %v", *configPath, err)
+	}
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
 
 	switch *mode {
 	case "ld":
-		loadData(databaseDir, loadDataDir)
+		loadData(cfg.DatabaseDir, cfg.LoadDataDir)
 		// notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
 		// txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
-		// loadAol(databaseDir, notxFile, txFile)
+		// loadAol(cfg.DatabaseDir, notxFile, txFile)
 	case "re":
-		replayTrace(databaseDir, traceFile)
-		replayTrace(databaseDir, traceFileNocache)
+		replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+		replayTrace(cfg.DatabaseDir, cfg.TraceFileNocache, *maxOps)
 	case "o":
-		otherRunner(traceFile)
+		otherRunner(cfg.TraceFile)
 	case "lb":
-		loadbaselineData(baselinepebbledir, loadDataDir)
+		loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
 	case "rb":
-		replaybaselineTrace(baselinepebbledir, traceFile)
+		replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
 	default:
 		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
 	}
@@ -159,7 +372,7 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 	}
 }
 
-func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
+func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int64) {
 	dir := baselinePebbleDir
 	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
 	if err != nil {
@@ -179,7 +392,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
 
 	var totalTime time.Duration
-	counter := 0
+	var counter int64
 	reader := bufio.NewReader(file)
 
 	var logicReadSize int64 = 0
@@ -287,8 +500,8 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
 		}
-		if counter == 100*1000*1000 {
-			fmt.Println("Reached 100 million operations, stopping replay.")
+		if maxOps > 0 && counter >= maxOps {
+			fmt.Printf("Reached max operations %d, stopping replay.\n", maxOps)
 			fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
 			break
 		}
@@ -1079,7 +1292,7 @@ func TestGetParentKey() {
 	}
 }
 
-func replayTrace(dataBaseDir string, traceFileDir string) {
+func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 	tempDir := dataBaseDir
 	store, err := ethstore.New(tempDir, 8000, "put_test", false, true)
 	if err != nil {
@@ -1107,8 +1320,9 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
 
 	var totalTime time.Duration
-	counter := 0
+	var counter int64
 	reader := bufio.NewReader(file)
+	stats := make(map[ethstore.DataType]map[opType]*latencyHistogram)
 
 	var oldIterationKey []byte
 	IterationCount := 0
@@ -1186,6 +1400,7 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 		}
 
 		var op opType
+		doStoreOp := true
 		switch opTypeStr {
 		case "Get":
 			op = opGet
@@ -1198,12 +1413,16 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 		case "NewIterator":
 			oldIterationKey = keyBytes
 			IterationCount = 0
+			op = opNewIterator
+			doStoreOp = false
 		case "IteratorNext":
 			if oldIterationKey == nil {
 				fmt.Printf("IteratorNext without NewIterator at line %d\n", counter)
 				continue
 			}
 			IterationCount++
+			op = opIteratorNext
+			doStoreOp = false
 		default:
 			// 未知操作，跳过
 			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
@@ -1218,20 +1437,28 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 		// 执行操作并计时
 		start := time.Now()
 		var opErr error
-
-		switch op {
-		case opGet:
-			_, opErr = store.Get(keyBytes)
-		case opHas:
-			_, opErr = store.Has(keyBytes)
-		case opPut:
-			opErr = store.Put(keyBytes, valueBytes)
-		case opDelete:
-			opErr = store.Delete(keyBytes)
+		if doStoreOp {
+			switch op {
+			case opGet:
+				_, opErr = store.Get(keyBytes)
+			case opHas:
+				_, opErr = store.Has(keyBytes)
+			case opPut:
+				opErr = store.Put(keyBytes, valueBytes)
+			case opDelete:
+				opErr = store.Delete(keyBytes)
+			}
 		}
-
 		end := time.Now()
-		totalTime += end.Sub(start)
+		elapsed := end.Sub(start)
+		totalTime += elapsed
+		if _, ok := stats[dataType]; !ok {
+			stats[dataType] = make(map[opType]*latencyHistogram)
+		}
+		if _, ok := stats[dataType][op]; !ok {
+			stats[dataType][op] = newLatencyHistogram()
+		}
+		stats[dataType][op].observe(elapsed)
 		if opErr != nil {
 			//fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
 			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
@@ -1241,12 +1468,15 @@ func replayTrace(dataBaseDir string, traceFileDir string) {
 			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 		}
 
-		if counter == 100*1000*1000 {
-			fmt.Println("Reached 100 million operations, stopping replay.")
+		if maxOps > 0 && counter >= maxOps {
+			fmt.Printf("Reached max operations %d, stopping replay.\n", maxOps)
 			break
 		}
 
 	}
+
+	fmt.Println("\nReplay completed. Reporting latency statistics...")
+	reportLatencyStats(stats)
 }
 
 func buildMemCache() error {
