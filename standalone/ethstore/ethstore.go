@@ -167,12 +167,11 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 
 // Database is a persistent key-value store based on the append-only log store.
 type Database struct {
-	fn         string                // filename/directory for reporting
-	txIndexAol *TxIndexAppendOnlyLog // Underlying append-only log store
-	db         *PebbleStore          // Pebble store for non-AOL data
-	statepdb   *prefixdb.PrefixDB    // world state PrefixDB
-	snappdb    *prefixdb.PrefixDB    // snapshot PrefixDB
-	blockAol   *BlockAppendOnlyLog
+	fn       string             // filename/directory for reporting
+	db       *PebbleStore       // Pebble store for non-AOL data
+	statepdb *prefixdb.PrefixDB // world state PrefixDB
+	snappdb  *prefixdb.PrefixDB // snapshot PrefixDB
+	blockAol *BlockAppendOnlyLog
 
 	diskSizeGauge *metrics.Gauge // Gauge for tracking the size of all the data in the database
 
@@ -224,13 +223,6 @@ func New(dirPath string, recentN int, namespace string, readonly bool, enableTxl
 	}
 	logger.Info("Initializing TxIndexAppendOnlyLog store", "recentN", recentN) // recentN will be default if <= 0
 
-	appendLog, err := NewAppendOnlyLog(dirPath+"/aol", recentN, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize append-only log: %w", err)
-	}
-	db.txIndexAol = appendLog
-	db.txIndexkvs = make(map[string]string)
-
 	// Initialize BlockAppendOnlyLog
 	baol, err := NewBlockAppendOnlyLog(dirPath+"/aol", recentN, logger)
 	if err != nil {
@@ -250,7 +242,6 @@ func New(dirPath string, recentN int, namespace string, readonly bool, enableTxl
 		// Close AOL if Pebble initialization fails
 		db.statepdb.Close()
 		db.snappdb.Close()
-		appendLog.Close()
 		baol.Close()
 		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
 	}
@@ -306,13 +297,6 @@ func (d *Database) Close() error {
 		}
 	}
 
-	// Close the TxIndexAppendOnlyLog store
-	if d.txIndexAol != nil {
-		if err := d.txIndexAol.Close(); err != nil {
-			d.log.Error("Failed to close TxIndexAppendOnlyLog", "err", err)
-			return fmt.Errorf("failed to close TxIndexAppendOnlyLog: %w", err)
-		}
-	}
 	// Close the BlockAppendOnlyLog
 	if d.blockAol != nil {
 		if err := d.blockAol.Close(); err != nil {
@@ -325,9 +309,6 @@ func (d *Database) Close() error {
 		if err := d.db.Close(); err != nil {
 			d.log.Error("Failed to close Pebble store", "err", err)
 			// Continue trying to close AOL, but remember Pebble's error
-			if aolErr := d.txIndexAol.Close(); aolErr != nil {
-				return fmt.Errorf("failed to close stores: pebble: %v, aol: %v", err, aolErr)
-			}
 
 			if baolErr := d.blockAol.Close(); baolErr != nil {
 				return fmt.Errorf("failed to close BlockAppendOnlyLog: %v", baolErr)
@@ -365,9 +346,6 @@ func (d *Database) Has(key []byte) (bool, error) {
 	}
 
 	if AolHandledDataTypes[dataType] {
-		if d.txIndexAol == nil {
-			return false, fmt.Errorf("AOL is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
-		}
 		var valStr string
 		var exists bool
 		var err error
@@ -446,9 +424,6 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		}
 	}
 	if AolHandledDataTypes[dataType] {
-		if d.txIndexAol == nil {
-			return nil, fmt.Errorf("AOL is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
-		}
 		var valStr string
 		var exists bool
 		var err error
@@ -556,9 +531,6 @@ func (d *Database) Put(key []byte, value []byte) error {
 	}
 
 	if AolHandledDataTypes[dataType] {
-		if d.txIndexAol == nil {
-			return fmt.Errorf("AOL is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
-		}
 		var blockID uint64
 		var foundBlockID bool
 
@@ -664,9 +636,6 @@ func (d *Database) Delete(key []byte) error {
 	}
 
 	if AolHandledDataTypes[dataType] {
-		if d.txIndexAol == nil {
-			return fmt.Errorf("AOL is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
-		}
 		var err error
 		err = d.blockAol.Delete(string(key))
 		if err != nil {
@@ -739,7 +708,7 @@ func (d *Database) Path() string {
 	if d.closed {
 		return "" // Or handle appropriately
 	}
-	return d.txIndexAol.Path()
+	return d.fn
 }
 
 // ethdbIterator is a wrapper implementing the ethdb.Iterator interface for Pebble iterator
@@ -864,12 +833,6 @@ func (it *iterator) init() {
 
 	// If this iterator is for AOL:
 	if AolHandledDataTypes[GetDataTypeFromKey(it.prefix)] {
-		if it.db.txIndexAol == nil {
-			it.err = errors.New("iterator: AOL not initialized in database for AOL-specific iterator")
-			it.keys = make([][]byte, 0)
-			it.pos = -1
-			return
-		}
 		// --- BEGIN AOL Key Loading Logic (Placeholder) ---
 		// This section requires significant implementation:
 		// 1. Identify relevant AOL segment files based on potential block ranges or timestamps if applicable.
@@ -1010,7 +973,7 @@ func (d *Database) Stat() (string, error) {
 	if d.closed {
 		return "", ErrClosed
 	}
-	return fmt.Sprintf("ethstore(path=%s, recentN=%d)", d.txIndexAol.Path(), d.txIndexAol.RecentN()), nil
+	return fmt.Sprintf("ethstore(path=%s, recentN=%d)", d.fn, 0), nil
 }
 
 // Compact flattens the underlying data store for the given key range.
@@ -1022,13 +985,6 @@ func (d *Database) Compact(start []byte, limit []byte) error {
 func (d *Database) CloseAol() error {
 	d.quitLock.Lock()
 	defer d.quitLock.Unlock()
-	if d.txIndexAol != nil {
-		if err := d.txIndexAol.Close(); err != nil {
-			d.log.Error("Failed to close TxIndexAppendOnlyLog", "err", err)
-			return fmt.Errorf("failed to close TxIndexAppendOnlyLog: %w", err)
-		}
-		d.txIndexAol = nil // Clear the reference after closing
-	}
 	if d.blockAol != nil {
 		if err := d.blockAol.Close(); err != nil {
 			d.log.Error("Failed to close BlockAppendOnlyLog", "err", err)

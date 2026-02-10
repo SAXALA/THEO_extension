@@ -160,7 +160,7 @@ type storageChunkEntry struct {
 	keyStart   []byte
 	keyEnd     []byte
 	entries    []kvPair
-	backing    []byte
+	backing    *bufferLease
 	lastAccess uint64
 }
 
@@ -228,7 +228,7 @@ func (b *storageChunkBuffer) releaseChunk(chunk *storageChunkEntry) {
 		chunk.entries = nil
 	}
 	if chunk.backing != nil {
-		putDataBuffer(chunk.backing)
+		chunk.backing.Release()
 		chunk.backing = nil
 	}
 }
@@ -264,14 +264,14 @@ func (b *storageChunkBuffer) covers(accountKey string, key []byte) bool {
 	return false
 }
 
-func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing []byte) {
+func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing *bufferLease) {
 	b.ensureLimits()
 	if accountKey == "" {
 		if len(entries) > 0 {
 			b.returnEntries(entries)
 		}
 		if backing != nil {
-			putDataBuffer(backing)
+			backing.Release()
 		}
 		b.reset()
 		return
@@ -282,7 +282,7 @@ func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing 
 	}
 	if len(entries) == 0 {
 		if backing != nil {
-			putDataBuffer(backing)
+			backing.Release()
 		}
 		return
 	}

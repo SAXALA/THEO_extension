@@ -34,6 +34,7 @@ const (
 	opDelete
 	opNewIterator
 	opIteratorNext
+	opNewBatch
 )
 
 func main() {
@@ -52,12 +53,12 @@ func main() {
 	// TestPrefixGet()
 	// loadPebble()
 	// loadAccount()
-	repalceAccountHashToAccountKey()
+	// repalceAccountHashToAccountKey()
 
-	//recordTraceStorage(traceFile)
+	// recordTraceStorage(traceFile)
 	// recordAccount(traceFileNocache)
-	// recordTraceBlock(traceFile)
-	// replayTraceAccount(databaseDir, traceFile)
+	// recordTraceBlock(traceFileNocache)
+	replayTraceAccount(databaseDir, traceFile)
 	// replayTrace(databaseDir, traceFile)
 
 	// time.Sleep(5 * time.Second)
@@ -238,6 +239,8 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 			op = opPut
 		case "Delete", "BatchDelete":
 			op = opDelete
+		case "NewBatch":
+			op = opNewBatch
 		default:
 			// 未知操作，跳过
 			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
@@ -249,6 +252,9 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 			continue
 		}
 
+		if op != opGet {
+			continue
+		}
 		// 执行操作并计时
 		var value []byte
 		var size int
@@ -287,7 +293,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string) {
 			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
 			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
 		}
-		if counter == 100*1000*1000 {
+		if counter == 1*1000*1000 {
 			fmt.Println("Reached 100 million operations, stopping replay.")
 			fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
 			break
@@ -1080,7 +1086,7 @@ func TestGetParentKey() {
 }
 
 func replayTrace(dataBaseDir string, traceFileDir string) {
-	tempDir := dataBaseDir
+	tempDir := "/mnt/ssd2/ethstore/database"
 	store, err := ethstore.New(tempDir, 8000, "put_test", false, true)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
@@ -1752,6 +1758,7 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 
 	var oldop string
 
+	store.UpgradeSegmentIndexFiles()
 	fmt.Println("start replay")
 	for {
 		// read line
