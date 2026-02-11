@@ -8,15 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/cache"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	_ "github.com/syndtr/goleveldb/leveldb/opt"
 	_ "io"
 	log2 "log"
 	"math/big"
@@ -27,6 +18,16 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb"
+	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/cache"
+	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
+	_ "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
 )
 
 var (
