@@ -208,7 +208,10 @@ type PrefixDB struct {
 	storageGCWait     sync.WaitGroup
 	storageGCMu       sync.Mutex
 
-	storageCache *lru.Cache
+	storageCache          *lru.Cache
+	stroageCacheSizeLimit uint64
+	cacheEvictTicker      *time.Ticker
+	cacheEvictTickerTime  time.Duration
 	// for debug
 	totalOps   uint64
 	cachedOps  uint64
@@ -270,11 +273,13 @@ func NewPrefixDB(dirpath string, databaseType DatabaseType) (*PrefixDB, error) {
 	}
 
 	db := &PrefixDB{
-		accountFile:  accountFile,
-		batch:        NewWriteBatch(cfg.WriteBatchSize),
-		writeMutex:   sync.Mutex{},
-		storageDir:   storageDir,
-		databaseType: databaseType,
+		accountFile:           accountFile,
+		batch:                 NewWriteBatch(cfg.WriteBatchSize),
+		writeMutex:            sync.Mutex{},
+		storageDir:            storageDir,
+		databaseType:          databaseType,
+		cacheEvictTickerTime:  10 * time.Millisecond,
+		stroageCacheSizeLimit: 8192,
 	}
 
 	if err := os.MkdirAll(db.storageDir, 0755); err != nil {
@@ -308,13 +313,15 @@ func NewPrefixDB(dirpath string, databaseType DatabaseType) (*PrefixDB, error) {
 	}
 	db.storageIndexCache = indexCache
 
-	storageCache, err := lru.New(4096)
+	storageCache, err := lru.New(8192)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init storage cache: %v", err)
 	}
 	db.storageCache = storageCache
 
 	db.startStorageGCWorker()
+
+	db.startCacheEvictionWorker(db.cacheEvictTickerTime)
 
 	db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
@@ -1698,12 +1705,12 @@ func adjustMetaRange(meta *segmentChunkMeta, additions []kvPair) {
 	}
 }
 
-func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, error) {
+func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
 	var err error
 	if existing == nil {
 		existing, backing, err = db.readSegmentChunkFile(folderID, meta.FileName)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if backing != nil {
@@ -1711,11 +1718,7 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, me
 	}
 	merged := mergeAndDedupPairs(existing, additions)
 	if len(merged) == 0 {
-		fullPath := filepath.Join(folderPath, meta.FileName)
-		if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		return nil, nil
+		return nil, true, nil
 	}
 	chunks := splitEntriesBySize(merged, segmentedChunkHardLimit)
 	result := make([]segmentChunkMeta, 0, len(chunks))
@@ -1726,7 +1729,7 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, me
 			name = allocator.nextName()
 		}
 		if chunkSize, err = db.writeChunkFile(folderPath, name, chunk); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		result = append(result, segmentChunkMeta{
 			FileName:  name,
@@ -1736,7 +1739,35 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, me
 			ChunkSize: uint64(chunkSize),
 		})
 	}
-	return result, nil
+	return result, false, nil
+}
+
+func (db *PrefixDB) repairMissingChunkFile(folderID uint32, fileName string) error {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+	metas, err := db.readSegmentIndex(folderID)
+	if err != nil {
+		return err
+	}
+	filtered := make([]segmentChunkMeta, 0, len(metas))
+	removed := false
+	for _, meta := range metas {
+		if meta.FileName == fileName {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, meta)
+	}
+	if !removed {
+		return fmt.Errorf("missing chunk %s not referenced in folder %d", fileName, folderID)
+	}
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := db.writeSegmentIndex(folderPath, filtered); err != nil {
+		return err
+	}
+	db.invalidateSegmentIndexCache(folderID)
+	fmt.Printf("prefixdb: repaired missing chunk %s in folder %d\n", fileName, folderID)
+	return nil
 }
 
 func mergeAndDedupPairs(existing, additions []kvPair) []kvPair {
@@ -2532,6 +2563,8 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 
 func (db *PrefixDB) readSegmentedChunk(fileID uint32, storageKey []byte) ([]kvPair, *bufferLease, *segmentChunkMeta, error) {
 	folderID := fileID & ^segmentedStorageFlag
+	repaired := false
+retry:
 	metas, err := db.readSegmentIndexForKey(folderID, storageKey)
 	if err != nil {
 		return nil, nil, nil, err
@@ -2545,6 +2578,12 @@ func (db *PrefixDB) readSegmentedChunk(fileID uint32, storageKey []byte) ([]kvPa
 	}
 	payload, kvCount, backing, err := db.readSegmentChunkPayload(folderID, meta.FileName)
 	if err != nil {
+		if !repaired && errors.Is(err, os.ErrNotExist) {
+			if repairErr := db.repairMissingChunkFile(folderID, meta.FileName); repairErr == nil {
+				repaired = true
+				goto retry
+			}
+		}
 		return nil, nil, nil, err
 	}
 	entries, err := db.buildStorageEntries(payload, kvCount)
@@ -3219,7 +3258,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 			job.backing = nil
 		}
 	}
-	chunkMetas, err := db.rewriteChunkWithDedup(job.folderID, folderPath, metas[idx], nil, allocator, preloaded, preloadBacking)
+	chunkMetas, deleteOriginal, err := db.rewriteChunkWithDedup(job.folderID, folderPath, metas[idx], nil, allocator, preloaded, preloadBacking)
 	if preloaded != nil {
 		db.releaseStorageEntries(preloaded)
 	}
@@ -3237,6 +3276,12 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
 		return err
 	}
+	if deleteOriginal {
+		fullPath := filepath.Join(folderPath, metas[idx].FileName)
+		if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	db.invalidateSegmentIndexCache(job.folderID)
 	return nil
 }
@@ -3247,6 +3292,8 @@ func (db *PrefixDB) InsertAccountHashPebble(accountHash []byte, pebbleKey []byte
 
 func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, storageKey []byte) []byte {
 	folderID := fileID & ^segmentedStorageFlag
+	repaired := false
+retry:
 	metas, err := db.readSegmentIndexForKey(folderID, storageKey)
 	if err != nil || len(metas) == 0 {
 		return nil
@@ -3257,6 +3304,12 @@ func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, storageKey []byte) 
 	}
 	lease, err := db.readSegmentFileBuffer(folderID, meta.FileName)
 	if err != nil {
+		if !repaired && errors.Is(err, os.ErrNotExist) {
+			if repairErr := db.repairMissingChunkFile(folderID, meta.FileName); repairErr == nil {
+				repaired = true
+				goto retry
+			}
+		}
 		return nil
 	}
 	buf := lease.Bytes()
@@ -3349,4 +3402,27 @@ func (db *PrefixDB) UpgradeSegmentIndexFiles() error {
 		db.invalidateSegmentIndexCache(folderID)
 	}
 	return nil
+}
+
+func (db *PrefixDB) GCPrefixTree() error {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+	if count := db.prefixTree.GC(); count >= 0 {
+		return nil
+	}
+	return fmt.Errorf("prefix tree GC failed")
+}
+
+func (db *PrefixDB) startCacheEvictionWorker(interval time.Duration) {
+	if db.cacheEvictTicker != nil {
+		return
+	}
+	db.cacheEvictTicker = time.NewTicker(interval)
+	go func() {
+		for range db.cacheEvictTicker.C {
+			for db.storageCache.Len() > 4096 {
+				db.storageCache.RemoveOldest()
+			}
+		}
+	}()
 }

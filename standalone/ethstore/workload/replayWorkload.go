@@ -253,11 +253,16 @@ func loadReplayConfig(path string) (replayConfig, error) {
 }
 
 func main() {
-	configPath := flag.String("config", "workload/replay_config.json", "Path to replay config JSON")
+	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
 	go func() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
+
+	cfg, err := loadReplayConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config %s: %v", *configPath, err)
+	}
 
 	// TestPrefixGet()
 	// loadPebble()
@@ -267,21 +272,17 @@ func main() {
 	// recordTraceStorage(traceFile)
 	// recordAccount(traceFileNocache)
 	// recordTraceBlock(traceFileNocache)
-	replayTraceAccount(databaseDir, traceFile)
+	replayTraceAccount(cfg.DatabaseDir, cfg.TraceFile)
 	// replayTrace(databaseDir, traceFile)
 
 	// time.Sleep(5 * time.Second)
-	// loadbaselineData(baselinepebbledir, loadDataDir)
-	// replaybaselineTrace(baselinepebbledir, traceFileNocache)
+	// loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
+	// replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, 6000000)
 	// replayTrace(databaseDir, traceFileNocache)
+	return
 	mode := flag.String("mode", "re", "Mode of operation: ld (load data), re (replay trace), o (other), lb (load baseline), rb (replay baseline)")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	flag.Parse()
-
-	cfg, err := loadReplayConfig(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to load config %s: %v", *configPath, err)
-	}
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
 
@@ -399,6 +400,8 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 	var logicReadSize int64 = 0
 	var logicWriteSize int64 = 0
 
+	var oldop string
+
 	fmt.Println("Start replaying baseline trace...")
 	for {
 		// read line
@@ -442,6 +445,19 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 			continue
 		}
 
+		if keyBytes[0] != 'O' {
+			continue
+		}
+
+		if oldop != opTypeStr {
+			if oldop == "BatchPut" && opTypeStr == "BatchDelete" {
+
+			} else {
+				oldop = opTypeStr
+				fmt.Println("\nop changed to " + opTypeStr)
+			}
+		}
+
 		var op opType
 		switch opTypeStr {
 		case "Get":
@@ -465,9 +481,6 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 			continue
 		}
 
-		if op != opGet {
-			continue
-		}
 		// 执行操作并计时
 		var value []byte
 		var size int
@@ -1987,7 +2000,7 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 	var memStats runtime.MemStats
 
 	var oldop string
-
+	// store.GCPrefixTree()
 	store.UpgradeSegmentIndexFiles()
 	fmt.Println("start replay")
 	for {

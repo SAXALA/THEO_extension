@@ -224,6 +224,60 @@ func (pt *PrefixTree) maybeScheduleGC(fileID string, header FileNodeHeader, sort
 	}
 }
 
+func (pt *PrefixTree) buildGCStateFromFile(fileID string) (*gcState, error) {
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	f, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open filenode failed: %w", err)
+	}
+	defer f.Close()
+
+	var header FileNodeHeader
+	if err := binary.Read(f, binary.BigEndian, &header); err != nil {
+		return nil, fmt.Errorf("read filenode header failed: %w", err)
+	}
+	if header.Magic != FileNodeMagic {
+		return nil, fmt.Errorf("invalid filenode magic for %s", fileID)
+	}
+	if header.SortedEntryCount == 0 && header.UnsortedEntryCount == 0 {
+		return nil, nil
+	}
+	if header.UnsortedEntryCount == 0 {
+		return nil, nil
+	}
+	totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
+	dataSize := int64(totalEntries) * NodeEntrySize
+	if _, err := f.Seek(int64(binary.Size(header)), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek filenode failed: %w", err)
+	}
+	dataBuf := make([]byte, dataSize)
+	if _, err := io.ReadFull(f, dataBuf); err != nil {
+		return nil, fmt.Errorf("read filenode payload failed: %w", err)
+	}
+	sortedBytes := int(header.SortedEntryCount) * NodeEntrySize
+	if sortedBytes > len(dataBuf) {
+		sortedBytes = len(dataBuf)
+	}
+	unsortedOffset := sortedBytes
+	unsortedBytes := len(dataBuf) - unsortedOffset
+	state := &gcState{
+		done:   make(chan struct{}),
+		header: header,
+	}
+	if sortedBytes > 0 {
+		state.sorted = append([]byte(nil), dataBuf[:sortedBytes]...)
+	}
+	if unsortedBytes > 0 {
+		state.unsorted = append([]byte(nil), dataBuf[unsortedOffset:]...)
+	}
+	state.header.SortedEntryCount = uint32(len(state.sorted) / NodeEntrySize)
+	state.header.UnsortedEntryCount = uint32(len(state.unsorted) / NodeEntrySize)
+	return state, nil
+}
+
 func (pt *PrefixTree) processGCJob(job gcJob) {
 	if job.state == nil {
 		return
@@ -926,14 +980,48 @@ func (pt *PrefixTree) GC() int {
 
 	count := 0
 	for _, job := range gcJobs {
-		if job.state != nil {
-			if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
-				fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
-				continue
-			}
-			pt.finishGC(job.fileID)
-			count++
+		if job.state == nil {
+			continue
 		}
+		if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
+			fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
+			continue
+		}
+		pt.finishGC(job.fileID)
+		count++
+	}
+	entries, err := os.ReadDir(pt.fileNodeDir)
+	if err != nil {
+		fmt.Printf("PrefixTree GC scan failed: %v\n", err)
+		return count
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		fileID := entry.Name()
+		state, err := pt.buildGCStateFromFile(fileID)
+		if err != nil {
+			fmt.Printf("PrefixTree GC state build failed for %s: %v\n", fileID, err)
+			continue
+		}
+		if state == nil || state.header.UnsortedEntryCount == 0 {
+			continue
+		}
+		pt.gcMu.Lock()
+		if _, exists := pt.gcInFlight[fileID]; exists {
+			pt.gcMu.Unlock()
+			continue
+		}
+		pt.gcInFlight[fileID] = state
+		pt.gcMu.Unlock()
+		if err := pt.compactFileFromState(fileID, state); err != nil {
+			fmt.Printf("PrefixTree GC failed for %s: %v\n", fileID, err)
+			pt.finishGC(fileID)
+			continue
+		}
+		pt.finishGC(fileID)
+		count++
 	}
 	return count
 }

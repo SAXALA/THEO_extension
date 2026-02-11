@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/allegro/bigcache/v3"
 )
@@ -45,15 +44,6 @@ func DefaultConfig(dirpath string) *Config {
 		MemcacheAddr:   "127.0.0.1:11211",
 		MaxCacheSize:   1 << 20, // 1M entries
 		WriteBatchSize: 4096,
-		BigCacheConfig: bigcache.Config{
-			Shards:             1024,            // 分片数，必须是 2 的幂。越大并发冲突越小。
-			LifeWindow:         1 * time.Minute, // 对象的过期时间
-			CleanWindow:        1 * time.Minute, // 多久清理一次过期数据
-			MaxEntriesInWindow: 1000 * 10 * 60,  // 预期缓存条目数（影响内存预分配）
-			MaxEntrySize:       150,             // 预期单个 Entry 的平均字节数（影响内存预分配）
-			Verbose:            true,            // 是否打印内存分配信息
-			HardMaxCacheSize:   1024,            // 最大占用内存 (MB)
-		},
 	}
 }
 
