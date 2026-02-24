@@ -16,14 +16,15 @@ import (
 )
 
 const (
-	MaxPrefixDepth      = 6          // the maximum depth of the prefix tree
-	NodeEntrySize       = 76         // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
-	FileNodeMagic       = 0x50544E46 // "PTNF" - file node magic number
-	MaxKeySize          = 32         // maximum key size in bytes
-	TreeFileMagic       = 0x50545246 // "PTRF" - prefix tree file magic number
-	maxCacheFiles       = 1024
-	maxPooledBufferSize = 1024 * 1024 // 1MB
-	globalFileName      = "global.node"
+	MaxPrefixDepth        = 6          // the maximum depth of the prefix tree
+	NodeEntrySize         = 76         // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
+	FileNodeMagic         = 0x50544E46 // "PTNF" - file node magic number
+	MaxKeySize            = 32         // maximum key size in bytes
+	TreeFileMagic         = 0x50545246 // "PTRF" - prefix tree file magic number
+	maxCacheFiles         = 1024
+	fileNodeCacheCapacity = 64
+	maxPooledBufferSize   = 1024 * 1024 // 1MB
+	globalFileName        = "global.node"
 )
 
 type NodeType byte
@@ -71,8 +72,7 @@ type NodeInfo struct {
 	storageSize   uint64
 }
 
-type FileNodeCache struct {
-	fileID string
+type fileNodeCacheEntry struct {
 	hdrBuf []byte
 	buf    []byte
 }
@@ -92,30 +92,19 @@ type gcState struct {
 func (pt *PrefixTree) invalidateFileNodeCache(fileID string) {
 	pt.fileNodeCacheMu.Lock()
 	defer pt.fileNodeCacheMu.Unlock()
-	if fileID != pt.fileNodeCache.fileID {
+	if pt.fileNodeCache == nil || fileID == "" {
 		return
 	}
-	pt.clearFileNodeCacheLocked()
+	pt.fileNodeCache.Remove(fileID)
 }
 
 func (pt *PrefixTree) setFileNodeCache(fileID string, hdrBuf []byte, buf []byte) {
 	pt.fileNodeCacheMu.Lock()
 	defer pt.fileNodeCacheMu.Unlock()
-	if pt.fileNodeCache.buf != nil {
-		pt.releaseBuf(pt.fileNodeCache.buf)
+	if pt.fileNodeCache == nil || fileID == "" {
+		return
 	}
-	pt.fileNodeCache.fileID = fileID
-	pt.fileNodeCache.hdrBuf = hdrBuf
-	pt.fileNodeCache.buf = buf
-}
-
-func (pt *PrefixTree) clearFileNodeCacheLocked() {
-	if pt.fileNodeCache.buf != nil {
-		pt.releaseBuf(pt.fileNodeCache.buf)
-	}
-	pt.fileNodeCache.fileID = ""
-	pt.fileNodeCache.hdrBuf = nil
-	pt.fileNodeCache.buf = nil
+	pt.fileNodeCache.Add(fileID, &fileNodeCacheEntry{hdrBuf: hdrBuf, buf: buf})
 }
 
 // PrefixTree
@@ -134,7 +123,7 @@ type PrefixTree struct {
 	mergeWait sync.WaitGroup
 
 	fileCache       *lru.Cache
-	fileNodeCache   FileNodeCache
+	fileNodeCache   *lru.Cache
 	fileNodeCacheMu sync.RWMutex
 	fileStripeLocks stripedRWLocks // striped locks for file operations
 
@@ -423,9 +412,8 @@ func NewPrefixTree(db *PrefixDB, dirPath string, databaseType DatabaseType) (*Pr
 		fileNodeDir:  fileNodeDir,
 		globalFileID: globalFileName,
 		// bucketPrefixLength: MaxPrefixDepth - 1,
-		mergeStop:     make(chan struct{}),
-		fileCache:     fileCache,
-		fileNodeCache: FileNodeCache{},
+		mergeStop: make(chan struct{}),
+		fileCache: fileCache,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, NodeEntrySize*512)
@@ -435,14 +423,24 @@ func NewPrefixTree(db *PrefixDB, dirPath string, databaseType DatabaseType) (*Pr
 		gcInFlight:    make(map[string]*gcState),
 		gcWriteBlocks: make(map[string]int),
 	}
+	fileNodeCache, err := lru.NewWithEvict(fileNodeCacheCapacity, func(key interface{}, value interface{}) {
+		entry, _ := value.(*fileNodeCacheEntry)
+		if entry != nil && entry.buf != nil {
+			pt.releaseBuf(entry.buf)
+		}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create file node cache failed: %w", err)
+	}
+	pt.fileNodeCache = fileNodeCache
 	pt.startMergeWorker()
 
 	switch databaseType {
 	case StateDB:
 		pt.bucketPrefixLength = pt.maxDepth
 	case SnapshotDB:
-		pt.bucketPrefixLength = pt.maxDepth / 2
-		pt.maxDepth = pt.maxDepth / 2
+		pt.bucketPrefixLength = pt.maxDepth/2 - 1
+		pt.maxDepth = pt.maxDepth/2 - 1
 	default:
 		pt.bucketPrefixLength = pt.maxDepth
 	}
@@ -504,8 +502,7 @@ func decodeNodeEntry(entry []byte) NodeInfo {
 	if keyLen > MaxKeySize {
 		keyLen = MaxKeySize
 	}
-	res.key = make([]byte, keyLen)
-	copy(res.key, entry[1:1+keyLen])
+	res.key = entry[1 : 1+keyLen]
 
 	res.accountOffset = int64(binary.BigEndian.Uint64(entry[33:41]))
 	res.storageFileID = binary.BigEndian.Uint32(entry[41:45])
@@ -753,12 +750,14 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 	} else {
 		cacheLocked := false
 		pt.fileNodeCacheMu.RLock()
-		if pt.fileNodeCache.fileID == fileID && pt.fileNodeCache.hdrBuf != nil {
-			hdrBuf = pt.fileNodeCache.hdrBuf
-			bigBuf = pt.fileNodeCache.buf
-			cacheLocked = true
-		} else {
-			pt.fileNodeCacheMu.RUnlock()
+		if pt.fileNodeCache != nil {
+			if raw, ok := pt.fileNodeCache.Get(fileID); ok {
+				if entry, _ := raw.(*fileNodeCacheEntry); entry != nil && entry.hdrBuf != nil {
+					hdrBuf = entry.hdrBuf
+					bigBuf = entry.buf
+					cacheLocked = true
+				}
+			}
 		}
 		if cacheLocked {
 			defer pt.fileNodeCacheMu.RUnlock()
@@ -769,6 +768,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 				return NodeInfo{}, false, fmt.Errorf("invalid cached file node magic (got 0x%X, file=%s)", header.Magic, fileID)
 			}
 		} else {
+			pt.fileNodeCacheMu.RUnlock()
 			file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
 			if err != nil {
 				if os.IsNotExist(err) {

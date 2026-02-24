@@ -38,7 +38,7 @@ func DefaultConfig(dirpath string) *Config {
 		BaseDir:        dirpath,
 		AccountDir:     filepath.Join(prefixDBDir, "na"),
 		TrieDir:        filepath.Join(prefixDBDir, "trie"),
-		PebblePath:     filepath.Join(prefixDBDir, "accountHash_key_pebble"),
+		PebblePath:     filepath.Join("/mnt/ramdisk/accountHash_key_pebble"),
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
 		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
 		MemcacheAddr:   "127.0.0.1:11211",

@@ -193,17 +193,17 @@ type Database struct {
 // The namespace is the prefix that the metrics reporting should use.
 // cache and handles parameters might be less relevant for TxIndexAppendOnlyLog,
 // but recentN (number of blocks to index) becomes important.
-func New(dirPath string, recentN int, namespace string, readonly bool, enableTxlookupData bool) (*Database, error) {
+func New(dirPath string, recentN int, namespace string, readonly bool, enableTxlookupData bool, chunkFileSize int, prefixTreeCacheSize uint64) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, prefixdb.StateDB)
+	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, prefixdb.StateDB, chunkFileSize, prefixTreeCacheSize/2) // Example chunk size and cache size
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
 
 	dirPathSnapshot := dirPath + "_snapshot"
-	snapshotPrefixdb, err := prefixdb.NewPrefixDB(dirPathSnapshot, prefixdb.SnapshotDB)
+	snapshotPrefixdb, err := prefixdb.NewPrefixDB(dirPathSnapshot, prefixdb.SnapshotDB, chunkFileSize, prefixTreeCacheSize/2) // Example chunk size and cache size
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -603,6 +603,66 @@ func (d *Database) Put(key []byte, value []byte) error {
 		return fmt.Errorf("pebble put failed for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
 	d.log.Trace("Stored key via Pebble", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	return nil
+}
+
+func (d *Database) BatchPut(key []byte, value []byte) error {
+	if key[0] != 'O' && key[0] != 'o' {
+		return nil
+	}
+	dataType := GetDataTypeFromKey(key)
+	if PrefixDBHandledDataTypes[dataType] {
+		if d.statepdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in PrefixDB
+
+		err := d.statepdb.BatchPut(key, value, d.accountKey)
+
+		if err != nil {
+			return fmt.Errorf("failed to batch put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	} else if SSPrefixdbHandledDataTypes[dataType] {
+		if d.snappdb == nil {
+			return fmt.Errorf("SSPrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Store in SSPrefixDB
+
+		err := d.snappdb.BatchPut(key, value, d.accountKey)
+
+		if err != nil {
+			return fmt.Errorf("failed to batch put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Batch stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	}
+
+	return nil
+}
+
+func (d *Database) PrefixdbBatchCommit(prefix byte) error {
+	switch prefix {
+	case 'O':
+		if d.statepdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot commit batch for prefix %c", prefix)
+		}
+		err := d.statepdb.BatchCommit()
+		if err != nil {
+			return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
+		}
+		d.log.Trace("Committed batch for PrefixDB", "prefix", prefix)
+	case 'o':
+		if d.snappdb == nil {
+			return fmt.Errorf("SSPrefixDB is not initialized, cannot commit batch for prefix %c", prefix)
+		}
+		err := d.snappdb.BatchCommit()
+		if err != nil {
+			return fmt.Errorf("failed to commit batch for SSPrefixDB: %w", err)
+		}
+		d.log.Trace("Committed batch for SSPrefixDB", "prefix", prefix)
+	default:
+		return fmt.Errorf("unsupported prefix %c for batch commit", prefix)
+	}
 	return nil
 }
 

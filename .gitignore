@@ -59,3 +59,11 @@ standalone/ethstore/workload/baselineIO.log
 standalone/ethstore/workload/ethstore
 standalone/ethstore/workload/ethstore.log
 standalone/ethstore/workload/ethstoreIO.log
+standalone/ethstore/workload/bin/*
+standalone/ethstore/workload/replayLog/*
+standalone/ethstore/workload/*.log
+standalone/ethstore/workload/*.out
+ChainKV/workload/*
+standalone/ethstore/workload/ethstoreIO_02-24_io_trend.png
+standalone/ethstore/workload/ethstoreIO_02-24.log1
+standalone/ethstore/workload/ethstoreIO_02-24_io_summary.txt

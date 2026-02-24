@@ -1,5 +1,5 @@
 {
-  "databaseDir": "/mnt/ssd2/ethstore/database_state",
+  "databaseDir": "/mnt/ssd2/ethstore/database",
   "loadDataDir": "/mnt/ssd/ethstore/20500000_key_value_pairs.txt",
   "baselinePebbleDir": "/mnt/ssd2/ethstore/baseline/pebble",
   "traceFile": "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000",

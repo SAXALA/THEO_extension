@@ -1,24 +1,36 @@
 #!/bin/bash
 
 # --- 1. 参数与进程查找 ---
-PROCESS_NAME=$1
+TARGET=$1
 INTERVAL=${2:-1}
-LOGFILE=${3:-"monitor_${PROCESS_NAME}.log"}
+LOGFILE=${3:-"monitor_${TARGET}.log"}
 
-if [ -z "$PROCESS_NAME" ]; then
-    echo "使用方法: $0 <进程名> [间隔/s] [日志文件名]"
+if [ -z "$TARGET" ]; then
+    echo "使用方法: $0 <进程名|PID> [间隔/s] [日志文件名]"
     exit 1
 fi
 
-# 根据进程名查找最新的 PID
-MAIN_PID=$(pgrep -n "$PROCESS_NAME")
+# 支持传入 PID 或进程名
+if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+    MAIN_PID="$TARGET"
+    PROCESS_DESC="PID $MAIN_PID"
+else
+    # 根据进程名查找最新的 PID
+    MAIN_PID=$(pgrep -n "$TARGET")
+    PROCESS_DESC="$TARGET (PID: $MAIN_PID)"
+fi
 
 if [ -z "$MAIN_PID" ]; then
-    echo "错误: 未找到名为 '$PROCESS_NAME' 的进程。"
+    echo "错误: 未找到目标 '$TARGET' 对应的进程。"
     exit 1
 fi
 
-echo "开始监控进程: $PROCESS_NAME (PID: $MAIN_PID)"
+if [ ! -d "/proc/$MAIN_PID" ]; then
+    echo "错误: PID $MAIN_PID 不存在。"
+    exit 1
+fi
+
+echo "开始监控进程: $PROCESS_DESC"
 echo "采样间隔: ${INTERVAL}s | 日志保存至: $LOGFILE"
 
 # 写入 CSV 表头以便后续分析

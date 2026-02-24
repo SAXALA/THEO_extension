@@ -341,21 +341,6 @@ func (b *storageChunkBuffer) lookup(key []byte) ([]byte, bool) {
 		chunk.lastAccess = b.accessCounter
 		return chunk.entries[idx].val, true
 	}
-
-	for _, chunk := range b.chunks {
-		if len(chunk.keyStart) == 0 || len(chunk.keyEnd) == 0 {
-			continue
-
-		} else {
-			for _, entry := range chunk.entries {
-				if bytes.Equal(entry.key, key) {
-					b.accessCounter++
-					chunk.lastAccess = b.accessCounter
-					return entry.val, true
-				}
-			}
-		}
-	}
 	return nil, false
 }
 
