@@ -1,6 +1,7 @@
 package prefixdb
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -325,6 +326,10 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 				return err
 			}
 			db.nodeCache.UpdateAccountOffset(key, trieAccountOffset-int64(len(entry)))
+
+			cacheKeyHex := hex.EncodeToString([]byte(key))
+			fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))
+
 		}
 	}
 

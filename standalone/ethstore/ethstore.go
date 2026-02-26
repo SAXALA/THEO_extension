@@ -79,11 +79,6 @@ var PrefixDBHandledDataTypes = map[DataType]bool{
 	TrieNodeStorageDataType: true,
 }
 
-var SSPrefixdbHandledDataTypes = map[DataType]bool{
-	SnapshotAccountDataType: true,
-	SnapshotStorageDataType: true,
-}
-
 const aolDeleteTombstone = "__AOL_DELETED__"
 
 // txLookupRLP is a local struct definition for RLP decoding TransactionLookupMetadata.
@@ -170,8 +165,9 @@ type Database struct {
 	fn       string             // filename/directory for reporting
 	db       *PebbleStore       // Pebble store for non-AOL data
 	statepdb *prefixdb.PrefixDB // world state PrefixDB
-	snappdb  *prefixdb.PrefixDB // snapshot PrefixDB
 	blockAol *BlockAppendOnlyLog
+
+	accountHashKeyCache *accountHashToKeyCache // in-memory cache: accountHash(32) -> accountKey(max64)
 
 	diskSizeGauge *metrics.Gauge // Gauge for tracking the size of all the data in the database
 
@@ -197,23 +193,17 @@ func New(dirPath string, recentN int, namespace string, readonly bool, enableTxl
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, prefixdb.StateDB, chunkFileSize, prefixTreeCacheSize/2) // Example chunk size and cache size
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
-	}
-
-	dirPathSnapshot := dirPath + "_snapshot"
-	snapshotPrefixdb, err := prefixdb.NewPrefixDB(dirPathSnapshot, prefixdb.SnapshotDB, chunkFileSize, prefixTreeCacheSize/2) // Example chunk size and cache size
+	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, chunkFileSize, prefixTreeCacheSize) // Example chunk size and cache size
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
 	db := &Database{
-		fn:                 dirPath, // Use directory path now
-		log:                logger,
-		quitChan:           make(chan chan error, 1),
-		statepdb:           statePrefixdb,
-		snappdb:            snapshotPrefixdb,
-		enableTxlookupData: enableTxlookupData,
+		fn:                  dirPath, // Use directory path now
+		log:                 logger,
+		quitChan:            make(chan chan error, 1),
+		statepdb:            statePrefixdb,
+		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
+		enableTxlookupData:  enableTxlookupData,
 	}
 
 	// Initialize the TxIndexAppendOnlyLog store
@@ -241,7 +231,7 @@ func New(dirPath string, recentN int, namespace string, readonly bool, enableTxl
 	if err != nil {
 		// Close AOL if Pebble initialization fails
 		db.statepdb.Close()
-		db.snappdb.Close()
+
 		baol.Close()
 		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
 	}
@@ -288,12 +278,6 @@ func (d *Database) Close() error {
 	if d.statepdb != nil {
 		if err := d.statepdb.Close(); err != nil {
 			d.log.Error("Failed to close state prefixDB", "err", err)
-		}
-	}
-
-	if d.snappdb != nil {
-		if err := d.snappdb.Close(); err != nil {
-			d.log.Error("Failed to close snapshot prefixDB", "err", err)
 		}
 	}
 
@@ -371,23 +355,15 @@ func (d *Database) Has(key []byte) (bool, error) {
 			return false, fmt.Errorf("PrefixDB is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Check if the key exists in PrefixDB
+		if dataType == TrieNodeStorageDataType {
+			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
+		}
 		exists, err := d.statepdb.Has(key, d.accountKey)
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
 		}
 		return exists, nil
-	} else if SSPrefixdbHandledDataTypes[dataType] {
-		if d.snappdb == nil {
-			return false, fmt.Errorf("SSPrefixDB is not initialized, cannot check key %x(type %s)", key, DataTypeStrings[dataType])
-		}
-		// Check if the key exists in SSPrefixDB
-		exists, err := d.snappdb.Has(key, d.accountKey)
-		if err != nil {
-			return false, fmt.Errorf("failed to check key %x in SSPrefixDB: %w", key, err)
-		}
-		return exists, nil
 	}
-
 	// Check if the key exists in Pebble
 	_, err := d.db.Get(key)
 	if err == nil {
@@ -453,7 +429,10 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		}
 
 		// Try to get from PrefixDB
+		if dataType == TrieNodeStorageDataType {
+			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
 
+		}
 		value, exists, err := d.statepdb.Get(key, d.accountKey)
 
 		if err != nil {
@@ -468,28 +447,7 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		// Log the found key in PrefixDB
 		d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return value, nil // Return the found value
-	} else if SSPrefixdbHandledDataTypes[dataType] {
-		if d.snappdb == nil {
-			return nil, fmt.Errorf("SSPrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		// Try to get from SSPrefixDB
-
-		value, exists, err := d.snappdb.Get(key, d.accountKey)
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to get key %x from SSPrefixDB: %w", key, err)
-		}
-		if !exists {
-			return nil, ErrNotFound // Key not found in SSPrefixDB
-		}
-		if value == nil {
-			return nil, fmt.Errorf("key %x found in SSPrefixDB but value is nil", key)
-		}
-		// Log the found key in SSPrefixDB
-		d.log.Trace("Key found in SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		return value, nil // Return the found value
 	}
-
 	// Try to get from Pebble
 
 	// fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
@@ -567,7 +525,12 @@ func (d *Database) Put(key []byte, value []byte) error {
 			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in PrefixDB
-
+		if dataType == TrieNodeStorageDataType {
+			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
+			if d.accountKey == nil {
+				return fmt.Errorf("failed to derive account key for key %x (type %s)", key, DataTypeStrings[dataType])
+			}
+		}
 		err := d.statepdb.Put(key, value, d.accountKey)
 
 		if err != nil {
@@ -575,21 +538,7 @@ func (d *Database) Put(key []byte, value []byte) error {
 		}
 		d.log.Trace("Stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return nil // Data stored in PrefixDB
-	} else if SSPrefixdbHandledDataTypes[dataType] {
-		if d.snappdb == nil {
-			return fmt.Errorf("SSPrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		// Store in SSPrefixDB
-
-		err := d.snappdb.Put(key, value, d.accountKey)
-
-		if err != nil {
-			return fmt.Errorf("failed to put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-		}
-		d.log.Trace("Stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		return nil // Data stored in SSPrefixDB
 	}
-
 	// Default: store non-AOL data in Pebble
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
@@ -607,7 +556,7 @@ func (d *Database) Put(key []byte, value []byte) error {
 }
 
 func (d *Database) BatchPut(key []byte, value []byte) error {
-	if key[0] != 'O' && key[0] != 'o' {
+	if key[0] != 'O' {
 		return nil
 	}
 	dataType := GetDataTypeFromKey(key)
@@ -616,27 +565,19 @@ func (d *Database) BatchPut(key []byte, value []byte) error {
 			return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
 		}
 		// Store in PrefixDB
-
+		if dataType == TrieNodeStorageDataType {
+			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
+			if d.accountKey == nil {
+				return fmt.Errorf("failed to derive account key for batch put of key %x (type %s)", key, DataTypeStrings[dataType])
+			}
+		}
 		err := d.statepdb.BatchPut(key, value, d.accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to batch put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
 		d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-	} else if SSPrefixdbHandledDataTypes[dataType] {
-		if d.snappdb == nil {
-			return fmt.Errorf("SSPrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		// Store in SSPrefixDB
-
-		err := d.snappdb.BatchPut(key, value, d.accountKey)
-
-		if err != nil {
-			return fmt.Errorf("failed to batch put key %x in SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-		}
-		d.log.Trace("Batch stored key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 	}
-
 	return nil
 }
 
@@ -651,15 +592,6 @@ func (d *Database) PrefixdbBatchCommit(prefix byte) error {
 			return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
 		}
 		d.log.Trace("Committed batch for PrefixDB", "prefix", prefix)
-	case 'o':
-		if d.snappdb == nil {
-			return fmt.Errorf("SSPrefixDB is not initialized, cannot commit batch for prefix %c", prefix)
-		}
-		err := d.snappdb.BatchCommit()
-		if err != nil {
-			return fmt.Errorf("failed to commit batch for SSPrefixDB: %w", err)
-		}
-		d.log.Trace("Committed batch for SSPrefixDB", "prefix", prefix)
 	default:
 		return fmt.Errorf("unsupported prefix %c for batch commit", prefix)
 	}
@@ -715,19 +647,7 @@ func (d *Database) Delete(key []byte) error {
 		}
 		d.log.Trace("Deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return nil // Data deleted from PrefixDB
-	} else if SSPrefixdbHandledDataTypes[dataType] {
-		if d.snappdb == nil {
-			return fmt.Errorf("SSPrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		// Delete from SSPrefixDB
-		err := d.snappdb.Delete(key, d.accountKey)
-		if err != nil {
-			return fmt.Errorf("failed to delete key %x from SSPrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-		}
-		d.log.Trace("Deleted key via SSPrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		return nil // Data deleted from SSPrefixDB
 	}
-
 	// Default: delete from Pebble
 	if d.db == nil {
 		return fmt.Errorf("Pebble store is not initialized, cannot delete non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
@@ -874,6 +794,24 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	d.log.Trace("Delegating NewIterator to PebbleStore", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
 	// PebbleStore's NewIterator is expected to return an ethdb.Iterator (specifically, a *pebbleIterator).
 	// It handles its own internal errors by setting an initErr field in the returned iterator.
+	return d.db.NewIterator(prefix, start)
+}
+
+// NewPebbleIterator creates an iterator using the underlying Pebble store directly.
+// This is useful for replay workloads that want to exercise Pebble iterator behavior
+// and intentionally bypass EthStore's higher-level routing (e.g., AOL-specific iterators).
+func (d *Database) NewPebbleIterator(prefix []byte, start []byte) ethdb.Iterator {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+
+	if d.closed {
+		d.log.Warn("NewPebbleIterator called on closed database")
+		return &errorIterator{err: ErrClosed}
+	}
+	if d.db == nil {
+		d.log.Error("Pebble store (d.db) not initialized, cannot create pebble iterator", "prefix", common.Bytes2Hex(prefix))
+		return &errorIterator{err: errors.New("internal pebble store not initialized for pebble iterator")}
+	}
 	return d.db.NewIterator(prefix, start)
 }
 
@@ -1062,9 +1000,36 @@ func (d *Database) SetAccountKey(accountKey []byte) error {
 }
 
 func (d *Database) GetParentAccountKey(key []byte) []byte {
-	return d.statepdb.GetParentAccountKey(key)
+	// key is expected to be accountHash (fixed 32 bytes)
+	if len(key) != 32 {
+		return nil
+	}
+
+	// Fast path: in-memory cache
+	if d.accountHashKeyCache != nil {
+		var tmp [64]byte
+		if n, ok := d.accountHashKeyCache.Get(key, &tmp); ok {
+			d.accountKey = append(d.accountKey[:0], tmp[:n]...)
+			return d.accountKey
+		}
+	}
+
+	// Fallback: resolve via Pebble + PrefixDB index
+	val, err := d.db.Get(key)
+	if err != nil {
+		d.log.Error("Failed to get parent account key", "key", key, "err", err)
+		return nil
+	}
+
+	if d.accountHashKeyCache != nil {
+		d.accountHashKeyCache.Put(key, val)
+	}
+	return val
 }
 
 func (d *Database) InsertAccountHashPebble(key []byte, accounthash []byte) error {
+	if d.accountHashKeyCache != nil {
+		d.accountHashKeyCache.Put(accounthash, key)
+	}
 	return d.statepdb.InsertAccountHashPebble(accounthash, key)
 }

@@ -7,19 +7,19 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 )
 
-// StorageInfo keeps track of persisted storage metadata for a trie account node.
-type StorageInfo struct {
-	storageFileID uint32
-	storageOffset int64
-	storageSize   uint64
-}
-
 // NodeCacheEntry mirrors the data kept in the prefix tree plus the cached value.
 type NodeCacheEntry struct {
 	Key           string
 	Value         []byte
 	AccountOffset int64
 	StorageInfo   StorageInfo
+}
+
+// StorageInfo keeps track of persisted storage metadata for a trie account node.
+type StorageInfo struct {
+	storageFileID uint32
+	storageOffset int64
+	storageSize   uint64
 }
 
 type nodeCacheRecord struct {
@@ -59,7 +59,7 @@ func (nc *NodeCache) Get(key string) (NodeCacheEntry, bool) {
 		rec := raw.(*nodeCacheRecord)
 		return NodeCacheEntry{
 			Key:           key,
-			Value:         rec.value,
+			Value:         cloneBytes(rec.value),
 			AccountOffset: rec.accountOffset,
 			StorageInfo:   rec.storageInfo,
 		}, true
@@ -76,7 +76,7 @@ func (nc *NodeCache) Put(entry NodeCacheEntry) {
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
 	nc.cache.Add(entry.Key, &nodeCacheRecord{
-		value:         entry.Value,
+		value:         cloneBytes(entry.Value),
 		accountOffset: entry.AccountOffset,
 		storageInfo:   entry.StorageInfo,
 	})
@@ -111,7 +111,7 @@ func (nc *NodeCache) UpdateValue(key string, value []byte) {
 	defer nc.lock.Unlock()
 	if raw, ok := nc.cache.Get(key); ok {
 		rec := raw.(*nodeCacheRecord)
-		rec.value = value
+		rec.value = cloneBytes(value)
 		nc.cache.Add(key, rec)
 	}
 }

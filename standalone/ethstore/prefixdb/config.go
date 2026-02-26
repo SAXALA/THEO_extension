@@ -42,7 +42,7 @@ func DefaultConfig(dirpath string) *Config {
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
 		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
 		MemcacheAddr:   "127.0.0.1:11211",
-		MaxCacheSize:   1 << 20, // 1M entries
+		MaxCacheSize:   1 << 18, // 256K
 		WriteBatchSize: 4096,
 	}
 }

@@ -390,8 +390,8 @@ type FileNodeHeader struct {
 }
 
 // NewPrefixTree
-func NewPrefixTree(db *PrefixDB, dirPath string, databaseType DatabaseType) (*PrefixTree, error) {
-	fmt.Println("Initializing " + databaseType.String() + " Prefix Tree...")
+func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
+	fmt.Println("Initializing " + " Prefix Tree...")
 	fileNodeDir := filepath.Join(dirPath, "prefixdb", "filenodes")
 	if err := os.MkdirAll(fileNodeDir, 0755); err != nil {
 		return nil, fmt.Errorf("creat node file path failed: %w", err)
@@ -435,19 +435,11 @@ func NewPrefixTree(db *PrefixDB, dirPath string, databaseType DatabaseType) (*Pr
 	pt.fileNodeCache = fileNodeCache
 	pt.startMergeWorker()
 
-	switch databaseType {
-	case StateDB:
-		pt.bucketPrefixLength = pt.maxDepth
-	case SnapshotDB:
-		pt.bucketPrefixLength = pt.maxDepth/2 - 1
-		pt.maxDepth = pt.maxDepth/2 - 1
-	default:
-		pt.bucketPrefixLength = pt.maxDepth
-	}
+	pt.bucketPrefixLength = pt.maxDepth
 
 	pt.gcCount = 0
 
-	fmt.Println(databaseType.String() + " Prefix Tree initialized.")
+	fmt.Println(" Prefix Tree initialized.")
 	return pt, nil
 }
 

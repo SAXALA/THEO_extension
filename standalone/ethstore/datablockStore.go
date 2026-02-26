@@ -134,10 +134,6 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		return nil, fmt.Errorf("failed to load block index: %w", err)
 	}
 
-	// if err := baol.loadSkiplistIndex(); err != nil {
-	// 	baol.log.Warn("Failed to load skiplist index, will rebuild", "error", err)
-	// }
-
 	// Determine the actual N most recent blocks from all loaded blockIndex entries.
 	allLoadedBlockIDs := make([]uint64, 0, len(baol.blockIndex))
 	for id := range baol.blockIndex {
