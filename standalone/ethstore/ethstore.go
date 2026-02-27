@@ -441,9 +441,6 @@ func (d *Database) Get(key []byte) ([]byte, error) {
 		if !exists {
 			return nil, ErrNotFound // Key not found in PrefixDB
 		}
-		if value == nil {
-			return nil, fmt.Errorf("key %x found in PrefixDB but value is nil", key)
-		}
 		// Log the found key in PrefixDB
 		d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 		return value, nil // Return the found value

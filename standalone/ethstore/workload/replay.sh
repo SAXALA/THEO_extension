@@ -23,43 +23,32 @@ if ! go mod download; then
     exit 1
 fi
 
-
-
-# baseline replay 
-# 1. recover from baseline data
-sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
-# 2. replay trace
-go run replayWorkload.go -mode rb > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
-go_run_pid=$!
-
-# locate the actual child process spawned by `go run`
-replay_pid=""
-for _ in {1..50}; do
-    replay_pid=$(pgrep -P "$go_run_pid" -n || true)
-    if [ -n "$replay_pid" ]; then
-        break
-    fi
-    sleep 0.1
-done
-
-if [ -z "$replay_pid" ]; then
-    echo "未找到 go run 的子进程，回退为监控 go run 进程 PID: $go_run_pid"
-    replay_pid="$go_run_pid"
+mkdir -p ./bin
+if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
+    echo "构建 replayWorkload 失败，退出。"
+    exit 1
 fi
 
-echo "monitor target PID: $replay_pid"
-# 3. record resource usage
-sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
-wait  # wait for the replay to finish
+
+# # baseline replay 
+# # 1. recover from baseline data
+# sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
+# # 2. replay trace
+# ./bin/replayWorkload -mode rb > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
+# replay_pid=$!
+# echo "monitor target PID: $replay_pid"
+# # 3. record resource usage
+# sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
+# wait  # wait for the replay to finish
 
 # load account
 # 4KB
 # echo "Start loading accounts with 4KB chunk file size and 512MB cache size..."
 # go run replayWorkload.go -mode ld -ld-db-type state -ld-chunk-file-size $chunk_file_size_4KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_stateDB_4KB_512MB_${log_date}.log 2>&1 
 # go run replayWorkload.go -mode ld -ld-db-type snapshot -ld-chunk-file-size $chunk_file_size_4KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_snapshot_4KB_512MB_${log_date}.log 2>&1 
-# # 16KB
+# 16KB
 # echo "Start loading accounts with 16KB chunk file size and 512MB cache size..."
-# go run replayWorkload.go -mode ld -ld-db-type state -ld-chunk-file-size $chunk_file_size_16KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_stateDB_16KB_512MB_${log_date}.log 2>&1
+# ./bin/replayWorkload -mode ld  -ld-chunk-file-size $chunk_file_size_16KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_stateDB_16KB_512MB_${log_date}.log 2>&1
 # go run replayWorkload.go -mode ld -ld-db-type snapshot -ld-chunk-file-size $chunk_file_size_16KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_snapshot_16KB_512MB_${log_date}.log 2>&1 
 # # # 64KB
 # echo "Start loading accounts with 64KB chunk file size and 512MB cache size..."
@@ -71,25 +60,21 @@ wait  # wait for the replay to finish
 # go run replayWorkload.go -mode ld -ld-db-type snapshot -ld-chunk-file-size $chunk_file_size_256KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_snapshot_256KB_512MB_${log_date}.log 2>&1 
 
 # replay trace ethstore
-# # 1. recover from bak data
-# echo "Start rsync database files from DBbak to current database directory..."
-# sudo rsync -avP /mnt/ssd2/ethstore/database/database_statedb64KB/prefixdb/ /mnt/ssd2/ethstore/database_state/prefixdb/
-# sudo chmod -R 777 /mnt/ssd2/ethstore/database_state/prefixdb/
-# sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database/aol/ /mnt/ssd2/ethstore/database/aol/
-# sudo chmod -R 777 /mnt/ssd2/ethstore/database/aol/
-# sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_pebble/ /mnt/ssd2/ethstore/database_pebble/
-# sudo chmod -R 777 /mnt/ssd2/ethstore/database_pebble/
-# # # 2. replay trace
-# echo "Start replaying trace with re mode..."
-# mkdir -p ./bin
-# if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
-#     echo "构建 replayWorkload 失败，退出。"
-#     exit 1
-# fi
+# 1. recover from bak data
+echo "Start rsync database files from DBbak to current database directory..."
+sudo rsync -avP /mnt/ssd2/ethstore/database/database_statedb16KB/prefixdb/ /mnt/ssd2/ethstore/database_state/prefixdb/
+sudo chmod -R 777 /mnt/ssd2/ethstore/database_state/prefixdb/
+sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database/aol/ /mnt/ssd2/ethstore/database/aol/
+sudo chmod -R 777 /mnt/ssd2/ethstore/database/aol/
+sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_pebble/ /mnt/ssd2/ethstore/database_pebble/
+sudo chmod -R 777 /mnt/ssd2/ethstore/database_pebble/
+# # 2. replay trace
+echo "Start replaying trace with re mode..."
 
-# ./bin/replayWorkload -mode re > ./replayLog/ethstoreLog_${log_date}.log 2>&1 &
-# replay_pid=$!
-# echo "monitor target PID: $replay_pid"
-# # 3. record resource usage
-# sudo ./monitor.sh "$replay_pid" 1 ethstoreIO_${log_date}.log &
-# wait  # wait for the replay to finish
+
+./bin/replayWorkload -mode re -max-ops 100000000> ./replayLog/ethstoreLog_${log_date}.log 2>&1 &
+replay_pid=$!
+echo "monitor target PID: $replay_pid"
+# 3. record resource usage
+sudo ./monitor.sh "$replay_pid" 1 ethstoreIO_${log_date}.log &
+wait  # wait for the replay to finish

@@ -868,9 +868,9 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 		// 	continue
 		// }
 
-		// if counter < 2000000000 {
-		// 	continue
-		// }
+		if counter > 2000000000 {
+			break
+		}
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
@@ -913,30 +913,30 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 			}
 			// accountKey = nil
 		}
-		// startTime := time.Now()
-		// err = pdb.Put(keyBytes, valueBytes, accountKey)
+		startTime := time.Now()
+		err = pdb.Put(keyBytes, valueBytes, accountKey)
 
-		// endTime := time.Now()
-		// totalTime += endTime.Sub(startTime)
+		endTime := time.Now()
+		totalTime += endTime.Sub(startTime)
 
-		value, ok, err := pdb.Get(keyBytes, accountKey)
+		// value, ok, err := pdb.Get(keyBytes, accountKey)
 
 		if err != nil {
 			// err = pdb.Put(keyBytes, valueBytes)
 			fmt.Printf("Get operation failed for key %s: %v ", keyPart, err)
 			continue
 		}
-		if !ok {
-			fmt.Printf("Key %s not found in PrefixDB ", keyPart)
-			continue
-		}
-		if !bytes.Equal(value, valueBytes) {
-			fmt.Println("counter:", counter)
-			// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
-		}
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
+		// if !ok {
+		// 	fmt.Printf("Key %s not found in PrefixDB ", keyPart)
+		// 	continue
+		// }
+		// if !bytes.Equal(value, valueBytes) {
+		// 	fmt.Println("counter:", counter)
+		// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
+		// }
+		// if err != nil {
+		// 	log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+		// }
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
@@ -1503,7 +1503,7 @@ func TestGetParentKey() {
 
 func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 	tempDir := dataBaseDir
-	store, err := ethstore.New(tempDir, 6000, "put_test", false, true, 64*1024, 512*1024*1024)
+	store, err := ethstore.New(tempDir, 6000, "put_test", false, true, 64*1024, 12*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1617,9 +1617,9 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 
 		line = strings.TrimSpace(line)
 		linecount++
-		if linecount < 954178 {
-			continue
-		}
+		// if linecount < 954178 {
+		// 	continue
+		// }
 
 		// Block boundary marker: commit all pending batches when a block ends.
 		if strings.Contains(line, "Processing block (end), ID:") {
