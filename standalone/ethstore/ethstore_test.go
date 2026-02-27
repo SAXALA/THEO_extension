@@ -40,7 +40,7 @@ func TestEthStore(t *testing.T) {
 
 			// Use the actual New constructor from ethstore.go
 			// Parameters for New: dirPath string, recentN int, namespace string, readonly bool
-			db, err := New(tempDir, 10, "testdb", false, false, 0, 0)
+			db, err := New(tempDir, 10, "testdb", false, 0, 0)
 			if err != nil {
 				t.Fatalf("Failed to create database with New: %v", err)
 			}
@@ -56,7 +56,7 @@ func BenchmarkEthStore(b *testing.B) {
 			b.Fatalf("Failed to create temp dir for benchmark: %v", err)
 		}
 
-		db, err := New(tempDir, 10, "benchdb", false, false, 0, 0)
+		db, err := New(tempDir, 10, "benchdb", false, 0, 0)
 		if err != nil {
 			b.Fatalf("Failed to create database with New for benchmark: %v", err)
 		}
@@ -70,7 +70,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		tempDir := t.TempDir()
 		// Call the actual New constructor
 		// For "in-memory" like behavior with AppendOnlyLog, we still need a path.
-		store, err := New(tempDir, 10, "lifecycle_mem_test", false, false, 0, 0)
+		store, err := New(tempDir, 10, "lifecycle_mem_test", false, 0, 0)
 		require.NoError(t, err, "New with temp path should not fail")
 		require.NotNil(t, store, "Opened store should not be nil")
 
@@ -82,7 +82,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := tempDir // AppendOnlyLog uses the directory directly
 
-		store1, err := New(dbPath, 10, "lifecycle_persist_test", false, false, 0, 0)
+		store1, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, 0)
 		require.NoError(t, err, "New with a new path should not fail")
 		require.NotNil(t, store1, "Opened store1 should not be nil")
 
@@ -100,7 +100,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		err = store1.Close()
 		assert.NoError(t, err, "store1.Close() should not fail")
 
-		store2, err := New(dbPath, 10, "lifecycle_persist_test", false, false, 0, 0) // Reopen
+		store2, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, 0) // Reopen
 		require.NoError(t, err, "Reopening persistent DB should not fail")
 		require.NotNil(t, store2, "Reopened store2 should not be nil")
 
@@ -117,7 +117,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 // assuming your ethstore.Database struct has such methods (e.g., from blockStore.go logic).
 func TestEthStore_SpecificBlockOperations(t *testing.T) {
 	tempDir := t.TempDir()
-	store, err := New(tempDir, 10, "specific_ops_test", false, false, 0, 0) // Using temp dir
+	store, err := New(tempDir, 10, "specific_ops_test", false, 0, 0) // Using temp dir
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	defer store.Close() // Ensure the database is closed at the end
@@ -192,7 +192,7 @@ func TestPutAndGet(t *testing.T) {
 
 func TestOther(t *testing.T) {
 	tempDir := t.TempDir()
-	store, err := New(tempDir, 10, "put_test", false, false, 0, 0)
+	store, err := New(tempDir, 10, "put_test", false, 0, 0)
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	defer store.Close()
@@ -229,7 +229,7 @@ func TestPraseBlockID(t *testing.T) {
 
 	blockID, foundBlockID := parseBlockNumberFromKey(key1, dataType)
 
-	// If not found in key, try from value (for HeaderNumber, TxLookup)
+	// If not found in key, try from value (for HeaderNumber)
 	if !foundBlockID {
 		blockID, foundBlockID = ParseBlockNumberFromValue(value1, dataType)
 	}

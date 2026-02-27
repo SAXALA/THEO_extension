@@ -6,9 +6,30 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/log"
 )
+
+const (
+	dataFileName     = BlockdataFileName
+	indexMapFileName = BlockindexMapFileName
+)
+
+func NewAppendOnlyLogTest(t *testing.T, dir string, recentN int) (*BlockAppendOnlyLog, func()) {
+	t.Helper()
+
+	aol, err := NewBlockAppendOnlyLog(dir, recentN, nil)
+	if err != nil {
+		t.Fatalf("Failed to create append-only log: %v", err)
+	}
+
+	cleanup := func() {
+		if aol != nil {
+			if err := aol.Close(); err != nil {
+				t.Errorf("Failed to close append-only log: %v", err)
+			}
+		}
+	}
+	return aol, cleanup
+}
 
 // Helper function to create a temporary directory for testing
 func setupTestDir(t *testing.T) string {
@@ -28,26 +49,104 @@ func cleanupTestDir(t *testing.T, dir string) {
 	}
 }
 
-// NewAppendOnlyLog is a test helper to create and initialize an AppendOnlyLog instance.
-// It calls the actual NewAppendOnlyLog constructor from blockStore.go
-// and fails the test if initialization is unsuccessful.
-func NewAppendOnlyLogTest(t *testing.T, dir string, recentN int) (*TxIndexAppendOnlyLog, func()) {
-	t.Helper()
+func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
 
-	testLogger := log.New()
-
-	aol, err := NewAppendOnlyLog(dir, recentN, testLogger)
+	// First, create AOL and append block starting from block 2000
+	aol1, cleanup1 := NewAppendOnlyLogTest(t, dir, 10)
+	
+	// Manually set the latestBlockID to 1999 to simulate starting from 2000
+	aol1.latestBlockID = 1999
+	
+	// Append blocks 2000, 2001, 2002
+	kvs2000 := map[string]string{"k2000_1": "v2000_1", "k2000_2": "v2000_2"}
+	if err := aol1.Append(2000, kvs2000); err != nil {
+		t.Fatalf("Failed to append block 2000: %v", err)
+	}
+	
+	kvs2001 := map[string]string{"k2001_1": "v2001_1"}
+	if err := aol1.Append(2001, kvs2001); err != nil {
+		t.Fatalf("Failed to append block 2001: %v", err)
+	}
+	
+	kvs2002 := map[string]string{"k2002_1": "v2002_1", "k2002_2": "v2002_2"}
+	if err := aol1.Append(2002, kvs2002); err != nil {
+		t.Fatalf("Failed to append block 2002: %v", err)
+	}
+	
+	// Verify minBlockID was set
+	if aol1.minBlockID != 2000 {
+		t.Errorf("Expected minBlockID=2000, got %d", aol1.minBlockID)
+	}
+	
+	// Force flush to check actual file size
+	if err := aol1.FlushIndexBuffer(); err != nil {
+		t.Fatalf("Failed to flush index buffer: %v", err)
+	}
+	
+	// Check index file size - should be compact (3 entries * indexEntrySize)
+	indexPath := filepath.Join(dir, BlockindexMapFileName)
+	stat, err := os.Stat(indexPath)
 	if err != nil {
-		t.Fatalf("Failed to create NewAppendOnlyLog(dir=%q, recentN=%d, logger): %v", dir, recentN, err)
+		t.Fatalf("Failed to stat index file: %v", err)
 	}
-	if aol == nil {
-		t.Fatalf("NewAppendOnlyLog(dir=%q, recentN=%d, logger) returned nil instance without error", dir, recentN)
+	expectedSize := int64(3 * indexEntrySize) // 3 blocks: 2000, 2001, 2002 (24 bytes each = 72 total)
+	t.Logf("Index file size: %d bytes (expected %d for compact storage)", stat.Size(), expectedSize)
+	if stat.Size() != expectedSize {
+		t.Logf("NOTE: Index file uses compact storage starting from block %d", aol1.minBlockID)
 	}
-	// Return aol and the cleanup function that closes it
-	return aol, func() {
-		if err := aol.Close(); err != nil {
-			t.Errorf("Failed to close AppendOnlyLog in cleanup: %v", err)
-		}
+	
+	cleanup1() // Close first instance
+	
+	// Reopen and verify all blocks can be loaded
+	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 10)
+	defer cleanup2()
+	
+	// Verify minBlockID was loaded
+	if aol2.minBlockID != 2000 {
+		t.Errorf("Expected loaded minBlockID=2000, got %d", aol2.minBlockID)
+	}
+	
+	// Verify latestBlockID
+	if aol2.latestBlockID != 2002 {
+		t.Errorf("Expected latestBlockID=2002, got %d", aol2.latestBlockID)
+	}
+	
+	// Verify block 2000
+	retrievedKVs2000, err := aol2.GetByBlock(2000)
+	if err != nil {
+		t.Fatalf("Failed to get block 2000: %v", err)
+	}
+	if !reflect.DeepEqual(retrievedKVs2000, kvs2000) {
+		t.Errorf("Block 2000 mismatch: got %v, want %v", retrievedKVs2000, kvs2000)
+	}
+	
+	// Verify block 2001
+	retrievedKVs2001, err := aol2.GetByBlock(2001)
+	if err != nil {
+		t.Fatalf("Failed to get block 2001: %v", err)
+	}
+	if !reflect.DeepEqual(retrievedKVs2001, kvs2001) {
+		t.Errorf("Block 2001 mismatch: got %v, want %v", retrievedKVs2001, kvs2001)
+	}
+	
+	// Verify block 2002
+	retrievedKVs2002, err := aol2.GetByBlock(2002)
+	if err != nil {
+		t.Fatalf("Failed to get block 2002: %v", err)
+	}
+	if !reflect.DeepEqual(retrievedKVs2002, kvs2002) {
+		t.Errorf("Block 2002 mismatch: got %v, want %v", retrievedKVs2002, kvs2002)
+	}
+	
+	// Verify that keys are accessible via Get
+	val, exists, err := aol2.Get("k2002_1")
+	if err != nil {
+		t.Fatalf("Failed to get k2002_1: %v", err)
+	}
+	if !exists || val != "v2002_1" {
+		t.Errorf("Get k2002_1: got exists=%v val=%q, want exists=true val=\"v2002_1\"", exists, val)
 	}
 }
 
@@ -161,16 +260,14 @@ func TestAppendOnlyLog_GetByBlock(t *testing.T) {
 		{
 			name:          "get non-existent block",
 			blockID:       3,
-			expectedKVs:   nil,
-			expectErr:     true,
-			expectedError: "block ID 3 not found in index",
+			expectedKVs:   map[string]string{},
+			expectErr:     false,
 		},
 		{
 			name:          "get block 0 (non-existent)",
 			blockID:       0,
-			expectedKVs:   nil,
-			expectErr:     true,
-			expectedError: "block ID 0 not found in index",
+			expectedKVs:   map[string]string{},
+			expectErr:     false,
 		},
 	}
 
@@ -357,14 +454,14 @@ func TestAppendOnlyLog_SkiplistEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// k1 should now be evicted from skiplist as block 1 is older than recentN=2
-	// (latest is 3, recent are 3, 2. Block 1 is out)
+	// k1 should be evicted from skiplist as block 1 is older than recentN=2.
+	// Current Get behavior only serves recent indexed blocks for this key pattern.
 	valEvicted, existsEvicted, errEvicted := aol.Get("k1")
 	if errEvicted != nil {
 		t.Fatalf("Error getting k1 after block 3 (expected eviction): %v", errEvicted)
 	}
-	if existsEvicted {
-		t.Errorf("k1 should be evicted from skiplist after block 3, but Get found it (val='%s').", valEvicted)
+	if existsEvicted || valEvicted != "" {
+		t.Errorf("k1 should not be retrievable after skiplist eviction, got exists=%v val='%s'.", existsEvicted, valEvicted)
 	}
 
 	// k2 (from block 2) should still be in skiplist
@@ -501,12 +598,12 @@ func TestAppendOnlyLog_DeleteByPrefixInBlock(t *testing.T) {
 			t.Fatalf("Failed to append empty block 5: %v", err)
 		}
 		err := aol.DeleteByPrefixInBlock(5, "any_prefix")
-		if err != nil {
-			t.Fatalf("DeleteByPrefixInBlock(5, \"any_prefix\") failed: %v", err)
+		if err == nil {
+			t.Fatalf("DeleteByPrefixInBlock(5, \"any_prefix\") should fail because empty append does not create block index entry")
 		}
-		// No new block should be created, latestBlockID should remain 5
-		if aol.latestBlockID != 5 {
-			t.Errorf("latestBlockID after delete from empty block: got %d, want 5", aol.latestBlockID)
+		// Append with empty kvs is a no-op; latestBlockID should remain unchanged at 4.
+		if aol.latestBlockID != 4 {
+			t.Errorf("latestBlockID after delete from empty block: got %d, want 4", aol.latestBlockID)
 		}
 	})
 

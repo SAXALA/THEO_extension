@@ -23,16 +23,17 @@ import (
 const (
 	BlockdataFileName     = "headerdata.log"
 	BlockindexMapFileName = "blockindex.map"
-	defaultRecentN        = 100 // Default number of recent blocks to keep indexed in memory
+	BlockindexMetaFileName = "blockindex.meta"
+	defaultRecentN        = 6000 // Default number of recent blocks to keep indexed in memory
 	offsetSize            = 8   // Size of uint64 for offsets
 	blockIDSize           = 8   // Assuming block ID is uint64
 	keyLenSize            = 4   // Size of uint32 for key length
 	valueLenSize          = 4   // Size of uint32 for value length
+	indexEntrySize        = blockIDSize + offsetSize + offsetSize
+	indexMetaSize         = 16  // minBlockID (8 bytes) + maxBlockID (8 bytes)
 	// TombstoneMarker is a special value to mark deletion
 	TombstoneMarker    = "_D_"
 	initialBufferSize  = 4096  // Initial buffer size for writers
-	SkipDistanceForGet = 10000 // If the requested blockID is more than this distance behind latestBlockID, return
-
 )
 
 // BlockAppendOnlyLog implements the append-only log store with skiplist indexing for recent blocks.
@@ -47,7 +48,9 @@ type BlockAppendOnlyLog struct {
 
 	indexMapFilePath string
 	indexMapFile     *os.File
+	indexMetaFilePath string
 	blockIndex       map[uint64]blockIndexEntry // In-memory cache of block offsets
+	minBlockID       uint64 // Minimum block ID in the log (0 means empty)
 	latestBlockID    uint64
 
 	// Skiplist index for recent N blocks
@@ -84,6 +87,7 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 
 	dataFilePath := filepath.Join(dirPath, BlockdataFileName)
 	indexMapFilePath := filepath.Join(dirPath, BlockindexMapFileName)
+	indexMetaFilePath := filepath.Join(dirPath, BlockindexMetaFileName)
 	// Open data file for appending
 	dataFile, err := os.OpenFile(dataFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -112,7 +116,9 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 		currentOffset:    currentOffset,
 		indexMapFilePath: indexMapFilePath,
 		indexMapFile:     indexMapFile,
+		indexMetaFilePath: indexMetaFilePath,
 		blockIndex:       make(map[uint64]blockIndexEntry),
+		minBlockID:       0,
 		recentN:          recentN,
 		recentBlocks:     make([]uint64, 0, recentN), // Initialize empty, will be populated below
 		skiplistIndex:    skiplist.New(skiplist.String),
@@ -127,6 +133,12 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 	}
 
 	go baol.backgroundFlush()
+
+	// Load index metadata (minBlockID, maxBlockID)
+	if err := baol.loadIndexMeta(); err != nil {
+		baol.Close()
+		return nil, fmt.Errorf("failed to load index metadata: %w", err)
+	}
 
 	// Load existing block index map
 	if err := baol.loadBlockIndex(); err != nil {
@@ -171,7 +183,115 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 
 	baol.log.Info("AppendOnlyLog initialized", "dataSize", common.StorageSize(currentOffset),
 		"indexedBlocks", len(baol.indexedBlocks), "recentBlocksTracked", len(baol.recentBlocks))
+	baol.releaseBootstrapResources()
 	return baol, nil
+}
+
+func (baol *BlockAppendOnlyLog) releaseBootstrapResources() {
+	if baol.indexMapFile != nil {
+		if err := baol.indexMapFile.Close(); err != nil {
+			baol.log.Warn("Failed to close index map file after bootstrap", "error", err)
+		}
+		baol.indexMapFile = nil
+	}
+
+	// Release blockIndex - queries will fall back to disk via getBlockIndexEntry()
+	baol.blockIndex = nil
+	
+	// Keep indexedBlocks - it's small (just block IDs) and needed for fast skiplist lookup
+	// baol.indexedBlocks is retained
+	
+	// Release recentBlocks and indexedBlockKeys - will be rebuilt on write if needed
+	baol.recentBlocks = nil
+	baol.indexedBlockKeys = nil
+
+	baol.log.Info("Released bootstrap resources", 
+		"skiplistKeys", baol.skiplistIndex.Len(),
+		"indexedBlocks", len(baol.indexedBlocks))
+}
+
+func (baol *BlockAppendOnlyLog) ensureWriteTrackingInitialized() {
+	// indexedBlocks is preserved after releaseBootstrapResources()
+	// Only rebuild recentBlocks and indexedBlockKeys if needed
+	if baol.recentBlocks != nil && baol.indexedBlockKeys != nil {
+		return
+	}
+
+	blockSet := make(map[uint64]struct{})
+	blockKeys := make(map[uint64][]string)
+	for e := baol.skiplistIndex.Front(); e != nil; e = e.Next() {
+		ptr := e.Value.(*kvPointer)
+		blockSet[ptr.BlockID] = struct{}{}
+		key := e.Key().(string)
+		blockKeys[ptr.BlockID] = append(blockKeys[ptr.BlockID], key)
+	}
+
+	blockIDs := make([]uint64, 0, len(blockSet))
+	for id := range blockSet {
+		blockIDs = append(blockIDs, id)
+	}
+	sort.Slice(blockIDs, func(i, j int) bool { return blockIDs[i] < blockIDs[j] })
+	if len(blockIDs) > baol.recentN {
+		blockIDs = blockIDs[len(blockIDs)-baol.recentN:]
+	}
+
+	baol.recentBlocks = make([]uint64, len(blockIDs))
+	copy(baol.recentBlocks, blockIDs)
+	
+	// Only rebuild indexedBlocks if it was actually released (nil)
+	if baol.indexedBlocks == nil {
+		baol.indexedBlocks = make(map[uint64]struct{}, len(blockIDs))
+		for _, id := range blockIDs {
+			baol.indexedBlocks[id] = struct{}{}
+		}
+	}
+	
+	baol.indexedBlockKeys = blockKeys
+}
+
+func (baol *BlockAppendOnlyLog) findBlockIndexEntryOnDisk(blockID uint64) (blockIndexEntry, bool, error) {
+	// Check if blockID is in valid range
+	if baol.minBlockID == 0 || blockID < baol.minBlockID {
+		return blockIndexEntry{}, false, nil
+	}
+
+	f, err := os.OpenFile(baol.indexMapFilePath, os.O_RDONLY, 0644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return blockIndexEntry{}, false, nil
+		}
+		return blockIndexEntry{}, false, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, indexEntrySize)
+	// Use compact storage: position based on offset from minBlockID
+	pos := int64(blockID-baol.minBlockID) * int64(indexEntrySize)
+	n, readErr := f.ReadAt(buf, pos)
+	if readErr != nil {
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return blockIndexEntry{}, false, nil
+		}
+		return blockIndexEntry{}, false, readErr
+	}
+	if n != len(buf) {
+		return blockIndexEntry{}, false, nil
+	}
+
+	entry := blockIndexEntry{
+		BlockID:     binary.BigEndian.Uint64(buf[0:blockIDSize]),
+		StartOffset: int64(binary.BigEndian.Uint64(buf[blockIDSize : blockIDSize+offsetSize])),
+		EndOffset:   int64(binary.BigEndian.Uint64(buf[blockIDSize+offsetSize:])),
+	}
+
+	if entry.BlockID != blockID {
+		return blockIndexEntry{}, false, nil
+	}
+	if entry.EndOffset <= entry.StartOffset {
+		return blockIndexEntry{}, false, nil
+	}
+
+	return entry, true, nil
 }
 
 // Path returns the data directory of the append-only log.
@@ -184,23 +304,86 @@ func (baol *BlockAppendOnlyLog) RecentN() int {
 	return baol.recentN
 }
 
-// loadBlockIndex reads the index map file into memory.
+// loadIndexMeta loads the minimum and maximum block IDs from the metadata file.
+func (baol *BlockAppendOnlyLog) loadIndexMeta() error {
+	file, err := os.Open(baol.indexMetaFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No metadata file yet, this is a new log
+			baol.minBlockID = 0
+			return nil
+		}
+		return fmt.Errorf("failed to open index meta file: %w", err)
+	}
+	defer file.Close()
+
+	buf := make([]byte, indexMetaSize)
+	n, err := io.ReadFull(file, buf)
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// Empty or incomplete file, treat as new
+			baol.minBlockID = 0
+			return nil
+		}
+		return fmt.Errorf("failed to read index meta: %w", err)
+	}
+	if n != indexMetaSize {
+		baol.minBlockID = 0
+		return nil
+	}
+
+	baol.minBlockID = binary.BigEndian.Uint64(buf[0:8])
+	// maxBlockID is stored but not loaded into memory since latestBlockID will be updated from index
+	baol.log.Debug("Loaded index metadata", "minBlockID", baol.minBlockID)
+	return nil
+}
+
+// saveIndexMeta saves the minimum and maximum block IDs to the metadata file.
+func (baol *BlockAppendOnlyLog) saveIndexMeta() error {
+	file, err := os.OpenFile(baol.indexMetaFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open index meta file for writing: %w", err)
+	}
+	defer file.Close()
+
+	buf := make([]byte, indexMetaSize)
+	binary.BigEndian.PutUint64(buf[0:8], baol.minBlockID)
+	binary.BigEndian.PutUint64(buf[8:16], baol.latestBlockID)
+
+	if _, err := file.Write(buf); err != nil {
+		return fmt.Errorf("failed to write index meta: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync index meta: %w", err)
+	}
+
+	baol.log.Debug("Saved index metadata", "minBlockID", baol.minBlockID, "maxBlockID", baol.latestBlockID)
+	return nil
+}
+
+// loadBlockIndex reads the index map file into memory using compact storage based on minBlockID.
 func (baol *BlockAppendOnlyLog) loadBlockIndex() error {
-	baol.indexMapFile.Seek(0, io.SeekStart) // Go to the beginning
+	if baol.minBlockID == 0 {
+		// No blocks yet, index is empty
+		baol.latestBlockID = 0
+		return nil
+	}
+
+	baol.indexMapFile.Seek(0, io.SeekStart)
 	reader := bufio.NewReader(baol.indexMapFile)
-	buf := make([]byte, blockIDSize+offsetSize+offsetSize)
+	buf := make([]byte, indexEntrySize)
 	latestBlock := uint64(0)
+	slotIndex := uint64(0)
 
 	for {
 		n, err := io.ReadFull(reader, buf)
 		if err == io.EOF {
-			break // End of file
+			break
 		}
 		if err != nil && err != io.ErrUnexpectedEOF {
 			return fmt.Errorf("error reading index map file: %w", err)
 		}
 		if n != len(buf) {
-			// Should not happen with properly written file unless corrupted
 			baol.log.Warn("Incomplete record found in index map file", "bytesRead", n)
 			break
 		}
@@ -210,14 +393,31 @@ func (baol *BlockAppendOnlyLog) loadBlockIndex() error {
 			StartOffset: int64(binary.BigEndian.Uint64(buf[blockIDSize : blockIDSize+offsetSize])),
 			EndOffset:   int64(binary.BigEndian.Uint64(buf[blockIDSize+offsetSize:])),
 		}
+
+		// Calculate expected blockID based on slot position and minBlockID
+		expectedBlockID := baol.minBlockID + slotIndex
+		slotIndex++
+
+		// Skip invalid entries
+		if entry.BlockID == 0 || entry.EndOffset <= entry.StartOffset {
+			continue
+		}
+
+		// Verify blockID matches expected position (data integrity check)
+		if entry.BlockID != expectedBlockID {
+			baol.log.Warn("Block ID mismatch in index file",
+				"expected", expectedBlockID, "got", entry.BlockID, "slot", slotIndex-1)
+			continue
+		}
+
 		baol.blockIndex[entry.BlockID] = entry
 		if entry.BlockID > latestBlock {
 			latestBlock = entry.BlockID
 		}
-		// Removed logic that attempted to populate aol.recentBlocks here.
-		// It will be correctly populated in NewAppendOnlyLog after this function returns.
 	}
 	baol.latestBlockID = latestBlock
+	baol.log.Debug("Loaded block index", "entries", len(baol.blockIndex),
+		"minBlockID", baol.minBlockID, "latestBlockID", baol.latestBlockID)
 	return nil
 }
 
@@ -351,8 +551,9 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 	if baol.closed {
 		return fmt.Errorf("block append-only log is closed")
 	}
+	baol.ensureWriteTrackingInitialized()
 	// isFirstAppend checks if this is the very first operation on a completely empty log.
-	isFirstAppend := baol.latestBlockID == 0 && len(baol.blockIndex) == 0
+	isFirstAppend := baol.latestBlockID == 0 && baol.currentOffset == 0
 
 	// Monotonicity checks:
 	// 1. If blockID is 0, it's only allowed if it's the first append on an empty log.
@@ -361,7 +562,7 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 	// }
 	// 2. If blockID is not 0 (or it is 0 and isFirstAppend), it must be greater than the current latestBlockID.
 	//    (The case blockID == 0 && isFirstAppend means latestBlockID is also 0, so 0 <= 0 is true, but it's allowed).
-	if !(blockID == 0 && isFirstAppend) && blockID < baol.latestBlockID {
+	if !(blockID == 0 && isFirstAppend) && blockID <= baol.latestBlockID {
 		return fmt.Errorf("non-monotonic block ID: current latest %d, got %d", baol.latestBlockID, blockID)
 	}
 
@@ -388,14 +589,13 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 
 	var startOffset int64
 	// --- Logic for non-empty KVS starts here ---
-	existingEntry, exists := baol.blockIndex[blockID]
+	existingEntry, exists := baol.getBlockIndexEntry(blockID)
 	if exists {
 		startOffset = existingEntry.EndOffset
 	} else {
 		// New block, append at current end offset
 		startOffset = baol.currentOffset
 	}
-	// startOffset = aol.currentOffset
 	blockDataBuf := new(bytes.Buffer)
 
 	// Serialize all entries for the block into the buffer
@@ -432,21 +632,27 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 		}(),
 		EndOffset: endOffset,
 	}
-	baol.blockIndex[blockID] = indexEntry
-	// baol.latestBlockID = blockID // This is correct for non-empty appends
 
 	if err := baol.writeIndexEntry(baol.indexMapFile, indexEntry); err != nil {
 		baol.log.Crit("Failed to write block index entry to file after writing data!", "blockID", blockID, "error", err)
-		// Attempt to revert in-memory changes on critical failure
-		delete(baol.blockIndex, blockID)
-		// Reverting latestBlock
-		// and this error path is considered critical and rare.
 		return fmt.Errorf("CRITICAL: failed to write index entry for block %d: %w", blockID, err)
 	}
 
 	if blockID > baol.latestBlockID {
+		// Update minBlockID on first block
+		if baol.minBlockID == 0 {
+			baol.minBlockID = blockID
+			baol.log.Info("Set minBlockID for first block", "minBlockID", baol.minBlockID)
+		}
+		
 		baol.latestBlockID = blockID
 		baol.updateRecentBlocks(blockID)
+		
+		// Save metadata after updating block range
+		if err := baol.saveIndexMeta(); err != nil {
+			baol.log.Error("Failed to save index metadata", "error", err)
+			// Non-critical error, continue
+		}
 	}
 
 	if _, isIndexed := baol.indexedBlocks[blockID]; isIndexed {
@@ -472,12 +678,28 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 		}
 	}
 
+	// Flush index buffer to persist entries (like Delete and AppendToNewBlock do)
+	if err := baol.flushIndexBufferWithBlockID(baol.minBlockID); err != nil {
+		baol.log.Error("Failed to flush index buffer", "blockID", blockID, "error", err)
+		return fmt.Errorf("failed to flush index buffer for block %d: %w", blockID, err)
+	}
+
 	baol.evictOldEntries()
 	return nil
 }
 
 // updateRecentBlocks adds the new block ID and removes the oldest if the limit is exceeded.
 func (baol *BlockAppendOnlyLog) updateRecentBlocks(newBlockID uint64) {
+	if baol.recentBlocks == nil {
+		baol.recentBlocks = make([]uint64, 0, baol.recentN)
+	}
+	if baol.indexedBlocks == nil {
+		baol.indexedBlocks = make(map[uint64]struct{})
+	}
+	if baol.indexedBlockKeys == nil {
+		baol.indexedBlockKeys = make(map[uint64][]string)
+	}
+
 	baol.recentBlocks = append(baol.recentBlocks, newBlockID)
 	baol.indexedBlocks[newBlockID] = struct{}{}
 
@@ -552,107 +774,39 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		return value, true, nil // Key found in skiplist
 	}
 
-	// Check if the key is in the headerIndex
-	// Header keys are special and stored in a separate skiplist.
+	// Key not in skiplist - check if we can determine blockID from key
 	dataType := GetDataTypeFromKey([]byte(key))
 	if blockID, ok := parseBlockNumberFromKey([]byte(key), dataType); ok {
+		// For keys with embedded block numbers (Header, BlockBody, BlockReceipts)
 		if blockID > baol.latestBlockID {
-			// keyhex := hex.EncodeToString([]byte(key))
-			// return "", false, fmt.Errorf("Get: needed blockID lager than aol.lastBlockID, key: %s", keyhex)
-			return "", false, fmt.Errorf("Get: needed blockID larger than baol.latestBlockID")
+			return "", false, fmt.Errorf("Get: requested blockID %d > latestBlockID %d", blockID, baol.latestBlockID)
 		}
-		if baol.latestBlockID-blockID > SkipDistanceForGet {
-			return "", true, nil
-		}
-		if baol.latestBlockID-blockID > uint64(baol.recentN) {
-			if _, isIndexed := baol.indexedBlocks[blockID]; !isIndexed {
-				if mainEntry, okMain := baol.getBlockIndexEntry(blockID); okMain {
-					if val, found, err := baol.findKeyInOneBlock(baol.dataFile, mainEntry, key); err != nil {
-						return "", false, err
-					} else if found {
-						if val == TombstoneMarker {
-							return "", true, nil
-						}
-						return val, true, nil
-					}
-					return "", false, nil
-				}
+		
+		// Check if this block is in the skiplist
+		if baol.indexedBlocks != nil {
+			if _, isIndexed := baol.indexedBlocks[blockID]; isIndexed {
+				// Block is in skiplist but key not found - key doesn't exist
+				return "", false, nil
 			}
-			return "", false, nil
 		}
+		
+		// Block not in skiplist - read from disk via index
+		if mainEntry, okMain := baol.getBlockIndexEntry(blockID); okMain {
+			if val, found, err := baol.findKeyInOneBlock(baol.dataFile, mainEntry, key); err != nil {
+				return "", false, fmt.Errorf("failed to scan block %d from disk: %w", blockID, err)
+			} else if found {
+				if val == TombstoneMarker {
+					return "", true, nil
+				}
+				return val, true, nil
+			}
+		}
+		// Block not found in index either
 		return "", false, nil
 	}
 
-	return "", false, nil
-
-	//    Iterate all blockIndex entries from newest to oldest.
-	allBlockIDs := make([]uint64, 0, len(baol.blockIndex))
-	for id := range baol.blockIndex {
-		allBlockIDs = append(allBlockIDs, id)
-	}
-	// Sort from newest to oldest to find the most recent version of the key
-	sort.Slice(allBlockIDs, func(i, j int) bool {
-		return allBlockIDs[i] > allBlockIDs[j]
-	})
-
-	for _, blockIDToScan := range allBlockIDs {
-		// If this block IS covered by the skiplist index, then the skiplist.Get() above
-		// would have found the key's latest state if it originated from this block or a newer
-		// skiplist-indexed block. So, we can skip re-scanning its data here.
-		if _, isIndexed := baol.indexedBlocks[blockIDToScan]; isIndexed {
-			continue
-		}
-
-		// This block is older and not covered by the skiplist. Scan its data.
-		indexEntry, ok := baol.getBlockIndexEntry(blockIDToScan) // Still under RLock
-		if !ok {
-			baol.log.Error("Get: Block ID from allBlockIDs not found in blockIndex", "blockID", blockIDToScan)
-			continue // Should not happen
-		}
-
-		size := indexEntry.EndOffset - indexEntry.StartOffset
-		if size <= 0 {
-			continue // Empty block
-		}
-
-		blockData := make([]byte, size)
-		// dataFile.ReadAt is thread-safe and suitable for use under RLock
-		_, err := baol.dataFile.ReadAt(blockData, indexEntry.StartOffset)
-		if err != nil {
-			baol.log.Error("Get: Failed to read block data for older block", "blockID", blockIDToScan, "key", key, "error", err)
-			// Depending on desired behavior, might continue to try other blocks or return error.
-			// For now, return error as it indicates a potential issue reading data.
-			return "", false, fmt.Errorf("Get: failed to read data for block %d: %w", blockIDToScan, err)
-		}
-
-		if blockIDToScan == 0 {
-			fmt.Println("key:", key, "keyType:", dataType, "mark")
-		}
-
-		reader := bytes.NewReader(blockData)
-		// Iterate through entries in this specific block's data
-		for reader.Len() > 0 {
-			entry, _, readErr := baol.readLogEntry(reader)
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				baol.log.Error("Get: Failed to decode entry in older block", "blockID", blockIDToScan, "key", key, "error", readErr)
-				return "", false, fmt.Errorf("Get: failed to decode entry in block %d: %w", blockIDToScan, readErr)
-			}
-
-			if entry.Key == key {
-				// Found the key in this older block. Since we are iterating newest to oldest,
-				// this is the most recent version not covered by the skiplist.
-				if entry.Value == TombstoneMarker {
-					return "", true, nil // Found tombstone
-				}
-				return entry.Value, true, nil // Found value
-			}
-		}
-	}
-
-	// Key not found in skiplist or any older blocks
+	// For keys without embedded block numbers, only check skiplist
+	// (we can't determine which block to scan without a full scan)
 	return "", false, nil
 }
 
@@ -669,14 +823,14 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 	if baol.closed {
 		return fmt.Errorf("append-only log is closed")
 	}
+	baol.ensureWriteTrackingInitialized()
 
-	if baol.latestBlockID != 0 {
-		return nil
-	}
-
-	blockIDForDelete := baol.latestBlockID + 1
-	if len(baol.blockIndex) == 0 && baol.latestBlockID == 0 {
-		blockIDForDelete = 1
+	// Determine next block ID
+	blockIDForDelete := baol.latestBlockID
+	if blockIDForDelete == 0 {
+		blockIDForDelete = 1 // First block
+	} else {
+		blockIDForDelete++ // Next block
 	}
 
 	startOffset := baol.currentOffset
@@ -705,7 +859,6 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 		StartOffset: startOffset,
 		EndOffset:   endOffset,
 	}
-	baol.blockIndex[blockIDForDelete] = indexEntry
 	baol.latestBlockID = blockIDForDelete // Update latestBlockID
 
 	if err := baol.writeIndexEntry(baol.indexMapFile, indexEntry); err != nil {
@@ -721,9 +874,9 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 		baol.log.Error("Failed to sync data file after tombstone", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to sync data file for tombstone block %d: %w", blockIDForDelete, err)
 	}
-	if err := baol.indexMapFile.Sync(); err != nil {
-		baol.log.Error("Failed to sync index map file after tombstone", "blockID", blockIDForDelete, "error", err)
-		return fmt.Errorf("failed to sync index map file for tombstone block %d: %w", blockIDForDelete, err)
+	if err := baol.flushIndexBuffer(); err != nil {
+		baol.log.Error("Failed to flush index map buffer after tombstone", "blockID", blockIDForDelete, "error", err)
+		return fmt.Errorf("failed to flush index map buffer for tombstone block %d: %w", blockIDForDelete, err)
 	}
 
 	baol.updateRecentBlocks(blockIDForDelete) // This will add the new block
@@ -952,7 +1105,11 @@ func (baol *BlockAppendOnlyLog) readLogEntry(r io.Reader) (*logEntry, int64, err
 
 // writeIndexEntry appends a block index entry to the index map file.
 func (baol *BlockAppendOnlyLog) writeIndexEntry(w io.Writer, entry blockIndexEntry) error {
-	if f, ok := w.(*os.File); ok && f == baol.indexMapFile {
+	if w == nil {
+		return baol.bufferIndexEntry(entry)
+	}
+
+	if f, ok := w.(*os.File); ok && (f == nil || (baol.indexMapFile != nil && f == baol.indexMapFile)) {
 		return baol.bufferIndexEntry(entry)
 	}
 
@@ -976,6 +1133,10 @@ func (baol *BlockAppendOnlyLog) writeIndexEntry(w io.Writer, entry blockIndexEnt
 
 // persistIndexMap writes the current block index map to the index map file.
 func (baol *BlockAppendOnlyLog) persistIndexMap() error {
+	if baol.indexMapFile == nil {
+		return nil
+	}
+
 	baol.indexMapFile.Seek(0, io.SeekStart)
 	writer := bufio.NewWriter(baol.indexMapFile)
 
@@ -1005,6 +1166,7 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 	if baol.closed {
 		return 0, fmt.Errorf("append-only log is closed")
 	}
+	baol.ensureWriteTrackingInitialized()
 
 	if len(kvs) == 0 {
 		baol.log.Debug("AppendToNewBlock called with empty KVS, no operation performed")
@@ -1047,7 +1209,12 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		StartOffset: startOffset,
 		EndOffset:   endOffset,
 	}
-	baol.blockIndex[newBlockID] = indexEntry
+	// Update minBlockID on first block
+	if baol.minBlockID == 0 {
+		baol.minBlockID = newBlockID
+		baol.log.Info("Set minBlockID for first block", "minBlockID", baol.minBlockID)
+	}
+	
 	baol.latestBlockID = newBlockID
 
 	if err := baol.writeIndexEntry(baol.indexMapFile, indexEntry); err != nil {
@@ -1064,9 +1231,15 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		baol.log.Error("Failed to sync data file after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to sync data file for new block %d: %w", newBlockID, err)
 	}
-	if err := baol.indexMapFile.Sync(); err != nil {
-		baol.log.Error("Failed to sync index map file after new block", "assignedBlockID", newBlockID, "error", err)
-		return 0, fmt.Errorf("failed to sync index map file for new block %d: %w", newBlockID, err)
+	if err := baol.flushIndexBuffer(); err != nil {
+		baol.log.Error("Failed to flush index map buffer after new block", "assignedBlockID", newBlockID, "error", err)
+		return 0, fmt.Errorf("failed to flush index map buffer for new block %d: %w", newBlockID, err)
+	}
+	
+	// Save metadata after successful append
+	if err := baol.saveIndexMeta(); err != nil {
+		baol.log.Error("Failed to save index metadata", "error", err)
+		// Non-critical error, continue
 	}
 
 	baol.updateRecentBlocks(newBlockID) // Manages recentBlocks and indexedBlocks
@@ -1179,13 +1352,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 		if err := baol.dataWriter.Flush(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to flush data writer on close: %w", err))
 		}
-	}
-
-	// Persist the final state of the index map.
-	// This ensures that even if the last Append's persistIndexMap had issues
-	// or if there were no appends since the last persist, the current map is written.
-	if err := baol.persistIndexMap(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to persist index map on close: %w", err))
 	}
 
 	if baol.dataFile != nil {
@@ -1319,7 +1485,25 @@ func (baol *BlockAppendOnlyLog) bufferIndexEntry(entry blockIndexEntry) error {
 	return nil
 }
 
+func (baol *BlockAppendOnlyLog) restoreIndexBuffer(entries []blockIndexEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	baol.indexBufferMu.Lock()
+	defer baol.indexBufferMu.Unlock()
+	baol.indexBuffer = append(entries, baol.indexBuffer...)
+}
+
 func (baol *BlockAppendOnlyLog) flushIndexBuffer() error {
+	// Read minBlockID without holding mu lock (safe for background flush)
+	baol.mu.RLock()
+	minBlockID := baol.minBlockID
+	baol.mu.RUnlock()
+	
+	return baol.flushIndexBufferWithBlockID(minBlockID)
+}
+
+func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) error {
 	baol.indexBufferMu.Lock()
 
 	if len(baol.indexBuffer) == 0 {
@@ -1333,27 +1517,38 @@ func (baol *BlockAppendOnlyLog) flushIndexBuffer() error {
 	baol.indexBuffer = baol.indexBuffer[:0]
 	baol.indexBufferMu.Unlock()
 
-	writer := bufio.NewWriter(baol.indexMapFile)
+	f, err := os.OpenFile(baol.indexMapFilePath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		baol.log.Error("Failed to open index map file during flush", "path", baol.indexMapFilePath, "error", err)
+		baol.restoreIndexBuffer(entries)
+		return err
+	}
+	defer f.Close()
+
 	for _, entry := range entries {
-		buf := make([]byte, blockIDSize+offsetSize+offsetSize)
+		buf := make([]byte, indexEntrySize)
 		binary.BigEndian.PutUint64(buf[0:blockIDSize], entry.BlockID)
 		binary.BigEndian.PutUint64(buf[blockIDSize:blockIDSize+offsetSize], uint64(entry.StartOffset))
 		binary.BigEndian.PutUint64(buf[blockIDSize+offsetSize:], uint64(entry.EndOffset))
-
-		if _, err := writer.Write(buf); err != nil {
-			baol.log.Error("Failed to write index entry during flush", "error", err)
-			return err
+		
+		// Use compact storage: position based on offset from minBlockID
+		if minBlockID > 0 && entry.BlockID >= minBlockID {
+			pos := int64(entry.BlockID-minBlockID) * int64(indexEntrySize)
+			if _, err := f.WriteAt(buf, pos); err != nil {
+				baol.log.Error("Failed to write index entry during flush", "error", err)
+				baol.restoreIndexBuffer(entries)
+				return err
+			}
+		} else {
+			// Fallback for edge case (shouldn't happen in normal operation)
+			baol.log.Warn("Skipping index entry with blockID < minBlockID", 
+				"blockID", entry.BlockID, "minBlockID", minBlockID)
 		}
 	}
 
-	// Flush and sync
-	if err := writer.Flush(); err != nil {
-		baol.log.Error("Failed to flush index buffer writer", "error", err)
-		return err
-	}
-
-	if err := baol.indexMapFile.Sync(); err != nil {
+	if err := f.Sync(); err != nil {
 		baol.log.Error("Failed to sync index file after buffer flush", "error", err)
+		baol.restoreIndexBuffer(entries)
 		return err
 	}
 
@@ -1367,10 +1562,11 @@ func (baol *BlockAppendOnlyLog) FlushIndexBuffer() error {
 
 // getBlockIndexEntry retrieves the block index entry for a given block ID.
 func (baol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEntry, bool) {
-
-	entry, ok := baol.blockIndex[blockID]
-	if ok {
-		return entry, true
+	if baol.blockIndex != nil {
+		entry, ok := baol.blockIndex[blockID]
+		if ok {
+			return entry, true
+		}
 	}
 	baol.indexBufferMu.Lock()
 	for _, entry := range baol.indexBuffer {
@@ -1380,6 +1576,15 @@ func (baol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEn
 		}
 	}
 	baol.indexBufferMu.Unlock()
+
+	entry, ok, err := baol.findBlockIndexEntryOnDisk(blockID)
+	if err != nil {
+		baol.log.Error("Failed to lookup block index entry from disk", "blockID", blockID, "error", err)
+		return blockIndexEntry{}, false
+	}
+	if ok {
+		return entry, true
+	}
 	return blockIndexEntry{}, false
 }
 
@@ -1470,7 +1675,7 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 
 	// use BlockID to locate the correct data file
 	if pointer.BlockID != 0 {
-		if mainEntry, ok := baol.blockIndex[pointer.BlockID]; ok {
+		if mainEntry, ok := baol.getBlockIndexEntry(pointer.BlockID); ok {
 			if pointer.Offset >= mainEntry.StartOffset && pointer.Offset+int64(headerSize) <= mainEntry.EndOffset {
 				if _, err := baol.dataFile.ReadAt(headerBytes, pointer.Offset); err == nil {
 					keyLen := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
