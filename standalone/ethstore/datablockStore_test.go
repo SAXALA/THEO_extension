@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -147,6 +148,171 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	}
 	if !exists || val != "v2002_1" {
 		t.Errorf("Get k2002_1: got exists=%v val=%q, want exists=true val=\"v2002_1\"", exists, val)
+	}
+}
+
+func TestAppendOnlyLog_ReopenAfterBlockZeroAndAppend(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol1, _ := NewAppendOnlyLogTest(t, dir, 10)
+	if err := aol1.Append(0, map[string]string{"k0": "v0"}); err != nil {
+		t.Fatalf("Failed to append block 0: %v", err)
+	}
+	if err := aol1.Close(); err != nil {
+		t.Fatalf("Failed to close first instance: %v", err)
+	}
+
+	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 10)
+	defer cleanup2()
+
+	if err := aol2.Append(1, map[string]string{"k1": "v1"}); err != nil {
+		t.Fatalf("Failed to append block 1 after reopen: %v", err)
+	}
+
+	if err := aol2.FlushIndexBuffer(); err != nil {
+		t.Fatalf("Failed to flush index buffer after reopen append: %v", err)
+	}
+
+	if got, exists, err := aol2.Get("k1"); err != nil {
+		t.Fatalf("Get(k1) failed: %v", err)
+	} else if !exists || got != "v1" {
+		t.Fatalf("Get(k1) mismatch, got exists=%v val=%q", exists, got)
+	}
+
+	if got, exists, err := aol2.Get("k0"); err != nil {
+		t.Fatalf("Get(k0) failed: %v", err)
+	} else if !exists || got != "v0" {
+		t.Fatalf("Get(k0) mismatch, got exists=%v val=%q", exists, got)
+	}
+}
+
+func TestAppendOnlyLog_ReopenAndAppendRangeWithOverlap(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol1, _ := NewAppendOnlyLogTest(t, dir, 64)
+	for blockID := uint64(10); blockID <= 20; blockID++ {
+		kvs := map[string]string{fmt.Sprintf("k_%d", blockID): fmt.Sprintf("v_phase1_%d", blockID)}
+		if err := aol1.Append(blockID, kvs); err != nil {
+			t.Fatalf("phase1 append block %d failed: %v", blockID, err)
+		}
+	}
+	if err := aol1.Close(); err != nil {
+		t.Fatalf("failed to close first instance: %v", err)
+	}
+
+	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 64)
+	defer cleanup2()
+
+	for blockID := uint64(19); blockID <= 30; blockID++ {
+		kvs := map[string]string{fmt.Sprintf("k_%d", blockID): fmt.Sprintf("v_phase2_%d", blockID)}
+		err := aol2.Append(blockID, kvs)
+		if err != nil {
+			t.Fatalf("phase2 append block %d failed: %v", blockID, err)
+		}
+	}
+
+	if aol2.latestBlockID != 30 {
+		t.Fatalf("latestBlockID mismatch after phase2 append, got %d want 30", aol2.latestBlockID)
+	}
+
+	for blockID := uint64(10); blockID <= 20; blockID++ {
+		kvs, err := aol2.GetByBlock(blockID)
+		if err != nil {
+			t.Fatalf("GetByBlock(%d) failed: %v", blockID, err)
+		}
+		expected := map[string]string{fmt.Sprintf("k_%d", blockID): fmt.Sprintf("v_phase1_%d", blockID)}
+		if blockID == 20 {
+			expected = map[string]string{fmt.Sprintf("k_%d", blockID): fmt.Sprintf("v_phase2_%d", blockID)}
+		}
+		if !reflect.DeepEqual(kvs, expected) {
+			t.Fatalf("block %d mismatch: got %v want %v", blockID, kvs, expected)
+		}
+	}
+
+	for blockID := uint64(21); blockID <= 30; blockID++ {
+		kvs, err := aol2.GetByBlock(blockID)
+		if err != nil {
+			t.Fatalf("GetByBlock(%d) failed: %v", blockID, err)
+		}
+		expected := map[string]string{fmt.Sprintf("k_%d", blockID): fmt.Sprintf("v_phase2_%d", blockID)}
+		if !reflect.DeepEqual(kvs, expected) {
+			t.Fatalf("block %d mismatch: got %v want %v", blockID, kvs, expected)
+		}
+	}
+}
+
+func TestAppendOnlyLog_DuplicateLatestBlockIDAppendsMultipleKVs(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 16)
+	defer cleanup()
+
+	if err := aol.Append(100, map[string]string{"k1": "v1"}); err != nil {
+		t.Fatalf("append #1 failed: %v", err)
+	}
+	if err := aol.Append(100, map[string]string{"k2": "v2"}); err != nil {
+		t.Fatalf("append #2 failed: %v", err)
+	}
+	if err := aol.Append(100, map[string]string{"k3": "v3"}); err != nil {
+		t.Fatalf("append #3 failed: %v", err)
+	}
+
+	kvs, err := aol.GetByBlock(100)
+	if err != nil {
+		t.Fatalf("GetByBlock(100) failed: %v", err)
+	}
+	expected := map[string]string{"k1": "v1", "k2": "v2", "k3": "v3"}
+	if !reflect.DeepEqual(kvs, expected) {
+		t.Fatalf("block 100 mismatch: got %v want %v", kvs, expected)
+	}
+}
+
+func TestAppendOnlyLog_ReopenAndGapFillUntilContinuous(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol1, _ := NewAppendOnlyLogTest(t, dir, 64)
+	for blockID := uint64(10); blockID <= 20; blockID++ {
+		kvs := map[string]string{fmt.Sprintf("gk_%d", blockID): fmt.Sprintf("gv_phase1_%d", blockID)}
+		if err := aol1.Append(blockID, kvs); err != nil {
+			t.Fatalf("phase1 append block %d failed: %v", blockID, err)
+		}
+	}
+	if err := aol1.Close(); err != nil {
+		t.Fatalf("failed to close first instance: %v", err)
+	}
+
+	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 64)
+	defer cleanup2()
+
+	if err := aol2.Append(25, map[string]string{"gk_25": "gv_phase2_25"}); err != nil {
+		t.Fatalf("phase2 append block 25 failed: %v", err)
+	}
+
+	for blockID := uint64(21); blockID <= 24; blockID++ {
+		kvs, err := aol2.GetByBlock(blockID)
+		if err != nil {
+			t.Fatalf("GetByBlock(%d) failed: %v", blockID, err)
+		}
+		if len(kvs) != 0 {
+			t.Fatalf("expected gap-filled block %d to be empty, got %v", blockID, kvs)
+		}
+	}
+
+	kvs25, err := aol2.GetByBlock(25)
+	if err != nil {
+		t.Fatalf("GetByBlock(25) failed: %v", err)
+	}
+	expected25 := map[string]string{"gk_25": "gv_phase2_25"}
+	if !reflect.DeepEqual(kvs25, expected25) {
+		t.Fatalf("block 25 mismatch: got %v want %v", kvs25, expected25)
+	}
+
+	if aol2.latestBlockID != 25 {
+		t.Fatalf("latestBlockID mismatch, got %d want 25", aol2.latestBlockID)
 	}
 }
 
@@ -486,10 +652,10 @@ func TestAppendOnlyLog_AppendErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Error: Append duplicate block ID
+	// Duplicate block ID should be idempotent success
 	err := aol.Append(1, map[string]string{"k_new": "v_new"})
-	if err == nil {
-		t.Error("Expected error when appending duplicate block ID, got nil")
+	if err != nil {
+		t.Errorf("Expected nil when appending duplicate block ID, got %v", err)
 	}
 
 	// Error: Append non-monotonic block ID
