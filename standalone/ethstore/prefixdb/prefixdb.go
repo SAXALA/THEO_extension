@@ -1010,10 +1010,6 @@ func (db *PrefixDB) Close() error {
 		return fmt.Errorf("failed to close prefix tree: %v", err)
 	}
 
-	// if err := db.SaveSlotIndex(); err != nil {
-	// 	return fmt.Errorf("failed to save prefix tree: %v", err)
-	// }
-
 	if err := db.accountFile.Sync(); err != nil {
 		// Check if file is already closed
 		if !errors.Is(err, os.ErrClosed) {
@@ -1021,19 +1017,11 @@ func (db *PrefixDB) Close() error {
 		}
 	}
 
-	// if err := db.slotFile.Sync(); err != nil {
-	// 	errs = append(errs, fmt.Errorf("failed to sync slot file: %v", err))
-	// }
-
 	if err := db.accountFile.Close(); err != nil {
 		if !errors.Is(err, os.ErrClosed) {
 			errs = append(errs, err)
 		}
 	}
-
-	// if err := db.slotFile.Close(); err != nil {
-	// 	errs = append(errs, err)
-	// }
 
 	db.nodeCache = nil
 	db.batch = nil

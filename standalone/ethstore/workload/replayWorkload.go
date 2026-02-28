@@ -316,6 +316,8 @@ func main() {
 	// loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
 	// replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
 	// replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+	// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
+	// loadAol(cfg.DatabaseDir, notxFile)
 	// return
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
@@ -324,8 +326,7 @@ func main() {
 	case "ld":
 		loadAccount(cfg.DatabaseDir, *ldChunkFileSize, *ldCacheSize)
 		// loadData(cfg.DatabaseDir, cfg.LoadDataDir)
-		// notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
-		// txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
+		// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
 		// loadAol(cfg.DatabaseDir, notxFile, txFile)
 	case "re":
 		replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
@@ -744,7 +745,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 func loadData(dataBaseDir string, dataFile string) {
 	// ethStoreDir := "/mnt/ssd/ethstore/database/prefixdb"
 	ethStoreDir := dataBaseDir
-	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false, true, 64*1024, 512*1024*1024)
+	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false, 64*1024, 512*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1037,9 +1038,9 @@ func replaySSPut() {
 	}
 }
 
-func loadAol(dataBaseDir string, notxFile string, txFile string) {
+func loadAol(dataBaseDir string, notxFile string) {
 
-	store, err := ethstore.New(dataBaseDir, 200, "put_test", false, true, 64*1024, 512*1024*1024)
+	store, err := ethstore.New(dataBaseDir, 6000, "put_test", false, 16*1024, 12*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1053,12 +1054,6 @@ func loadAol(dataBaseDir string, notxFile string, txFile string) {
 	}
 	defer notxfile.Close()
 
-	txfile, err := os.Open(txFile)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer txfile.Close()
-
 	var totalTime time.Duration
 	counter := 0
 	notxreader := bufio.NewReader(notxfile)
@@ -1067,19 +1062,16 @@ func loadAol(dataBaseDir string, notxFile string, txFile string) {
 
 		line, err := notxreader.ReadString('\n')
 		if err == io.EOF {
-			break // End of file reached
+			break
 		}
 
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value:")
+		parts := strings.Split(string(line), "\tvalue:")
 		if len(parts) != 2 {
 			// log.Printf("无法解析行: %s", line)
 			continue
 		}
 		counter++
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		keyPart := strings.TrimPrefix(parts[0], "key: ")
 		valuePart := strings.TrimSpace(parts[1])
 
 		// Convert key and value to byte slices
@@ -1117,55 +1109,6 @@ func loadAol(dataBaseDir string, notxFile string, txFile string) {
 		}
 	}
 
-	txreader := bufio.NewReader(txfile)
-	counter = 0
-	for {
-
-		line, err := txreader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value:")
-		if len(parts) != 2 {
-			// log.Printf("无法解析行: %s", line)
-			continue
-		}
-		counter++
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		// Perform the Put operation
-		startTime := time.Now()
-		err = store.Put(keyBytes, valueBytes)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-		// Verify the value was stored correctly
-
-		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
-		}
-	}
 	log.Printf("Total Put operations: %d, Total time: %d ns", counter, totalTime.Nanoseconds())
 	log.Println("Put test completed.")
 	// store.CloseAol()
@@ -1206,7 +1149,7 @@ func TestPrefixGet() {
 
 func testPdbPerformance() {
 	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 10, "put_test", false, true, 64*1024, 512*1024*1024)
+	store, err := ethstore.New(tempDir, 10, "put_test", false, 64*1024, 512*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1275,14 +1218,13 @@ func testPdbPerformance() {
 
 func testAolPreformance() {
 	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 100, "put_test", false, true, 64*1024, 512*1024*1024)
+	store, err := ethstore.New(tempDir, 100, "put_test", false, 64*1024, 512*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
 	notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
-	txFile := "/mnt/ssd/ethstore/sortAol/txlookup_sorted.dat"
 
 	// Read key-value pairs from the test file
 	notxfile, err := os.Open(notxFile)
@@ -1290,12 +1232,6 @@ func testAolPreformance() {
 		log.Fatalf("Failed to open test file: %v", err)
 	}
 	defer notxfile.Close()
-
-	txfile, err := os.Open(txFile)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer txfile.Close()
 
 	var totalTime time.Duration
 	counter := 0
@@ -1350,56 +1286,6 @@ func testAolPreformance() {
 	}
 
 	fmt.Println("total put:", counter, " use time:", totalTime.Seconds(), " s", " avg time:", float64(counter)/totalTime.Seconds(), " s")
-
-	txreader := bufio.NewReader(txfile)
-	counter = 0
-	for {
-		line, err := txreader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value:")
-		if len(parts) != 2 {
-			// log.Printf("无法解析行: %s", line)
-			continue
-		}
-		counter++
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		// Perform the Put operation
-		startTime := time.Now()
-		err = store.Put(keyBytes, valueBytes)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-		// Verify the value was stored correctly
-
-		if counter%100000 < 10 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-		}
-	}
-	log.Printf("Total Put operations: %d, Total time: %f s", counter, totalTime.Seconds())
 	log.Println("Put test completed.")
 }
 
@@ -1503,7 +1389,7 @@ func TestGetParentKey() {
 
 func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 	tempDir := dataBaseDir
-	store, err := ethstore.New(tempDir, 6000, "put_test", false, true, 64*1024, 12*1024*1024)
+	store, err := ethstore.New(tempDir, 6000, "put_test", false, 16*1024, 12*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1830,11 +1716,11 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 			}
 			// EthStore's iterator routing may involve non-Pebble backends (e.g., AOL) and PrefixDB has no iterator.
 			// For replayTrace we only exercise Pebble iterator behavior; skip TrieStorage (PrefixDB) prefixes.
-			if len(iterPrefixBytes) > 0 && (iterPrefixBytes[0] == 'O' || iterPrefixBytes[0] == 'o') {
+			if len(iterPrefixBytes) > 0 && (iterPrefixBytes[0] == 'O') {
 				iter = nil
 				break
 			}
-			iter = store.NewPebbleIterator(iterPrefixBytes, iterStartBytes)
+			iter = store.NewIterator(iterPrefixBytes, iterStartBytes)
 		case opIteratorNext:
 			if iter != nil {
 				_ = iter.Next()

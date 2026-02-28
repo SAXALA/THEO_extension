@@ -64,17 +64,39 @@ fi
 echo "Start rsync database files from DBbak to current database directory..."
 sudo rsync -avP /mnt/ssd2/ethstore/database/database_statedb16KB/prefixdb/ /mnt/ssd2/ethstore/database_state/prefixdb/
 sudo chmod -R 777 /mnt/ssd2/ethstore/database_state/prefixdb/
-sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database/aol/ /mnt/ssd2/ethstore/database/aol/
-sudo chmod -R 777 /mnt/ssd2/ethstore/database/aol/
+sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_aol /mnt/ssd2/ethstore/database_aol/
+sudo chmod -R 777 /mnt/ssd2/ethstore/database_aol/
 sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_pebble/ /mnt/ssd2/ethstore/database_pebble/
 sudo chmod -R 777 /mnt/ssd2/ethstore/database_pebble/
 # # 2. replay trace
 echo "Start replaying trace with re mode..."
 
 
-./bin/replayWorkload -mode re -max-ops 100000000> ./replayLog/ethstoreLog_${log_date}.log 2>&1 &
+./bin/replayWorkload -mode re -max-ops 100000000 > ./replayLog/ethstoreLog_${log_date}.log 2>&1 &
 replay_pid=$!
 echo "monitor target PID: $replay_pid"
 # 3. record resource usage
 sudo ./monitor.sh "$replay_pid" 1 ethstoreIO_${log_date}.log &
+wait  # wait for the replay to finish
+
+# baseline replay 
+# 1. recover from baseline data
+sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
+# 2. replay trace
+./bin/replayWorkload -mode rb -max-ops 100000000 > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
+replay_pid=$!
+echo "monitor target PID: $replay_pid"
+# 3. record resource usage
+sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
+wait  # wait for the replay to finish
+
+# baseline replay 
+# 1. recover from baseline data
+sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
+# 2. replay trace
+./bin/replayWorkload -mode rb -max-ops 100000000 > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
+replay_pid=$!
+echo "monitor target PID: $replay_pid"
+# 3. record resource usage
+sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
 wait  # wait for the replay to finish
