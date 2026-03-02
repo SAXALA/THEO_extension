@@ -21,19 +21,20 @@ import (
 )
 
 const (
-	BlockdataFileName     = "headerdata.log"
-	BlockindexMapFileName = "blockindex.map"
+	BlockdataFileName      = "headerdata.log"
+	BlockindexMapFileName  = "blockindex.map"
 	BlockindexMetaFileName = "blockindex.meta"
-	defaultRecentN        = 6000 // Default number of recent blocks to keep indexed in memory
-	offsetSize            = 8   // Size of uint64 for offsets
-	blockIDSize           = 8   // Assuming block ID is uint64
-	keyLenSize            = 4   // Size of uint32 for key length
-	valueLenSize          = 4   // Size of uint32 for value length
-	indexEntrySize        = blockIDSize + offsetSize + offsetSize
-	indexMetaSize         = 16  // minBlockID (8 bytes) + maxBlockID (8 bytes)
+	defaultRecentN         = 6000 // Default number of recent blocks to keep indexed in memory
+	offsetSize             = 8    // Size of uint64 for offsets
+	blockIDSize            = 8    // Assuming block ID is uint64
+	keyLenSize             = 4    // Size of uint32 for key length
+	valueLenSize           = 4    // Size of uint32 for value length
+	indexEntrySize         = blockIDSize + offsetSize + offsetSize
+	indexMetaSize          = 16 // minBlockID (8 bytes) + maxBlockID (8 bytes)
 	// TombstoneMarker is a special value to mark deletion
-	TombstoneMarker    = "_D_"
-	initialBufferSize  = 4096  // Initial buffer size for writers
+	TombstoneMarker   = "_D_"
+	initialBufferSize = 4096  // Initial buffer size for writers
+	IgnoredThreshold  = 10000 // Threshold for ignoring very old blocks in Get (e.g., if blockID is more than 10k behind latestBlockID, treat as non-existent)
 )
 
 // BlockAppendOnlyLog implements the append-only log store with skiplist indexing for recent blocks.
@@ -46,12 +47,12 @@ type BlockAppendOnlyLog struct {
 	dataWriter    *bufio.Writer
 	currentOffset int64 // Current end offset of the data file
 
-	indexMapFilePath string
-	indexMapFile     *os.File
+	indexMapFilePath  string
+	indexMapFile      *os.File
 	indexMetaFilePath string
-	blockIndex       map[uint64]blockIndexEntry // In-memory cache of block offsets
-	minBlockID       uint64 // Minimum block ID in the log (0 means empty)
-	latestBlockID    uint64
+	blockIndex        map[uint64]blockIndexEntry // In-memory cache of block offsets
+	minBlockID        uint64                     // Minimum block ID in the log (0 means empty)
+	latestBlockID     uint64
 
 	// Skiplist index for recent N blocks
 	recentN          int
@@ -109,26 +110,26 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 	}
 
 	baol := &BlockAppendOnlyLog{
-		dirPath:          dirPath,
-		log:              logger.New("module", "appendlog", "path", dirPath),
-		dataFilePath:     dataFilePath,
-		dataFile:         dataFile,
-		dataWriter:       bufio.NewWriterSize(dataFile, initialBufferSize),
-		currentOffset:    currentOffset,
-		indexMapFilePath: indexMapFilePath,
-		indexMapFile:     indexMapFile,
+		dirPath:           dirPath,
+		log:               logger.New("module", "appendlog", "path", dirPath),
+		dataFilePath:      dataFilePath,
+		dataFile:          dataFile,
+		dataWriter:        bufio.NewWriterSize(dataFile, initialBufferSize),
+		currentOffset:     currentOffset,
+		indexMapFilePath:  indexMapFilePath,
+		indexMapFile:      indexMapFile,
 		indexMetaFilePath: indexMetaFilePath,
-		blockIndex:       make(map[uint64]blockIndexEntry),
-		minBlockID:       0,
-		recentN:          recentN,
-		recentBlocks:     make([]uint64, 0, recentN), // Initialize empty, will be populated below
-		skiplistIndex:    skiplist.New(skiplist.String),
-		indexedBlocks:    make(map[uint64]struct{}), // Initialize empty, will be populated below
-		indexedBlockKeys: make(map[uint64][]string),
-		indexBuffer:      make([]blockIndexEntry, 0, recentN/2),
-		indexBufferSize:  recentN / 2,
-		indexBufferFlush: make(chan struct{}, 1),
-		backgroundDone:   make(chan struct{}),
+		blockIndex:        make(map[uint64]blockIndexEntry),
+		minBlockID:        0,
+		recentN:           recentN,
+		recentBlocks:      make([]uint64, 0, recentN), // Initialize empty, will be populated below
+		skiplistIndex:     skiplist.New(skiplist.String),
+		indexedBlocks:     make(map[uint64]struct{}), // Initialize empty, will be populated below
+		indexedBlockKeys:  make(map[uint64][]string),
+		indexBuffer:       make([]blockIndexEntry, 0, recentN/2),
+		indexBufferSize:   recentN / 2,
+		indexBufferFlush:  make(chan struct{}, 1),
+		backgroundDone:    make(chan struct{}),
 
 		// opCount:   0,
 		// failedOps: 0,
@@ -195,15 +196,15 @@ func (baol *BlockAppendOnlyLog) releaseBootstrapResources() {
 
 	// Release blockIndex - queries will fall back to disk via getBlockIndexEntry()
 	baol.blockIndex = nil
-	
+
 	// Keep indexedBlocks - it's small (just block IDs) and needed for fast skiplist lookup
 	// baol.indexedBlocks is retained
-	
+
 	// Release recentBlocks and indexedBlockKeys - will be rebuilt on write if needed
 	baol.recentBlocks = nil
 	baol.indexedBlockKeys = nil
 
-	baol.log.Info("Released bootstrap resources", 
+	baol.log.Info("Released bootstrap resources",
 		"skiplistKeys", baol.skiplistIndex.Len(),
 		"indexedBlocks", len(baol.indexedBlocks))
 }
@@ -235,7 +236,7 @@ func (baol *BlockAppendOnlyLog) ensureWriteTrackingInitialized() {
 
 	baol.recentBlocks = make([]uint64, len(blockIDs))
 	copy(baol.recentBlocks, blockIDs)
-	
+
 	// Only rebuild indexedBlocks if it was actually released (nil)
 	if baol.indexedBlocks == nil {
 		baol.indexedBlocks = make(map[uint64]struct{}, len(blockIDs))
@@ -243,7 +244,7 @@ func (baol *BlockAppendOnlyLog) ensureWriteTrackingInitialized() {
 			baol.indexedBlocks[id] = struct{}{}
 		}
 	}
-	
+
 	baol.indexedBlockKeys = blockKeys
 }
 
@@ -528,11 +529,7 @@ func (baol *BlockAppendOnlyLog) readAndIndexBlock(indexEntry blockIndexEntry) er
 
 		// Add or update the key in the skiplist
 		// The latest occurrence of a key within the indexed blocks wins.
-		ptr := &kvPointer{
-			Offset:   entryOffset,
-			ValueLen: uint32(len(entry.Value)), // Store length for faster Get
-			BlockID:  entry.BlockID,            // Store block ID for reference
-		}
+		ptr := buildKVPointerForSkiplist(entry.BlockID, entryOffset, entry.Key, entry.Value)
 		baol.setSkiplistEntry(entry.BlockID, entry.Key, ptr)
 	}
 	return nil
@@ -543,6 +540,19 @@ func (baol *BlockAppendOnlyLog) recordIndexedKey(blockID uint64, key string) {
 		baol.indexedBlockKeys = make(map[uint64][]string)
 	}
 	baol.indexedBlockKeys[blockID] = append(baol.indexedBlockKeys[blockID], key)
+}
+
+func buildKVPointerForSkiplist(blockID uint64, entryOffset int64, key, value string) *kvPointer {
+	ptr := &kvPointer{
+		Offset:   entryOffset,
+		ValueLen: uint32(len(value)),
+		BlockID:  blockID,
+	}
+	if GetDataTypeFromKey([]byte(key)) == HeaderDataType {
+		ptr.InlineValue = []byte(value)
+		ptr.HasInlineValue = true
+	}
+	return ptr
 }
 
 func (baol *BlockAppendOnlyLog) setSkiplistEntry(blockID uint64, key string, ptr *kvPointer) {
@@ -701,10 +711,10 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 			baol.minBlockID = blockID
 			baol.log.Info("Set minBlockID for first block", "minBlockID", baol.minBlockID)
 		}
-		
+
 		baol.latestBlockID = blockID
 		baol.updateRecentBlocks(blockID)
-		
+
 		// Save metadata after updating block range
 		if err := baol.saveIndexMeta(); err != nil {
 			baol.log.Error("Failed to save index metadata", "error", err)
@@ -725,11 +735,7 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 				baol.log.Error("Failed to decode entry while indexing new block", "blockID", blockID, "error", errRead)
 				return fmt.Errorf("failed to decode entry for skiplist indexing block %d: %w", blockID, errRead)
 			}
-			ptr := &kvPointer{
-				Offset:   entryPos,
-				ValueLen: uint32(len(entry.Value)),
-				BlockID:  entry.BlockID, // Store block ID for reference
-			}
+			ptr := buildKVPointerForSkiplist(entry.BlockID, entryPos, entry.Key, entry.Value)
 			baol.setSkiplistEntry(entry.BlockID, entry.Key, ptr)
 			entryPos += bytesReadThisEntry
 		}
@@ -837,8 +843,10 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		// For keys with embedded block numbers (Header, BlockBody, BlockReceipts)
 		if blockID > baol.latestBlockID {
 			return "", false, fmt.Errorf("Get: requested blockID %d > latestBlockID %d", blockID, baol.latestBlockID)
+			// return "", false, nil
+		} else if baol.latestBlockID-blockID > IgnoredThreshold {
+			return "", true, nil
 		}
-		
 		// Check if this block is in the skiplist
 		if baol.indexedBlocks != nil {
 			if _, isIndexed := baol.indexedBlocks[blockID]; isIndexed {
@@ -846,7 +854,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 				return "", false, nil
 			}
 		}
-		
+
 		// Block not in skiplist - read from disk via index
 		if mainEntry, okMain := baol.getBlockIndexEntry(blockID); okMain {
 			if val, found, err := baol.findKeyInOneBlock(baol.dataFile, mainEntry, key); err != nil {
@@ -882,6 +890,11 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 	}
 	baol.ensureWriteTrackingInitialized()
 
+	dataType := GetDataTypeFromKey([]byte(key))
+	blockID, _ := ParseBlockNumberFromKey([]byte(key), dataType)
+	if baol.latestBlockID > 0 && baol.latestBlockID-blockID > IgnoredThreshold {
+		return nil
+	}
 	// Determine next block ID
 	blockIDForDelete := baol.latestBlockID
 	if blockIDForDelete == 0 {
@@ -940,11 +953,7 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 	if _, isIndexed := baol.indexedBlocks[blockIDForDelete]; isIndexed {
 		baol.log.Debug("Indexing tombstone in skiplist", "blockID", blockIDForDelete, "key", key)
 		// Add tombstone to skiplist
-		ptr := &kvPointer{
-			Offset:   startOffset, // Offset of this specific logEntry (tombstone)
-			ValueLen: uint32(len(TombstoneMarker)),
-			BlockID:  blockIDForDelete, // Store block ID for reference
-		}
+		ptr := buildKVPointerForSkiplist(blockIDForDelete, startOffset, key, TombstoneMarker)
 		baol.setSkiplistEntry(blockIDForDelete, key, ptr)
 	}
 
@@ -1271,7 +1280,7 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		baol.minBlockID = newBlockID
 		baol.log.Info("Set minBlockID for first block", "minBlockID", baol.minBlockID)
 	}
-	
+
 	baol.latestBlockID = newBlockID
 
 	if err := baol.writeIndexEntry(baol.indexMapFile, indexEntry); err != nil {
@@ -1292,7 +1301,7 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		baol.log.Error("Failed to flush index map buffer after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to flush index map buffer for new block %d: %w", newBlockID, err)
 	}
-	
+
 	// Save metadata after successful append
 	if err := baol.saveIndexMeta(); err != nil {
 		baol.log.Error("Failed to save index metadata", "error", err)
@@ -1314,11 +1323,7 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 				// Data is persisted, but skiplist might be inconsistent for this new block.
 				return 0, fmt.Errorf("failed to decode entry for skiplist indexing new block %d: %w", newBlockID, readErr)
 			}
-			ptr := &kvPointer{
-				Offset:   entryPos,
-				ValueLen: uint32(len(entry.Value)),
-				BlockID:  newBlockID, // Store block ID for reference
-			}
+			ptr := buildKVPointerForSkiplist(entry.BlockID, entryPos, entry.Key, entry.Value)
 			baol.setSkiplistEntry(entry.BlockID, entry.Key, ptr)
 			entryPos += bytesRead
 		}
@@ -1347,6 +1352,10 @@ func (baol *BlockAppendOnlyLog) isLogEmptyInitial() bool {
 // Assumes aol.mu is RLocked by the caller if called during skiplist iteration.
 // Reading from aol.dataFile with ReadAt is safe concurrently.
 func (baol *BlockAppendOnlyLog) readValueBytesFromPointer(pointer *kvPointer) ([]byte, error) {
+	if pointer.HasInlineValue {
+		return pointer.InlineValue, nil
+	}
+
 	// logEntry format on disk: blockID (uint64) | keyLen (uint32) | valueLen (uint32) | key (bytes) | value (bytes)
 	// pointer.Offset points to the start of this logEntry.
 	// pointer.ValueLen is the length of the string form of the value (can be TombstoneMarker).
@@ -1559,7 +1568,7 @@ func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) e
 		binary.BigEndian.PutUint64(buf[0:blockIDSize], entry.BlockID)
 		binary.BigEndian.PutUint64(buf[blockIDSize:blockIDSize+offsetSize], uint64(entry.StartOffset))
 		binary.BigEndian.PutUint64(buf[blockIDSize+offsetSize:], uint64(entry.EndOffset))
-		
+
 		if entry.BlockID < minBlockID {
 			baol.log.Warn("Skipping index entry with blockID < minBlockID",
 				"blockID", entry.BlockID, "minBlockID", minBlockID)
@@ -1646,11 +1655,7 @@ func (baol *BlockAppendOnlyLog) readAndIndexBlockFrom(indexEntry blockIndexEntry
 		}
 		currentPos += bytesRead
 
-		ptr := &kvPointer{
-			Offset:   entryOffset,
-			ValueLen: uint32(len(entry.Value)),
-			BlockID:  entry.BlockID,
-		}
+		ptr := buildKVPointerForSkiplist(entry.BlockID, entryOffset, entry.Key, entry.Value)
 		// Insert into skiplist
 		baol.setSkiplistEntry(entry.BlockID, entry.Key, ptr)
 	}

@@ -93,7 +93,7 @@ while [ -d "/proc/$MAIN_PID" ]; do
     echo "$DATA_LINE" >> "$LOGFILE"
     
     # 可选：在屏幕上实时打印缩略信息
-    echo "[$(date +%T)] CPU: $CPU_USAGE% | RSS: ${RSS}KB | IO Read: ${IO_READ_KB}KB"
+    # echo "[$(date +%T)] CPU: $CPU_USAGE% | RSS: ${RSS}KB | IO Read: ${IO_READ_KB}KB"
 done
 
 echo -e "\n进程已结束。监控日志已保存至: $LOGFILE"

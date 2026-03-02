@@ -42,7 +42,7 @@ const (
 
 const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
 
-const chunkNormalizationThreshold uint64 = 64 // chunk files over this size have been appended
+const chunkNormalizationThreshold uint64 = 16 * 1024 // chunk files over this size have been appended
 
 const ()
 
@@ -200,6 +200,10 @@ type PrefixDB struct {
 
 	// storageBatcher enables BatchPut/BatchCommit for storage-only kvs.
 	storageBatch *storageBatcher
+	// ParentKeyResolver, when set, is used to resolve a parent account key from
+	// a storage key. It is intended to be set by the owning `ethstore.Database`
+	// so that PrefixDB can defer resolution to the higher-level store.
+	ParentKeyResolver func([]byte) []byte
 	// for debug
 	totalOps   uint64
 	cachedOps  uint64
@@ -434,26 +438,24 @@ func (db *PrefixDB) Put(key, value, accountKey []byte) error {
 			// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", entry.StorageInfo.storageFileID) + ", offset:" + fmt.Sprintf("%d", entry.StorageInfo.storageOffset) + ", size:" + fmt.Sprintf("%d", entry.StorageInfo.storageSize))
 
 		} else {
-			node, err := db.getAccountNode(key)
-			if err != nil {
-				return err
+			// node, err := db.getAccountNode(key)
+			// if err != nil {
+			// 	return err
+			// }
+			stroageInfo = StorageInfo{
+				storageFileID: 0,
+				storageOffset: 0,
+				storageSize:   0,
 			}
-			if node != nil {
-				stroageInfo = StorageInfo{
-					storageFileID: node.storageFileID,
-					storageOffset: node.storageOffset,
-					storageSize:   node.storageSize,
-				}
-				db.nodeCache.Put(NodeCacheEntry{
-					Key:           cacheKey,
-					Value:         value,
-					AccountOffset: node.offset,
-					StorageInfo:   stroageInfo,
-				})
+			db.nodeCache.Put(NodeCacheEntry{
+				Key:           cacheKey,
+				Value:         value,
+				AccountOffset: 0,
+				StorageInfo:   stroageInfo,
+			})
+			// cacheKeyHex := hex.EncodeToString([]byte(cacheKey))
+			// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))
 
-				// cacheKeyHex := hex.EncodeToString([]byte(cacheKey))
-				// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))
-			}
 		}
 		if db.batch != nil {
 			db.batch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
@@ -663,7 +665,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{})
 		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(stringToBytes(buf.accountKey), StorageInfo{})
+			_ = db.batch.updateStoragePointer(buf.accountKey, StorageInfo{})
 		}
 	} else {
 		fileID, off, sz, err := db.persistStorageEntries(buf.storagekvs, existingFileID, existingOffset, existingSize)
@@ -683,7 +685,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", fileID) + ", offset:" + fmt.Sprintf("%d", off) + ", size:" + fmt.Sprintf("%d", sz))
 
 		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(stringToBytes(buf.accountKey), StorageInfo{
+			_ = db.batch.updateStoragePointer(buf.accountKey, StorageInfo{
 				storageFileID: fileID,
 				storageOffset: off,
 				storageSize:   sz,
@@ -1289,7 +1291,7 @@ func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
 func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 	cacheKey := string(key)
 	if entry, ok := db.nodeCache.Get(cacheKey); ok {
-		if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
+		if entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
 			return &TrieNode{
 				storageFileID: entry.StorageInfo.storageFileID,
 				storageOffset: entry.StorageInfo.storageOffset,
@@ -1862,7 +1864,7 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, me
 	if len(merged) == 0 {
 		return nil, true, nil
 	}
-	chunks := splitEntriesBySize(merged, db.segmentedChunkHardLimit)
+	chunks := splitEntriesBySize(merged, db.segmentedChunkTargetSize())
 	result := make([]segmentChunkMeta, 0, len(chunks))
 	var chunkSize int
 	for idx, chunk := range chunks {
@@ -1971,6 +1973,23 @@ func payloadSize(entries []kvPair) int64 {
 		total += int64(6 + len(kv.key) + len(kv.val))
 	}
 	return total
+}
+
+func (db *PrefixDB) segmentedChunkTargetSize() int {
+	if db != nil && db.storageChunkSize > 0 {
+		return db.storageChunkSize
+	}
+	if db != nil && db.segmentedChunkHardLimit > 0 {
+		return db.segmentedChunkHardLimit
+	}
+	return 16 * 1024
+}
+
+func (db *PrefixDB) segmentedChunkTriggerSize() int {
+	if db != nil && db.segmentedChunkHardLimit > 0 {
+		return db.segmentedChunkHardLimit
+	}
+	return db.segmentedChunkTargetSize()
 }
 
 func (db *PrefixDB) writeChunkFile(folderPath, fileName string, entries []kvPair) (int, error) {
@@ -3575,7 +3594,7 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 		release()
 		return
 	}
-	if db.storageGCQueue == nil || meta.ChunkSize <= uint64(db.segmentedChunkHardLimit) {
+	if db.storageGCQueue == nil || meta.ChunkSize <= uint64(db.segmentedChunkTriggerSize()) {
 		release()
 		return
 	}
@@ -3832,6 +3851,111 @@ func (db *PrefixDB) UpgradeSegmentIndexFiles() error {
 		db.invalidateSegmentIndexCache(folderID)
 		db.segmentedMu.Unlock()
 	}
+	return nil
+}
+
+// GCAllStorageChunkFiles runs a full sweep GC for all segmented storage chunk files.
+// It rewrites every chunk file with deduplication and splits by target chunk size,
+// then updates index metadata for each segmented folder.
+func (db *PrefixDB) GCAllStorageChunkFiles() error {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+	fmt.Println("start GC for all segmented storage chunk files")
+
+	entries, err := os.ReadDir(db.storageDir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		var folderID uint32
+		if _, err := fmt.Sscanf(entry.Name(), segmentedDirNamePrefix+"%08d", &folderID); err != nil {
+			continue
+		}
+
+		db.segmentedMu.Lock()
+
+		metas, err := db.readSegmentIndexNoCache(folderID)
+		if err != nil {
+			db.segmentedMu.Unlock()
+			return err
+		}
+		if len(metas) == 0 {
+			db.segmentedMu.Unlock()
+			continue
+		}
+
+		folderPath := db.segmentedFolderPath(folderID)
+		allEntries := make([]kvPair, 0)
+		for _, meta := range metas {
+			entries, backing, err := db.readSegmentChunkFile(folderID, meta.FileName)
+			if err != nil {
+				db.segmentedMu.Unlock()
+				return err
+			}
+			for _, entry := range entries {
+				keyCopy := append([]byte(nil), entry.key...)
+				var valCopy []byte
+				if entry.val != nil {
+					valCopy = append([]byte(nil), entry.val...)
+				}
+				allEntries = append(allEntries, kvPair{key: keyCopy, val: valCopy})
+			}
+			if backing != nil {
+				backing.Release()
+			}
+		}
+
+		if len(allEntries) > 1 {
+			sortKVPairs(allEntries)
+			allEntries = dedupSortedKVPairs(allEntries)
+		}
+
+		updated := make([]segmentChunkMeta, 0, len(metas))
+		keep := make(map[string]struct{})
+		if len(allEntries) > 0 {
+			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
+			for i, chunk := range chunks {
+				fileName := fmt.Sprintf("chunk_%04d.dat", i)
+				chunkSize, err := db.writeChunkFile(folderPath, fileName, chunk)
+				if err != nil {
+					db.segmentedMu.Unlock()
+					return err
+				}
+				updated = append(updated, segmentChunkMeta{
+					FileName:  fileName,
+					KeyStart:  cloneBytes(chunk[0].key),
+					KeyEnd:    cloneBytes(chunk[len(chunk)-1].key),
+					KVCount:   uint32(len(chunk)),
+					ChunkSize: uint64(chunkSize),
+				})
+				keep[fileName] = struct{}{}
+			}
+		}
+
+		for _, meta := range metas {
+			if _, ok := keep[meta.FileName]; ok {
+				continue
+			}
+			fullPath := filepath.Join(folderPath, meta.FileName)
+			if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				db.segmentedMu.Unlock()
+				return err
+			}
+		}
+
+		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+			db.segmentedMu.Unlock()
+			return err
+		}
+		db.invalidateSegmentIndexCache(folderID)
+		db.segmentedMu.Unlock()
+	}
+	fmt.Println("Completed GC for all segmented storage chunk files")
 	return nil
 }
 

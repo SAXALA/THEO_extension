@@ -57,6 +57,9 @@ func (b *errorBatch) Put(key []byte, value []byte) error { return b.err }
 // Delete implements ethdb.Batch and returns the predefined error.
 func (b *errorBatch) Delete(key []byte) error { return b.err }
 
+// DeleteRange implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) DeleteRange(start []byte, end []byte) error { return b.err }
+
 // ValueSize implements ethdb.Batch and returns 0.
 func (b *errorBatch) ValueSize() int { return 0 }
 
@@ -168,6 +171,15 @@ func New(dirPath string, recentN int, namespace string, readonly bool, chunkFile
 		quitChan:            make(chan chan error, 1),
 		statepdb:            statePrefixdb,
 		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
+	}
+	// Let PrefixDB resolve parent account keys from full storage keys.
+	// PrefixDB passes the original storage key ('O' + 32-byte account hash + slot),
+	// while Database.GetParentAccountKey expects only the 32-byte account hash.
+	statePrefixdb.ParentKeyResolver = func(storageKey []byte) []byte {
+		if len(storageKey) < 33 {
+			return nil
+		}
+		return db.GetParentAccountKey(storageKey[1:33])
 	}
 	// Initialize BlockAppendOnlyLog
 	baol, err := NewBlockAppendOnlyLog(dirPath+"_aol", recentN, logger)
@@ -462,9 +474,6 @@ func (d *Database) Put(key []byte, value []byte) error {
 }
 
 func (d *Database) BatchPut(key []byte, value []byte) error {
-	if key[0] != 'O' {
-		return nil
-	}
 	dataType := GetDataTypeFromKey(key)
 	if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
@@ -472,12 +481,10 @@ func (d *Database) BatchPut(key []byte, value []byte) error {
 		}
 		// Store in PrefixDB
 		if dataType == TrieNodeStorageDataType {
-			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
-			if d.accountKey == nil {
-				return fmt.Errorf("failed to derive account key for batch put of key %x (type %s)", key, DataTypeStrings[dataType])
-			}
+			// Defer parent account key resolution until BatchCommit to avoid repeated lookups.
 		}
-		err := d.statepdb.BatchPut(key, value, d.accountKey)
+		// Pass nil accountKey to let PrefixDB record unresolved entries.
+		err := d.statepdb.BatchPut(key, value, nil)
 
 		if err != nil {
 			return fmt.Errorf("failed to batch put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
@@ -912,6 +919,18 @@ func (d *Database) GetParentAccountKey(key []byte) []byte {
 		d.accountHashKeyCache.Put(key, val)
 	}
 	return val
+}
+
+func (d *Database) GCPrefixTreeStorage() error {
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot perform GC on prefix tree storage")
+	}
+	err := d.statepdb.GCAllStorageChunkFiles()
+	if err != nil {
+		return fmt.Errorf("failed to perform GC on prefix tree storage: %w", err)
+	}
+	d.log.Trace("Performed GC on prefix tree storage")
+	return nil
 }
 
 func (d *Database) InsertAccountHashPebble(key []byte, accounthash []byte) error {
