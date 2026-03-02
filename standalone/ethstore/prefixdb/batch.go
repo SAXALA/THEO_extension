@@ -251,11 +251,11 @@ func (wb *WriteBatch) get(key []byte) ([]byte, StorageInfo, bool) {
 	}, exists
 }
 
-func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo StorageInfo) error {
+func (wb *WriteBatch) updateStoragePointer(key string, cacheInfo StorageInfo) error {
 	wb.lock.Lock()
 	defer wb.lock.Unlock()
 
-	op, exists := wb.operations[string(key)]
+	op, exists := wb.operations[key]
 	if !exists || op.value == nil {
 		return errors.New("key not found in batch or marked for deletion")
 	}
@@ -263,7 +263,7 @@ func (wb *WriteBatch) updateStoragePointer(key []byte, cacheInfo StorageInfo) er
 	op.storageFileID = cacheInfo.storageFileID
 	op.storageOffset = cacheInfo.storageOffset
 	op.storageSize = cacheInfo.storageSize
-	wb.operations[string(key)] = op
+	wb.operations[key] = op
 	return nil
 }
 

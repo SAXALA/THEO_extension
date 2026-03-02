@@ -93,7 +93,6 @@ func (nc *NodeCache) StoreMetadata(key string, accountOffset int64, storageInfo 
 		rec := raw.(*nodeCacheRecord)
 		rec.accountOffset = accountOffset
 		rec.storageInfo = storageInfo
-		nc.cache.Add(key, rec)
 		return
 	}
 	nc.cache.Add(key, &nodeCacheRecord{
@@ -112,7 +111,6 @@ func (nc *NodeCache) UpdateValue(key string, value []byte) {
 	if raw, ok := nc.cache.Get(key); ok {
 		rec := raw.(*nodeCacheRecord)
 		rec.value = cloneBytes(value)
-		nc.cache.Add(key, rec)
 	}
 }
 
@@ -125,7 +123,6 @@ func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64) {
 	if raw, ok := nc.cache.Get(key); ok {
 		rec := raw.(*nodeCacheRecord)
 		rec.accountOffset = accountOffset
-		nc.cache.Add(key, rec)
 	}
 }
 
@@ -139,7 +136,6 @@ func (nc *NodeCache) UpdateStoragePointer(key string, storageInfo StorageInfo) {
 	if raw, ok := nc.cache.Get(key); ok {
 		rec := raw.(*nodeCacheRecord)
 		rec.storageInfo = storageInfo
-		nc.cache.Add(key, rec)
 	}
 }
 

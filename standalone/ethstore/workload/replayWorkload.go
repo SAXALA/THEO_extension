@@ -45,6 +45,15 @@ const (
 	opGetBatchValueSize
 )
 
+type DBType int
+
+const (
+	AOL DBType = iota
+	PrefixDB
+	Pebble
+	allDBTypes
+)
+
 var opTypeNames = map[opType]string{
 	opGet:               "Get",
 	opHas:               "Has",
@@ -187,11 +196,11 @@ func dataTypeName(dt ethstore.DataType) string {
 	return fmt.Sprintf("DataType(%d)", dt)
 }
 
-func reportLatencyStats(stats map[ethstore.DataType]map[opType]*latencyHistogram) {
+func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 	if len(stats) == 0 {
 		return
 	}
-	dataTypes := make([]ethstore.DataType, 0, len(stats))
+	dataTypes := make([]string, 0, len(stats))
 	for dt := range stats {
 		dataTypes = append(dataTypes, dt)
 	}
@@ -220,7 +229,7 @@ func reportLatencyStats(stats map[ethstore.DataType]map[opType]*latencyHistogram
 				throughputK = float64(hist.totalCount) / totalSec / 1000.0
 			}
 			fmt.Printf("\n[Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
-				dataTypeName(dt),
+				dt,
 				opTypeName(op),
 				hist.totalCount,
 				throughputK,
@@ -260,11 +269,12 @@ func reportHistogramSummary(label string, hist *latencyHistogram) {
 }
 
 type replayConfig struct {
-	DatabaseDir       string `json:"databaseDir"`
-	LoadDataDir       string `json:"loadDataDir"`
-	BaselinePebbleDir string `json:"baselinePebbleDir"`
-	TraceFile         string `json:"traceFile"`
-	TraceFileNocache  string `json:"traceFileNocache"`
+	DatabaseDir          string `json:"databaseDir"`
+	LoadDataDir          string `json:"loadDataDir"`
+	BaselinePebbleDir    string `json:"baselinePebbleDir"`
+	TraceFile            string `json:"traceFile"`
+	TraceFileNocache     string `json:"traceFileNocache"`
+	TraceFileNoCacheSnap string `json:"traceFileNoCacheSnap"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -288,19 +298,50 @@ func main() {
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
 	ldCacheSize := flag.Int("ld-cache-size", 0, "Cache size for ld mode")
-
+	DBTypeStr := flag.String("db-type", "allDBtypes", "Database type for replay: prefixdb, pebble, or aol")
+	replayTraceFile := flag.String("trace-file", "Cache", "Path to trace file for recording")
 	flag.Parse()
+
+	cfg, err := loadReplayConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config %s: %v", *configPath, err)
+	}
+
+	dbType := allDBTypes
+	switch strings.ToLower(strings.TrimSpace(*DBTypeStr)) {
+	case "prefixdb":
+		*DBTypeStr = "prefixdb"
+		dbType = PrefixDB
+	case "pebble":
+		*DBTypeStr = "pebble"
+		dbType = Pebble
+	case "aol":
+		*DBTypeStr = "aol"
+		dbType = AOL
+	case "alldbtypes", "all_db_types", "all":
+		*DBTypeStr = "allDBTypes"
+		dbType = allDBTypes
+	default:
+		log.Fatalf("invalid -db-type %q (expected: prefixdb, pebble, aol, all)", *DBTypeStr)
+	}
+
+	var traceFile string
+	switch strings.ToLower(strings.TrimSpace(*replayTraceFile)) {
+	case "cache":
+		traceFile = cfg.TraceFile
+	case "nocache":
+		traceFile = cfg.TraceFileNocache
+	case "nocache_snap":
+		traceFile = cfg.TraceFileNoCacheSnap
+	default:
+		log.Fatalf("invalid -trace-file %q (expected: cache, nocache, nocache_snap)", *replayTraceFile)
+	}
 
 	go func() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 	// runtime.SetMutexProfileFraction(5)
-
-	cfg, err := loadReplayConfig(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to load config %s: %v", *configPath, err)
-	}
 
 	// TestPrefixGet()
 	// loadPebble()
@@ -315,10 +356,10 @@ func main() {
 	// time.Sleep(5 * time.Second)
 	// loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
 	// replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
-	// replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+	replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps, allDBTypes)
 	// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
 	// loadAol(cfg.DatabaseDir, notxFile)
-	// return
+	return
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
 
@@ -329,15 +370,15 @@ func main() {
 		// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
 		// loadAol(cfg.DatabaseDir, notxFile, txFile)
 	case "re":
-		replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+		replayTrace(cfg.DatabaseDir, traceFile, *maxOps, dbType)
 	case "ra":
-		replayTraceAccount(cfg.DatabaseDir, cfg.TraceFile)
+		replayTraceAccount(cfg.DatabaseDir, traceFile)
 	case "o":
-		otherRunner(cfg.TraceFile)
+		otherRunner(traceFile)
 	case "lb":
 		loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
 	case "rb":
-		replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
+		replaybaselineTrace(cfg.BaselinePebbleDir, traceFile, *maxOps, dbType)
 	default:
 		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
 	}
@@ -411,7 +452,7 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 	}
 }
 
-func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int64) {
+func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int64, dbType DBType) {
 	fmt.Printf("Replaying baseline trace from file %s using Pebble store at %s\n", traceFile, baselinePebbleDir)
 	dir := baselinePebbleDir
 	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
@@ -490,7 +531,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 
 	var dataType ethstore.DataType
 	var it ethdb.Iterator
-	var stats = make(map[ethstore.DataType]map[opType]*latencyHistogram)
+	var stats = make(map[string]map[opType]*latencyHistogram)
 	defer func() {
 		if it != nil {
 			it.Release()
@@ -592,6 +633,37 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 					continue
 				}
 			}
+		}
+
+		counter++
+		if counter%10000 == 0 {
+			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds()
+			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		// throughput
+		if maxOps > 0 && counter >= maxOps {
+			if !stopAtNextBlockEnd {
+				stopAtNextBlockEnd = true
+				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
+				fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
+			}
+		}
+
+		switch dbType {
+		case AOL:
+			if !ethstore.AolHandledDataTypes[dataType] {
+				continue
+			}
+		case PrefixDB:
+			if !ethstore.PrefixDBHandledDataTypes[dataType] {
+				continue
+			}
+		case Pebble:
+			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
+				continue
+			}
+		case allDBTypes:
+		default:
 		}
 
 		var op opType
@@ -698,10 +770,21 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		elapsed := end.Sub(start)
 		totalTime += elapsed
 
-		if opErr != nil {
-			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+		var kvTypeStr string
+		if ethstore.AolHandledDataTypes[dataType] {
+			kvTypeStr = "AOL"
+		} else if ethstore.PrefixDBHandledDataTypes[dataType] {
+			kvTypeStr = "PrefixDB"
+		} else {
+			kvTypeStr = "Pebble"
 		}
-		counter++
+
+		if opErr != nil {
+			if keyBytes[0] != 'o' && keyBytes[0] != 'a' {
+				fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+			}
+		}
+
 		// 在 switch 外部统一处理统计
 		if opErr == nil {
 			switch op {
@@ -714,25 +797,14 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 			}
 		}
 
-		if _, ok := stats[dataType]; !ok {
-			stats[dataType] = make(map[opType]*latencyHistogram)
+		if _, ok := stats[kvTypeStr]; !ok {
+			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
 		}
-		if _, ok := stats[dataType][op]; !ok {
-			stats[dataType][op] = newLatencyHistogram()
+		if _, ok := stats[kvTypeStr][op]; !ok {
+			stats[kvTypeStr][op] = newLatencyHistogram()
 		}
-		stats[dataType][op].observe(elapsed)
-		if counter%10000 == 0 {
-			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
-			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-		}
-		// throughput
-		if maxOps > 0 && counter >= maxOps {
-			if !stopAtNextBlockEnd {
-				stopAtNextBlockEnd = true
-				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
-				fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
-			}
-		}
+		stats[kvTypeStr][op].observe(elapsed)
+
 	}
 	if err := commitBlock(); err != nil {
 		fmt.Printf("Final batch commit failed: %v\n", err)
@@ -1387,13 +1459,15 @@ func TestGetParentKey() {
 	}
 }
 
-func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
+func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType DBType) {
 	tempDir := dataBaseDir
 	store, err := ethstore.New(tempDir, 6000, "put_test", false, 16*1024, 12*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
+
+	// store.GCPrefixTreeStorage()
 
 	// dbPath := "/mnt/ssd2/pebble"
 
@@ -1424,7 +1498,7 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 	var counter int64
 	var linecount int64
 	reader := bufio.NewReader(file)
-	stats := make(map[ethstore.DataType]map[opType]*latencyHistogram)
+	stats := make(map[string]map[opType]*latencyHistogram)
 
 	var nextBatchRequested bool
 	var nextBatchSize int
@@ -1607,8 +1681,38 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
 		}
 
-		testKeyHex := "4f1ff0800a6e13bdcaff61b95238167ef377e01ba97f832b3f9c149aad1d9f6a2109050103040e"
-		testKey, _ := hex.DecodeString(testKeyHex)
+		counter++
+		if counter%10000 == 0 {
+			fmt.Printf("\rProcessed %d operations, total time: %f s, blockCommits=%d, dirty(prefixdb=%v, pebble=%v)",
+				counter, totalTime.Seconds(), blockCommitCounter, prefixdbDirty, pebbleBatch != nil)
+		}
+
+		if maxOps > 0 && counter >= maxOps {
+			if !stopAtNextBlockEnd {
+				stopAtNextBlockEnd = true
+				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
+			}
+		}
+
+		switch dbType {
+		case AOL:
+			if !ethstore.AolHandledDataTypes[dataType] {
+				continue
+			}
+		case PrefixDB:
+			if !ethstore.PrefixDBHandledDataTypes[dataType] {
+				continue
+			}
+		case Pebble:
+			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
+				continue
+			}
+		case allDBTypes:
+		default:
+		}
+
+		// testKeyHex := "4f4e881af4e10baec755ed1eff3857514735d4e6e34f188bd6afdc48f4b70933830e040c"
+		// testKey, _ := hex.DecodeString(testKeyHex)
 		// val, err := store.Get(testKey)
 		// if err != nil {
 		// 	fmt.Printf("Error getting test key %s: %v\n", testKeyHex, err)
@@ -1652,14 +1756,16 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 			continue
 		}
 
+		if op == opBatchPut {
+			if ethstore.AolHandledDataTypes[dataType] || (len(keyBytes) > 0 && keyBytes[0] == 'A') {
+				op = opPut
+			}
+		}
 		// 执行操作并计时
 		start := time.Now()
 		var opErr error
 		switch op {
 		case opGet:
-			if bytes.Equal(keyBytes, testKey) {
-				fmt.Printf("Performing Get operation for test key %s\n", testKeyHex)
-			}
 			_, opErr = store.Get(keyBytes)
 		case opHas:
 			_, opErr = store.Has(keyBytes)
@@ -1684,7 +1790,7 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 			if len(keyBytes) == 0 {
 				break
 			}
-			if keyBytes[0] == 'O' || keyBytes[0] == 'o' {
+			if keyBytes[0] == 'O' {
 				// NOTE: There is no PrefixDB batch-delete API here; keep existing behavior.
 				opErr = store.Delete(keyBytes)
 			} else {
@@ -1730,36 +1836,36 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 		end := time.Now()
 		elapsed := end.Sub(start)
 		totalTime += elapsed
-		if _, ok := stats[dataType]; !ok {
-			stats[dataType] = make(map[opType]*latencyHistogram)
+
+		var kvTypeStr string
+		if ethstore.AolHandledDataTypes[dataType] {
+			kvTypeStr = "AOL"
+		} else if ethstore.PrefixDBHandledDataTypes[dataType] {
+			kvTypeStr = "PrefixDB"
+		} else {
+			kvTypeStr = "Pebble"
 		}
-		if _, ok := stats[dataType][op]; !ok {
-			stats[dataType][op] = newLatencyHistogram()
+
+		if _, ok := stats[kvTypeStr]; !ok {
+			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
 		}
-		stats[dataType][op].observe(elapsed)
+		if _, ok := stats[kvTypeStr][op]; !ok {
+			stats[kvTypeStr][op] = newLatencyHistogram()
+		}
+		stats[kvTypeStr][op].observe(elapsed)
 		if opErr != nil {
 			//fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
-			fmt.Printf("linecount: %d Operation %s failed for key %s: %v\n", linecount, opTypeStr, keyHex, opErr)
-		}
-		counter++
-		if counter%10000 == 0 {
-			fmt.Printf("\rProcessed %d operations, total time: %f s, blockCommits=%d, dirty(prefixdb=%v, pebble=%v)",
-				counter, totalTime.Seconds(), blockCommitCounter, prefixdbDirty, pebbleBatch != nil)
-		}
-
-		if maxOps > 0 && counter >= maxOps {
-			if !stopAtNextBlockEnd {
-				stopAtNextBlockEnd = true
-				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
+			if keyBytes[0] != 'o' && keyBytes[0] != 'a' {
+				fmt.Printf("linecount: %d Operation %s failed for key %s: %v\n", linecount, opTypeStr, keyHex, opErr)
 			}
 		}
-
 	}
 	if err := commitBlock(); err != nil {
 		fmt.Printf("Final batch commit failed: %v\n", err)
 	}
 
-	fmt.Println("\nReplay completed. Reporting latency statistics...")
+	fmt.Printf("\nFinished replaying trace file '%s'. Total operations: %d, total time: %f s\n", traceFileDir, counter, totalTime.Seconds())
+	fmt.Println("\nReporting latency statistics...")
 	reportLatencyStats(stats)
 	reportHistogramSummary("replayTrace commit (PrefixdbBatchCommit)", prefixdbCommitHist)
 	reportHistogramSummary("replayTrace commit (pebble Batch.Write)", pebbleCommitHist)
@@ -2248,7 +2354,7 @@ func recordTraceBlock(traceFileDir string) {
 
 func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 	tempDir := dataBaseDir + "_state"
-	store, err := prefixdb.NewPrefixDB(tempDir, 64*1024, 3538944)
+	store, err := prefixdb.NewPrefixDB(tempDir, 16*1024, 12*1024*1024)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -2279,13 +2385,17 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 	counter := 0
 	reader := bufio.NewReader(file)
 
+	commitBlock := func() error {
+		store.BatchCommit()
+		return nil
+	}
 	var memStats runtime.MemStats
 
-	var oldop string
-	var oldPre string
+	// var oldop string
+	// var oldPre string
 	var lineCount int64
 	// store.GCPrefixTree()
-	// store.UpgradeSegmentIndexFiles()
+	// store.GCAllStorageChunkFiles()
 	// return
 	fmt.Println("start replay")
 	for {
@@ -2319,6 +2429,14 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 			continue
 		}
 
+		// Block boundary marker: commit all pending batches when a block ends.
+		if strings.Contains(line, "Processing block (end), ID:") {
+			if err := commitBlock(); err != nil {
+				fmt.Printf("Batch commit on block end failed at trace line %d: %v\n", lineCount, err)
+			}
+			continue
+		}
+
 		matches := opRegex.FindStringSubmatch(line)
 		if len(matches) == 0 {
 			// 无法解析的行，跳过
@@ -2343,21 +2461,15 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 				// 无效的键，跳过
 				continue
 			}
-			if len(keyHex) > 1 {
-				oldPre = keyHex[0:2]
-			} else {
-				oldPre = ""
-			}
-
 			if len(keyHex) > 0 && (keyBytes[0] == 'O' || keyBytes[0] == 'A') {
 			} else {
 				continue
 			}
 		}
 
-		if (oldPre != "4f" && opTypeStr == "BatchPutCommit") || opTypeStr == "NewBatch" || (oldPre == "4f" && oldop == "Get" && opTypeStr == "BatchPutCommit") {
-			continue
-		}
+		// if (oldPre != "4f" && opTypeStr == "BatchPutCommit") || opTypeStr == "NewBatch" || (oldPre == "4f" && oldop == "Get" && opTypeStr == "BatchPutCommit") {
+		// 	continue
+		// }
 
 		// 检查是否有值部分
 		// var valueHex string
@@ -2369,21 +2481,21 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 		// keyBytes[0] == 'o' storagesnapshotkvs
 		// keyBytes[0] == 'c' codekvs
 
-		if oldop != opTypeStr {
-			if oldop == "Get" && opTypeStr != "Get" {
-				fmt.Println("op changed to "+"Put"+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
-			} else if oldop != "Get" && opTypeStr == "Get" {
-				err := store.BatchCommit()
-				if err != nil {
-					fmt.Printf("BatchCommit failed: %v\n", err)
-				} else {
-					fmt.Printf("BatchCommit success at line %d, total time: %f s\n", lineCount, totalTime.Seconds())
-				}
-				fmt.Println("op changed to "+opTypeStr+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
-			}
-			oldop = opTypeStr
+		// if oldop != opTypeStr {
+		// 	if oldop == "Get" && opTypeStr != "Get" {
+		// 		fmt.Println("op changed to "+"Put"+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
+		// 	} else if oldop != "Get" && opTypeStr == "Get" {
+		// 		err := store.BatchCommit()
+		// 		if err != nil {
+		// 			fmt.Printf("BatchCommit failed: %v\n", err)
+		// 		} else {
+		// 			fmt.Printf("BatchCommit success at line %d, total time: %f s\n", lineCount, totalTime.Seconds())
+		// 		}
+		// 		fmt.Println("op changed to "+opTypeStr+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
+		// 	}
+		// 	oldop = opTypeStr
 
-		}
+		// }
 
 		var accountKey []byte
 		if len(keyBytes) > 0 && keyBytes[0] == 'O' {
@@ -2418,17 +2530,17 @@ func replayTraceAccount(dataBaseDir string, traceFileDir string) {
 		// 	continue
 		// }
 		// Perform the operation
-		// testKeyhex := "4f8679e8eda65bd257638cf8cf09b8238888947cc3c0bea2aa2cc3f1c4ac7a30020d06"
-		// testKeyBytes, _ := hex.DecodeString(testKeyhex)
-		// testAccountKey := store.GetParentAccountKey(testKeyBytes)
-		// val, yes, err := store.Get(testKeyBytes, testAccountKey)
-		// if err != nil {
-		// 	fmt.Printf("Test Get operation failed for key %s: %v\n", testKeyhex, err)
-		// } else if !yes {
-		// 	fmt.Printf("Test Get operation: key %s not found\n", testKeyhex)
-		// } else {
-		// 	fmt.Printf("Test Get operation succeeded for key %s, value: %x\n", testKeyhex, val)
-		// }
+		testKeyhex := "4105020b03010e000d"
+		testKeyBytes, _ := hex.DecodeString(testKeyhex)
+		testAccountKey := store.GetParentAccountKey(testKeyBytes)
+		val, yes, err := store.Get(testKeyBytes, testAccountKey)
+		if err != nil {
+			fmt.Printf("Test Get operation failed for key %s: %v\n", testKeyhex, err)
+		} else if !yes {
+			fmt.Printf("Test Get operation: key %s not found\n", testKeyhex)
+		} else {
+			fmt.Printf("Test Get operation succeeded for key %s, value: %x\n", testKeyhex, val)
+		}
 
 		startTime := time.Now()
 		var opErr error

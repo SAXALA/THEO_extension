@@ -2,6 +2,7 @@ package prefixdb
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -10,22 +11,28 @@ import (
 type storageBatcher struct {
 	mu      sync.Mutex
 	pending map[string]map[string][]byte
+	// unresolved stores original full keys (string) -> value for entries
+	// where the accountKey was not provided at BatchPut time.
+	unresolved map[string][]byte
 }
 
 func newStorageBatcher() *storageBatcher {
 	return &storageBatcher{
-		pending: make(map[string]map[string][]byte),
+		pending:    make(map[string]map[string][]byte),
+		unresolved: make(map[string][]byte),
 	}
 }
 
 func (sb *storageBatcher) reset() {
 	sb.mu.Lock()
 	sb.pending = make(map[string]map[string][]byte)
+	sb.unresolved = make(map[string][]byte)
 	sb.mu.Unlock()
 }
 
 func (sb *storageBatcher) put(accountKey string, storageKey, value []byte) {
 	if accountKey == "" {
+		// Should not drop unresolved here; caller should use putUnresolved when accountKey is unknown.
 		return
 	}
 	sb.mu.Lock()
@@ -46,6 +53,22 @@ func (sb *storageBatcher) put(accountKey string, storageKey, value []byte) {
 	sb.mu.Unlock()
 }
 
+func (sb *storageBatcher) putUnresolved(originalKey string, value []byte) {
+	if originalKey == "" {
+		return
+	}
+	sb.mu.Lock()
+	if value == nil {
+		sb.unresolved[originalKey] = nil
+		sb.mu.Unlock()
+		return
+	}
+	valCopy := make([]byte, len(value))
+	copy(valCopy, value)
+	sb.unresolved[originalKey] = valCopy
+	sb.mu.Unlock()
+}
+
 func (sb *storageBatcher) get(accountKey string, storageKey []byte) ([]byte, bool) {
 	if accountKey == "" {
 		return nil, false
@@ -63,16 +86,22 @@ func (sb *storageBatcher) get(accountKey string, storageKey []byte) ([]byte, boo
 }
 
 // drain transfers ownership of all pending storage kvs to the caller.
-func (sb *storageBatcher) drain() map[string]map[string][]byte {
+// drain transfers ownership of all pending storage kvs to the caller.
+// Returns both the per-account pending map and the unresolved original-key map.
+func (sb *storageBatcher) drain() (map[string]map[string][]byte, map[string][]byte) {
 	sb.mu.Lock()
-	if len(sb.pending) == 0 {
+	emptyPending := len(sb.pending) == 0
+	emptyUnresolved := len(sb.unresolved) == 0
+	if emptyPending && emptyUnresolved {
 		sb.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	batch := sb.pending
+	unresolved := sb.unresolved
 	sb.pending = make(map[string]map[string][]byte)
+	sb.unresolved = make(map[string][]byte)
 	sb.mu.Unlock()
-	return batch
+	return batch, unresolved
 }
 
 func (db *PrefixDB) initStorageBatcher() {
@@ -101,12 +130,14 @@ func (db *PrefixDB) BatchPut(key, value, accountKey []byte) error {
 	if keyType != TrieStorage {
 		return errors.New("BatchPut only accepts storage keys")
 	}
-	if len(accountKey) == 0 {
-		return errors.New("account key is required for BatchPut")
-	}
 	storageKey, err := db.normalizeStorageKey(key, keyType)
 	if err != nil {
 		return err
+	}
+	if len(accountKey) == 0 {
+		// Defer resolution of the parent account key until BatchCommit.
+		db.storageBatch.putUnresolved(string(key), value)
+		return nil
 	}
 	if db.storageCache != nil {
 		db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
@@ -120,14 +151,58 @@ func (db *PrefixDB) BatchCommit() error {
 	if db.storageBatch == nil {
 		return nil
 	}
-	batch := db.storageBatch.drain()
-	if len(batch) == 0 {
+	batch, unresolved := db.storageBatch.drain()
+	if len(batch) == 0 && len(unresolved) == 0 {
 		return nil
+	}
+	if batch == nil {
+		batch = make(map[string]map[string][]byte)
 	}
 
 	// Hold the write lock across the commit to serialize with regular Put/Delete.
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
+
+	// Merge unresolved entries by resolving their parent account keys now.
+	if len(unresolved) > 0 {
+		for origKeyStr, v := range unresolved {
+			origKeyBytes := []byte(origKeyStr)
+			// Derive parent account key using external resolver if provided
+			// (prefer ethstore.Database.GetParentAccountKey), otherwise use
+			// PrefixDB's local method.
+			var accountKey []byte
+			if db.ParentKeyResolver != nil {
+				accountKey = db.ParentKeyResolver(origKeyBytes)
+			}
+			// if accountKey == nil {
+			// 	accountKey = db.GetParentAccountKey(origKeyBytes)
+			// }
+			if accountKey == nil {
+				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
+				continue
+			}
+			storageKey, err := db.normalizeStorageKey(origKeyBytes, TrieStorage)
+			if err != nil {
+				return err
+			}
+			accStr := string(accountKey)
+			perAcc := batch[accStr]
+			if perAcc == nil {
+				perAcc = make(map[string][]byte)
+				batch[accStr] = perAcc
+			}
+			if v == nil {
+				perAcc[string(storageKey)] = nil
+			} else {
+				valCopy := make([]byte, len(v))
+				copy(valCopy, v)
+				perAcc[string(storageKey)] = valCopy
+			}
+			if db.storageCache != nil {
+				db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
+			}
+		}
+	}
 
 	accountKeys := make([]string, 0, len(batch))
 	for accountKey := range batch {
@@ -170,23 +245,24 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		existingSize   uint64
 	)
 
-	node, err := db.getNode([]byte(accountKey))
+	keyBytes := []byte(accountKey)
+	nodeInfo, found, err := db.prefixTree.Get(keyBytes)
 	if err != nil {
 		return err
 	}
-	if node != nil {
-		accOff = node.offset
-		existingFileID = node.storageFileID
-		existingOffset = node.storageOffset
-		existingSize = node.storageSize
+	if found {
+		accOff = nodeInfo.accountOffset
+		existingFileID = nodeInfo.storageFileID
+		existingOffset = nodeInfo.storageOffset
+		existingSize = nodeInfo.storageSize
 	}
 	if len(kvs) == 0 {
-		if err := db.prefixTree.Put([]byte(accountKey), accOff, 0, 0, 0); err != nil {
+		if err := db.prefixTree.Put(keyBytes, accOff, 0, 0, 0); err != nil {
 			return err
 		}
-		db.nodeCache.UpdateStoragePointer(accountKey, StorageInfo{})
+		db.nodeCache.StoreMetadata(accountKey, accOff, StorageInfo{})
 		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(stringToBytes(accountKey), StorageInfo{})
+			_ = db.batch.updateStoragePointer(accountKey, StorageInfo{})
 		}
 		db.invalidateStorageBuffer(accountKey)
 		return nil
@@ -196,22 +272,23 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 	if err != nil {
 		return err
 	}
-	if err := db.prefixTree.Put([]byte(accountKey), accOff, fileID, off, sz); err != nil {
-		return err
-	}
 	info := StorageInfo{
 		storageFileID: fileID,
 		storageOffset: off,
 		storageSize:   sz,
 	}
-	db.nodeCache.UpdateStoragePointer(accountKey, info)
+	db.nodeCache.Delete(accountKey)
+	// db.nodeCache.StoreMetadata(accountKey, accOff, info)
 	if db.batch != nil {
-		_ = db.batch.updateStoragePointer(stringToBytes(accountKey), info)
+		_ = db.batch.updateStoragePointer(accountKey, info)
+	}
+	if err := db.prefixTree.Put(keyBytes, accOff, fileID, off, sz); err != nil {
+		return err
 	}
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))
 	// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", info.storageFileID) + ", offset:" + fmt.Sprintf("%d", info.storageOffset) + ", size:" + fmt.Sprintf("%d", info.storageSize))
-	// db.invalidateStorageBuffer(accountKey)
+	db.invalidateStorageBuffer(accountKey)
 	return nil
 }
 

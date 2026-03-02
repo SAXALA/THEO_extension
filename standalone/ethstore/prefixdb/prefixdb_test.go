@@ -63,3 +63,28 @@ func sortSliceKVPairs(entries []kvPair) {
 		return bytes.Compare(entries[i].key, entries[j].key) < 0
 	})
 }
+
+func TestSegmentedChunkSizePolicy(t *testing.T) {
+	db := &PrefixDB{
+		storageChunkSize:        16 * 1024,
+		segmentedChunkHardLimit: 32 * 1024,
+	}
+
+	if got := db.segmentedChunkTargetSize(); got != 16*1024 {
+		t.Fatalf("target size mismatch: got %d, want %d", got, 16*1024)
+	}
+	if got := db.segmentedChunkTriggerSize(); got != 32*1024 {
+		t.Fatalf("trigger size mismatch: got %d, want %d", got, 32*1024)
+	}
+}
+
+func TestSegmentedChunkSizePolicyFallback(t *testing.T) {
+	db := &PrefixDB{}
+
+	if got := db.segmentedChunkTargetSize(); got <= 0 {
+		t.Fatalf("target size should be positive, got %d", got)
+	}
+	if got := db.segmentedChunkTriggerSize(); got <= 0 {
+		t.Fatalf("trigger size should be positive, got %d", got)
+	}
+}

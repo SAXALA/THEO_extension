@@ -458,4 +458,7 @@ type kvPointer struct {
 	Offset   int64 // Offset of the logEntry start
 	ValueLen uint32
 	BlockID  uint64 // The block ID this entry belongs to
+	// Header keys can store value inline to avoid extra file reads on Get.
+	InlineValue    []byte
+	HasInlineValue bool
 }
