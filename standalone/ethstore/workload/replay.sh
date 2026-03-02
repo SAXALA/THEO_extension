@@ -1,12 +1,16 @@
+#!/bin/bash
 date +%Y-%m-%d-%H-%M-%S
 chunk_file_size_4KB=4096
 chunk_file_size_16KB=16384
 chunk_file_size_64KB=65536
 chunk_file_size_256KB=262144
-cache_size_1MB=1048576
-cache_size_8MB=8388608
-cache_size_64MB=67108864
-cache_size_512MB=536870912
+WORKLOAD_BACKEND="${WORKLOAD_BACKEND:-ethstore}" # ethstore | chainkv | pebble
+WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-100000000}"
+CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
+CHAINKV_HANDLES="${CHAINKV_HANDLES:-128}"
+CHAINKV_STATE="${CHAINKV_STATE:-true}"
+CHAINKV_STATE_KEY_PREFIXES="${CHAINKV_STATE_KEY_PREFIXES:-}"
+CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
 log_date=$(date +%m-%d-%H-%M-%S)  # for log file name
 log_dir="./replayLog"
 if [ ! -d "$log_dir" ]; then
@@ -28,7 +32,6 @@ if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./re
     echo "构建 replayWorkload 失败，退出。"
     exit 1
 fi
-
 
 # # baseline replay 
 # # 1. recover from baseline data
@@ -59,44 +62,37 @@ fi
 # go run replayWorkload.go -mode ld -ld-db-type state -ld-chunk-file-size $chunk_file_size_256KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_stateDB_256KB_512MB_${log_date}.log 2>&1
 # go run replayWorkload.go -mode ld -ld-db-type snapshot -ld-chunk-file-size $chunk_file_size_256KB -ld-cache-size $cache_size_512MB > ./replayLog/loadAccount_snapshot_256KB_512MB_${log_date}.log 2>&1 
 
-# replay trace ethstore
-# 1. recover from bak data
-echo "Start rsync database files from DBbak to current database directory..."
-sudo rsync -avP /mnt/ssd2/ethstore/database/database_statedb16KB/prefixdb/ /mnt/ssd2/ethstore/database_state/prefixdb/
-sudo chmod -R 777 /mnt/ssd2/ethstore/database_state/prefixdb/
-sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_aol /mnt/ssd2/ethstore/database_aol/
-sudo chmod -R 777 /mnt/ssd2/ethstore/database_aol/
-sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_pebble/ /mnt/ssd2/ethstore/database_pebble/
-sudo chmod -R 777 /mnt/ssd2/ethstore/database_pebble/
-# # 2. replay trace
-echo "Start replaying trace with re mode..."
+case "$WORKLOAD_BACKEND" in
+    ethstore)
+        echo "Selected backend: ethstore"
+        echo "Start rsync database files from DBbak to current database directory..."
+        sudo rsync -avP /mnt/ssd2/ethstore/database/database_statedb16KB/prefixdb/ /mnt/ssd2/ethstore/database_state/prefixdb/
+        sudo chmod -R 777 /mnt/ssd2/ethstore/database_state/prefixdb/
+        sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_aol /mnt/ssd2/ethstore/database_aol/
+        sudo chmod -R 777 /mnt/ssd2/ethstore/database_aol/
+        sudo rsync -avP /mnt/ssd2/ethstore/DBbak/database_pebble/ /mnt/ssd2/ethstore/database_pebble/
+        sudo chmod -R 777 /mnt/ssd2/ethstore/database_pebble/
+        replay_cmd=(./bin/replayWorkload -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS")
+        ;;
+    chainkv)
+        echo "Selected backend: chainkv"
+        sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/chainkv/ /mnt/ssd2/ethstore/chainkv/
+        replay_cmd=(./bin/replayWorkload -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT")
+        ;;
+    pebble)
+        echo "Selected backend: pebble (baseline)"
+        sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
+        replay_cmd=(./bin/replayWorkload -mode rb -max-ops "$WORKLOAD_MAX_OPS")
+        ;;
+    *)
+        echo "不支持的 WORKLOAD_BACKEND=$WORKLOAD_BACKEND，支持: ethstore | chainkv | pebble"
+        exit 1
+        ;;
+esac
 
-
-./bin/replayWorkload -mode re -max-ops 100000000 > ./replayLog/ethstoreLog_${log_date}.log 2>&1 &
+echo "Start replaying trace... backend=$WORKLOAD_BACKEND"
+"${replay_cmd[@]}" > ./replayLog/${WORKLOAD_BACKEND}Log_${log_date}.log 2>&1 &
 replay_pid=$!
 echo "monitor target PID: $replay_pid"
-# 3. record resource usage
-sudo ./monitor.sh "$replay_pid" 1 ethstoreIO_${log_date}.log &
-wait  # wait for the replay to finish
-
-# baseline replay 
-# 1. recover from baseline data
-sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
-# 2. replay trace
-./bin/replayWorkload -mode rb -max-ops 100000000 > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
-replay_pid=$!
-echo "monitor target PID: $replay_pid"
-# 3. record resource usage
-sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
-wait  # wait for the replay to finish
-
-# baseline replay 
-# 1. recover from baseline data
-sudo rsync -avz --progress /mnt/ssd2/ethstore/DBbak/baseline/ /mnt/ssd2/ethstore/baseline/
-# 2. replay trace
-./bin/replayWorkload -mode rb -max-ops 100000000 > ./replayLog/baseline_replay_${log_date}.log 2>&1 &
-replay_pid=$!
-echo "monitor target PID: $replay_pid"
-# 3. record resource usage
-sudo ./monitor.sh "$replay_pid" 1 baselineIO_${log_date}.log &
-wait  # wait for the replay to finish
+sudo ./monitor.sh "$replay_pid" 1 ${WORKLOAD_BACKEND}IO_${log_date}.log &
+wait

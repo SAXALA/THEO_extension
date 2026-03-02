@@ -375,6 +375,18 @@ func (b *pebbleBatch) Delete(key []byte) error {
 	return nil
 }
 
+// DeleteRange inserts a key-range removal into the batch for later committing.
+func (b *pebbleBatch) DeleteRange(start []byte, end []byte) error {
+	if b.b == nil {
+		return fmt.Errorf("pebble batch not initialized")
+	}
+	if err := b.b.DeleteRange(start, end, nil); err != nil {
+		return err
+	}
+	b.size += len(start) + len(end)
+	return nil
+}
+
 // ValueSize retrieves the amount of data queued up for writing.
 func (b *pebbleBatch) ValueSize() int {
 	return b.size

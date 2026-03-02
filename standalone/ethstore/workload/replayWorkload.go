@@ -24,6 +24,9 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb"
+	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
+	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
@@ -32,32 +35,32 @@ type opType int
 
 const (
 	opGet opType = iota
-	opHas
+	// opHas
 	opPut
 	opDelete
 	opNewIterator
 	opIteratorNext
-	opNewBatch
-	opBatchPut
-	opBatchPutCommit
-	opBatchDelete
-	opNewBatchWithSize
-	opGetBatchValueSize
+	// opNewBatch
+	// opBatchPut
+	// opBatchPutCommit
+	// opBatchDelete
+	// opNewBatchWithSize
+	// opGetBatchValueSize
 )
 
 var opTypeNames = map[opType]string{
 	opGet:               "Get",
-	opHas:               "Has",
+	// opHas:               "Has",
 	opPut:               "Put",
 	opDelete:            "Delete",
 	opNewIterator:       "NewIterator",
 	opIteratorNext:      "IteratorNext",
-	opNewBatch:          "NewBatch",
-	opBatchPut:          "BatchPut",
-	opBatchPutCommit:    "BatchPutCommit",
-	opBatchDelete:       "BatchDelete",
-	opNewBatchWithSize:  "NewBatchWithSize",
-	opGetBatchValueSize: "GetBatchValueSize",
+	// opNewBatch:          "NewBatch",
+	// opBatchPut:          "BatchPut",
+	// opBatchPutCommit:    "BatchPutCommit",
+	// opBatchDelete:       "BatchDelete",
+	// opNewBatchWithSize:  "NewBatchWithSize",
+	// opGetBatchValueSize: "GetBatchValueSize",
 }
 
 type latencyHistogram struct {
@@ -70,15 +73,32 @@ type latencyHistogram struct {
 }
 
 func newLatencyHistogram() *latencyHistogram {
-	boundsNs := []int64{
-		1000, 2000, 5000, 10000, 20000, 50000,
-		100000, 200000, 500000,
-		1000000, 2000000, 5000000,
-		10000000, 20000000, 50000000,
-		100000000, 200000000, 500000000,
-		1000000000, 2000000000, 5000000000,
-		10000000000,
+	boundsNs := make([]int64, 0, 60)
+	// 1-10 us, step 1 us (9 buckets)
+	for i := int64(1); i < 10; i++ {
+		boundsNs = append(boundsNs, i*1000)
 	}
+	// 10-100 us, step 10 us (9 buckets)
+	for i := int64(10); i < 100; i += 10 {
+		boundsNs = append(boundsNs, i*1000)
+	}
+	// 100-1000 us, step 100 us (9 buckets)
+	for i := int64(100); i < 1000; i += 100 {
+		boundsNs = append(boundsNs, i*1000)
+	}
+	// 1-10 ms, step 1ms (9 buckets)
+	for i := int64(1); i < 10; i++ {
+		boundsNs = append(boundsNs, i*1000*1000)
+	}
+	// 10-100 ms, step 10ms (9 buckets)
+	for i := int64(10); i < 100; i += 10 {
+		boundsNs = append(boundsNs, i*1000*1000)
+	}
+	// 100-1000 ms, step 100ms (9 buckets)
+	for i := int64(100); i < 1000; i += 100 {
+		boundsNs = append(boundsNs, i*1000*1000)
+	}
+
 	return &latencyHistogram{
 		boundsNs: boundsNs,
 		counts:   make([]int64, len(boundsNs)+1),
@@ -265,6 +285,9 @@ type replayConfig struct {
 	BaselinePebbleDir string `json:"baselinePebbleDir"`
 	TraceFile         string `json:"traceFile"`
 	TraceFileNocache  string `json:"traceFileNocache"`
+	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
+	ChainKVDatabaseDir string `json:"chainKVDatabaseDir"`
+	ChainKVLoadDataDir string `json:"chainKVLoadDataDir"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -282,12 +305,535 @@ func loadReplayConfig(path string) (replayConfig, error) {
 	return cfg, nil
 }
 
+type chainKVLDB struct {
+	db            *chainkvdb.LDBDatabase
+	useState      bool
+	statePrefixes [][]byte
+}
+
+func NewChainKVLDB(path string, cache int, handles int, useState bool, statePrefixes []string) (*chainKVLDB, error) {
+	db, err := chainkvdb.NewLDBDatabase(path, cache, handles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open chainkv database: %w", err)
+	}
+
+	prefixes := make([][]byte, 0, len(statePrefixes))
+	for _, prefix := range statePrefixes {
+		prefix = strings.TrimSpace(prefix)
+		if prefix == "" {
+			continue
+		}
+		prefixes = append(prefixes, []byte(prefix))
+	}
+
+	return &chainKVLDB{
+		db:            db,
+		useState:      useState,
+		statePrefixes: prefixes,
+	}, nil
+}
+
+func (c *chainKVLDB) useStateForKey(key []byte) bool {
+	if c.useState {
+		return true
+	}
+	for _, prefix := range c.statePrefixes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *chainKVLDB) Put(key, value []byte) error {
+	if c.useStateForKey(key) {
+		return c.db.Put_s(key, value)
+	}
+	return c.db.Put(key, value)
+}
+
+func (c *chainKVLDB) Get(key []byte) ([]byte, error) {
+	if c.useStateForKey(key) {
+		return c.db.Get_s(key)
+	}
+	return c.db.Get(key)
+}
+
+func (c *chainKVLDB) Delete(key []byte) error {
+	return c.db.Delete(key)
+}
+
+func (c *chainKVLDB) NewBatch() chainkvdb.Batch {
+	return c.db.NewBatch()
+}
+
+func (c *chainKVLDB) BatchPut(batch chainkvdb.Batch, key, value []byte) error {
+	if c.useStateForKey(key) {
+		return batch.Put_s(key, value)
+	}
+	return batch.Put(key, value)
+}
+
+func (c *chainKVLDB) BatchDelete(batch chainkvdb.Batch, key []byte) error {
+	if c.useStateForKey(key) {
+		return batch.Put_s(key, nil)
+	}
+	return batch.Put(key, nil)
+}
+
+func (c *chainKVLDB) NewIterator() iterator.Iterator {
+	return c.db.NewIterator()
+}
+
+func (c *chainKVLDB) IteratorNext(it iterator.Iterator) (key, value []byte, valid bool) {
+	if it.Next() {
+		return it.Key(), it.Value(), true
+	}
+	return nil, nil, false
+}
+
+func (c *chainKVLDB) BatchCommit(batch chainkvdb.Batch) error {
+	return batch.Write()
+}
+
+func (c *chainKVLDB) Close() {
+	if c.db != nil && c.db.LDB() != nil {
+		_ = c.db.LDB().Close()
+	}
+}
+
+func chainKVDataTypeName(dt leveldb.DataType) string {
+	if name, ok := leveldb.DataTypeStrings[dt]; ok {
+		return name
+	}
+	return fmt.Sprintf("DataType(%d)", dt)
+}
+
+func reportChainKVLatencyStats(stats map[leveldb.DataType]map[opType]*latencyHistogram) {
+	if len(stats) == 0 {
+		return
+	}
+	dataTypes := make([]leveldb.DataType, 0, len(stats))
+	for dt := range stats {
+		dataTypes = append(dataTypes, dt)
+	}
+	sort.Slice(dataTypes, func(i, j int) bool {
+		return dataTypes[i] < dataTypes[j]
+	})
+
+	for _, dt := range dataTypes {
+		opMap := stats[dt]
+		ops := make([]opType, 0, len(opMap))
+		for op := range opMap {
+			ops = append(ops, op)
+		}
+		sort.Slice(ops, func(i, j int) bool {
+			return ops[i] < ops[j]
+		})
+
+		for _, op := range ops {
+			hist := opMap[op]
+			if hist.totalCount == 0 {
+				continue
+			}
+			totalSec := float64(hist.totalNs) / 1000000000.0
+			throughputK := 0.0
+			if totalSec > 0 {
+				throughputK = float64(hist.totalCount) / totalSec / 1000.0
+			}
+			fmt.Printf("\n[ChainKV Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
+				chainKVDataTypeName(dt),
+				opTypeName(op),
+				hist.totalCount,
+				throughputK,
+				formatDurationCompact(hist.avg()),
+				formatDurationCompact(hist.percentile(50.0)),
+				formatDurationCompact(hist.percentile(75.0)),
+				formatDurationCompact(hist.percentile(90.0)),
+				formatDurationCompact(hist.percentile(95.0)),
+				formatDurationCompact(hist.percentile(99.0)),
+				formatDurationCompact(hist.percentile(99.99)),
+			)
+			fmt.Println("Histogram (<= upper bound):")
+			for _, line := range hist.histogramLines() {
+				fmt.Printf("  %s\n", line)
+			}
+		}
+	}
+}
+
+func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
+	file, err := os.Open(dataFile)
+	if err != nil {
+		return fmt.Errorf("failed to open data file: %w", err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	count := 0
+	startTime := time.Now()
+
+	for limit == 0 || count < limit {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			if readErr == io.EOF {
+				if line == "" {
+					break
+				}
+			} else {
+				return fmt.Errorf("error reading data file: %w", readErr)
+			}
+		}
+
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+
+		parts := strings.Split(line, ", Value :")
+		if len(parts) != 2 {
+			log.Printf("无法解析行: %s", line)
+			continue
+		}
+
+		keyPart := strings.TrimPrefix(parts[0], "Key: ")
+		valuePart := strings.TrimSpace(parts[1])
+		keyBytes, err := hex.DecodeString(keyPart)
+		if err != nil {
+			return fmt.Errorf("failed to decode key: %w", err)
+		}
+		valueBytes, err := hex.DecodeString(valuePart)
+		if err != nil {
+			return fmt.Errorf("failed to decode value: %w", err)
+		}
+
+		if err := db.Put(keyBytes, valueBytes); err != nil {
+			return fmt.Errorf("failed to put key-value: %w", err)
+		}
+		count++
+		if count%100000 == 0 {
+			elapsed := time.Since(startTime)
+			rate := float64(count) / elapsed.Seconds()
+			fmt.Printf("Loaded %d entries (%.2f ops/sec)\n", count, rate)
+		}
+
+		if readErr == io.EOF {
+			break
+		}
+	}
+
+	elapsed := time.Since(startTime)
+	rate := float64(count) / elapsed.Seconds()
+	fmt.Printf("Loaded %d entries in %v (%.2f ops/sec)\n", count, elapsed, rate)
+	return nil
+}
+
+func chainKVReplayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
+	file, err := os.Open(traceFile)
+	if err != nil {
+		return fmt.Errorf("failed to open trace file: %w", err)
+	}
+	defer file.Close()
+
+	opRegex := regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
+
+	var totalTime time.Duration
+	var counter int64
+	reader := bufio.NewReader(file)
+	var logicReadSize int64
+	var logicWriteSize int64
+	var lineCounter int64
+
+	var stateBatch chainkvdb.Batch
+	var nonStateBatch chainkvdb.Batch
+	var stateBatchActive bool
+	var nonStateBatchActive bool
+	var it iterator.Iterator
+	var lastIterDataType leveldb.DataType = -1
+	stats := make(map[leveldb.DataType]map[opType]*latencyHistogram)
+	batchCommitHist := newLatencyHistogram()
+
+	recordOp := func(op opType, dt leveldb.DataType, elapsed time.Duration) {
+		if _, ok := stats[dt]; !ok {
+			stats[dt] = make(map[opType]*latencyHistogram)
+		}
+		if _, ok := stats[dt][op]; !ok {
+			stats[dt][op] = newLatencyHistogram()
+		}
+		stats[dt][op].observe(elapsed)
+	}
+
+	commitBatch := func(batch chainkvdb.Batch, label string) {
+		if batch == nil {
+			return
+		}
+		start := time.Now()
+		err := db.BatchCommit(batch)
+		elapsed := time.Since(start)
+		totalTime += elapsed
+		batchCommitHist.observe(elapsed)
+		if err != nil {
+			fmt.Printf("%s batch commit failed: %v\n", label, err)
+		}
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				if line == "" {
+					break
+				}
+			} else {
+				return fmt.Errorf("error reading trace file: %w", err)
+			}
+		}
+
+		line = strings.TrimSpace(line)
+		lineCounter++
+
+		if strings.Contains(line, "Processing block (end)") && strings.Contains(line, "geth:") {
+			if stateBatchActive {
+				commitBatch(stateBatch, "state")
+				stateBatch = nil
+				stateBatchActive = false
+			}
+			if nonStateBatchActive {
+				commitBatch(nonStateBatch, "non-state")
+				nonStateBatch = nil
+				nonStateBatchActive = false
+			}
+			if maxOps > 0 && counter >= maxOps {
+				break
+			}
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		if strings.Contains(line, "Global log file opened successfully") || !strings.Contains(line, "OPType:") {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		matches := opRegex.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		opTypeStr := matches[1]
+		keyHex := ""
+		var keyBytes []byte
+		dataType := leveldb.DataType(-1)
+		if len(matches) >= 3 && matches[2] != "" {
+			keyHex = matches[2]
+			keyBytes, err = hex.DecodeString(keyHex)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			if len(keyBytes) > 0 {
+				dataType = leveldb.GetDataTypeFromKey(keyBytes)
+			}
+		}
+
+		var valueBytes []byte
+		if len(matches) >= 6 && matches[4] != "" {
+			valueBytes, err = hex.DecodeString(matches[4])
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+		}
+
+		if len(matches) >= 9 && matches[7] != "" {
+			iterPrefixBytes, decodeErr := hex.DecodeString(matches[7])
+			if decodeErr == nil {
+				dataType = leveldb.GetDataTypeFromKey(iterPrefixBytes)
+				lastIterDataType = dataType
+			}
+		}
+
+		start := time.Now()
+		var opErr error
+		op := opGet
+
+		switch opTypeStr {
+		case "Get", "Has":
+			op = opGet
+			var val []byte
+			val, opErr = db.Get(keyBytes)
+			if opErr == nil {
+				logicReadSize += int64(len(val))
+			}
+		case "Put":
+			op = opPut
+			opErr = db.Put(keyBytes, valueBytes)
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
+			}
+		case "Delete":
+			op = opDelete
+			opErr = db.Delete(keyBytes)
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes))
+			}
+		case "NewBatch", "NewBatchWithSize":
+			if !stateBatchActive {
+				stateBatch = db.NewBatch()
+				stateBatchActive = true
+			}
+			if !nonStateBatchActive {
+				nonStateBatch = db.NewBatch()
+				nonStateBatchActive = true
+			}
+			if err == io.EOF {
+				break
+			}
+			continue
+		case "BatchPut":
+			op = opPut
+			if len(keyBytes) == 0 {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			if db.useStateForKey(keyBytes) {
+				if !stateBatchActive || stateBatch == nil {
+					stateBatch = db.NewBatch()
+					stateBatchActive = true
+				}
+				opErr = db.BatchPut(stateBatch, keyBytes, valueBytes)
+			} else {
+				if !nonStateBatchActive || nonStateBatch == nil {
+					nonStateBatch = db.NewBatch()
+					nonStateBatchActive = true
+				}
+				opErr = db.BatchPut(nonStateBatch, keyBytes, valueBytes)
+			}
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
+			}
+		case "BatchDelete":
+			op = opDelete
+			if len(keyBytes) == 0 {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			if db.useStateForKey(keyBytes) {
+				if !stateBatchActive || stateBatch == nil {
+					stateBatch = db.NewBatch()
+					stateBatchActive = true
+				}
+				opErr = db.BatchDelete(stateBatch, keyBytes)
+			} else {
+				if !nonStateBatchActive || nonStateBatch == nil {
+					nonStateBatch = db.NewBatch()
+					nonStateBatchActive = true
+				}
+				opErr = db.BatchDelete(nonStateBatch, keyBytes)
+			}
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes))
+			}
+		case "BatchPutCommit":
+			if err == io.EOF {
+				break
+			}
+			continue
+		case "NewIterator":
+			op = opNewIterator
+			if it != nil {
+				it.Release()
+			}
+			it = db.NewIterator()
+		case "IteratorNext":
+			op = opIteratorNext
+			dataType = lastIterDataType
+			if it == nil {
+				opErr = fmt.Errorf("IteratorNext without active iterator at trace line %d", lineCounter)
+			} else {
+				_, val, valid := db.IteratorNext(it)
+				if valid {
+					logicReadSize += int64(len(val))
+				} else {
+					it.Release()
+					it = nil
+				}
+			}
+		default:
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
+		elapsed := time.Since(start)
+		totalTime += elapsed
+		if opErr != nil {
+			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+		}
+		counter++
+		recordOp(op, dataType, elapsed)
+
+		if counter%10000 == 0 {
+			fmt.Printf("\r[ChainKV] Processed %d operations, total time: %f s, logic read size: %d, logic write size: %d",
+				counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		if maxOps > 0 && counter >= maxOps {
+			fmt.Printf("\n[ChainKV] Reached max operations %d; waiting for next block-end commit.\n", maxOps)
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	if stateBatchActive && stateBatch != nil {
+		commitBatch(stateBatch, "state-final")
+	}
+	if nonStateBatchActive && nonStateBatch != nil {
+		commitBatch(nonStateBatch, "non-state-final")
+	}
+	if it != nil {
+		it.Release()
+	}
+
+	fmt.Printf("\n[ChainKV] Finished replaying trace. Total operations: %d, total time: %f s, logic read size: %d, logic write size: %d\n",
+		counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+	reportChainKVLatencyStats(stats)
+	reportHistogramSummary("chainkv commit (Batch.Write)", batchCommitHist)
+	return nil
+}
+
 func main() {
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld (load data), re (replay trace), o (other), lb (load baseline), rb (replay baseline)")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/o/lb/rb")
+	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore or chainkv")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
 	ldCacheSize := flag.Int("ld-cache-size", 0, "Cache size for ld mode")
+	ckvCache := flag.Int("ckv-cache", 16, "ChainKV cache size in MB")
+	ckvHandles := flag.Int("ckv-handles", 128, "ChainKV number of file handles")
+	ckvUseState := flag.Bool("ckv-state", true, "ChainKV use state-specific operations (Put_s/Get_s)")
+	ckvStateKeyPrefixes := flag.String("ckv-state-key-prefixes", "", "ChainKV comma-separated key prefixes routed to Put_s/Get_s")
+	ckvLoadLimit := flag.Int("ckv-limit", 0, "ChainKV load limit, 0 means no limit")
 
 	flag.Parse()
 
@@ -324,12 +870,67 @@ func main() {
 
 	switch *mode {
 	case "ld":
-		loadAccount(cfg.DatabaseDir, *ldChunkFileSize, *ldCacheSize)
-		// loadData(cfg.DatabaseDir, cfg.LoadDataDir)
-		// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
-		// loadAol(cfg.DatabaseDir, notxFile, txFile)
+		if strings.EqualFold(*backend, "chainkv") {
+			dbDir := cfg.ChainKVDatabaseDir
+			if dbDir == "" {
+				dbDir = cfg.DatabaseDir
+			}
+			if dbDir == "" {
+				log.Fatal("ld with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
+			}
+			dataFile := cfg.ChainKVLoadDataDir
+			if dataFile == "" {
+				dataFile = cfg.LoadDataDir
+			}
+			if dataFile == "" {
+				log.Fatal("ld with chainkv backend requires chainKVLoadDataDir or loadDataDir in config")
+			}
+			var prefixes []string
+			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
+				prefixes = strings.Split(*ckvStateKeyPrefixes, ",")
+			}
+			ckv, openErr := NewChainKVLDB(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
+			if openErr != nil {
+				log.Fatalf("failed to open chainkv database: %v", openErr)
+			}
+			defer ckv.Close()
+			if loadErr := chainKVLoadData(ckv, dataFile, *ckvLoadLimit); loadErr != nil {
+				log.Fatalf("chainkv load failed: %v", loadErr)
+			}
+		} else {
+			loadAccount(cfg.DatabaseDir, *ldChunkFileSize, *ldCacheSize)
+			// loadData(cfg.DatabaseDir, cfg.LoadDataDir)
+			// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
+			// loadAol(cfg.DatabaseDir, notxFile, txFile)
+		}
 	case "re":
-		replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+		if strings.EqualFold(*backend, "chainkv") {
+			dbDir := cfg.ChainKVDatabaseDir
+			if dbDir == "" {
+				dbDir = cfg.DatabaseDir
+			}
+			if dbDir == "" {
+				log.Fatal("re with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
+			}
+			traceFile := cfg.TraceFile
+			if traceFile == "" {
+				log.Fatal("re with chainkv backend requires traceFile in config")
+			}
+			var prefixes []string
+			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
+				prefixes = strings.Split(*ckvStateKeyPrefixes, ",")
+			}
+			ckv, openErr := NewChainKVLDB(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
+			if openErr != nil {
+				log.Fatalf("failed to open chainkv database: %v", openErr)
+			}
+			defer ckv.Close()
+			if replayErr := chainKVReplayTrace(ckv, traceFile, *maxOps); replayErr != nil {
+				log.Fatalf("chainkv replay failed: %v", replayErr)
+			}
+		} else {
+			replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps)
+		}
 	case "ra":
 		replayTraceAccount(cfg.DatabaseDir, cfg.TraceFile)
 	case "o":
@@ -447,13 +1048,13 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 	// var oldop string
 
 	var lineCounter int64 = 0
-	var nextBatchRequested bool
-	var nextBatchSize int
+	// var nextBatchRequested bool
+	// var nextBatchSize int
 	var pebbleBatch ethdb.Batch
 	var stopAtNextBlockEnd bool
 	var blockCommitCounter int64
-	var lastKeyPrefix byte
-	var hasLastKeyPrefix bool
+	// var lastKeyPrefix byte
+	// var hasLastKeyPrefix bool
 	var lastIterDataType ethstore.DataType
 	pebbleCommitHist := newLatencyHistogram()
 
@@ -461,16 +1062,16 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		if pebbleBatch != nil {
 			return pebbleBatch
 		}
-		if nextBatchRequested {
-			if nextBatchSize > 0 {
-				pebbleBatch = store.NewBatchWithSize(nextBatchSize)
-			} else {
-				pebbleBatch = store.NewBatch()
-			}
-			nextBatchRequested = false
-			nextBatchSize = 0
-			return pebbleBatch
-		}
+		// if nextBatchRequested {
+		// 	if nextBatchSize > 0 {
+		// 		pebbleBatch = store.NewBatchWithSize(nextBatchSize)
+		// 	} else {
+		// 		pebbleBatch = store.NewBatch()
+		// 	}
+		// 	nextBatchRequested = false
+		// 	nextBatchSize = 0
+		// 	return pebbleBatch
+		// }
 		pebbleBatch = store.NewBatch()
 		return pebbleBatch
 	}
@@ -549,8 +1150,8 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 				continue
 			}
 			if len(keyBytes) > 0 {
-				lastKeyPrefix = keyBytes[0]
-				hasLastKeyPrefix = true
+				// lastKeyPrefix = keyBytes[0]
+				// hasLastKeyPrefix = true
 				dataType = ethstore.GetDataTypeFromKey(keyBytes)
 			}
 		}
@@ -564,17 +1165,17 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		}
 
 		// 解析 NewBatchWithSize 中的 batch 大小
-		var batchSize int
-		if len(matches) >= 7 && matches[6] != "" {
-			if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
-				maxInt := int64(int(^uint(0) >> 1))
-				if v > maxInt {
-					batchSize = int(maxInt)
-				} else {
-					batchSize = int(v)
-				}
-			}
-		}
+		// var batchSize int
+		// if len(matches) >= 7 && matches[6] != "" {
+		// 	if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
+		// 		maxInt := int64(int(^uint(0) >> 1))
+		// 		if v > maxInt {
+		// 			batchSize = int(maxInt)
+		// 		} else {
+		// 			batchSize = int(v)
+		// 		}
+		// 	}
+		// }
 
 		// 解析 NewIterator 的 prefix/start key（start key 可能为空）
 		var iterPrefixBytes []byte
@@ -598,24 +1199,24 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		switch opTypeStr {
 		case "Get":
 			op = opGet
-		case "Has":
-			op = opHas
+		// case "Has":
+		// 	op = opHas
 		case "Put":
 			op = opPut
 		case "BatchPut":
-			op = opBatchPut
+			op = opPut
 		case "Delete":
 			op = opDelete
-		case "NewBatch":
-			op = opNewBatch
-		case "NewBatchWithSize":
-			op = opNewBatchWithSize
-		case "GetBatchValueSize":
-			op = opGetBatchValueSize
-		case "BatchPutCommit":
-			op = opBatchPutCommit
+		// case "NewBatch":
+		// 	op = opNewBatch
+		// case "NewBatchWithSize":
+		// 	op = opNewBatchWithSize
+		// case "GetBatchValueSize":
+		// 	op = opGetBatchValueSize
+		// case "BatchPutCommit":
+		// 	op = opBatchPutCommit
 		case "BatchDelete":
-			op = opBatchDelete
+			op = opDelete
 		case "NewIterator":
 			op = opNewIterator
 		case "IteratorNext":
@@ -623,7 +1224,7 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 			op = opIteratorNext
 		default:
 			// 未知操作，跳过
-			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			// fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
 			continue
 		}
 		valueBytes, decodeErr := hex.DecodeString(valueHex)
@@ -642,46 +1243,53 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		case opGet:
 			value, opErr = store.Get(keyBytes)
 			size = len(value)
-		case opHas:
-			size, _, opErr = store.Has(keyBytes)
+		// case opHas:
+		// 	size, _, opErr = store.Has(keyBytes)
 		case opPut:
-			opErr = store.Put(keyBytes, valueBytes)
-		case opDelete:
-			opErr = store.Delete(keyBytes)
-		case opNewBatch:
-			nextBatchRequested = true
-			nextBatchSize = 0
-		case opBatchPut:
+			// opErr = store.Put(keyBytes, valueBytes)
 			if len(keyBytes) == 0 {
 				break
 			}
 			b := ensurePebbleBatch()
 			opErr = b.Put(keyBytes, valueBytes)
-		case opBatchPutCommit:
-			// Commit is deferred until we observe a block end marker.
-			// (See "Processing block (end)" handling above.)
-			opErr = nil
-		case opBatchDelete:
-			if len(keyBytes) == 0 {
-				break
-			}
+		case opDelete:
+			// opErr = store.Delete(keyBytes)
 			b := ensurePebbleBatch()
 			opErr = b.Delete(keyBytes)
-		case opNewBatchWithSize:
-			nextBatchRequested = true
-			if batchSize > 0 {
-				nextBatchSize = batchSize
-			} else {
-				fmt.Printf("Invalid batch size %d at line %d, using default NewBatch\n", batchSize, counter)
-				nextBatchSize = 0
-			}
-		case opGetBatchValueSize:
-			if hasLastKeyPrefix {
-				_ = lastKeyPrefix
-			}
-			if pebbleBatch != nil {
-				size = pebbleBatch.ValueSize()
-			}
+		// case opNewBatch:
+		// 	nextBatchRequested = true
+		// 	nextBatchSize = 0
+		// case opBatchPut:
+		// 	if len(keyBytes) == 0 {
+		// 		break
+		// 	}
+		// 	b := ensurePebbleBatch()
+		// 	opErr = b.Put(keyBytes, valueBytes)
+		// case opBatchPutCommit:
+			// Commit is deferred until we observe a block end marker.
+			// (See "Processing block (end)" handling above.)
+			// opErr = nil
+		// case opBatchDelete:
+		// 	if len(keyBytes) == 0 {
+		// 		break
+		// 	}
+		// 	b := ensurePebbleBatch()
+		// 	opErr = b.Delete(keyBytes)
+		// case opNewBatchWithSize:
+		// 	nextBatchRequested = true
+		// 	if batchSize > 0 {
+		// 		nextBatchSize = batchSize
+		// 	} else {
+		// 		fmt.Printf("Invalid batch size %d at line %d, using default NewBatch\n", batchSize, counter)
+		// 		nextBatchSize = 0
+		// 	}
+		// case opGetBatchValueSize:
+		// 	if hasLastKeyPrefix {
+		// 		_ = lastKeyPrefix
+		// 	}
+		// 	if pebbleBatch != nil {
+		// 		size = pebbleBatch.ValueSize()
+		// 	}
 		case opNewIterator:
 			if it != nil {
 				it.Release()
@@ -705,11 +1313,11 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		// 在 switch 外部统一处理统计
 		if opErr == nil {
 			switch op {
-			case opGet, opHas:
+			case opGet:
 				logicReadSize += int64(size)
-			case opPut, opBatchPut:
+			case opPut:
 				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
-			case opDelete, opBatchDelete:
+			case opDelete:
 				logicWriteSize += int64(len(keyBytes))
 			}
 		}
@@ -1574,17 +2182,17 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 			}
 		}
 
-		var batchSize int
-		if len(matches) >= 7 && matches[6] != "" {
-			if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
-				maxInt := int64(int(^uint(0) >> 1))
-				if v > maxInt {
-					batchSize = int(maxInt)
-				} else {
-					batchSize = int(v)
-				}
-			}
-		}
+		// var batchSize int
+		// if len(matches) >= 7 && matches[6] != "" {
+		// 	if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
+		// 		maxInt := int64(int(^uint(0) >> 1))
+		// 		if v > maxInt {
+		// 			batchSize = int(maxInt)
+		// 		} else {
+		// 			batchSize = int(v)
+		// 		}
+		// 	}
+		// }
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		var iterPrefixBytes []byte
 		var iterStartBytes []byte
@@ -1620,26 +2228,26 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 		switch opTypeStr {
 		case "Get":
 			op = opGet
-		case "Has":
-			op = opHas
-		case "Put":
+		// case "Has":
+		// 	op = opHas
+		case "Put", "BatchPut":
 			op = opPut
 		case "Delete", "BatchDelete":
-			if opTypeStr == "BatchDelete" {
-				op = opBatchDelete
-			} else {
-				op = opDelete
-			}
-		case "BatchPut":
-			op = opBatchPut
-		case "BatchPutCommit":
-			op = opBatchPutCommit
-		case "NewBatch":
-			op = opNewBatch
-		case "NewBatchWithSize":
-			op = opNewBatchWithSize
-		case "GetBatchValueSize":
-			op = opGetBatchValueSize
+			// if opTypeStr == "BatchDelete" {
+			// 	op = opBatchDelete
+			// } else {
+			op = opDelete
+			// }
+		// case "BatchPut":
+		// 	op = opBatchPut
+		// case "BatchPutCommit":
+		// 	op = opBatchPutCommit
+		// case "NewBatch":
+		// 	op = opNewBatch
+		// case "NewBatchWithSize":
+		// 	op = opNewBatchWithSize
+		// case "GetBatchValueSize":
+		// 	op = opGetBatchValueSize
 		case "NewIterator":
 			op = opNewIterator
 		case "IteratorNext":
@@ -1648,7 +2256,7 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 
 		default:
 			// 未知操作，跳过
-			fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			// fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
 			continue
 		}
 
@@ -1661,13 +2269,10 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 				fmt.Printf("Performing Get operation for test key %s\n", testKeyHex)
 			}
 			_, opErr = store.Get(keyBytes)
-		case opHas:
-			_, opErr = store.Has(keyBytes)
+		// case opHas:
+		// 	_, opErr = store.Has(keyBytes)
 		case opPut:
-			opErr = store.Put(keyBytes, valueBytes)
-		case opDelete:
-			opErr = store.Delete(keyBytes)
-		case opBatchPut:
+			// opErr = store.Put(keyBytes, valueBytes)
 			if len(keyBytes) == 0 {
 				break
 			}
@@ -1680,7 +2285,8 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 				b := ensurePebbleBatch()
 				opErr = b.Put(keyBytes, valueBytes)
 			}
-		case opBatchDelete:
+		case opDelete:
+			// opErr = store.Delete(keyBytes)
 			if len(keyBytes) == 0 {
 				break
 			}
@@ -1691,24 +2297,48 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64) {
 				b := ensurePebbleBatch()
 				opErr = b.Delete(keyBytes)
 			}
-		case opBatchPutCommit:
-			// Commit is deferred until we observe a block end marker.
-			// (See "Processing block (end)" handling above.)
-			opErr = nil
-		case opNewBatch:
-			nextBatchRequested = true
-			nextBatchSize = 0
-		case opNewBatchWithSize:
-			nextBatchRequested = true
-			if batchSize > 0 {
-				nextBatchSize = batchSize
-			} else {
-				nextBatchSize = 0
-			}
-		case opGetBatchValueSize:
-			if pebbleBatch != nil {
-				_ = pebbleBatch.ValueSize()
-			}
+		// case opBatchPut:
+		// 	if len(keyBytes) == 0 {
+		// 		break
+		// 	}
+		// 	if keyBytes[0] == 'O' {
+		// 		opErr = store.BatchPut(keyBytes, valueBytes)
+		// 		if opErr == nil {
+		// 			prefixdbDirty = true
+		// 		}
+		// 	} else {
+		// 		b := ensurePebbleBatch()
+		// 		opErr = b.Put(keyBytes, valueBytes)
+		// 	}
+		// case opBatchDelete:
+		// 	if len(keyBytes) == 0 {
+		// 		break
+		// 	}
+		// 	if keyBytes[0] == 'O' || keyBytes[0] == 'o' {
+		// 		// NOTE: There is no PrefixDB batch-delete API here; keep existing behavior.
+		// 		opErr = store.Delete(keyBytes)
+		// 	} else {
+		// 		b := ensurePebbleBatch()
+		// 		opErr = b.Delete(keyBytes)
+		// 	}
+		// case opBatchPutCommit:
+		// 	// Commit is deferred until we observe a block end marker.
+		// 	// (See "Processing block (end)" handling above.)
+		// 	opErr = nil
+		// case opNewBatch:
+		// 	nextBatchRequested = true
+		// 	nextBatchSize = 0
+		// case opNewBatchWithSize:
+		// 	nextBatchRequested = true
+		// 	if batchSize > 0 {
+		// 		nextBatchSize = batchSize
+		// 	} else {
+		// 		nextBatchSize = 0
+		// 	}
+		// case opGetBatchValueSize:
+		// 	if pebbleBatch != nil {
+		// 		_ = pebbleBatch.ValueSize()
+		// 	}
 		case opNewIterator:
 			if iter != nil {
 				iter.Release()
