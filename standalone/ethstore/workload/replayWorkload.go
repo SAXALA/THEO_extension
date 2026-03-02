@@ -356,10 +356,10 @@ func main() {
 	// time.Sleep(5 * time.Second)
 	// loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
 	// replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
-	replayTrace(cfg.DatabaseDir, cfg.TraceFile, *maxOps, allDBTypes)
+	//replayTrace(cfg.DatabaseDir, cfg.TraceFileNoCacheSnap, *maxOps, allDBTypes)
 	// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
 	// loadAol(cfg.DatabaseDir, notxFile)
-	return
+	// return
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
 
@@ -1792,7 +1792,7 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType D
 			}
 			if keyBytes[0] == 'O' {
 				// NOTE: There is no PrefixDB batch-delete API here; keep existing behavior.
-				opErr = store.Delete(keyBytes)
+				opErr = store.BatchPut(keyBytes, nil)
 			} else {
 				b := ensurePebbleBatch()
 				opErr = b.Delete(keyBytes)

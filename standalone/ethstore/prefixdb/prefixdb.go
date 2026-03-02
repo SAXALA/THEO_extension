@@ -42,8 +42,6 @@ const (
 
 const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
 
-const chunkNormalizationThreshold uint64 = 16 * 1024 // chunk files over this size have been appended
-
 const ()
 
 type KeyType int
@@ -1291,7 +1289,7 @@ func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
 func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 	cacheKey := string(key)
 	if entry, ok := db.nodeCache.Get(cacheKey); ok {
-		if entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
+		if entry.StorageInfo.storageFileID != 0 {
 			return &TrieNode{
 				storageFileID: entry.StorageInfo.storageFileID,
 				storageOffset: entry.StorageInfo.storageOffset,
@@ -3004,7 +3002,7 @@ func (db *PrefixDB) maybeNormalizeChunkEntries(entries []kvPair, meta *segmentCh
 	if len(entries) < 2 || meta == nil {
 		return entries
 	}
-	if meta.ChunkSize <= chunkNormalizationThreshold {
+	if meta.ChunkSize <= uint64(db.storageChunkSize) {
 		return entries
 	}
 	return normalizeStorageEntries(entries)

@@ -245,19 +245,19 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		existingSize   uint64
 	)
 
-	keyBytes := []byte(accountKey)
-	nodeInfo, found, err := db.prefixTree.Get(keyBytes)
+	accountKeyBytes := []byte(accountKey)
+	node, err := db.getNode(accountKeyBytes)
 	if err != nil {
 		return err
 	}
-	if found {
-		accOff = nodeInfo.accountOffset
-		existingFileID = nodeInfo.storageFileID
-		existingOffset = nodeInfo.storageOffset
-		existingSize = nodeInfo.storageSize
+	if node != nil {
+		accOff = node.offset
+		existingFileID = node.storageFileID
+		existingOffset = node.storageOffset
+		existingSize = node.storageSize
 	}
 	if len(kvs) == 0 {
-		if err := db.prefixTree.Put(keyBytes, accOff, 0, 0, 0); err != nil {
+		if err := db.prefixTree.Put(accountKeyBytes, accOff, 0, 0, 0); err != nil {
 			return err
 		}
 		db.nodeCache.StoreMetadata(accountKey, accOff, StorageInfo{})
@@ -277,13 +277,12 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		storageOffset: off,
 		storageSize:   sz,
 	}
-	db.nodeCache.Delete(accountKey)
-	// db.nodeCache.StoreMetadata(accountKey, accOff, info)
+	if err := db.prefixTree.Put(accountKeyBytes, accOff, fileID, off, sz); err != nil {
+		return err
+	}
+	db.nodeCache.StoreMetadata(accountKey, accOff, info)
 	if db.batch != nil {
 		_ = db.batch.updateStoragePointer(accountKey, info)
-	}
-	if err := db.prefixTree.Put(keyBytes, accOff, fileID, off, sz); err != nil {
-		return err
 	}
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))

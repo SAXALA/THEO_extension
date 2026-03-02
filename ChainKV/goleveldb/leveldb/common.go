@@ -457,3 +457,16 @@ type kvPointer struct {
 	ValueLen uint32
 	BlockID  uint64 // The block ID this entry belongs to
 }
+
+var AolHandledDataTypes = map[DataType]bool{
+	HeaderDataType:        true,
+	BlockBodyDataType:     true,
+	BlockReceiptsDataType: true,
+	// TransactionLookupMetadataDataType: true,
+	// HeaderNumberDataType: true,
+}
+
+var PrefixDBHandledDataTypes = map[DataType]bool{
+	TrieNodeAccountDataType: true,
+	TrieNodeStorageDataType: true,
+}

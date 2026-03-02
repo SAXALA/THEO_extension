@@ -136,8 +136,8 @@ replay_trace_files=(nocache_snap cache cache cache)
 #         "./replayLog/IO/baselineIO_${log_date}_${baseline_db_type}.log"
 # done
 
-restore_ethstore_db
-drop_caches
+# restore_ethstore_db
+# drop_caches
 # echo "Start replaying trace with re mode... db-type=${replay_db_types[$1]} trace=${replay_trace_files[$1]}"
 #     run_and_monitor \
 #         re \
@@ -145,3 +145,13 @@ drop_caches
 #         "${replay_trace_files[$1]}" \
 #         "./replayLog/ethstoreLog_${log_date}_${replay_db_types[$1]}_${replay_trace_files[$1]}.log" \
 #         "./replayLog/IO/ethstoreIO_${log_date}_${replay_db_types[$1]}_${replay_trace_files[$1]}.log"
+
+# restore_baseline_db
+# drop_caches
+echo "Start baseline replay with rb mode... db-type=prefixdb"
+run_and_monitor \
+    rb \
+    all \
+    cache \
+    "./replayLog/baseline_replay_${log_date}_${baseline_db_type}.log" \
+    "./replayLog/IO/baselineIO_${log_date}_${baseline_db_type}.log"

@@ -487,6 +487,38 @@ func (d *Database) BatchPut(key []byte, value []byte) error {
 			return fmt.Errorf("failed to batch put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
 		d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	} else if AolHandledDataTypes[dataType] {
+		var blockID uint64
+		var foundBlockID bool
+
+		// Try to get blockID from key
+		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+
+		// If not found in key, try from value (for HeaderNumber)
+		if !foundBlockID {
+			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
+		}
+		if foundBlockID {
+			var err error
+			if blockID > d.baolLatestBlock {
+				if d.baolLatestBlock != 0 {
+					err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
+				}
+				d.baolLatestBlock = blockID
+				d.baolkvs = make(map[string]string, 4)
+				d.baolkvs[string(key)] = string(value)
+				if err != nil {
+					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+				}
+				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+				return nil // Data stored in AOL
+			} else {
+				d.baolkvs[string(key)] = string(value)
+				return nil // Data queued for AOL
+			}
+		}
+		// If blockID couldn't be determined for an AOL-handled type.
+		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
 	}
 	return nil
 }

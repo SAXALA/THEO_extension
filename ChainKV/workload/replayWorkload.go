@@ -419,11 +419,11 @@ func dataTypeName(dt leveldb.DataType) string {
 	return fmt.Sprintf("DataType(%d)", dt)
 }
 
-func reportLatencyStats(stats map[leveldb.DataType]map[opType]*latencyHistogram) {
+func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 	if len(stats) == 0 {
 		return
 	}
-	dataTypes := make([]leveldb.DataType, 0, len(stats))
+	dataTypes := make([]string, 0, len(stats))
 	for dt := range stats {
 		dataTypes = append(dataTypes, dt)
 	}
@@ -452,7 +452,7 @@ func reportLatencyStats(stats map[leveldb.DataType]map[opType]*latencyHistogram)
 				throughputK = float64(hist.totalCount) / totalSec / 1000.0
 			}
 			fmt.Printf("\n[Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
-				dataTypeName(dt),
+				dt,
 				opTypeName(op),
 				hist.totalCount,
 				throughputK,
@@ -531,18 +531,30 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 	var nonStateBatchActive bool
 
 	var iterator iterator.Iterator
+	defer func() {
+		if iterator != nil {
+			iterator.Release()
+		}
+	}()
 	var lastIterDataType leveldb.DataType = -1
-	var stats = make(map[leveldb.DataType]map[opType]*latencyHistogram)
-	var dataType leveldb.DataType = -1
+	var stats = make(map[string]map[opType]*latencyHistogram)
 	const batchCommitDataType leveldb.DataType = -1
 	recordOp := func(op opType, dt leveldb.DataType, elapsed time.Duration) {
-		if _, ok := stats[dt]; !ok {
-			stats[dt] = make(map[opType]*latencyHistogram)
+		var dtStr string
+		if leveldb.AolHandledDataTypes[dt] {
+			dtStr = "aol"
+		} else if leveldb.PrefixDBHandledDataTypes[dt] {
+			dtStr = "prefixdb"
+		} else {
+			dtStr = "pebble"
 		}
-		if _, ok := stats[dt][op]; !ok {
-			stats[dt][op] = newLatencyHistogram()
+		if _, ok := stats[dtStr]; !ok {
+			stats[dtStr] = make(map[opType]*latencyHistogram)
 		}
-		stats[dt][op].observe(elapsed)
+		if _, ok := stats[dtStr][op]; !ok {
+			stats[dtStr][op] = newLatencyHistogram()
+		}
+		stats[dtStr][op].observe(elapsed)
 	}
 
 	fmt.Println("Start replaying baseline trace...")
@@ -600,6 +612,7 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 		}
 
 		opTypeStr := matches[1]
+		currentDataType := leveldb.DataType(-1)
 		keyHex := ""
 		keySize := 0
 		keyBytes := []byte{}
@@ -610,10 +623,11 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 			}
 			keyBytes, err = hex.DecodeString(keyHex)
 			if err != nil {
+				log.Printf("line %d: failed to decode key hex %q: %v", lineCounter, keyHex, err)
 				continue
 			}
 			if len(keyBytes) > 0 {
-				dataType = leveldb.GetDataTypeFromKey(keyBytes)
+				currentDataType = leveldb.GetDataTypeFromKey(keyBytes)
 			}
 		}
 
@@ -625,6 +639,7 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 			fmt.Sscanf(matches[5], "%d", &valueSize)
 			valueBytes, err = hex.DecodeString(valueHex)
 			if err != nil {
+				log.Printf("line %d: failed to decode value hex for key %q: %v", lineCounter, keyHex, err)
 				continue
 			}
 			if len(valueBytes) != valueSize {
@@ -649,9 +664,10 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 		if len(matches) >= 9 && matches[7] != "" {
 			iterPrefixBytes, err = hex.DecodeString(matches[7])
 			if err != nil {
+				log.Printf("line %d: failed to decode iterator prefix %q: %v", lineCounter, matches[7], err)
 				continue
 			}
-			dataType = leveldb.GetDataTypeFromKey(iterPrefixBytes)
+			currentDataType = leveldb.GetDataTypeFromKey(iterPrefixBytes)
 			// if matches[8] != "" {
 			// 	iterStartBytes, err = hex.DecodeString(matches[8])
 			// 	if err != nil {
@@ -663,21 +679,37 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 		var op opType
 		start := time.Now()
 		var opErr error
+		shouldRecord := true
 
 		switch opTypeStr {
 		case "Get":
 			op = opGet
-			_, opErr = db.Get(keyBytes)
+			var value []byte
+			value, opErr = db.Get(keyBytes)
+			if opErr == nil {
+				logicReadSize += int64(len(value))
+			}
 		case "Has":
 			op = opHas
-			_, opErr = db.Get(keyBytes)
+			var value []byte
+			value, opErr = db.Get(keyBytes)
+			if opErr == nil {
+				logicReadSize += int64(len(value))
+			}
 		case "Put":
 			op = opPut
 			opErr = db.Put(keyBytes, valueBytes)
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
+			}
 		case "Delete":
 			op = opDelete
 			opErr = db.Delete(keyBytes)
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes))
+			}
 		case "NewBatch":
+			op = opNewBatch
 			if !stateBatchActive {
 				stateBatch = db.NewBatch()
 				stateBatchActive = true
@@ -690,6 +722,7 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 			if len(keyBytes) == 0 {
 				break
 			}
+			op = opBatchPut
 			if db.useStateForKey(keyBytes) {
 				if !stateBatchActive || stateBatch == nil {
 					stateBatch = db.NewBatch()
@@ -703,12 +736,17 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 				}
 				opErr = db.BatchPut(nonStateBatch, keyBytes, valueBytes)
 			}
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
+			}
 		case "BatchPutCommit":
 			// 不再在这里commit，交由区块结束行处理
+			shouldRecord = false
 		case "BatchDelete":
 			if len(keyBytes) == 0 {
 				break
 			}
+			op = opBatchDelete
 			if db.useStateForKey(keyBytes) {
 				if !stateBatchActive || stateBatch == nil {
 					stateBatch = db.NewBatch()
@@ -722,7 +760,11 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 				}
 				opErr = db.BatchDelete(nonStateBatch, keyBytes)
 			}
+			if opErr == nil {
+				logicWriteSize += int64(len(keyBytes))
+			}
 		case "NewBatchWithSize":
+			op = opNewBatchWithSize
 			if !stateBatchActive {
 				stateBatch = db.NewBatch()
 				stateBatchActive = true
@@ -739,19 +781,26 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 				iterator.Release()
 			}
 			iterator = db.NewIterator()
+			lastIterDataType = currentDataType
 		case "IteratorNext":
-			dataType = lastIterDataType
+			currentDataType = lastIterDataType
 			op = opIteratorNext
 			if iterator == nil {
 				opErr = fmt.Errorf("IteratorNext without active iterator at line %d", lineCounter)
 			} else {
 				var valid bool
-				_, _, valid = db.IteratorNext(iterator)
+				var key []byte
+				var value []byte
+				key, value, valid = db.IteratorNext(iterator)
 				if !valid {
 					iterator.Release()
 					iterator = nil
+				} else {
+					logicReadSize += int64(len(key) + len(value))
 				}
 			}
+		default:
+			shouldRecord = false
 		}
 
 		end := time.Now()
@@ -759,10 +808,14 @@ func replayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 		totalTime += elapsed
 
 		if opErr != nil {
-			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+			if len(keyBytes) > 0 && (keyBytes[0] != 'o' && keyBytes[0] != 'a') {
+				fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+			}
 		}
 		counter++
-		recordOp(op, dataType, elapsed)
+		if shouldRecord {
+			recordOp(op, currentDataType, elapsed)
+		}
 		if counter%10000 == 0 {
 			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
 		}
