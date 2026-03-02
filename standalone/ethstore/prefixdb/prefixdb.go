@@ -593,11 +593,6 @@ func (db *PrefixDB) Delete(key []byte, accountKey []byte) error {
 		if err != nil {
 			return err
 		}
-		// db.totalOps++
-		// if db.totalOps%10000 == 0 {
-		// 	fmt.Printf("Total Ops: %d, Cached Ops: %d, Sorted Ops: %d, Read Count: %d, Time on Read: %s\n",
-		// 		db.totalOps, db.cachedOps, db.sortedOps, db.readCount, db.timeOnRead)
-		// }
 
 		if db.storageCache != nil {
 			if accountKey != nil {

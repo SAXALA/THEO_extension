@@ -330,119 +330,28 @@ func (it *pebbleIterator) Release() {
 	}
 }
 
-type pebbleBatch struct {
-	db   *PebbleStore
-	b    *pebble.Batch
-	size int
-}
-
 // NewBatch implements the Store interface
 func (d *PebbleStore) NewBatch() ethdb.Batch {
-	return &pebbleBatch{db: d, b: d.db.NewBatch()}
+	wb := NewWriteBatch(0)
+	wb.DisableAutoCommit()
+	wb.db = d
+	return wb
 }
 
 // NewBatchWithSize implements the Store interface
 func (d *PebbleStore) NewBatchWithSize(size int) ethdb.Batch {
-	return &pebbleBatch{db: d, b: d.db.NewBatchWithSize(size)}
+	if size < 0 {
+		size = 0
+	}
+	wb := NewWriteBatch(size)
+	wb.DisableAutoCommit()
+	wb.db = d
+	return wb
 }
 
 // DeleteRange implements the Store interface
 func (d *PebbleStore) DeleteRange(start []byte, end []byte) error {
 	return d.db.DeleteRange(start, end, pebble.Sync)
-}
-
-// Put inserts the given value into the batch for later committing.
-func (b *pebbleBatch) Put(key []byte, value []byte) error {
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	if err := b.b.Set(key, value, nil); err != nil {
-		return err
-	}
-	b.size += len(key) + len(value)
-	return nil
-}
-
-// Delete inserts the key removal into the batch for later committing.
-func (b *pebbleBatch) Delete(key []byte) error {
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	if err := b.b.Delete(key, nil); err != nil {
-		return err
-	}
-	b.size += len(key)
-	return nil
-}
-
-// DeleteRange inserts a key-range removal into the batch for later committing.
-func (b *pebbleBatch) DeleteRange(start []byte, end []byte) error {
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	if err := b.b.DeleteRange(start, end, nil); err != nil {
-		return err
-	}
-	b.size += len(start) + len(end)
-	return nil
-}
-
-// ValueSize retrieves the amount of data queued up for writing.
-func (b *pebbleBatch) ValueSize() int {
-	return b.size
-}
-
-// Write flushes any accumulated data to disk.
-func (b *pebbleBatch) Write() (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = ErrClosed
-		}
-	}()
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	// Using pebble.Sync for consistency with PebbleStore direct Put/Delete.
-	// Pebble's default is pebble.NoSync for Commit unless WriteOptions are passed.
-	return b.b.Commit(pebble.Sync)
-}
-
-// Reset resets the batch for reuse.
-func (b *pebbleBatch) Reset() {
-	if b.b != nil {
-		b.b.Reset()
-	}
-	b.size = 0
-}
-
-// Replay replays the batch contents over another KeyValueWriter.
-func (b *pebbleBatch) Replay(w ethdb.KeyValueWriter) error {
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	reader := b.b.Reader()
-	for {
-		kind, k, v, ok, err := reader.Next()
-		if !ok {
-			if err != nil {
-				return err // Error during iteration
-			}
-			return nil // End of iteration
-		}
-
-		switch kind {
-		case pebble.InternalKeyKindSet:
-			if err = w.Put(k, v); err != nil {
-				return err
-			}
-		case pebble.InternalKeyKindDelete:
-			if err = w.Delete(k); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unhandled pebble batch operation kind: %v", kind)
-		}
-	}
 }
 
 // NewIterator creates a new iterator over the store.

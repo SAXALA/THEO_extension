@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -571,13 +572,35 @@ func (d *Database) DeleteRange(start, end []byte) error {
 	if d.closed {
 		return ErrClosed
 	}
-	// Delegate to PebbleStore for now, as most range deletions in tests target Pebble data.
-	// TODO: Implement range deletion for AOL and PrefixDB if needed.
-	if d.pebble != nil {
-		return d.pebble.DeleteRange(start, end)
+	if d.pebble == nil {
+		d.log.Warn("DeleteRange called but PebbleStore is nil")
+		return nil
 	}
-	d.log.Warn("DeleteRange called but PebbleStore is nil")
-	return nil
+
+	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
+		return nil
+	}
+
+	batch := d.pebble.NewBatch()
+	iter := d.pebble.NewIterator(nil, nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		key := iter.Key()
+		if start != nil && bytes.Compare(key, start) < 0 {
+			continue
+		}
+		if end != nil && bytes.Compare(key, end) >= 0 {
+			continue
+		}
+		if err := batch.Delete(key); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	return batch.Write()
 }
 
 // Path returns the path to the database directory.
@@ -872,6 +895,37 @@ func (d *Database) Stat() (string, error) {
 func (d *Database) Compact(start []byte, limit []byte) error {
 	d.log.Warn("Compact operation may not be applicable or is handled differently")
 	return nil // Or return an error if not supported
+}
+
+// SyncKeyValue flushes pending writes to durable storage.
+func (d *Database) SyncKeyValue() error {
+	d.quitLock.Lock()
+	defer d.quitLock.Unlock()
+
+	if d.closed {
+		return ErrClosed
+	}
+
+	if d.baolLatestBlock != 0 && len(d.baolkvs) > 0 && d.blockAol != nil {
+		if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+			return fmt.Errorf("failed to sync AOL writes: %w", err)
+		}
+		d.baolkvs = make(map[string]string)
+	}
+
+	if d.statepdb != nil {
+		if err := d.statepdb.BatchCommit(); err != nil {
+			return fmt.Errorf("failed to sync PrefixDB batch: %w", err)
+		}
+	}
+
+	if d.pebble != nil && d.pebble.db != nil {
+		if err := d.pebble.db.Flush(); err != nil {
+			return fmt.Errorf("failed to flush pebble: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (d *Database) CloseAol() error {

@@ -681,39 +681,14 @@ func chainKVReplayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 		op := opGet
 
 		switch opTypeStr {
-		case "Get", "Has":
+		case "Get":
 			op = opGet
 			var val []byte
 			val, opErr = db.Get(keyBytes)
 			if opErr == nil {
 				logicReadSize += int64(len(val))
 			}
-		case "Put":
-			op = opPut
-			opErr = db.Put(keyBytes, valueBytes)
-			if opErr == nil {
-				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
-			}
-		case "Delete":
-			op = opDelete
-			opErr = db.Delete(keyBytes)
-			if opErr == nil {
-				logicWriteSize += int64(len(keyBytes))
-			}
-		case "NewBatch", "NewBatchWithSize":
-			if !stateBatchActive {
-				stateBatch = db.NewBatch()
-				stateBatchActive = true
-			}
-			if !nonStateBatchActive {
-				nonStateBatch = db.NewBatch()
-				nonStateBatchActive = true
-			}
-			if err == io.EOF {
-				break
-			}
-			continue
-		case "BatchPut":
+		case "Put", "BatchPut":
 			op = opPut
 			if len(keyBytes) == 0 {
 				if err == io.EOF {
@@ -737,7 +712,7 @@ func chainKVReplayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 			if opErr == nil {
 				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
 			}
-		case "BatchDelete":
+		case "Delete", "BatchDelete":
 			op = opDelete
 			if len(keyBytes) == 0 {
 				if err == io.EOF {
@@ -761,11 +736,6 @@ func chainKVReplayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
 			if opErr == nil {
 				logicWriteSize += int64(len(keyBytes))
 			}
-		case "BatchPutCommit":
-			if err == io.EOF {
-				break
-			}
-			continue
 		case "NewIterator":
 			op = opNewIterator
 			if it != nil {
@@ -1271,23 +1241,9 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 		switch opTypeStr {
 		case "Get":
 			op = opGet
-		// case "Has":
-		// 	op = opHas
-		case "Put":
+		case "Put", "BatchPut":
 			op = opPut
-		case "BatchPut":
-			op = opPut
-		case "Delete":
-			op = opDelete
-		// case "NewBatch":
-		// 	op = opNewBatch
-		// case "NewBatchWithSize":
-		// 	op = opNewBatchWithSize
-		// case "GetBatchValueSize":
-		// 	op = opGetBatchValueSize
-		// case "BatchPutCommit":
-		// 	op = opBatchPutCommit
-		case "BatchDelete":
+		case "Delete", "BatchDelete":
 			op = opDelete
 		case "NewIterator":
 			op = opNewIterator
@@ -1295,8 +1251,9 @@ func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int6
 			dataType = lastIterDataType
 			op = opIteratorNext
 		default:
-			// 未知操作，跳过
-			// fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			if err := io.EOF; err != nil {
+				break
+			}
 			continue
 		}
 		valueBytes, decodeErr := hex.DecodeString(valueHex)
@@ -2226,22 +2183,6 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType D
 				// 无效的键，跳过
 				continue
 			}
-			// if len(keyBytes) > 0 && keyBytes[0] == 'O' {
-			// 	accountKey := store.GetParentAccountKey(keyBytes)
-			// 	if accountKey == nil {
-			// 		Key, _, err := findKeyValuePair(keyHex[2:66], ps)
-			// 		if Key == "" || err != nil {
-			// 			fmt.Printf("Failed to get parent account key for key %s\n", keyHex)
-			// 			continue
-			// 		}
-			// 		accountKey = []byte(Key)
-			// 		store.InsertAccountHashPebble(accountKey, keyBytes[1:33])
-			// 	}
-			// 	if err := store.SetAccountKey(accountKey); err != nil {
-			// 		fmt.Printf("SetAccountKey failed for key %s: %v\n", keyHex, err)
-			// 		break
-			// 	}
-			// }
 		}
 		// 检查是否有值部分
 		var valueHex string
@@ -2256,17 +2197,6 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType D
 			}
 		}
 
-		// var batchSize int
-		// if len(matches) >= 7 && matches[6] != "" {
-		// 	if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
-		// 		maxInt := int64(int(^uint(0) >> 1))
-		// 		if v > maxInt {
-		// 			batchSize = int(maxInt)
-		// 		} else {
-		// 			batchSize = int(v)
-		// 		}
-		// 	}
-		// }
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		var iterPrefixBytes []byte
 		var iterStartBytes []byte
@@ -2332,57 +2262,30 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType D
 		switch opTypeStr {
 		case "Get":
 			op = opGet
-		// case "Has":
-		// 	op = opHas
 		case "Put", "BatchPut":
 			op = opPut
 		case "Delete", "BatchDelete":
-			// if opTypeStr == "BatchDelete" {
-			// 	op = opBatchDelete
-			// } else {
 			op = opDelete
-			// }
-		// case "BatchPut":
-		// 	op = opBatchPut
-		// case "BatchPutCommit":
-		// 	op = opBatchPutCommit
-		// case "NewBatch":
-		// 	op = opNewBatch
-		// case "NewBatchWithSize":
-		// 	op = opNewBatchWithSize
-		// case "GetBatchValueSize":
-		// 	op = opGetBatchValueSize
 		case "NewIterator":
 			op = opNewIterator
 		case "IteratorNext":
 			dataType = lastIterDataType
 			op = opIteratorNext
-
 		default:
-			// 未知操作，跳过
-			// fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
+			if err := io.EOF; err != nil {
+				break
+			}
 			continue
 		}
 
-		// if op == opBatchPut {
-		// 	if ethstore.AolHandledDataTypes[dataType] || (len(keyBytes) > 0 && keyBytes[0] == 'A') {
-		// 		op = opPut
-		// 	}
-		// }
 		// 执行操作并计时
 		start := time.Now()
 		var opErr error
 		switch op {
 		case opGet:
 			_, opErr = store.Get(keyBytes)
-		// case opHas:
-		// 	_, opErr = store.Has(keyBytes)
 		case opPut:
-			// opErr = store.Put(keyBytes, valueBytes)
-			if len(keyBytes) == 0 {
-				break
-			}
-			if keyBytes[0] == 'O' {
+			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
 				opErr = store.BatchPut(keyBytes, valueBytes)
 				if opErr == nil {
 					prefixdbDirty = true
@@ -2392,66 +2295,17 @@ func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType D
 				opErr = b.Put(keyBytes, valueBytes)
 			}
 		case opDelete:
-			// opErr = store.Delete(keyBytes)
-			if len(keyBytes) == 0 {
-				break
-			}
-			if keyBytes[0] == 'O' {
-				// NOTE: There is no PrefixDB batch-delete API here; keep existing behavior.
+			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
 				opErr = store.Delete(keyBytes)
 			} else {
 				b := ensurePebbleBatch()
 				opErr = b.Delete(keyBytes)
 			}
-		// case opBatchPut:
-		// 	if len(keyBytes) == 0 {
-		// 		break
-		// 	}
-		// 	if keyBytes[0] == 'O' {
-		// 		opErr = store.BatchPut(keyBytes, valueBytes)
-		// 		if opErr == nil {
-		// 			prefixdbDirty = true
-		// 		}
-		// 	} else {
-		// 		b := ensurePebbleBatch()
-		// 		opErr = b.Put(keyBytes, valueBytes)
-		// 	}
-		// case opBatchDelete:
-		// 	if len(keyBytes) == 0 {
-		// 		break
-		// 	}
-		// 	if keyBytes[0] == 'O' || keyBytes[0] == 'o' {
-		// 		// NOTE: There is no PrefixDB batch-delete API here; keep existing behavior.
-		// 		opErr = store.Delete(keyBytes)
-		// 	} else {
-		// 		b := ensurePebbleBatch()
-		// 		opErr = b.Delete(keyBytes)
-		// 	}
-		// case opBatchPutCommit:
-		// 	// Commit is deferred until we observe a block end marker.
-		// 	// (See "Processing block (end)" handling above.)
-		// 	opErr = nil
-		// case opNewBatch:
-		// 	nextBatchRequested = true
-		// 	nextBatchSize = 0
-		// case opNewBatchWithSize:
-		// 	nextBatchRequested = true
-		// 	if batchSize > 0 {
-		// 		nextBatchSize = batchSize
-		// 	} else {
-		// 		nextBatchSize = 0
-		// 	}
-		// case opGetBatchValueSize:
-		// 	if pebbleBatch != nil {
-		// 		_ = pebbleBatch.ValueSize()
-		// 	}
 		case opNewIterator:
 			if iter != nil {
 				iter.Release()
 				iter = nil
 			}
-			// EthStore's iterator routing may involve non-Pebble backends (e.g., AOL) and PrefixDB has no iterator.
-			// For replayTrace we only exercise Pebble iterator behavior; skip TrieStorage (PrefixDB) prefixes.
 			if len(iterPrefixBytes) > 0 && (iterPrefixBytes[0] == 'O') {
 				iter = nil
 				break
