@@ -56,36 +56,36 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 
 	// First, create AOL and append block starting from block 2000
 	aol1, cleanup1 := NewAppendOnlyLogTest(t, dir, 10)
-	
+
 	// Manually set the latestBlockID to 1999 to simulate starting from 2000
 	aol1.latestBlockID = 1999
-	
+
 	// Append blocks 2000, 2001, 2002
 	kvs2000 := map[string]string{"k2000_1": "v2000_1", "k2000_2": "v2000_2"}
 	if err := aol1.Append(2000, kvs2000); err != nil {
 		t.Fatalf("Failed to append block 2000: %v", err)
 	}
-	
+
 	kvs2001 := map[string]string{"k2001_1": "v2001_1"}
 	if err := aol1.Append(2001, kvs2001); err != nil {
 		t.Fatalf("Failed to append block 2001: %v", err)
 	}
-	
+
 	kvs2002 := map[string]string{"k2002_1": "v2002_1", "k2002_2": "v2002_2"}
 	if err := aol1.Append(2002, kvs2002); err != nil {
 		t.Fatalf("Failed to append block 2002: %v", err)
 	}
-	
+
 	// Verify minBlockID was set
 	if aol1.minBlockID != 2000 {
 		t.Errorf("Expected minBlockID=2000, got %d", aol1.minBlockID)
 	}
-	
+
 	// Force flush to check actual file size
 	if err := aol1.FlushIndexBuffer(); err != nil {
 		t.Fatalf("Failed to flush index buffer: %v", err)
 	}
-	
+
 	// Check index file size - should be compact (3 entries * indexEntrySize)
 	indexPath := filepath.Join(dir, BlockindexMapFileName)
 	stat, err := os.Stat(indexPath)
@@ -97,23 +97,23 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	if stat.Size() != expectedSize {
 		t.Logf("NOTE: Index file uses compact storage starting from block %d", aol1.minBlockID)
 	}
-	
+
 	cleanup1() // Close first instance
-	
+
 	// Reopen and verify all blocks can be loaded
 	aol2, cleanup2 := NewAppendOnlyLogTest(t, dir, 10)
 	defer cleanup2()
-	
+
 	// Verify minBlockID was loaded
 	if aol2.minBlockID != 2000 {
 		t.Errorf("Expected loaded minBlockID=2000, got %d", aol2.minBlockID)
 	}
-	
+
 	// Verify latestBlockID
 	if aol2.latestBlockID != 2002 {
 		t.Errorf("Expected latestBlockID=2002, got %d", aol2.latestBlockID)
 	}
-	
+
 	// Verify block 2000
 	retrievedKVs2000, err := aol2.GetByBlock(2000)
 	if err != nil {
@@ -122,7 +122,7 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	if !reflect.DeepEqual(retrievedKVs2000, kvs2000) {
 		t.Errorf("Block 2000 mismatch: got %v, want %v", retrievedKVs2000, kvs2000)
 	}
-	
+
 	// Verify block 2001
 	retrievedKVs2001, err := aol2.GetByBlock(2001)
 	if err != nil {
@@ -131,7 +131,7 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	if !reflect.DeepEqual(retrievedKVs2001, kvs2001) {
 		t.Errorf("Block 2001 mismatch: got %v, want %v", retrievedKVs2001, kvs2001)
 	}
-	
+
 	// Verify block 2002
 	retrievedKVs2002, err := aol2.GetByBlock(2002)
 	if err != nil {
@@ -140,7 +140,7 @@ func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	if !reflect.DeepEqual(retrievedKVs2002, kvs2002) {
 		t.Errorf("Block 2002 mismatch: got %v, want %v", retrievedKVs2002, kvs2002)
 	}
-	
+
 	// Verify that keys are accessible via Get
 	val, exists, err := aol2.Get("k2002_1")
 	if err != nil {
@@ -267,6 +267,56 @@ func TestAppendOnlyLog_DuplicateLatestBlockIDAppendsMultipleKVs(t *testing.T) {
 	expected := map[string]string{"k1": "v1", "k2": "v2", "k3": "v3"}
 	if !reflect.DeepEqual(kvs, expected) {
 		t.Fatalf("block 100 mismatch: got %v want %v", kvs, expected)
+	}
+}
+
+func TestBlockAppendOnlyLog_IteratorOrder_HeaderBodyReceipts(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 16)
+	defer cleanup()
+
+	// Keys are crafted to match the single-byte prefixes used by GetDataTypeFromKey:
+	// 'h' => Header, 'b' => Body, 'r' => Receipts.
+	headerKey := "h_header"
+	bodyKey := "b_body"
+	receiptKey := "r_receipts"
+
+	kvs := map[string]string{
+		receiptKey: "V_R",
+		bodyKey:    "V_B",
+		headerKey:  "V_H",
+	}
+	if err := aol.Append(1, kvs); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	it := aol.NewIterator([]byte(headerKey))
+	defer it.Release()
+
+	if !it.Next() {
+		t.Fatalf("expected first Next() to be true, err=%v", it.Error())
+	}
+	if got := string(it.Key()); got != headerKey {
+		t.Fatalf("first key mismatch: got=%q want=%q", got, headerKey)
+	}
+	if got := string(it.Value()); got != "V_H" {
+		t.Fatalf("first value mismatch: got=%q want=%q", got, "V_H")
+	}
+
+	if !it.Next() {
+		t.Fatalf("expected second Next() to be true, err=%v", it.Error())
+	}
+	if got := string(it.Key()); got != bodyKey {
+		t.Fatalf("second key mismatch: got=%q want=%q", got, bodyKey)
+	}
+
+	if !it.Next() {
+		t.Fatalf("expected third Next() to be true, err=%v", it.Error())
+	}
+	if got := string(it.Key()); got != receiptKey {
+		t.Fatalf("third key mismatch: got=%q want=%q", got, receiptKey)
 	}
 }
 
@@ -424,16 +474,16 @@ func TestAppendOnlyLog_GetByBlock(t *testing.T) {
 			expectErr:   false,
 		},
 		{
-			name:          "get non-existent block",
-			blockID:       3,
-			expectedKVs:   map[string]string{},
-			expectErr:     false,
+			name:        "get non-existent block",
+			blockID:     3,
+			expectedKVs: map[string]string{},
+			expectErr:   false,
 		},
 		{
-			name:          "get block 0 (non-existent)",
-			blockID:       0,
-			expectedKVs:   map[string]string{},
-			expectErr:     false,
+			name:        "get block 0 (non-existent)",
+			blockID:     0,
+			expectedKVs: map[string]string{},
+			expectErr:   false,
 		},
 	}
 

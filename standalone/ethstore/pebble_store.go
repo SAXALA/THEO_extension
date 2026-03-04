@@ -3,6 +3,7 @@ package ethstore
 import (
 	"bytes"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -331,19 +332,21 @@ func (it *pebbleIterator) Release() {
 }
 
 type pebbleBatch struct {
+	mu   sync.Mutex
 	db   *PebbleStore
 	b    *pebble.Batch
+	kvs  map[string][]byte
 	size int
 }
 
 // NewBatch implements the Store interface
 func (d *PebbleStore) NewBatch() ethdb.Batch {
-	return &pebbleBatch{db: d, b: d.db.NewBatch()}
+	return &pebbleBatch{db: d, b: d.db.NewBatch(), kvs: make(map[string][]byte)}
 }
 
 // NewBatchWithSize implements the Store interface
 func (d *PebbleStore) NewBatchWithSize(size int) ethdb.Batch {
-	return &pebbleBatch{db: d, b: d.db.NewBatchWithSize(size)}
+	return &pebbleBatch{db: d, b: d.db.NewBatchWithSize(size), kvs: make(map[string][]byte)}
 }
 
 // DeleteRange implements the Store interface
@@ -351,27 +354,53 @@ func (d *PebbleStore) DeleteRange(start []byte, end []byte) error {
 	return d.db.DeleteRange(start, end, pebble.Sync)
 }
 
-// Put inserts the given value into the batch for later committing.
-func (b *pebbleBatch) Put(key []byte, value []byte) error {
-	if b.b == nil {
-		return fmt.Errorf("pebble batch not initialized")
-	}
-	if err := b.b.Set(key, value, nil); err != nil {
+// DeleteRange deletes all keys in the range [start, end).
+func (b *pebbleBatch) DeleteRange(start, end []byte) error {
+	if err := b.b.DeleteRange(start, end, nil); err != nil {
 		return err
 	}
-	b.size += len(key) + len(value)
+	b.size += len(start) + len(end)
 	return nil
+}
+
+// Put inserts the given value into the batch for later committing.
+func (b *pebbleBatch) Put(key []byte, value []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// if b.b == nil {
+	// 	return fmt.Errorf("pebble batch not initialized")
+	// }
+	// if err := b.b.Set(key, value, nil); err != nil {
+	// 	return err
+	// }
+	// b.size += len(key) + len(value)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+	b.kvs[string(key)] = valueCopy
+	return nil
+}
+
+func (b *pebbleBatch) get(key []byte) ([]byte, bool) {
+	keyStr := string(key)
+	b.mu.Lock()
+	value, ok := b.kvs[keyStr]
+	b.mu.Unlock()
+	return value, ok
 }
 
 // Delete inserts the key removal into the batch for later committing.
 func (b *pebbleBatch) Delete(key []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// if b.b == nil {
 	if b.b == nil {
 		return fmt.Errorf("pebble batch not initialized")
 	}
-	if err := b.b.Delete(key, nil); err != nil {
-		return err
-	}
-	b.size += len(key)
+	// if err := b.b.Delete(key, nil); err != nil {
+	// 	return err
+	// }
+	// b.size += len(key)
+	b.kvs[string(key)] = nil
 	return nil
 }
 
@@ -382,6 +411,8 @@ func (b *pebbleBatch) ValueSize() int {
 
 // Write flushes any accumulated data to disk.
 func (b *pebbleBatch) Write() (err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
 			err = ErrClosed
@@ -390,6 +421,22 @@ func (b *pebbleBatch) Write() (err error) {
 	if b.b == nil {
 		return fmt.Errorf("pebble batch not initialized")
 	}
+
+	for k, v := range b.kvs {
+		keyBytes := []byte(k)
+		if v == nil {
+			if err := b.b.Delete(keyBytes, nil); err != nil {
+				return err
+			}
+			b.size += len(keyBytes)
+		} else {
+			if err := b.b.Set(keyBytes, v, nil); err != nil {
+				return err
+			}
+			b.size += len(keyBytes) + len(v)
+		}
+	}
+
 	// Using pebble.Sync for consistency with PebbleStore direct Put/Delete.
 	// Pebble's default is pebble.NoSync for Commit unless WriteOptions are passed.
 	return b.b.Commit(pebble.Sync)
@@ -401,6 +448,7 @@ func (b *pebbleBatch) Reset() {
 		b.b.Reset()
 	}
 	b.size = 0
+	b.kvs = make(map[string][]byte)
 }
 
 // Replay replays the batch contents over another KeyValueWriter.

@@ -15,7 +15,8 @@ import (
 	"time"
 
 	// Added testing import
-	"github.com/ethereum/go-ethereum/common" // Added common import
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/huandu/skiplist" // Using a third-party skiplist library
 )
@@ -1108,13 +1109,31 @@ func (baol *BlockAppendOnlyLog) writeLogEntry(w io.Writer, blockID uint64, key, 
 // writeLogEntriess serializes some log entries to the writer.
 // Format: blockID (uint64) | keyLen (uint32) | valueLen (uint32) | key (bytes) | value (bytes)
 func (baol *BlockAppendOnlyLog) writeLogEntries(w io.Writer, blockID uint64, kvs map[string]string) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(kvs))
+	for k := range kvs {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		pi := baolWritePriority(keys[i])
+		pj := baolWritePriority(keys[j])
+		if pi != pj {
+			return pi < pj
+		}
+		return keys[i] < keys[j]
+	})
+
 	size := 0
-	for key, value := range kvs {
+	for _, key := range keys {
+		value := kvs[key]
 		size += blockIDSize + keyLenSize + valueLenSize + len(key) + len(value)
 	}
 	buf := make([]byte, size)
 	offset := 0
-	for key, value := range kvs {
+	for _, key := range keys {
+		value := kvs[key]
 		kb := []byte(key)
 		vb := []byte(value)
 		keyLen := uint32(len(kb))
@@ -1130,6 +1149,20 @@ func (baol *BlockAppendOnlyLog) writeLogEntries(w io.Writer, blockID uint64, kvs
 	}
 	_, err := w.Write(buf)
 	return err
+}
+
+func baolWritePriority(key string) int {
+	dt := GetDataTypeFromKey(StringToBytes(key))
+	switch dt {
+	case HeaderDataType:
+		return 0
+	case BlockBodyDataType:
+		return 1
+	case BlockReceiptsDataType:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // readLogEntry deserializes a single log entry from the reader.
@@ -1249,11 +1282,8 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 
 	startOffset := baol.currentOffset
 	blockDataBuf := new(bytes.Buffer)
-
-	for key, value := range kvs {
-		if err := baol.writeLogEntry(blockDataBuf, newBlockID, key, value); err != nil {
-			return 0, fmt.Errorf("failed to serialize entry for new block %d, key %s: %w", newBlockID, key, err)
-		}
+	if err := baol.writeLogEntries(blockDataBuf, newBlockID, kvs); err != nil {
+		return 0, fmt.Errorf("failed to serialize entries for new block %d: %w", newBlockID, err)
 	}
 
 	blockBytes := blockDataBuf.Bytes()
@@ -1726,4 +1756,210 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 		return baol.dataFile, headerSize, keyLen, valLen, nil
 	}
 	return nil, 0, 0, 0, fmt.Errorf("failed to detect data file for pointer offset %d (blockID %d)", pointer.Offset, pointer.BlockID)
+}
+
+type baolStreamIterator struct {
+	baol *BlockAppendOnlyLog
+
+	minBlockID uint64
+	maxBlockID uint64
+
+	curBlockID      uint64
+	curBlockEntry   blockIndexEntry
+	hasCurrentBlock bool
+	nextOffset      int64
+
+	// Prefetched next KV (filled by prefetchNext)
+	hasNextKV bool
+	nextKey   []byte
+	nextValue []byte
+
+	// Current KV (visible via Key/Value)
+	key   []byte
+	value []byte
+
+	err error
+}
+
+// NewIterator returns a streaming iterator over KV pairs in the data log,
+// in on-disk order (block by block, entry by entry), starting from the block
+// parsed from startKey.
+//
+// If startKey is nil/empty, iteration starts from minBlockID.
+//
+// Behavior (per requirement): during NewIterator it reads the corresponding block index
+// and preloads the first KV pair in the data log (read sizes, then read key/value).
+// The first call to Next() returns that KV pair.
+func (baol *BlockAppendOnlyLog) NewIterator(startKey []byte) ethdb.Iterator {
+	baol.mu.RLock()
+	if baol.closed {
+		baol.mu.RUnlock()
+		return &errorIterator{err: ErrClosed}
+	}
+	minBlockID := baol.minBlockID
+	maxBlockID := baol.latestBlockID
+	baol.mu.RUnlock()
+
+	it := &baolStreamIterator{
+		baol:       baol,
+		minBlockID: minBlockID,
+		maxBlockID: maxBlockID,
+	}
+
+	// Determine start block ID.
+	start := uint64(0)
+	if len(startKey) > 0 {
+		dt := GetDataTypeFromKey(startKey)
+		if blockID, ok := ParseBlockNumberFromKey(startKey, dt); ok {
+			start = blockID
+		} else {
+			// If caller passed a key but we can't parse a block number, return an error iterator.
+			it.err = fmt.Errorf("cannot parse blockID from startKey (type %s)", DataTypeStrings[dt])
+			return it
+		}
+	} else {
+		start = minBlockID
+	}
+
+	if start == 0 {
+		if maxBlockID == 0 {
+			// Empty log.
+			return it
+		}
+		// Fallback for legacy datasets where minBlockID isn't set.
+		start = 1
+	}
+	if minBlockID != 0 && start < minBlockID {
+		start = minBlockID
+	}
+	if start > maxBlockID {
+		// Start beyond current range => empty iterator.
+		return it
+	}
+
+	it.curBlockID = start
+	it.prefetchNext()
+	return it
+}
+
+func (it *baolStreamIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	if !it.hasNextKV {
+		return false
+	}
+	// Publish prefetched KV as current.
+	it.key = it.nextKey
+	it.value = it.nextValue
+	it.hasNextKV = false
+	it.nextKey = nil
+	it.nextValue = nil
+
+	// Prefetch next one.
+	it.prefetchNext()
+	return true
+}
+
+func (it *baolStreamIterator) Error() error { return it.err }
+
+func (it *baolStreamIterator) Key() []byte { return it.key }
+
+func (it *baolStreamIterator) Value() []byte { return it.value }
+
+func (it *baolStreamIterator) Release() {
+	it.baol = nil
+	it.key = nil
+	it.value = nil
+	it.nextKey = nil
+	it.nextValue = nil
+}
+
+func (it *baolStreamIterator) prefetchNext() {
+	if it.baol == nil {
+		return
+	}
+	if it.curBlockID == 0 {
+		return
+	}
+	for {
+		if it.curBlockID > it.maxBlockID {
+			it.hasNextKV = false
+			return
+		}
+
+		// Load current block index entry if needed.
+		if !it.hasCurrentBlock {
+			it.baol.mu.RLock()
+			entry, ok := it.baol.getBlockIndexEntry(it.curBlockID)
+			closed := it.baol.closed
+			it.baol.mu.RUnlock()
+			if closed {
+				it.err = ErrClosed
+				it.hasNextKV = false
+				return
+			}
+			if !ok || entry.EndOffset <= entry.StartOffset {
+				it.curBlockID++
+				continue
+			}
+			it.curBlockEntry = entry
+			it.hasCurrentBlock = true
+			it.nextOffset = entry.StartOffset
+		}
+
+		// End of this block? move to next.
+		if it.nextOffset >= it.curBlockEntry.EndOffset {
+			it.curBlockID++
+			it.hasCurrentBlock = false
+			continue
+		}
+
+		key, value, bytesRead, err := it.readKVAt(it.nextOffset, it.curBlockEntry.EndOffset)
+		if err != nil {
+			it.err = err
+			it.hasNextKV = false
+			return
+		}
+		it.nextOffset += bytesRead
+		it.nextKey = key
+		it.nextValue = value
+		it.hasNextKV = true
+		return
+	}
+}
+
+func (it *baolStreamIterator) readKVAt(offset int64, blockEnd int64) ([]byte, []byte, int64, error) {
+	const headerSize = int64(blockIDSize + keyLenSize + valueLenSize)
+	if offset+headerSize > blockEnd {
+		return nil, nil, 0, fmt.Errorf("corrupted entry header at offset %d: remaining=%d < headerSize=%d", offset, blockEnd-offset, headerSize)
+	}
+
+	hdr := make([]byte, headerSize)
+	if _, err := it.baol.dataFile.ReadAt(hdr, offset); err != nil {
+		return nil, nil, 0, err
+	}
+
+	keyLenU32 := binary.BigEndian.Uint32(hdr[blockIDSize : blockIDSize+keyLenSize])
+	valueLenU32 := binary.BigEndian.Uint32(hdr[blockIDSize+keyLenSize:])
+	keyLen := int64(keyLenU32)
+	valueLen := int64(valueLenU32)
+	maxInt := int64(int(^uint(0) >> 1))
+	if keyLen > maxInt || valueLen > maxInt {
+		return nil, nil, 0, fmt.Errorf("entry too large at offset %d: keyLen=%d valueLen=%d", offset, keyLen, valueLen)
+	}
+	entrySize := headerSize + keyLen + valueLen
+	if offset+entrySize > blockEnd {
+		return nil, nil, 0, fmt.Errorf("corrupted entry at offset %d: entrySize=%d exceeds blockEnd=%d", offset, entrySize, blockEnd)
+	}
+
+	key := make([]byte, int(keyLen))
+	if _, err := it.baol.dataFile.ReadAt(key, offset+headerSize); err != nil {
+		return nil, nil, 0, err
+	}
+	value := make([]byte, int(valueLen))
+	if _, err := it.baol.dataFile.ReadAt(value, offset+headerSize+keyLen); err != nil {
+		return nil, nil, 0, err
+	}
+	return key, value, entrySize, nil
 }

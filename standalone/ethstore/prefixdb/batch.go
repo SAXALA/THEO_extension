@@ -225,13 +225,13 @@ func (wb *WriteBatch) add(key, value []byte, storageFileID uint32, storageOffset
 // delete marks a key for deletion in the batch
 func (wb *WriteBatch) delete(key []byte) {
 	wb.lock.Lock()
-	// Use nil value to indicate deletion
-	if wb.operations[string(key)].value == nil {
-		// If the key is already marked for deletion, do nothing
+	// Use nil value to indicate deletion.
+	// Only skip if the key is already explicitly marked for deletion.
+	if op, exists := wb.operations[string(key)]; exists && op.value == nil {
 		wb.lock.Unlock()
 		return
 	}
-	wb.operations[string(key)] = WriteOperation{value: nil, storageFileID: 0, storageOffset: 0, storageSize: 0, modifiedType: 1}
+	wb.operations[string(key)] = WriteOperation{value: nil, storageFileID: 0, storageOffset: 0, storageSize: 0, modifiedType: ValueModified}
 	wb.lock.Unlock()
 
 	wb.checkAndCommit()
@@ -306,6 +306,16 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 			// No changes, skip
 			continue
 		case ValueModified:
+			if op.value == nil {
+				// Tombstone delete: store offset=0 so future lookups treat as missing.
+				if db.nodeCache != nil {
+					db.nodeCache.Delete(key)
+				}
+				if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
+					return err
+				}
+				continue
+			}
 			entry, err := db.ConvertKV(keyBytes, op.value)
 			if err != nil {
 				return err

@@ -118,19 +118,12 @@ func (db *PrefixDB) stopStorageBatcher() {
 	db.storageBatch = nil
 }
 
-// BatchPut stages storage kvs in memory until BatchCommit.
-func (db *PrefixDB) BatchPut(key, value, accountKey []byte) error {
+// StorageBatchPut stages storage kvs in memory until BatchCommit.
+func (db *PrefixDB) StorageBatchPut(key, value, accountKey []byte) error {
 	if db.storageBatch == nil {
 		return errors.New("storage batcher not initialized")
 	}
-	keyType, err := db.getKeyType(key)
-	if err != nil {
-		return err
-	}
-	if keyType != TrieStorage {
-		return errors.New("BatchPut only accepts storage keys")
-	}
-	storageKey, err := db.normalizeStorageKey(key, keyType)
+	storageKey, err := db.normalizeStorageKey(key)
 	if err != nil {
 		return err
 	}
@@ -146,8 +139,8 @@ func (db *PrefixDB) BatchPut(key, value, accountKey []byte) error {
 	return nil
 }
 
-// BatchCommit persists all staged storage kvs and waits for storage GC completion.
-func (db *PrefixDB) BatchCommit() error {
+// StorageBatchCommit persists all staged storage kvs and waits for storage GC completion.
+func (db *PrefixDB) StorageBatchCommit() error {
 	if db.storageBatch == nil {
 		return nil
 	}
@@ -181,7 +174,7 @@ func (db *PrefixDB) BatchCommit() error {
 				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
 				continue
 			}
-			storageKey, err := db.normalizeStorageKey(origKeyBytes, TrieStorage)
+			storageKey, err := db.normalizeStorageKey(origKeyBytes)
 			if err != nil {
 				return err
 			}
@@ -194,9 +187,9 @@ func (db *PrefixDB) BatchCommit() error {
 			if v == nil {
 				perAcc[string(storageKey)] = nil
 			} else {
-				valCopy := make([]byte, len(v))
-				copy(valCopy, v)
-				perAcc[string(storageKey)] = valCopy
+				// v is already owned by this commit (putUnresolved makes a copy),
+				// so avoid an extra copy here.
+				perAcc[string(storageKey)] = v
 			}
 			if db.storageCache != nil {
 				db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
@@ -221,12 +214,8 @@ func (db *PrefixDB) BatchCommit() error {
 		kvs := make([]kvPair, 0, len(perAccount))
 		for k, v := range perAccount {
 			keyBytes := []byte(k)
-			var valCopy []byte
-			if v != nil {
-				valCopy = make([]byte, len(v))
-				copy(valCopy, v)
-			}
-			kvs = append(kvs, kvPair{key: keyBytes, val: valCopy})
+			// v is already a stable copy owned by this commit (sb.put makes a copy).
+			kvs = append(kvs, kvPair{key: keyBytes, val: v})
 		}
 		sortKVPairs(kvs)
 		if err := db.commitStorageForAccount(accountKey, kvs); err != nil {
@@ -296,7 +285,7 @@ func (db *PrefixDB) batchGetOverlay(key, accountKey []byte) ([]byte, bool) {
 	if db.storageBatch == nil || len(accountKey) == 0 {
 		return nil, false
 	}
-	storageKey, err := db.normalizeStorageKey(key, TrieStorage)
+	storageKey, err := db.normalizeStorageKey(key)
 	if err != nil {
 		return nil, false
 	}

@@ -1,6 +1,7 @@
 package ethstore
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -56,6 +57,9 @@ func (b *errorBatch) Put(key []byte, value []byte) error { return b.err }
 
 // Delete implements ethdb.Batch and returns the predefined error.
 func (b *errorBatch) Delete(key []byte) error { return b.err }
+
+// DeleteRange implements ethdb.Batch and returns the predefined error.
+func (b *errorBatch) DeleteRange(start []byte, end []byte) error { return b.err }
 
 // ValueSize implements ethdb.Batch and returns 0.
 func (b *errorBatch) ValueSize() int { return 0 }
@@ -154,11 +158,11 @@ type Database struct {
 }
 
 // The namespace is the prefix that the metrics reporting should use.
-func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64) (*Database, error) {
+func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, cacheCount int) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, chunkFileSize, prefixTreeCacheSize) // Example chunk size and cache size
+	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, chunkFileSize, prefixTreeCacheSize, cacheCount) // Example chunk size and cache size
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -415,20 +419,28 @@ func (d *Database) Put(key []byte, value []byte) error {
 			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
 		}
 		if foundBlockID {
-			var err error
 			if blockID > d.baolLatestBlock {
+				if d.blockAol == nil {
+					return fmt.Errorf("block append-only log is not initialized")
+				}
+				if d.baolkvs == nil {
+					d.baolkvs = make(map[string]string, 4)
+				}
 				if d.baolLatestBlock != 0 {
-					err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
+					if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+						return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+					}
 				}
+				// Reuse the map to avoid per-block allocations.
+				clear(d.baolkvs)
 				d.baolLatestBlock = blockID
-				d.baolkvs = make(map[string]string, 4)
 				d.baolkvs[string(key)] = string(value)
-				if err != nil {
-					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-				}
 				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
 				return nil // Data stored in AOL
 			} else {
+				if d.baolkvs == nil {
+					d.baolkvs = make(map[string]string, 4)
+				}
 				d.baolkvs[string(key)] = string(value)
 				return nil // Data queued for AOL
 			}
@@ -470,22 +482,16 @@ func (d *Database) Put(key []byte, value []byte) error {
 	return nil
 }
 
-func (d *Database) BatchPut(key []byte, value []byte) error {
-	dataType := GetDataTypeFromKey(key)
+func (d *Database) BatchPut(key []byte, value []byte, dataType DataType) error {
 	if PrefixDBHandledDataTypes[dataType] {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		// Store in PrefixDB
-		if dataType == TrieNodeStorageDataType {
-			// Defer parent account key resolution until BatchCommit to avoid repeated lookups.
-		}
-		// Pass nil accountKey to let PrefixDB record unresolved entries.
 		err := d.statepdb.BatchPut(key, value, nil)
-
 		if err != nil {
-			return fmt.Errorf("failed to batch put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+			return fmt.Errorf("failed to batch put account key %x in PrefixDB: %w", key, err)
 		}
+
 		d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
 	} else if AolHandledDataTypes[dataType] {
 		var blockID uint64
@@ -499,20 +505,28 @@ func (d *Database) BatchPut(key []byte, value []byte) error {
 			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
 		}
 		if foundBlockID {
-			var err error
 			if blockID > d.baolLatestBlock {
+				if d.blockAol == nil {
+					return fmt.Errorf("block append-only log is not initialized")
+				}
+				if d.baolkvs == nil {
+					d.baolkvs = make(map[string]string, 4)
+				}
 				if d.baolLatestBlock != 0 {
-					err = d.blockAol.Append(d.baolLatestBlock, d.baolkvs)
+					if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+						return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+					}
 				}
+				// Reuse the map to avoid per-block allocations.
+				clear(d.baolkvs)
 				d.baolLatestBlock = blockID
-				d.baolkvs = make(map[string]string, 4)
 				d.baolkvs[string(key)] = string(value)
-				if err != nil {
-					return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-				}
 				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
 				return nil // Data stored in AOL
 			} else {
+				if d.baolkvs == nil {
+					d.baolkvs = make(map[string]string, 4)
+				}
 				d.baolkvs[string(key)] = string(value)
 				return nil // Data queued for AOL
 			}
@@ -529,7 +543,7 @@ func (d *Database) PrefixdbBatchCommit(prefix byte) error {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot commit batch for prefix %c", prefix)
 		}
-		err := d.statepdb.BatchCommit()
+		err := d.statepdb.StorageBatchCommit()
 		if err != nil {
 			return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
 		}
@@ -590,6 +604,23 @@ func (d *Database) Delete(key []byte) error {
 	return nil
 }
 
+func (d *Database) BatchDelete(key []byte, dataType DataType) error {
+	if PrefixDBHandledDataTypes[dataType] {
+		if d.statepdb == nil {
+			return fmt.Errorf("PrefixDB is not initialized, cannot batch delete key %x (type %s)", key, DataTypeStrings[dataType])
+		}
+		// Delete from PrefixDB
+		err := d.statepdb.BatchPut(key, nil, nil)
+		if err != nil {
+			return fmt.Errorf("failed to batch delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		d.log.Trace("Batch deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+		return nil // Data deleted from PrefixDB
+	}
+	return nil
+
+}
+
 // DeleteRange removes all keys between start and end (exclusive of end).
 // WARNING: This is a placeholder implementation. True range deletion is complex
 // for an append-only log and might not be fully supported or may require
@@ -600,13 +631,35 @@ func (d *Database) DeleteRange(start, end []byte) error {
 	if d.closed {
 		return ErrClosed
 	}
-	// Delegate to PebbleStore for now, as most range deletions in tests target Pebble data.
-	// TODO: Implement range deletion for AOL and PrefixDB if needed.
-	if d.pebble != nil {
-		return d.pebble.DeleteRange(start, end)
+	if d.pebble == nil {
+		d.log.Warn("DeleteRange called but PebbleStore is nil")
+		return nil
 	}
-	d.log.Warn("DeleteRange called but PebbleStore is nil")
-	return nil
+
+	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
+		return nil
+	}
+
+	batch := d.pebble.NewBatch()
+	iter := d.pebble.NewIterator(nil, nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		key := iter.Key()
+		if start != nil && bytes.Compare(key, start) < 0 {
+			continue
+		}
+		if end != nil && bytes.Compare(key, end) >= 0 {
+			continue
+		}
+		if err := batch.Delete(key); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	return batch.Write()
 }
 
 // Path returns the path to the database directory.
@@ -700,15 +753,7 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	if AolHandledDataTypes[dataType] {
 		// This is an AOL-handled type, use the 'iterator' struct.
 		d.log.Trace("Creating new iterator for AOL", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
-		iter := &iterator{
-			db:     d,
-			prefix: prefix,
-			start:  start,
-			keys:   make([][]byte, 0),
-			pos:    -1,
-		}
-		iter.init()
-		return iter
+		return d.blockAol.NewIterator(prefix)
 	}
 
 	// Not an AOL-handled type, delegate to PebbleStore.
@@ -901,6 +946,38 @@ func (d *Database) Stat() (string, error) {
 func (d *Database) Compact(start []byte, limit []byte) error {
 	d.log.Warn("Compact operation may not be applicable or is handled differently")
 	return nil // Or return an error if not supported
+}
+
+// SyncKeyValue flushes pending writes to durable storage.
+func (d *Database) SyncKeyValue() error {
+	d.quitLock.Lock()
+	defer d.quitLock.Unlock()
+
+	if d.closed {
+		return ErrClosed
+	}
+
+	if d.baolLatestBlock != 0 && len(d.baolkvs) > 0 && d.blockAol != nil {
+		if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+			return fmt.Errorf("failed to sync AOL writes: %w", err)
+		}
+		// Reuse the map to avoid allocations on every SyncKeyValue.
+		clear(d.baolkvs)
+	}
+
+	if d.statepdb != nil {
+		if err := d.statepdb.StorageBatchCommit(); err != nil {
+			return fmt.Errorf("failed to sync PrefixDB batch: %w", err)
+		}
+	}
+
+	if d.pebble != nil && d.pebble.db != nil {
+		if err := d.pebble.db.Flush(); err != nil {
+			return fmt.Errorf("failed to flush pebble: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (d *Database) CloseAol() error {
