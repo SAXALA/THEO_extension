@@ -63,7 +63,6 @@ standalone/ethstore/workload/bin/*
 standalone/ethstore/workload/replayLog/*
 standalone/ethstore/workload/*.log
 standalone/ethstore/workload/*.out
-ChainKV/workload/*
 standalone/ethstore/workload/ethstoreIO_02-24_io_trend.png
 standalone/ethstore/workload/ethstoreIO_02-24.log1
 standalone/ethstore/workload/ethstoreIO_02-24_io_summary.txt

@@ -33,9 +33,6 @@ func TestNewPebbleStore(t *testing.T) {
 	if ps == nil {
 		t.Fatal("NewPebbleStore() returned nil PebbleStore")
 	}
-	if ps.db == nil {
-		t.Fatal("PebbleStore.db is nil after NewPebbleStore()")
-	}
 	err = ps.Close()
 	if err != nil {
 		t.Errorf("Failed to close pebble store: %v", err)
@@ -416,4 +413,60 @@ func TestPebbleStore_ManyOperations(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, expectedValue, value)
 	}
+}
+
+func TestPebbleBatch_BatchGetOverlaySemantics(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "pebble-batch-overlay-test")
+
+	store, err := NewPebbleStore(dbPath, 0, 0, "", false)
+	require.NoError(t, err)
+	defer store.Close()
+
+	key := []byte("overlay-key")
+	dbValue := []byte("db-value")
+	batchValue := []byte("batch-value")
+
+	require.NoError(t, store.Put(key, dbValue))
+
+	batch := store.NewBatch()
+	overlay, ok := batch.(interface{ BatchGet([]byte) ([]byte, bool) })
+	require.True(t, ok, "new batch should expose BatchGet overlay interface")
+
+	// 1) no pending batch mutation: should miss overlay and fall back to DB
+	v, present := overlay.BatchGet(key)
+	assert.False(t, present)
+	assert.Nil(t, v)
+
+	v, err = store.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, dbValue, v)
+
+	// 2) pending put in batch: overlay should win and return batch value
+	require.NoError(t, batch.Put(key, batchValue))
+	v, present = overlay.BatchGet(key)
+	require.True(t, present)
+	assert.Equal(t, batchValue, v)
+
+	// returned slice should be a copy, mutating it must not affect stored overlay value
+	v[0] = 'X'
+	v2, present := overlay.BatchGet(key)
+	require.True(t, present)
+	assert.Equal(t, batchValue, v2)
+
+	// DB still keeps old value before batch write
+	v, err = store.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, dbValue, v)
+
+	// 3) pending delete in batch: overlay should report tombstone
+	require.NoError(t, batch.Delete(key))
+	v, present = overlay.BatchGet(key)
+	require.True(t, present)
+	assert.Nil(t, v)
+
+	// 4) after write, DB read should observe delete
+	require.NoError(t, batch.Write())
+	_, err = store.Get(key)
+	assert.True(t, errors.Is(err, ErrNotFound))
 }

@@ -483,56 +483,9 @@ func (baol *BlockAppendOnlyLog) rebuildSkiplist() error {
 	}
 
 	baol.indexedBlocks = newIndexBlocks
-	// for el := oldSkiplist.Front(); el != nil; el = el.Next() {
-	// 	key := el.Key().(string)
-	// 	if isHeaderKey(key) && aol.skiplistIndex.Get(key) == nil {
-	// 		ptr := el.Value.(*kvPointer)
-
-	// 		valueBytes, err := aol.readValueBytesFromPointer(ptr)
-	// 		if err == nil && string(valueBytes) != TombstoneMarker {
-	// 			aol.headerIndex.Set(key, ptr)
-	// 			aol.log.Debug("Added evicted header key to headerIndex during rebuild", "key", key)
-	// 		}
-	// 	}
-	// }
 
 	baol.log.Debug("Skiplist rebuild complete", "indexedKeys", baol.skiplistIndex.Len(),
 		"currentRecentBlocks", baol.recentBlocks)
-	return nil
-}
-
-// readAndIndexBlock reads all log entries for a given block and adds/updates them in the skiplist.
-func (baol *BlockAppendOnlyLog) readAndIndexBlock(indexEntry blockIndexEntry) error {
-	size := indexEntry.EndOffset - indexEntry.StartOffset
-	if size <= 0 {
-		return nil // Empty block
-	}
-
-	blockData := make([]byte, size)
-	_, err := baol.dataFile.ReadAt(blockData, indexEntry.StartOffset)
-	if err != nil {
-		return fmt.Errorf("failed to read block data for %d from offset %d: %w", indexEntry.BlockID, indexEntry.StartOffset, err)
-	}
-
-	reader := bytes.NewReader(blockData) // Using bytes.NewReader
-	currentPos := indexEntry.StartOffset
-
-	for reader.Len() > 0 {
-		entryOffset := currentPos
-		entry, bytesRead, err := baol.readLogEntry(reader)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to decode entry in block %d: %w", indexEntry.BlockID, err)
-		}
-		currentPos += bytesRead
-
-		// Add or update the key in the skiplist
-		// The latest occurrence of a key within the indexed blocks wins.
-		ptr := buildKVPointerForSkiplist(entry.BlockID, entryOffset, entry.Key, entry.Value)
-		baol.setSkiplistEntry(entry.BlockID, entry.Key, ptr)
-	}
 	return nil
 }
 
@@ -1230,32 +1183,6 @@ func (baol *BlockAppendOnlyLog) writeIndexEntry(w io.Writer, entry blockIndexEnt
 	return nil
 }
 
-// persistIndexMap writes the current block index map to the index map file.
-func (baol *BlockAppendOnlyLog) persistIndexMap() error {
-	if baol.indexMapFile == nil {
-		return nil
-	}
-
-	baol.indexMapFile.Seek(0, io.SeekStart)
-	writer := bufio.NewWriter(baol.indexMapFile)
-
-	for _, entry := range baol.blockIndex {
-		if err := baol.writeIndexEntry(writer, entry); err != nil {
-			return fmt.Errorf("failed to write index entry for block %d: %w", entry.BlockID, err)
-		}
-	}
-
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush index map writer: %w", err)
-	}
-
-	if err := baol.indexMapFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync index map file: %w", err)
-	}
-
-	return nil
-}
-
 // AppendToNewBlock adds a batch of key-value pairs to a new, automatically assigned block ID.
 // If kvs is empty, no block is written, aol.latestBlockID is returned (or 0 if log was empty), and no error.
 func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64, error) {
@@ -1363,12 +1290,6 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 	// No explicit call to aol.evictOldEntries() needed here if updateRecentBlocks is comprehensive.
 
 	return newBlockID, nil
-}
-
-// getLatestBlockID returns the latest block ID known to the log.
-// Caller must hold aol.mu if consistency with a subsequent write is needed.
-func (baol *BlockAppendOnlyLog) getLatestBlockID() uint64 {
-	return baol.latestBlockID
 }
 
 // isLogEmptyInitial checks if the log is completely empty (no blocks indexed).
@@ -1813,9 +1734,11 @@ func (baol *BlockAppendOnlyLog) NewIterator(startKey []byte) ethdb.Iterator {
 		if blockID, ok := ParseBlockNumberFromKey(startKey, dt); ok {
 			start = blockID
 		} else {
-			// If caller passed a key but we can't parse a block number, return an error iterator.
-			it.err = fmt.Errorf("cannot parse blockID from startKey (type %s)", DataTypeStrings[dt])
-			return it
+			// startKey exists but doesn't encode a block number (e.g., it is a
+			// plain data key used as a hint). Fall back to iterating from the
+			// beginning of the log so callers that pass arbitrary prefix keys
+			// still get a valid iterator.
+			start = minBlockID
 		}
 	} else {
 		start = minBlockID

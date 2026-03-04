@@ -24,7 +24,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb"
 	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
 	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
@@ -35,17 +34,10 @@ type opType int
 
 const (
 	opGet opType = iota
-	// opHas
 	opPut
 	opDelete
 	opNewIterator
 	opIteratorNext
-	// opNewBatch
-	// opBatchPut
-	// opBatchPutCommit
-	// opBatchDelete
-	// opNewBatchWithSize
-	// opGetBatchValueSize
 )
 
 type DBType int
@@ -57,19 +49,15 @@ const (
 	allDBTypes
 )
 
+// opRegex is compiled once at init time and reused across all replayTrace calls.
+var opRegex = regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
+
 var opTypeNames = map[opType]string{
 	opGet: "Get",
-	// opHas:               "Has",
 	opPut:          "Put",
 	opDelete:       "Delete",
 	opNewIterator:  "NewIterator",
 	opIteratorNext: "IteratorNext",
-	// opNewBatch:          "NewBatch",
-	// opBatchPut:          "BatchPut",
-	// opBatchPutCommit:    "BatchPutCommit",
-	// opBatchDelete:       "BatchDelete",
-	// opNewBatchWithSize:  "NewBatchWithSize",
-	// opGetBatchValueSize: "GetBatchValueSize",
 }
 
 type latencyHistogram struct {
@@ -216,6 +204,18 @@ func dataTypeName(dt ethstore.DataType) string {
 	return fmt.Sprintf("DataType(%d)", dt)
 }
 
+// classifyDataType returns the stats bucket label for a given data type:
+// "AOL", "PrefixDB", or the raw data-type name for pebble-handled types.
+func classifyDataType(dt ethstore.DataType) string {
+	if ethstore.AolHandledDataTypes[dt] {
+		return "AOL"
+	}
+	if ethstore.PrefixDBHandledDataTypes[dt] {
+		return "PrefixDB"
+	}
+	return dataTypeName(dt)
+}
+
 func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 	if len(stats) == 0 {
 		return
@@ -248,7 +248,7 @@ func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 			if totalSec > 0 {
 				throughputK = float64(hist.totalCount) / totalSec / 1000.0
 			}
-			fmt.Printf("\n[Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
+			fmt.Printf("\n[Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s p99.999=%s\n",
 				dt,
 				opTypeName(op),
 				hist.totalCount,
@@ -260,6 +260,7 @@ func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 				formatDurationCompact(hist.percentile(95.0)),
 				formatDurationCompact(hist.percentile(99.0)),
 				formatDurationCompact(hist.percentile(99.99)),
+				formatDurationCompact(hist.percentile(99.999)),
 			)
 			fmt.Println("Histogram (<= upper bound):")
 			for _, line := range hist.histogramLines() {
@@ -276,27 +277,30 @@ func reportHistogramSummary(label string, hist *latencyHistogram) {
 	}
 	min := time.Duration(hist.minNs)
 	max := time.Duration(hist.maxNs)
-	fmt.Printf("\n[Latency] %s count=%d avg=%s p50=%s p95=%s p99=%s min=%s max=%s\n",
+	fmt.Printf("\n[Latency] %s count=%d avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s p99.999=%s min=%s max=%s\n",
 		label,
 		hist.totalCount,
 		formatDurationCompact(hist.avg()),
 		formatDurationCompact(hist.percentile(50.0)),
+		formatDurationCompact(hist.percentile(75.0)),
+		formatDurationCompact(hist.percentile(90.0)),
 		formatDurationCompact(hist.percentile(95.0)),
 		formatDurationCompact(hist.percentile(99.0)),
+		formatDurationCompact(hist.percentile(99.99)),
+		formatDurationCompact(hist.percentile(99.999)),
 		formatDurationCompact(min),
 		formatDurationCompact(max),
 	)
 }
 
 type replayConfig struct {
-	DatabaseDir                  string `json:"databaseDir"`
 	LoadDataDir                  string `json:"loadDataDir"`
-	BaselinePebbleDir            string `json:"baselinePebbleDir"`
 	TraceFile                    string `json:"traceFile"`
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
-	ChainKVDatabaseDir           string `json:"chainKVDatabaseDir"`
-	ChainKVLoadDataDir           string `json:"chainKVLoadDataDir"`
+	EthStoreDir                  string `json:"ethstoreDir"`
+	PebbleDBDir            		 string `json:"pebbleDir"`
+	ChainKVDir           		 string `json:"chainKVDir"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -411,66 +415,6 @@ func (c *chainKVLDB) Close() {
 	}
 }
 
-func chainKVDataTypeName(dt leveldb.DataType) string {
-	if name, ok := leveldb.DataTypeStrings[dt]; ok {
-		return name
-	}
-	return fmt.Sprintf("DataType(%d)", dt)
-}
-
-func reportChainKVLatencyStats(stats map[leveldb.DataType]map[opType]*latencyHistogram) {
-	if len(stats) == 0 {
-		return
-	}
-	dataTypes := make([]leveldb.DataType, 0, len(stats))
-	for dt := range stats {
-		dataTypes = append(dataTypes, dt)
-	}
-	sort.Slice(dataTypes, func(i, j int) bool {
-		return dataTypes[i] < dataTypes[j]
-	})
-
-	for _, dt := range dataTypes {
-		opMap := stats[dt]
-		ops := make([]opType, 0, len(opMap))
-		for op := range opMap {
-			ops = append(ops, op)
-		}
-		sort.Slice(ops, func(i, j int) bool {
-			return ops[i] < ops[j]
-		})
-
-		for _, op := range ops {
-			hist := opMap[op]
-			if hist.totalCount == 0 {
-				continue
-			}
-			totalSec := float64(hist.totalNs) / 1000000000.0
-			throughputK := 0.0
-			if totalSec > 0 {
-				throughputK = float64(hist.totalCount) / totalSec / 1000.0
-			}
-			fmt.Printf("\n[ChainKV Latency] dataType=%s op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s\n",
-				chainKVDataTypeName(dt),
-				opTypeName(op),
-				hist.totalCount,
-				throughputK,
-				formatDurationCompact(hist.avg()),
-				formatDurationCompact(hist.percentile(50.0)),
-				formatDurationCompact(hist.percentile(75.0)),
-				formatDurationCompact(hist.percentile(90.0)),
-				formatDurationCompact(hist.percentile(95.0)),
-				formatDurationCompact(hist.percentile(99.0)),
-				formatDurationCompact(hist.percentile(99.99)),
-			)
-			fmt.Println("Histogram (<= upper bound):")
-			for _, line := range hist.histogramLines() {
-				fmt.Printf("  %s\n", line)
-			}
-		}
-	}
-}
-
 func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	file, err := os.Open(dataFile)
 	if err != nil {
@@ -540,265 +484,550 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	return nil
 }
 
-func chainKVReplayTrace(db *chainKVLDB, traceFile string, maxOps int64) error {
+
+// ---------------------------------------------------------------------------
+// Read-your-writes overlay helper
+// ---------------------------------------------------------------------------
+
+// batchReader is satisfied by pebbleBatch (and Database's batch) which expose
+// a read-your-writes overlay for pending mutations.
+type batchReader interface {
+	BatchGet(key []byte) ([]byte, bool)
+}
+
+// getter is a minimal store read interface used by getWithPebbleBatchOverlay.
+type getter interface {
+	Get(key []byte) ([]byte, error)
+}
+
+// getWithPebbleBatchOverlay returns the value for key by checking the pending
+// batch first (read-your-writes semantics).  When batch is nil or does not
+// implement batchReader it falls back to store.Get.
+// A nil value returned by BatchGet means the key is deleted in the batch,
+// which is reported as ethstore.ErrNotFound.
+func getWithPebbleBatchOverlay(store getter, batch ethdb.Batch, key []byte) ([]byte, error) {
+	if batch != nil {
+		if br, ok := batch.(batchReader); ok {
+			if val, found := br.BatchGet(key); found {
+				if val == nil {
+					return nil, ethstore.ErrNotFound
+				}
+				return val, nil
+			}
+		}
+	}
+	return store.Get(key)
+}
+
+// ---------------------------------------------------------------------------
+// Unified replay interface
+// ---------------------------------------------------------------------------
+
+// replayIter is a simplified iterator interface used by the unified replay loop.
+type replayIter interface {
+	Next() bool
+	Value() []byte
+	Release()
+}
+
+// noopIter is a placeholder for when an iterator cannot be created
+// (e.g., EthStore skips 'O'-prefix iterators).
+type noopIter struct{}
+
+func (noopIter) Next() bool    { return false }
+func (noopIter) Value() []byte { return nil }
+func (noopIter) Release()      {}
+
+// ethdbIterWrapper wraps ethdb.Iterator to satisfy replayIter.
+type ethdbIterWrapper struct{ ethdb.Iterator }
+
+// chainKVIterWrapper wraps iterator.Iterator to satisfy replayIter while
+// also capturing the value returned by chainKVLDB.IteratorNext.
+type chainKVIterWrapper struct {
+	db      *chainKVLDB
+	it      iterator.Iterator
+	lastVal []byte
+}
+
+func (w *chainKVIterWrapper) Next() bool {
+	_, val, ok := w.db.IteratorNext(w.it)
+	w.lastVal = val
+	return ok
+}
+func (w *chainKVIterWrapper) Value() []byte { return w.lastVal }
+func (w *chainKVIterWrapper) Release()      { w.it.Release() }
+
+// replayBackend abstracts the three storage backends for the unified replay loop.
+type replayBackend interface {
+	// Name returns a short human-readable backend identifier.
+	Name() string
+	// Get reads key, consulting any pending batch first if applicable.
+	Get(key []byte) ([]byte, error)
+	// StagePut stages a put within the current block batch.
+	StagePut(key, value []byte, dataType ethstore.DataType) error
+	// StageDelete stages a delete within the current block batch.
+	StageDelete(key []byte, dataType ethstore.DataType) error
+	// CommitBlock commits all staged operations for the current block.
+	CommitBlock() error
+	// NewIterator creates a new iterator for prefix/start.
+	// May return a noopIter when the backend cannot iterate over that prefix.
+	NewIterator(prefix, start []byte) replayIter
+	// SkipByDBType returns true when this op should be skipped based on the
+	// dbType filter. ChainKV always returns false (no filtering).
+	SkipByDBType(dataType ethstore.DataType, dbType DBType) bool
+	// PrintCommitStats prints backend-specific commit-latency histograms.
+	PrintCommitStats()
+	// Close releases backend resources.
+	Close()
+}
+
+// skipByDBType is a shared helper used by pebble-based backends.
+func skipByDBType(dt ethstore.DataType, dbType DBType) bool {
+	switch dbType {
+	case AOL:
+		return !ethstore.AolHandledDataTypes[dt]
+	case PrefixDB:
+		return !ethstore.PrefixDBHandledDataTypes[dt]
+	case Pebble:
+		return ethstore.AolHandledDataTypes[dt] || ethstore.PrefixDBHandledDataTypes[dt]
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// pebbleBaselineReplayBackend – wraps *ethstore.PebbleStore
+// ---------------------------------------------------------------------------
+
+type pebbleBaselineReplayBackend struct {
+	store      *ethstore.PebbleStore
+	batch      ethdb.Batch
+	commitHist *latencyHistogram
+}
+
+func newPebbleBaselineReplayBackend(dir string) (*pebbleBaselineReplayBackend, error) {
+	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
+	if err != nil {
+		return nil, fmt.Errorf("newPebbleBaselineReplayBackend: open store: %w", err)
+	}
+	return &pebbleBaselineReplayBackend{store: store, commitHist: newLatencyHistogram()}, nil
+}
+
+func (b *pebbleBaselineReplayBackend) Name() string { return "baseline-pebble" }
+func (b *pebbleBaselineReplayBackend) Close()       { b.store.Close() }
+
+func (b *pebbleBaselineReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
+	return skipByDBType(dt, dbType)
+}
+func (b *pebbleBaselineReplayBackend) Get(key []byte) ([]byte, error) {
+	return getWithPebbleBatchOverlay(b.store, b.batch, key)
+}
+func (b *pebbleBaselineReplayBackend) ensureBatch() ethdb.Batch {
+	if b.batch == nil {
+		b.batch = b.store.NewBatch()
+	}
+	return b.batch
+}
+func (b *pebbleBaselineReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
+	return b.ensureBatch().Put(key, value)
+}
+func (b *pebbleBaselineReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
+	return b.ensureBatch().Delete(key)
+}
+func (b *pebbleBaselineReplayBackend) CommitBlock() error {
+	if b.batch == nil {
+		return nil
+	}
+	start := time.Now()
+	err := b.batch.Write()
+	b.commitHist.observe(time.Since(start))
+	b.batch = nil
+	return err
+}
+func (b *pebbleBaselineReplayBackend) NewIterator(prefix, start []byte) replayIter {
+	return ethdbIterWrapper{b.store.NewIterator(prefix, start)}
+}
+func (b *pebbleBaselineReplayBackend) PrintCommitStats() {
+	reportHistogramSummary("baseline-pebble commit (Batch.Write)", b.commitHist)
+}
+
+// ---------------------------------------------------------------------------
+// ethstoreReplayBackend – wraps *ethstore.Database
+// ---------------------------------------------------------------------------
+
+type ethstoreReplayBackend struct {
+	store              *ethstore.Database
+	pebbleBatch        ethdb.Batch
+	prefixdbDirty      bool
+	prefixdbCommitHist *latencyHistogram
+	pebbleCommitHist   *latencyHistogram
+	blockTotalHist     *latencyHistogram
+}
+
+func newEthstoreReplayBackend(dir string, cacheCount int) (*ethstoreReplayBackend, error) {
+	store, err := ethstore.New(dir, 6000, "put_test", false, 16*1024, 12*1024*1024, cacheCount)
+	if err != nil {
+		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
+	}
+	return &ethstoreReplayBackend{
+		store:              store,
+		prefixdbCommitHist: newLatencyHistogram(),
+		pebbleCommitHist:   newLatencyHistogram(),
+		blockTotalHist:     newLatencyHistogram(),
+	}, nil
+}
+
+func (b *ethstoreReplayBackend) Name() string { return "ethstore" }
+func (b *ethstoreReplayBackend) Close()       { b.store.Close() }
+func (b *ethstoreReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
+	return skipByDBType(dt, dbType)
+}
+func (b *ethstoreReplayBackend) Get(key []byte) ([]byte, error) {
+	return getWithPebbleBatchOverlay(b.store, b.pebbleBatch, key)
+}
+func (b *ethstoreReplayBackend) ensurePebbleBatch() ethdb.Batch {
+	if b.pebbleBatch == nil {
+		b.pebbleBatch = b.store.NewBatch()
+	}
+	return b.pebbleBatch
+}
+func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
+	if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
+		err := b.store.BatchPut(key, value, dataType)
+		if err == nil {
+			b.prefixdbDirty = true
+		}
+		return err
+	}
+	return b.ensurePebbleBatch().Put(key, value)
+}
+func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
+	if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
+		return b.store.BatchDelete(key, dataType)
+	}
+	return b.ensurePebbleBatch().Delete(key)
+}
+func (b *ethstoreReplayBackend) CommitBlock() error {
+	blockStart := time.Now()
+	if b.prefixdbDirty {
+		start := time.Now()
+		if err := b.store.PrefixdbBatchCommit('O'); err != nil {
+			return err
+		}
+		b.prefixdbCommitHist.observe(time.Since(start))
+		b.prefixdbDirty = false
+	}
+	if b.pebbleBatch != nil {
+		start := time.Now()
+		if err := b.pebbleBatch.Write(); err != nil {
+			return err
+		}
+		b.pebbleCommitHist.observe(time.Since(start))
+		b.pebbleBatch = nil
+	}
+	b.blockTotalHist.observe(time.Since(blockStart))
+	return nil
+}
+func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
+	if len(prefix) > 0 && prefix[0] == 'O' {
+		return noopIter{}
+	}
+	return ethdbIterWrapper{b.store.NewIterator(prefix, start)}
+}
+func (b *ethstoreReplayBackend) PrintCommitStats() {
+	reportHistogramSummary("ethstore commit (PrefixdbBatchCommit)", b.prefixdbCommitHist)
+	reportHistogramSummary("ethstore commit (pebble Batch.Write)", b.pebbleCommitHist)
+	reportHistogramSummary("ethstore commit (block total)", b.blockTotalHist)
+}
+
+// ---------------------------------------------------------------------------
+// chainKVReplayBackend – wraps *chainKVLDB
+// ---------------------------------------------------------------------------
+
+type chainKVReplayBackend struct {
+	db            *chainKVLDB
+	stateBatch    chainkvdb.Batch
+	nonStateBatch chainkvdb.Batch
+	commitHist    *latencyHistogram
+}
+
+func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool, statePrefixes []string) (*chainKVReplayBackend, error) {
+	db, err := NewChainKVLDB(dbDir, cache, handles, useState, statePrefixes)
+	if err != nil {
+		return nil, fmt.Errorf("newChainKVReplayBackend: open db: %w", err)
+	}
+	return &chainKVReplayBackend{db: db, commitHist: newLatencyHistogram()}, nil
+}
+
+func (b *chainKVReplayBackend) Name() string { return "chainkv" }
+func (b *chainKVReplayBackend) Close()       { b.db.Close() }
+
+// ChainKV does not filter by DBType – always replay all ops.
+func (b *chainKVReplayBackend) SkipByDBType(_ ethstore.DataType, _ DBType) bool { return false }
+func (b *chainKVReplayBackend) Get(key []byte) ([]byte, error)                  { return b.db.Get(key) }
+
+func (b *chainKVReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
+	if b.db.useStateForKey(key) {
+		if b.stateBatch == nil {
+			b.stateBatch = b.db.NewBatch()
+		}
+		return b.db.BatchPut(b.stateBatch, key, value)
+	}
+	if b.nonStateBatch == nil {
+		b.nonStateBatch = b.db.NewBatch()
+	}
+	return b.db.BatchPut(b.nonStateBatch, key, value)
+}
+func (b *chainKVReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
+	if b.db.useStateForKey(key) {
+		if b.stateBatch == nil {
+			b.stateBatch = b.db.NewBatch()
+		}
+		return b.db.BatchDelete(b.stateBatch, key)
+	}
+	if b.nonStateBatch == nil {
+		b.nonStateBatch = b.db.NewBatch()
+	}
+	return b.db.BatchDelete(b.nonStateBatch, key)
+}
+func (b *chainKVReplayBackend) CommitBlock() error {
+	if b.stateBatch != nil {
+		start := time.Now()
+		if err := b.db.BatchCommit(b.stateBatch); err != nil {
+			fmt.Printf("state batch commit failed: %v\n", err)
+		}
+		b.commitHist.observe(time.Since(start))
+		b.stateBatch = nil
+	}
+	if b.nonStateBatch != nil {
+		start := time.Now()
+		if err := b.db.BatchCommit(b.nonStateBatch); err != nil {
+			fmt.Printf("non-state batch commit failed: %v\n", err)
+		}
+		b.commitHist.observe(time.Since(start))
+		b.nonStateBatch = nil
+	}
+	return nil
+}
+func (b *chainKVReplayBackend) NewIterator(_, _ []byte) replayIter {
+	return &chainKVIterWrapper{db: b.db, it: b.db.NewIterator()}
+}
+func (b *chainKVReplayBackend) PrintCommitStats() {
+	reportHistogramSummary("chainkv commit (Batch.Write)", b.commitHist)
+}
+
+// ---------------------------------------------------------------------------
+// replayTrace – unified replay loop
+// ---------------------------------------------------------------------------
+
+// replayTrace replays a workload trace file against the given backend.
+// dbType controls which key types are replayed; chainKV backends ignore it.
+func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType) {
+	fmt.Printf("[%s] Replaying trace from %s\n", backend.Name(), traceFile)
 	file, err := os.Open(traceFile)
 	if err != nil {
-		return fmt.Errorf("failed to open trace file: %w", err)
+		log.Fatalf("replayTrace: failed to open trace file: %v", err)
 	}
 	defer file.Close()
 
-	opRegex := regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
+	var (
+		totalTime          time.Duration
+		counter            int64
+		lineCounter        int64
+		logicReadSize      int64
+		logicWriteSize     int64
+		stopAtNextBlockEnd bool
+		lastIterDataType   ethstore.DataType = ethstore.DataType(-1)
+	)
+	stats := make(map[string]map[opType]*latencyHistogram)
+	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
+		if _, ok := stats[kvTypeStr]; !ok {
+			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
+		}
+		if _, ok := stats[kvTypeStr][op]; !ok {
+			stats[kvTypeStr][op] = newLatencyHistogram()
+		}
+		stats[kvTypeStr][op].observe(elapsed)
+	}
 
-	var totalTime time.Duration
-	var counter int64
 	reader := bufio.NewReader(file)
-	var logicReadSize int64
-	var logicWriteSize int64
-	var lineCounter int64
-
-	var stateBatch chainkvdb.Batch
-	var nonStateBatch chainkvdb.Batch
-	var stateBatchActive bool
-	var nonStateBatchActive bool
-	var it iterator.Iterator
-	var lastIterDataType leveldb.DataType = -1
-	stats := make(map[leveldb.DataType]map[opType]*latencyHistogram)
-	batchCommitHist := newLatencyHistogram()
-
-	recordOp := func(op opType, dt leveldb.DataType, elapsed time.Duration) {
-		if _, ok := stats[dt]; !ok {
-			stats[dt] = make(map[opType]*latencyHistogram)
+	var iter replayIter
+	defer func() {
+		if iter != nil {
+			iter.Release()
 		}
-		if _, ok := stats[dt][op]; !ok {
-			stats[dt][op] = newLatencyHistogram()
-		}
-		stats[dt][op].observe(elapsed)
-	}
-
-	commitBatch := func(batch chainkvdb.Batch, label string) {
-		if batch == nil {
-			return
-		}
-		start := time.Now()
-		err := db.BatchCommit(batch)
-		elapsed := time.Since(start)
-		totalTime += elapsed
-		batchCommitHist.observe(elapsed)
-		if err != nil {
-			fmt.Printf("%s batch commit failed: %v\n", label, err)
-		}
-	}
+	}()
 
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			if readErr == io.EOF {
 				if line == "" {
 					break
 				}
 			} else {
-				return fmt.Errorf("error reading trace file: %w", err)
+				log.Printf("error reading trace file: %v", readErr)
+				break
 			}
 		}
-
 		line = strings.TrimSpace(line)
 		lineCounter++
 
-		if strings.Contains(line, "Processing block (end)") && strings.Contains(line, "geth:") {
-			if stateBatchActive {
-				commitBatch(stateBatch, "state")
-				stateBatch = nil
-				stateBatchActive = false
-			}
-			if nonStateBatchActive {
-				commitBatch(nonStateBatch, "non-state")
-				nonStateBatch = nil
-				nonStateBatchActive = false
-			}
-			if maxOps > 0 && counter >= maxOps {
+		if strings.Contains(line, "Processing block (end)") {
+			if commitErr := backend.CommitBlock(); commitErr != nil {
+				fmt.Printf("[%s] block commit failed at line %d: %v\n",
+					backend.Name(), lineCounter, commitErr)
 				break
 			}
-			if err == io.EOF {
+			if stopAtNextBlockEnd {
+				fmt.Printf("[%s] Reached max ops %d; stopping at block boundary (line %d).\n",
+					backend.Name(), maxOps, lineCounter)
 				break
 			}
 			continue
 		}
-
-		if strings.Contains(line, "Global log file opened successfully") || !strings.Contains(line, "OPType:") {
-			if err == io.EOF {
-				break
-			}
+		if !strings.Contains(line, "OPType:") {
 			continue
 		}
-
 		matches := opRegex.FindStringSubmatch(line)
 		if len(matches) < 2 {
-			if err == io.EOF {
-				break
-			}
 			continue
 		}
 
 		opTypeStr := matches[1]
 		keyHex := ""
 		var keyBytes []byte
-		dataType := leveldb.DataType(-1)
+		dataType := ethstore.DataType(-1)
 		if len(matches) >= 3 && matches[2] != "" {
 			keyHex = matches[2]
 			keyBytes, err = hex.DecodeString(keyHex)
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
 				continue
 			}
 			if len(keyBytes) > 0 {
-				dataType = leveldb.GetDataTypeFromKey(keyBytes)
+				dataType = ethstore.GetDataTypeFromKey(keyBytes)
 			}
 		}
-
+		var valueHex string
 		var valueBytes []byte
 		if len(matches) >= 6 && matches[4] != "" {
-			valueBytes, err = hex.DecodeString(matches[4])
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
+			valueHex = matches[4]
+			valueBytes, err = hex.DecodeString(valueHex)
+			if err != nil && valueHex != "" {
 				continue
 			}
 		}
-
+		var iterPrefixBytes, iterStartBytes []byte
 		if len(matches) >= 9 && matches[7] != "" {
-			iterPrefixBytes, decodeErr := hex.DecodeString(matches[7])
-			if decodeErr == nil {
-				dataType = leveldb.GetDataTypeFromKey(iterPrefixBytes)
-				lastIterDataType = dataType
+			iterPrefixBytes, err = hex.DecodeString(matches[7])
+			if err != nil {
+				continue
 			}
+			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
+			lastIterDataType = dataType
+			if matches[8] != "" {
+				iterStartBytes, err = hex.DecodeString(matches[8])
+				if err != nil {
+					continue
+				}
+			}
+		}
+
+		counter++
+		if counter%10000 == 0 {
+			fmt.Printf("\r[%s] ops=%d time=%.2fs read=%d write=%d",
+				backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		if maxOps > 0 && counter >= maxOps && !stopAtNextBlockEnd {
+			stopAtNextBlockEnd = true
+			fmt.Printf("\n[%s] Reached max ops %d; waiting for next block boundary.\n",
+				backend.Name(), maxOps)
+		}
+
+		kvTypeStr := classifyDataType(dataType)
+
+		if backend.SkipByDBType(dataType, dbType) {
+			continue
+		}
+
+		var op opType
+		switch opTypeStr {
+		case "Get":
+			op = opGet
+		case "Put", "BatchPut":
+			op = opPut
+		case "Delete", "BatchDelete":
+			op = opDelete
+		case "NewIterator":
+			op = opNewIterator
+		case "IteratorNext":
+			dataType = lastIterDataType
+			op = opIteratorNext
+			kvTypeStr = classifyDataType(dataType)
+		default:
+			continue
 		}
 
 		start := time.Now()
 		var opErr error
-		op := opGet
-
-		switch opTypeStr {
-		case "Get":
-			op = opGet
-			var val []byte
-			val, opErr = db.Get(keyBytes)
+		switch op {
+		case opGet:
+			val, getErr := backend.Get(keyBytes)
+			opErr = getErr
 			if opErr == nil {
 				logicReadSize += int64(len(val))
 			}
-		case "Put", "BatchPut":
-			op = opPut
+		case opPut:
 			if len(keyBytes) == 0 {
-				if err == io.EOF {
-					break
-				}
 				continue
 			}
-			if db.useStateForKey(keyBytes) {
-				if !stateBatchActive || stateBatch == nil {
-					stateBatch = db.NewBatch()
-					stateBatchActive = true
-				}
-				opErr = db.BatchPut(stateBatch, keyBytes, valueBytes)
-			} else {
-				if !nonStateBatchActive || nonStateBatch == nil {
-					nonStateBatch = db.NewBatch()
-					nonStateBatchActive = true
-				}
-				opErr = db.BatchPut(nonStateBatch, keyBytes, valueBytes)
-			}
+			opErr = backend.StagePut(keyBytes, valueBytes, dataType)
 			if opErr == nil {
 				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
 			}
-		case "Delete", "BatchDelete":
-			op = opDelete
+		case opDelete:
 			if len(keyBytes) == 0 {
-				if err == io.EOF {
-					break
-				}
 				continue
 			}
-			if db.useStateForKey(keyBytes) {
-				if !stateBatchActive || stateBatch == nil {
-					stateBatch = db.NewBatch()
-					stateBatchActive = true
-				}
-				opErr = db.BatchDelete(stateBatch, keyBytes)
-			} else {
-				if !nonStateBatchActive || nonStateBatch == nil {
-					nonStateBatch = db.NewBatch()
-					nonStateBatchActive = true
-				}
-				opErr = db.BatchDelete(nonStateBatch, keyBytes)
-			}
+			opErr = backend.StageDelete(keyBytes, dataType)
 			if opErr == nil {
 				logicWriteSize += int64(len(keyBytes))
 			}
-		case "NewIterator":
-			op = opNewIterator
-			if it != nil {
-				it.Release()
+		case opNewIterator:
+			if iter != nil {
+				iter.Release()
 			}
-			it = db.NewIterator()
-		case "IteratorNext":
-			op = opIteratorNext
-			dataType = lastIterDataType
-			if it == nil {
-				opErr = fmt.Errorf("IteratorNext without active iterator at trace line %d", lineCounter)
-			} else {
-				_, val, valid := db.IteratorNext(it)
-				if valid {
-					logicReadSize += int64(len(val))
+			iter = backend.NewIterator(iterPrefixBytes, iterStartBytes)
+		case opIteratorNext:
+			if iter != nil {
+				if ok := iter.Next(); !ok {
+					iter.Release()
+					iter = nil
 				} else {
-					it.Release()
-					it = nil
+					logicReadSize += int64(len(iter.Value()))
 				}
 			}
-		default:
-			if err == io.EOF {
-				break
-			}
-			continue
 		}
-
 		elapsed := time.Since(start)
 		totalTime += elapsed
 		if opErr != nil {
-			fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
+			if len(keyBytes) == 0 || (keyBytes[0] != 'o' && keyBytes[0] != 'a') {
+				fmt.Printf("[%s] op %s failed for key %s: %v\n",
+					backend.Name(), opTypeStr, keyHex, opErr)
+			}
 		}
-		counter++
-		recordOp(op, dataType, elapsed)
-
-		if counter%10000 == 0 {
-			fmt.Printf("\r[ChainKV] Processed %d operations, total time: %f s, logic read size: %d, logic write size: %d",
-				counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-		}
-		if maxOps > 0 && counter >= maxOps {
-			fmt.Printf("\n[ChainKV] Reached max operations %d; waiting for next block-end commit.\n", maxOps)
-		}
-
-		if err == io.EOF {
+		recordOp(kvTypeStr, op, elapsed)
+		if readErr == io.EOF {
 			break
 		}
 	}
 
-	if stateBatchActive && stateBatch != nil {
-		commitBatch(stateBatch, "state-final")
+	if commitErr := backend.CommitBlock(); commitErr != nil {
+		fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
 	}
-	if nonStateBatchActive && nonStateBatch != nil {
-		commitBatch(nonStateBatch, "non-state-final")
-	}
-	if it != nil {
-		it.Release()
-	}
-
-	fmt.Printf("\n[ChainKV] Finished replaying trace. Total operations: %d, total time: %f s, logic read size: %d, logic write size: %d\n",
-		counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-	reportChainKVLatencyStats(stats)
-	reportHistogramSummary("chainkv commit (Batch.Write)", batchCommitHist)
-	return nil
+	fmt.Printf("\n[%s] Replay finished. ops=%d time=%.2fs read=%d write=%d\n",
+		backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+	reportLatencyStats(stats)
+	backend.PrintCommitStats()
 }
 
 func main() {
@@ -861,20 +1090,20 @@ func main() {
 
 	// TestPrefixGet()
 	// loadPebble()
-	// loadAccount(cfg.DatabaseDir, 64*1024, 512*1024*1024)
+	// loadAccount(cfg.EthStoreDir, 64*1024, 512*1024*1024)
 	// insertAccountHashindexTopebble()
 	// repalceAccountHashToAccountKey()
 
 	// recordTraceStorage(traceFile)
 	// recordTraceBlock(traceFileNocache)
-	// replayTraceAccount(cfg.DatabaseDir, cfg.TraceFile)
+	// replayTraceAccount(cfg.EthStoreDir, cfg.TraceFile)
 
 	// time.Sleep(5 * time.Second)
-	// loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
-	// replaybaselineTrace(cfg.BaselinePebbleDir, cfg.TraceFile, *maxOps)
-	//replayTrace(cfg.DatabaseDir, cfg.TraceFileNoCacheSnap, *maxOps, allDBTypes)
+	// loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir)
+	// replaybaselineTrace(cfg.PebbleDBDir, cfg.TraceFile, *maxOps)
+	//replayTrace(cfg.EthStoreDir, cfg.TraceFileNoCacheSnap, *maxOps, allDBTypes)
 	// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
-	// loadAol(cfg.DatabaseDir, notxFile)
+	// loadAol(cfg.EthStoreDir, notxFile)
 	// return
 
 	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
@@ -882,19 +1111,16 @@ func main() {
 	switch *mode {
 	case "ld":
 		if strings.EqualFold(*backend, "chainkv") {
-			dbDir := cfg.ChainKVDatabaseDir
+			dbDir := cfg.ChainKVDir
 			if dbDir == "" {
-				dbDir = cfg.DatabaseDir
+				dbDir = cfg.EthStoreDir
 			}
 			if dbDir == "" {
 				log.Fatal("ld with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
 			}
-			dataFile := cfg.ChainKVLoadDataDir
+			dataFile := cfg.LoadDataDir
 			if dataFile == "" {
-				dataFile = cfg.LoadDataDir
-			}
-			if dataFile == "" {
-				log.Fatal("ld with chainkv backend requires chainKVLoadDataDir or loadDataDir in config")
+				log.Fatal("ld with chainkv backend requires loadDataDir in config")
 			}
 			var prefixes []string
 			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
@@ -909,47 +1135,51 @@ func main() {
 				log.Fatalf("chainkv load failed: %v", loadErr)
 			}
 		} else {
-			loadAccount(cfg.DatabaseDir, *ldChunkFileSize, *ldCacheSize)
-			// loadData(cfg.DatabaseDir, cfg.LoadDataDir)
+			loadAccount(cfg.EthStoreDir, *ldChunkFileSize, *ldCacheSize)
+			// loadData(cfg.EthStoreDir, cfg.LoadDataDir)
 			// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
-			// loadAol(cfg.DatabaseDir, notxFile, txFile)
+			// loadAol(cfg.EthStoreDir, notxFile, txFile)
 		}
 	case "re":
 		if strings.EqualFold(*backend, "chainkv") {
-			dbDir := cfg.ChainKVDatabaseDir
+			dbDir := cfg.ChainKVDir
 			if dbDir == "" {
-				dbDir = cfg.DatabaseDir
+				dbDir = cfg.EthStoreDir
 			}
 			if dbDir == "" {
 				log.Fatal("re with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
-			}
-			traceFile := cfg.TraceFile
-			if traceFile == "" {
-				log.Fatal("re with chainkv backend requires traceFile in config")
 			}
 			var prefixes []string
 			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
 				prefixes = strings.Split(*ckvStateKeyPrefixes, ",")
 			}
-			ckv, openErr := NewChainKVLDB(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
-			if openErr != nil {
-				log.Fatalf("failed to open chainkv database: %v", openErr)
+			ckvBackend, ckvErr := newChainKVReplayBackend(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
+			if ckvErr != nil {
+				log.Fatalf("re: failed to open chainkv backend: %v", ckvErr)
 			}
-			defer ckv.Close()
-			if replayErr := chainKVReplayTrace(ckv, traceFile, *maxOps); replayErr != nil {
-				log.Fatalf("chainkv replay failed: %v", replayErr)
-			}
+			defer ckvBackend.Close()
+			replayTrace(ckvBackend, traceFile, *maxOps, allDBTypes)
 		} else {
-			replayTrace(cfg.DatabaseDir, traceFile, *maxOps, dbType, *cacheCount)
+			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount)
+			if ethErr != nil {
+				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+			}
+			defer ethBackend.Close()
+			replayTrace(ethBackend, traceFile, *maxOps, dbType)
 		}
 	case "ra":
-		replayTraceAccount(cfg.DatabaseDir, traceFile)
+		replayTraceAccount(cfg.EthStoreDir, traceFile)
 	case "o":
 		otherRunner(traceFile)
 	case "lb":
-		loadbaselineData(cfg.BaselinePebbleDir, cfg.LoadDataDir)
+		loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir)
 	case "rb":
-		replaybaselineTrace(cfg.BaselinePebbleDir, traceFile, *maxOps, dbType)
+		pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir)
+		if pbErr != nil {
+			log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
+		}
+		defer pbBackend.Close()
+		replayTrace(pbBackend, traceFile, *maxOps, dbType)
 	default:
 		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
 	}
@@ -1021,361 +1251,6 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
 	}
-}
-
-func replaybaselineTrace(baselinePebbleDir string, traceFile string, maxOps int64, dbType DBType) {
-	fmt.Printf("Replaying baseline trace from file %s using Pebble store at %s\n", traceFile, baselinePebbleDir)
-	dir := baselinePebbleDir
-	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	testFilePath := traceFile
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	// Support both formats:
-	// - OPType: Put, key: ..., size: ..., value: ..., size: ...
-	// - OPType: BatchPutCommit (commit is deferred until a block end marker)
-	// - geth: ... Processing block (end), ID: ..., hash: ... (commit all pending batches)
-	// - OPType: NewBatchWithSize, size: <batch-bytes>
-	// - OPType: NewIterator, prefix: <hex>, start key: <hex or empty>
-	opRegex := regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
-
-	var totalTime time.Duration
-	var counter int64
-	reader := bufio.NewReader(file)
-
-	var logicReadSize int64 = 0
-	var logicWriteSize int64 = 0
-
-	// var oldop string
-
-	var lineCounter int64 = 0
-	// var nextBatchRequested bool
-	// var nextBatchSize int
-	var pebbleBatch ethdb.Batch
-	var stopAtNextBlockEnd bool
-	var blockCommitCounter int64
-	// var lastKeyPrefix byte
-	// var hasLastKeyPrefix bool
-	var lastIterDataType ethstore.DataType
-	pebbleCommitHist := newLatencyHistogram()
-
-	ensurePebbleBatch := func() ethdb.Batch {
-		if pebbleBatch != nil {
-			return pebbleBatch
-		}
-		// if nextBatchRequested {
-		// 	if nextBatchSize > 0 {
-		// 		pebbleBatch = store.NewBatchWithSize(nextBatchSize)
-		// 	} else {
-		// 		pebbleBatch = store.NewBatch()
-		// 	}
-		// 	nextBatchRequested = false
-		// 	nextBatchSize = 0
-		// 	return pebbleBatch
-		// }
-		pebbleBatch = store.NewBatch()
-		return pebbleBatch
-	}
-
-	commitBlock := func() error {
-		if pebbleBatch == nil {
-			blockCommitCounter++
-			return nil
-		}
-		start := time.Now()
-		err := pebbleBatch.Write()
-		pebbleCommitHist.observe(time.Since(start))
-		pebbleBatch = nil
-		blockCommitCounter++
-		return err
-	}
-
-	var dataType ethstore.DataType
-	var it ethdb.Iterator
-	var stats = make(map[string]map[opType]*latencyHistogram)
-	defer func() {
-		if it != nil {
-			it.Release()
-		}
-	}()
-	fmt.Println("Start replaying baseline trace...")
-	for {
-		// read line
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("End of file reached")
-				break
-			}
-			log.Printf("error reading trace file: %v", err)
-			break
-		}
-
-		line = strings.TrimSpace(line)
-		lineCounter++
-
-		// Block boundary marker: commit all pending batches when a block ends.
-		if strings.Contains(line, "Processing block (end), ID:") {
-			if err := commitBlock(); err != nil {
-				fmt.Printf("Batch commit on block end failed at trace line %d: %v\n", lineCounter, err)
-			} else if stopAtNextBlockEnd {
-				fmt.Printf("Reached max operations %d earlier; stopping at next block end (trace line %d).\n", maxOps, lineCounter)
-				break
-			}
-			continue
-		}
-
-		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") || !strings.Contains(line, "OPType:") {
-			continue
-		}
-
-		matches := opRegex.FindStringSubmatch(line)
-		if len(matches) < 2 {
-			// fmt.Printf("无法解析行: %s\n", line)
-			continue
-		}
-
-		opTypeStr := matches[1]
-		keyHex := ""
-		keySize := 0
-		keyBytes := []byte{}
-		if len(matches) >= 3 && matches[2] != "" {
-			keyHex = matches[2]
-			if len(matches) >= 4 && matches[3] != "" {
-				fmt.Sscanf(matches[3], "%d", &keySize)
-			}
-			keyBytes, err = hex.DecodeString(keyHex)
-			if err != nil {
-				// 无效的键，跳过
-				continue
-			}
-			if len(keyBytes) > 0 {
-				// lastKeyPrefix = keyBytes[0]
-				// hasLastKeyPrefix = true
-				dataType = ethstore.GetDataTypeFromKey(keyBytes)
-			}
-		}
-
-		// 检查是否有值部分
-		var valueHex string
-		var valueSize int
-		if len(matches) >= 6 && matches[4] != "" {
-			valueHex = matches[4]
-			fmt.Sscanf(matches[5], "%d", &valueSize)
-		}
-
-		// 解析 NewBatchWithSize 中的 batch 大小
-		// var batchSize int
-		// if len(matches) >= 7 && matches[6] != "" {
-		// 	if v, parseErr := strconv.ParseInt(matches[6], 10, 0); parseErr == nil && v > 0 {
-		// 		maxInt := int64(int(^uint(0) >> 1))
-		// 		if v > maxInt {
-		// 			batchSize = int(maxInt)
-		// 		} else {
-		// 			batchSize = int(v)
-		// 		}
-		// 	}
-		// }
-
-		// 解析 NewIterator 的 prefix/start key（start key 可能为空）
-		var iterPrefixBytes []byte
-		var iterStartBytes []byte
-		if len(matches) >= 9 && matches[7] != "" {
-			iterPrefixBytes, err = hex.DecodeString(matches[7])
-			if err != nil {
-				continue
-			}
-			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
-			lastIterDataType = dataType
-			if matches[8] != "" {
-				iterStartBytes, err = hex.DecodeString(matches[8])
-				if err != nil {
-					continue
-				}
-			}
-		}
-
-		counter++
-		if counter%10000 == 0 {
-			// fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds()
-			fmt.Printf("\rProcessed %d operations, total time: %f s, logic read size: %d, logic write size: %d", counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-		}
-		// throughput
-		if maxOps > 0 && counter >= maxOps {
-			if !stopAtNextBlockEnd {
-				stopAtNextBlockEnd = true
-				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
-				fmt.Println("logic read size: "+strconv.FormatInt(logicReadSize, 10), ", logic write size: ", strconv.FormatInt(logicWriteSize, 10))
-			}
-		}
-
-		switch dbType {
-		case AOL:
-			if !ethstore.AolHandledDataTypes[dataType] {
-				continue
-			}
-		case PrefixDB:
-			if !ethstore.PrefixDBHandledDataTypes[dataType] {
-				continue
-			}
-		case Pebble:
-			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-				continue
-			}
-		case allDBTypes:
-		default:
-		}
-
-		var op opType
-		switch opTypeStr {
-		case "Get":
-			op = opGet
-		case "Put", "BatchPut":
-			op = opPut
-		case "Delete", "BatchDelete":
-			op = opDelete
-		case "NewIterator":
-			op = opNewIterator
-		case "IteratorNext":
-			dataType = lastIterDataType
-			op = opIteratorNext
-		default:
-			if err := io.EOF; err != nil {
-				break
-			}
-			continue
-		}
-		valueBytes, decodeErr := hex.DecodeString(valueHex)
-		if decodeErr != nil && valueHex != "" {
-			// 无效的值，跳过
-			continue
-		}
-
-		// 执行操作并计时
-		var value []byte
-		var size int
-		start := time.Now()
-		var opErr error
-
-		switch op {
-		case opGet:
-			value, opErr = store.Get(keyBytes)
-			size = len(value)
-		// case opHas:
-		// 	size, _, opErr = store.Has(keyBytes)
-		case opPut:
-			// opErr = store.Put(keyBytes, valueBytes)
-			if len(keyBytes) == 0 {
-				break
-			}
-			b := ensurePebbleBatch()
-			opErr = b.Put(keyBytes, valueBytes)
-		case opDelete:
-			// opErr = store.Delete(keyBytes)
-			b := ensurePebbleBatch()
-			opErr = b.Delete(keyBytes)
-		// case opNewBatch:
-		// 	nextBatchRequested = true
-		// 	nextBatchSize = 0
-		// case opBatchPut:
-		// 	if len(keyBytes) == 0 {
-		// 		break
-		// 	}
-		// 	b := ensurePebbleBatch()
-		// 	opErr = b.Put(keyBytes, valueBytes)
-		// case opBatchPutCommit:
-		// Commit is deferred until we observe a block end marker.
-		// (See "Processing block (end)" handling above.)
-		// opErr = nil
-		// case opBatchDelete:
-		// 	if len(keyBytes) == 0 {
-		// 		break
-		// 	}
-		// 	b := ensurePebbleBatch()
-		// 	opErr = b.Delete(keyBytes)
-		// case opNewBatchWithSize:
-		// 	nextBatchRequested = true
-		// 	if batchSize > 0 {
-		// 		nextBatchSize = batchSize
-		// 	} else {
-		// 		fmt.Printf("Invalid batch size %d at line %d, using default NewBatch\n", batchSize, counter)
-		// 		nextBatchSize = 0
-		// 	}
-		// case opGetBatchValueSize:
-		// 	if hasLastKeyPrefix {
-		// 		_ = lastKeyPrefix
-		// 	}
-		// 	if pebbleBatch != nil {
-		// 		size = pebbleBatch.ValueSize()
-		// 	}
-		case opNewIterator:
-			if it != nil {
-				it.Release()
-				it = nil
-			}
-			it = store.NewIterator(iterPrefixBytes, iterStartBytes)
-		case opIteratorNext:
-			if it != nil {
-				_ = it.Next()
-			}
-		}
-
-		end := time.Now()
-		elapsed := end.Sub(start)
-		totalTime += elapsed
-
-		var kvTypeStr string
-		if ethstore.AolHandledDataTypes[dataType] {
-			kvTypeStr = "AOL"
-		} else if ethstore.PrefixDBHandledDataTypes[dataType] {
-			kvTypeStr = "PrefixDB"
-		} else {
-			kvTypeStr = "Pebble"
-		}
-
-		if opErr != nil {
-			if len(keyBytes) > 0 && keyBytes[0] != 'o' && keyBytes[0] != 'a' {
-				fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
-			}
-		}
-
-		// 在 switch 外部统一处理统计
-		if opErr == nil {
-			switch op {
-			case opGet:
-				logicReadSize += int64(size)
-			case opPut:
-				logicWriteSize += int64(len(keyBytes) + len(valueBytes))
-			case opDelete:
-				logicWriteSize += int64(len(keyBytes))
-			}
-		}
-
-		if _, ok := stats[kvTypeStr]; !ok {
-			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
-		}
-		if _, ok := stats[kvTypeStr][op]; !ok {
-			stats[kvTypeStr][op] = newLatencyHistogram()
-		}
-		stats[kvTypeStr][op].observe(elapsed)
-
-	}
-	if err := commitBlock(); err != nil {
-		fmt.Printf("Final batch commit failed: %v\n", err)
-	}
-	reportLatencyStats(stats)
-	reportHistogramSummary("baseline-pebble commit (Batch.Write)", pebbleCommitHist)
 }
 
 // load all data from the key-value file into EthStore
@@ -2022,338 +1897,6 @@ func TestGetParentKey() {
 	} else {
 		fmt.Println("Parent key test passed.")
 	}
-}
-
-func replayTrace(dataBaseDir string, traceFileDir string, maxOps int64, dbType DBType, cacheCount int) {
-	tempDir := dataBaseDir
-	store, err := ethstore.New(tempDir, 6000, "put_test", false, 16*1024, 12*1024*1024, cacheCount)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	// store.GCPrefixTreeStorage()
-
-	// dbPath := "/mnt/ssd2/pebble"
-
-	// ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
-	// if err != nil {
-	// 	fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
-	// 	return
-	// }
-
-	testFilePath := traceFileDir
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	// Support both formats:
-	// - OPType: Put, key: ..., size: ..., value: ..., size: ...
-	// - OPType: BatchPutCommit (commit is deferred until a block end marker)
-	// - geth: ... Processing block (end), ID: ..., hash: ... (commit all pending batches)
-	// - OPType: NewBatchWithSize, size: <batch-bytes>
-	// - OPType: NewIterator, prefix: <hex>, start key: <hex or empty>
-	opRegex := regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
-
-	var totalTime time.Duration
-	var counter int64
-	var linecount int64
-	reader := bufio.NewReader(file)
-	stats := make(map[string]map[opType]*latencyHistogram)
-
-	var nextBatchRequested bool
-	var nextBatchSize int
-	var pebbleBatch ethdb.Batch
-	var prefixdbDirty bool
-	var stopAtNextBlockEnd bool
-	var blockCommitCounter int64
-	var lastIterDataType ethstore.DataType
-	prefixdbCommitHist := newLatencyHistogram()
-	pebbleCommitHist := newLatencyHistogram()
-	blockCommitTotalHist := newLatencyHistogram()
-
-	ensurePebbleBatch := func() ethdb.Batch {
-		if pebbleBatch != nil {
-			return pebbleBatch
-		}
-		if nextBatchRequested {
-			if nextBatchSize > 0 {
-				pebbleBatch = store.NewBatchWithSize(nextBatchSize)
-			} else {
-				pebbleBatch = store.NewBatch()
-			}
-			nextBatchRequested = false
-			nextBatchSize = 0
-			return pebbleBatch
-		}
-		pebbleBatch = store.NewBatch()
-		return pebbleBatch
-	}
-
-	commitBlock := func() error {
-		// One block-end commit consists of at most two commits:
-		// 1) PrefixDB (TrieStorage) batch commit
-		// 2) Pebble batch write
-		blockStart := time.Now()
-		if prefixdbDirty {
-			start := time.Now()
-			if err := store.PrefixdbBatchCommit('O'); err != nil {
-				return err
-			}
-			prefixdbCommitHist.observe(time.Since(start))
-			prefixdbDirty = false
-		}
-		if pebbleBatch != nil {
-			start := time.Now()
-			if err := pebbleBatch.Write(); err != nil {
-				return err
-			}
-			pebbleCommitHist.observe(time.Since(start))
-			pebbleBatch = nil
-		}
-		blockCommitTotalHist.observe(time.Since(blockStart))
-		blockCommitCounter++
-		return nil
-	}
-
-	var iter ethdb.Iterator
-	defer func() {
-		if iter != nil {
-			iter.Release()
-		}
-	}()
-
-	fmt.Println("start replay")
-	for {
-		// read line
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("End of file reached")
-				break
-			}
-			log.Printf("error reading trace file: %v", err)
-			break
-		}
-
-		line = strings.TrimSpace(line)
-		linecount++
-		// if linecount < 954178 {
-		// 	continue
-		// }
-
-		// Block boundary marker: commit all pending batches when a block ends.
-		if strings.Contains(line, "Processing block (end), ID:") {
-			if err := commitBlock(); err != nil {
-				fmt.Printf("Batch commit on block end failed: %v\n", err)
-				break
-			} else if stopAtNextBlockEnd {
-				fmt.Printf("Reached max operations %d earlier; stopping at next block end.\n", maxOps)
-				break
-			}
-			continue
-		}
-
-		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") ||
-			!strings.Contains(line, "OPType:") {
-			continue
-		}
-
-		matches := opRegex.FindStringSubmatch(line)
-		if len(matches) == 0 {
-			continue
-		}
-
-		opTypeStr := matches[1]
-		keyHex := ""
-		keySize := 0
-		keyBytes := []byte{}
-		if len(matches) >= 3 && matches[2] != "" {
-			keyHex = matches[2]
-			if len(matches) >= 4 && matches[3] != "" {
-				fmt.Sscanf(matches[3], "%d", &keySize)
-			}
-			keyBytes, err = hex.DecodeString(keyHex)
-			if err != nil {
-				// 无效的键，跳过
-				continue
-			}
-		}
-		// 检查是否有值部分
-		var valueHex string
-		var valueSize int
-		var valueBytes []byte
-		if len(matches) >= 6 && matches[4] != "" {
-			valueHex = matches[4]
-			fmt.Sscanf(matches[5], "%d", &valueSize)
-			valueBytes, err = hex.DecodeString(valueHex)
-			if err != nil && valueHex != "" {
-				continue
-			}
-		}
-
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
-		var iterPrefixBytes []byte
-		var iterStartBytes []byte
-		if len(matches) >= 9 && matches[7] != "" {
-			iterPrefixBytes, err = hex.DecodeString(matches[7])
-			if err != nil {
-				continue
-			}
-			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
-			lastIterDataType = dataType
-			if matches[8] != "" {
-				iterStartBytes, err = hex.DecodeString(matches[8])
-				if err != nil {
-					continue
-				}
-			}
-		}
-
-		if len(keyBytes) == 0 && len(iterPrefixBytes) > 0 {
-			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
-		}
-
-		counter++
-		if counter%10000 == 0 {
-			fmt.Printf("\rProcessed %d operations, total time: %f s, blockCommits=%d, dirty(prefixdb=%v, pebble=%v)",
-				counter, totalTime.Seconds(), blockCommitCounter, prefixdbDirty, pebbleBatch != nil)
-		}
-
-		if maxOps > 0 && counter >= maxOps {
-			if !stopAtNextBlockEnd {
-				stopAtNextBlockEnd = true
-				fmt.Printf("Reached max operations %d; will continue until next block end then stop.\n", maxOps)
-			}
-		}
-
-		switch dbType {
-		case AOL:
-			if !ethstore.AolHandledDataTypes[dataType] {
-				continue
-			}
-		case PrefixDB:
-			if !ethstore.PrefixDBHandledDataTypes[dataType] {
-				continue
-			}
-		case Pebble:
-			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-				continue
-			}
-		case allDBTypes:
-		default:
-		}
-
-		// testKeyHex := "4f4e881af4e10baec755ed1eff3857514735d4e6e34f188bd6afdc48f4b70933830e040c"
-		// testKey, _ := hex.DecodeString(testKeyHex)
-		// val, err := store.Get(testKey)
-		// if err != nil {
-		// 	fmt.Printf("Error getting test key %s: %v\n", testKeyHex, err)
-		// } else {
-		// 	fmt.Printf("Successfully got test key %s, value: %x\n", testKeyHex, val)
-		// }
-
-		var op opType
-		switch opTypeStr {
-		case "Get":
-			op = opGet
-		case "Put", "BatchPut":
-			op = opPut
-		case "Delete", "BatchDelete":
-			op = opDelete
-		case "NewIterator":
-			op = opNewIterator
-		case "IteratorNext":
-			dataType = lastIterDataType
-			op = opIteratorNext
-		default:
-			if err := io.EOF; err != nil {
-				break
-			}
-			continue
-		}
-
-		// 执行操作并计时
-		start := time.Now()
-		var opErr error
-		switch op {
-		case opGet:
-			_, opErr = store.Get(keyBytes)
-		case opPut:
-			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-				opErr = store.BatchPut(keyBytes, valueBytes, dataType)
-				if opErr == nil {
-					prefixdbDirty = true
-				}
-			} else {
-				b := ensurePebbleBatch()
-				opErr = b.Put(keyBytes, valueBytes)
-			}
-		case opDelete:
-			if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-				opErr = store.BatchDelete(keyBytes, dataType)
-			} else {
-				b := ensurePebbleBatch()
-				opErr = b.Delete(keyBytes)
-			}
-		case opNewIterator:
-			if iter != nil {
-				iter.Release()
-				iter = nil
-			}
-			if len(iterPrefixBytes) > 0 && (iterPrefixBytes[0] == 'O') {
-				iter = nil
-				break
-			}
-			iter = store.NewIterator(iterPrefixBytes, iterStartBytes)
-		case opIteratorNext:
-			if iter != nil {
-				_ = iter.Next()
-			}
-		}
-
-		end := time.Now()
-		elapsed := end.Sub(start)
-		totalTime += elapsed
-
-		var kvTypeStr string
-		if ethstore.AolHandledDataTypes[dataType] {
-			kvTypeStr = "AOL"
-		} else if ethstore.PrefixDBHandledDataTypes[dataType] {
-			kvTypeStr = "PrefixDB"
-		} else {
-			kvTypeStr = "Pebble"
-		}
-
-		if _, ok := stats[kvTypeStr]; !ok {
-			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
-		}
-		if _, ok := stats[kvTypeStr][op]; !ok {
-			stats[kvTypeStr][op] = newLatencyHistogram()
-		}
-		stats[kvTypeStr][op].observe(elapsed)
-		if opErr != nil {
-			//fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
-			if len(keyBytes) > 0 && keyBytes[0] != 'o' && keyBytes[0] != 'a' {
-				fmt.Printf("linecount: %d Operation %s failed for key %s: %v\n", linecount, opTypeStr, keyHex, opErr)
-			}
-		}
-	}
-	if err := commitBlock(); err != nil {
-		fmt.Printf("Final batch commit failed: %v\n", err)
-	}
-
-	fmt.Printf("\nFinished replaying trace file '%s'. Total operations: %d, total time: %f s\n", traceFileDir, counter, totalTime.Seconds())
-	fmt.Println("\nReporting latency statistics...")
-	reportLatencyStats(stats)
-	reportHistogramSummary("replayTrace commit (PrefixdbBatchCommit)", prefixdbCommitHist)
-	reportHistogramSummary("replayTrace commit (pebble Batch.Write)", pebbleCommitHist)
-	reportHistogramSummary("replayTrace commit (block total)", blockCommitTotalHist)
 }
 
 func insertAccountHashindexTopebble() error {

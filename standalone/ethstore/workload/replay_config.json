@@ -1,8 +1,9 @@
 {
-  "databaseDir": "/mnt/ssd2/ethstore/database",
   "loadDataDir": "/mnt/ssd/ethstore/20500000_key_value_pairs.txt",
-  "baselinePebbleDir": "/mnt/ssd2/ethstore/baseline/pebble",
   "traceFile": "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000",
   "traceFileNocache": "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000",
-  "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot-10K-blocks"
+  "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot-10K-blocks",
+  "ethstoreDir": "/mnt/ssd2/ethstore/database",
+  "pebbleDir": "/mnt/ssd2/ethstore/baseline/pebble",
+  "chainKVDir": "/mnt/ssd2/ethstore/baseline/chainkv"
 }

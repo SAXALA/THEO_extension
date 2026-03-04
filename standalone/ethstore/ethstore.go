@@ -16,12 +16,6 @@ import (
 	"github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
 
-// backendStats tracks operation counts and durations
-type backendStats struct {
-	ops   uint64
-	durNs uint64
-}
-
 func isNotFoundError(err error) bool {
 	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound)
 }
@@ -672,60 +666,6 @@ func (d *Database) Path() string {
 	return d.fn
 }
 
-// ethdbIterator is a wrapper implementing the ethdb.Iterator interface for Pebble iterator
-type ethdbIterator struct {
-	iter       *pebble.Iterator
-	typePrefix byte
-	prefixLen  int
-	valid      bool
-	err        error
-}
-
-// Next moves to the next entry
-func (it *ethdbIterator) Next() bool {
-	// Move to the first element on the first call to Next()
-	if !it.valid {
-		it.valid = true
-		return it.iter.First()
-	}
-	// Subsequent calls move to the next element
-	return it.iter.Next()
-}
-
-// Error returns the iterator's error
-func (it *ethdbIterator) Error() error {
-	if it.err != nil {
-		return it.err
-	}
-	return it.iter.Error()
-}
-
-// Key returns the key of the current entry, removing the type prefix
-func (it *ethdbIterator) Key() []byte {
-	if !it.iter.Valid() {
-		return nil
-	}
-	key := it.iter.Key()
-	// Return the key after removing the type prefix
-	if len(key) > 1 && key[0] == it.typePrefix {
-		return key[1:]
-	}
-	return key
-}
-
-// Value returns the value of the current entry
-func (it *ethdbIterator) Value() []byte {
-	if !it.iter.Valid() {
-		return nil
-	}
-	return it.iter.Value()
-}
-
-// Release releases the iterator resources
-func (it *ethdbIterator) Release() {
-	it.iter.Close()
-}
-
 // iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database (primarily for AOL data)
 type iterator struct {
 	db     *Database
@@ -971,8 +911,8 @@ func (d *Database) SyncKeyValue() error {
 		}
 	}
 
-	if d.pebble != nil && d.pebble.db != nil {
-		if err := d.pebble.db.Flush(); err != nil {
+	if d.pebble != nil {
+		if err := d.pebble.Flush(); err != nil && err != ErrClosed {
 			return fmt.Errorf("failed to flush pebble: %w", err)
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"unsafe"
+
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
 // DataType defines the type of data identified by a key prefix.
@@ -428,10 +430,11 @@ func StringToBytes(s string) []byte {
 	))
 }
 
-// Define custom errors to replace ethdb's if they are undefined
+// ErrClosed and ErrNotFound are re-exported from pebblestore so that all
+// packages can use a single sentinel error instance.
 var (
-	ErrClosed     = errors.New("database closed")
-	ErrNotFound   = errors.New("not found")
+	ErrClosed     = pebblestore.ErrClosed
+	ErrNotFound   = pebblestore.ErrNotFound
 	ErrCompaction = errors.New("compaction error") // Example, if you need more
 )
 
