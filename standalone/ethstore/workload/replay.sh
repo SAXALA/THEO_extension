@@ -45,11 +45,11 @@ CHAINKV_STATE_KEY_PREFIXES="${CHAINKV_STATE_KEY_PREFIXES:-}"
 CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
 
 # restore 路径: 实际数据根目录
-RESTORE_ROOT="${RESTORE_ROOT:-/mnt/ssd2/ethstore}"
+RESTORE_ROOT="${RESTORE_ROOT:-}"
 # restore 路径: 备份根目录
-RESTORE_BAK_ROOT="${RESTORE_BAK_ROOT:-${RESTORE_ROOT}/DBbak}"
+RESTORE_BAK_ROOT="${RESTORE_BAK_ROOT:-}"
 # ethstore prefixdb 目录（用于权限预检查）
-ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-${RESTORE_ROOT}/database_state/prefixdb}"
+ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-}"
 
 log_date=$(date +%m-%d-%H-%M-%S)
 log_dir="./replayLog"
@@ -61,7 +61,7 @@ CURRENT_REPLAY_PID=""
 CURRENT_MONITOR_PID=""
 
 # sudo 密码；留空则使用交互式 sudo
-SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
+SUDO_PASSWD="${SUDO_PASSWD:-}"
 
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then
@@ -125,7 +125,11 @@ Common env vars:
     LD_CHUNK_FILE_SIZE(bytes), LD_CACHE_SIZE(bytes)
     CHAINKV_CACHE_MB, CHAINKV_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
-  RESTORE_ROOT RESTORE_BAK_ROOT SUDO_PASSWD
+    RESTORE_ROOT RESTORE_BAK_ROOT ETHSTORE_PREFIXDB_DIR SUDO_PASSWD
+
+Required by action/backend:
+    restore: RESTORE_ROOT + RESTORE_BAK_ROOT
+    load/replay ethstore: ETHSTORE_PREFIXDB_DIR
 EOF
 }
 
@@ -139,6 +143,37 @@ validate_inputs() {
         echo "Invalid backend: ${BACKEND}"
         usage
         exit 1
+    fi
+}
+
+validate_runtime_requirements() {
+    local needs_restore_paths="false"
+    local needs_ethstore_prefixdb="false"
+
+    if [ "$ACTION" = "restore" ]; then
+        needs_restore_paths="true"
+    fi
+
+    if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ]; then
+        if [ "$BACKEND" = "ethstore" ] || [ "$BACKEND" = "all" ]; then
+            needs_ethstore_prefixdb="true"
+        fi
+    fi
+
+    if [ "$needs_restore_paths" = "true" ]; then
+        if [ -z "$RESTORE_ROOT" ] || [ -z "$RESTORE_BAK_ROOT" ]; then
+            echo "restore 需要配置 RESTORE_ROOT 和 RESTORE_BAK_ROOT，当前为空。"
+            usage
+            exit 1
+        fi
+    fi
+
+    if [ "$needs_ethstore_prefixdb" = "true" ]; then
+        if [ -z "$ETHSTORE_PREFIXDB_DIR" ]; then
+            echo "ethstore 的 load/replay 需要配置 ETHSTORE_PREFIXDB_DIR，当前为空。"
+            usage
+            exit 1
+        fi
     fi
 }
 
@@ -384,6 +419,7 @@ main() {
     fi
 
     validate_inputs
+    validate_runtime_requirements
     if [ "$ACTION" != "restore" ]; then
         build_replay_binary
     fi

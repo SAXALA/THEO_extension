@@ -295,6 +295,9 @@ func reportHistogramSummary(label string, hist *latencyHistogram) {
 type replayConfig struct {
 	LoadDataDir                  string `json:"loadDataDir"`
 	AolDataFile                  string `json:"aolDataFile"`
+	AccountHashIndexSourceDir    string `json:"accountHashIndexSourceDir"`
+	AccountHashIndexTargetDir    string `json:"accountHashIndexTargetDir"`
+	PebbleAuxDir                 string `json:"pebbleAuxDir"`
 	TraceFile                    string `json:"traceFile"`
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
@@ -529,14 +532,19 @@ func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheS
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
 		}
-		if err := loadAccount(cfg.EthStoreDir, cfg.LoadDataDir, cfg.PebbleDBDir, ldChunkFileSize, ldCacheSize); err != nil {
+		if cfg.PebbleAuxDir == "" {
+			return fmt.Errorf("ld with ethstore backend requires pebbleAuxDir in config")
+		}
+		if cfg.AccountHashIndexSourceDir == "" || cfg.AccountHashIndexTargetDir == "" {
+			return fmt.Errorf("ld with ethstore backend requires accountHashIndexSourceDir and accountHashIndexTargetDir in config")
+		}
+		if err := loadAccount(cfg.EthStoreDir, cfg.LoadDataDir, cfg.PebbleAuxDir, cfg.AccountHashIndexSourceDir, cfg.AccountHashIndexTargetDir, ldChunkFileSize, ldCacheSize); err != nil {
 			return fmt.Errorf("ethstore load failed: %w", err)
 		}
 
 		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
 		if aolDataFile == "" {
-			// Keep backward-compatible default when config omits AOL source file.
-			aolDataFile = "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
+			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
 		}
 		if err := loadAol(cfg.EthStoreDir, aolDataFile); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
@@ -634,7 +642,7 @@ type replayBackend interface {
 	// May return a noopIter when the backend cannot iterate over that prefix.
 	NewIterator(prefix, start []byte) replayIter
 	// SkipByDBType returns true when this op should be skipped based on the
-	// dbType filter. ChainKV always returns false (no filtering).
+	// dbType filter.
 	SkipByDBType(dataType ethstore.DataType, dbType DBType) bool
 	// PrintCommitStats prints backend-specific commit-latency histograms.
 	PrintCommitStats()
@@ -822,8 +830,9 @@ func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool, st
 func (b *chainKVReplayBackend) Name() string { return "chainkv" }
 func (b *chainKVReplayBackend) Close()       { b.db.Close() }
 
-// ChainKV does not filter by DBType – always replay all ops.
-func (b *chainKVReplayBackend) SkipByDBType(_ ethstore.DataType, _ DBType) bool { return false }
+func (b *chainKVReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
+	return skipByDBType(dt, dbType)
+}
 func (b *chainKVReplayBackend) Get(key []byte) ([]byte, error)                  { return b.db.Get(key) }
 
 func (b *chainKVReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
@@ -881,7 +890,7 @@ func (b *chainKVReplayBackend) PrintCommitStats() {
 // ---------------------------------------------------------------------------
 
 // replayTrace replays a workload trace file against the given backend.
-// dbType controls which key types are replayed; chainKV backends ignore it.
+// dbType controls which key types are replayed across all backends.
 func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType) {
 	fmt.Printf("[%s] Replaying trace from %s\n", backend.Name(), traceFile)
 	file, err := os.Open(traceFile)
@@ -1145,25 +1154,6 @@ func main() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
-	// runtime.SetMutexProfileFraction(5)
-
-	// TestPrefixGet()
-	// loadPebble()
-	// loadAccount(cfg.EthStoreDir, 64*1024, 512*1024*1024)
-	// insertAccountHashindexTopebble()
-	// repalceAccountHashToAccountKey()
-
-	// recordTraceStorage(traceFile)
-	// recordTraceBlock(traceFileNocache)
-	// replayTraceAccount(cfg.EthStoreDir, cfg.TraceFile)
-
-	// time.Sleep(5 * time.Second)
-	// loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir)
-	// replaybaselineTrace(cfg.PebbleDBDir, cfg.TraceFile, *maxOps)
-	//replayTrace(cfg.EthStoreDir, cfg.TraceFileNoCacheSnap, *maxOps, allDBTypes)
-	// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
-	// loadAol(cfg.EthStoreDir, notxFile)
-	// return
 
 	switch *mode {
 	case "ld":
@@ -1188,7 +1178,14 @@ func main() {
 				log.Fatalf("re: failed to open chainkv backend: %v", ckvErr)
 			}
 			defer ckvBackend.Close()
-			replayTrace(ckvBackend, traceFile, *maxOps, allDBTypes)
+			replayTrace(ckvBackend, traceFile, *maxOps, dbType)
+		} else if strings.EqualFold(*backend, "pebble") {
+			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir)
+			if pbErr != nil {
+				log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
+			}
+			defer pbBackend.Close()
+			replayTrace(pbBackend, traceFile, *maxOps, dbType)
 		} else {
 			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount)
 			if ethErr != nil {
@@ -1197,15 +1194,8 @@ func main() {
 			defer ethBackend.Close()
 			replayTrace(ethBackend, traceFile, *maxOps, dbType)
 		}
-	case "rb":
-		pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir)
-		if pbErr != nil {
-			log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
-		}
-		defer pbBackend.Close()
-		replayTrace(pbBackend, traceFile, *maxOps, dbType)
 	default:
-		log.Fatalf("unknown mode %q, use ld, re, or rb", *mode)
+		log.Fatalf("unknown mode %q, use ld or re", *mode)
 	}
 }
 
@@ -1281,7 +1271,6 @@ func loadbaselineData(pebbleDir string, dataFile string) error {
 
 // load all data from the key-value file into EthStore
 func loadData(dataBaseDir string, dataFile string) {
-	// ethStoreDir := "/mnt/ssd/ethstore/database/prefixdb"
 	ethStoreDir := dataBaseDir
 	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false, 64*1024, 512*1024*1024, 16)
 	if err != nil {
@@ -1351,7 +1340,7 @@ func loadData(dataBaseDir string, dataFile string) {
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 }
 
-func loadAccount(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int) error {
+func loadAccount(databaseDir string, dataFile string, pebbleDir string, accountHashIndexSourceDir string, accountHashIndexTargetDir string, chunkFileSize int, cacheSize int) error {
 	var dir string
 	chunkFileSizeStr := strconv.Itoa(chunkFileSize/1024) + "KB"
 
@@ -1367,7 +1356,7 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, chunkFil
 
 	dbPath := strings.TrimSpace(pebbleDir)
 	if dbPath == "" {
-		dbPath = "/mnt/ssd2/pebble"
+		return fmt.Errorf("pebble aux dir is required for loadAccount")
 	}
 	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
@@ -1377,7 +1366,7 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, chunkFil
 
 	testFilePath := strings.TrimSpace(dataFile)
 	if testFilePath == "" {
-		testFilePath = "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+		return fmt.Errorf("load data file is required for loadAccount")
 	}
 
 	// Read key-value pairs from the test file
@@ -1481,7 +1470,7 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, chunkFil
 
 	// pdb.SaveTrie()
 	pdb.GCPrefixTree()
-	if err := insertAccountHashindexTopebble(); err != nil {
+	if err := insertAccountHashindexTopebble(accountHashIndexSourceDir, accountHashIndexTargetDir); err != nil {
 		return fmt.Errorf("failed to sync accountHash index to pebble: %w", err)
 	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
@@ -1564,290 +1553,24 @@ func loadAol(dataBaseDir string, notxFile string) error {
 	return nil
 }
 
-func TestPrefixGet() {
-	dirPath := "/mnt/ssd2/ethstore/database_state"
-	pd, err := prefixdb.NewPrefixDB(dirPath, 64*1024, 3538944, 16)
-	if err != nil {
-		log.Fatalf("Failed to create PrefixDB: %v", err)
-	}
-	defer pd.Close()
-
-	keyhex := "4f63d618e1fc15bd7e9d3579f3f8f7e186b02be609aa45700e5ca81cd8c52c945200000e0200"
-
-	pdkey, err := hex.DecodeString(keyhex)
-	if err != nil {
-		log.Fatalf("Failed to decode key hex: %v", err)
-	}
-
-	var accountKey []byte
-	if pdkey[0] == 'O' {
-		accountKey = pd.GetParentAccountKey(pdkey)
-	}
-
-	startTime := time.Now()
-	value, ok, err := pd.Get(pdkey, accountKey)
-	endTime := time.Now()
-	if err != nil {
-		log.Fatalf("Get operation failed: %v", err)
-	}
-	if !ok {
-		log.Fatalf("Key not found in PrefixDB")
-	}
-	fmt.Printf("Value: %x\n", value)
-	fmt.Printf("Get operation took %f seconds\n", endTime.Sub(startTime).Seconds())
-}
-
-func testPdbPerformance() {
-	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 10, "put_test", false, 64*1024, 512*1024*1024, 16)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	var totalTime time.Duration
-	counter := 0
-	reader := bufio.NewReader(file)
-
-	for {
-		counter++
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value :")
-		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
-			continue
-		}
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		// Perform the Put operation
-		startTime := time.Now()
-		err = store.Put(keyBytes, valueBytes)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-		// Verify the value was stored correctly
-
-		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-		}
-	}
-}
-
-func testAolPreformance() {
-	tempDir := "/mnt/ssd/ethstore/testDB"
-	store, err := ethstore.New(tempDir, 100, "put_test", false, 64*1024, 512*1024*1024, 16)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	notxFile := "/mnt/ssd/ethstore/sortAol/nontxlookup_sorted.dat"
-
-	// Read key-value pairs from the test file
-	notxfile, err := os.Open(notxFile)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer notxfile.Close()
-
-	var totalTime time.Duration
-	counter := 0
-	notxreader := bufio.NewReader(notxfile)
-
-	for {
-
-		line, err := notxreader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value:")
-		if len(parts) != 2 {
-			// log.Printf("无法解析行: %s", line)
-			continue
-		}
-		counter++
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		// Perform the Put operation
-		startTime := time.Now()
-		err = store.Put(keyBytes, valueBytes)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-		// Verify the value was stored correctly
-
-		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f ns", counter, totalTime.Seconds())
-		}
-	}
-
-	fmt.Println("total put:", counter, " use time:", totalTime.Seconds(), " s", " avg time:", float64(counter)/totalTime.Seconds(), " s")
-	log.Println("Put test completed.")
-}
-
-func TestPebblePreformance() {
-	tempDir := "/mnt/ssd/ethstore/testDB/pebble"
-	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "TestPebblePut", false)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	var totalTime time.Duration
-	counter := 0
-	reader := bufio.NewReader(file)
-
-	for {
-		counter++
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value :")
-		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
-			continue
-		}
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		startTime := time.Now()
-		err = store.Put(keyBytes, valueBytes)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-
-		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-		}
-	}
-}
-
-func TestGetParentKey() {
-	dirpath := "/mnt/ssd/ethstore/database"
-	pd, err := prefixdb.NewPrefixDB(dirpath, 64*1024, 3538944, 16)
-	if err != nil {
-		fmt.Printf("Failed to create PrefixDB: %v", err)
-	}
-	defer pd.Close()
-
-	// SK_1 := []byte("610000019759ea326fa019a55bda5dff44477be6e1d9c48db950e3fe07a0ba671e")
-	// SV_1 := []byte("f8440180a0665081a76be9ad792eec7ba0b7819e48a97cd6ab5210cae849c1ea4777ba9b6aa029164acf9a06c22bbe9da20100d94116c6ef93f44a5b58ebd6e1954c3bf436df")
-	// SK_1, err = hex.DecodeString(string(SK_1))
-	// SV_1, err = hex.DecodeString(string(SV_1))
-
-	// pd.Put(SK_1, SV_1)
-
-	Key1 := []byte("4f37d65eaa92c6bc4c13a5ec45527f0c18ea8932588728769ec7aecfe6d9f32e42")
-	Value1 := []byte("f91111111")
-
-	parentKey1 := pd.GetParentAccountKey(Key1)
-
-	Key1, err = hex.DecodeString(string(Key1))
-	Value1, err = hex.DecodeString(string(Value1))
-	pd.Put(Key1, Value1, parentKey1)
-	fmt.Print("Parent Key1: ", hex.EncodeToString(parentKey1), "\n")
-	if !bytes.Equal(parentKey1, Key1[:len(Key1)-2]) {
-		fmt.Printf("Expected parent key for Key1 to be %x, got %x\n", Key1[:len(Key1)-2], parentKey1)
-	} else {
-		fmt.Println("Parent key test passed.")
-	}
-}
-
-func insertAccountHashindexTopebble() error {
+func insertAccountHashindexTopebble(sourcePebblePath string, targetPebbleDir string) error {
 	// insert all kvs in hashKeyPebble into memCache
 	fmt.Println("Building memcache from pebble store...")
-	pebblePath := "/mnt/ramdisk/accountHash_key_pebble"
+	pebblePath := strings.TrimSpace(sourcePebblePath)
+	if pebblePath == "" {
+		return fmt.Errorf("account hash index source dir is required")
+	}
 
 	accountHashKeyPebble, err := ethstore.NewPebbleStore(pebblePath, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to open pebble store: %v", err)
 	}
+	defer accountHashKeyPebble.Close()
 
-	dir := "/mnt/ssd2/ethstore/database_pebble"
+	dir := strings.TrimSpace(targetPebbleDir)
+	if dir == "" {
+		return fmt.Errorf("account hash index target dir is required")
+	}
 	db, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create pebble store: %v", err)
@@ -1876,30 +1599,20 @@ func insertAccountHashindexTopebble() error {
 	}
 	fmt.Println("Finished inserting account hash key values.")
 
-	if accountHashKeyPebble != nil {
-		if err := accountHashKeyPebble.Close(); err != nil {
-			log.Printf("failed to close pebble store: %v", err)
-		}
-	}
-
-	if db != nil {
-		if err := db.Close(); err != nil {
-			log.Printf("failed to close pebble store: %v", err)
-		}
-	}
-
 	return nil
 }
 
-func replayPebble() {
-	tempDir := "/mnt/tmp/block-20500000-backup/execution/data/geth/chaindata"
+func replayPebble(tempDir string, testFilePath string) {
+	tempDir = strings.TrimSpace(tempDir)
+	testFilePath = strings.TrimSpace(testFilePath)
+	if tempDir == "" || testFilePath == "" {
+		log.Fatalf("replayPebble requires non-empty tempDir and testFilePath")
+	}
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
-
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
@@ -1965,17 +1678,18 @@ func replayPebble() {
 	}
 }
 
-func loadPebble() {
+func loadPebble(dirPath string, testFilePath string) {
+	dirPath = strings.TrimSpace(dirPath)
+	testFilePath = strings.TrimSpace(testFilePath)
+	if dirPath == "" || testFilePath == "" {
+		log.Fatalf("loadPebble requires non-empty dirPath and testFilePath")
+	}
 	fmt.Println("Start load pebble...")
-	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
-	dirPath := "/mnt/ssd2/ethstore/database_pebble"
 	pdb, err := ethstore.NewPebbleStore(dirPath, 0, 0, "pebble_load", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer pdb.Close()
-
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
