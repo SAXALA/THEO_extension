@@ -4,6 +4,6 @@
   "traceFileNocache": "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000",
   "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot-10K-blocks",
   "ethstoreDir": "/mnt/ssd2/ethstore/database",
-  "pebbleDir": "/mnt/ssd2/ethstore/baseline/pebble",
-  "chainKVDir": "/mnt/ssd2/ethstore/baseline/chainkv"
+  "pebbleDir": "/mnt/ssd2/baseline/pebble",
+  "chainKVDir": "/mnt/ssd2/baseline/chainkv"
 }

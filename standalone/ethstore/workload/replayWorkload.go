@@ -14,7 +14,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -295,6 +294,7 @@ func reportHistogramSummary(label string, hist *latencyHistogram) {
 
 type replayConfig struct {
 	LoadDataDir                  string `json:"loadDataDir"`
+	AolDataFile                  string `json:"aolDataFile"`
 	TraceFile                    string `json:"traceFile"`
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
@@ -482,6 +482,67 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	rate := float64(count) / elapsed.Seconds()
 	fmt.Printf("Loaded %d entries in %v (%.2f ops/sec)\n", count, elapsed, rate)
 	return nil
+}
+
+func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, ckvUseState bool, ckvStateKeyPrefixes string, ckvLoadLimit int) error {
+	switch {
+	case strings.EqualFold(backend, "chainkv"):
+		dbDir := cfg.ChainKVDir
+		if dbDir == "" {
+			dbDir = cfg.EthStoreDir
+		}
+		if dbDir == "" {
+			return fmt.Errorf("ld with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
+		}
+		dataFile := cfg.LoadDataDir
+		if dataFile == "" {
+			return fmt.Errorf("ld with chainkv backend requires loadDataDir in config")
+		}
+		var prefixes []string
+		if strings.TrimSpace(ckvStateKeyPrefixes) != "" {
+			prefixes = strings.Split(ckvStateKeyPrefixes, ",")
+		}
+		ckv, openErr := NewChainKVLDB(dbDir, ckvCache, ckvHandles, ckvUseState, prefixes)
+		if openErr != nil {
+			return fmt.Errorf("failed to open chainkv database: %w", openErr)
+		}
+		defer ckv.Close()
+		if loadErr := chainKVLoadData(ckv, dataFile, ckvLoadLimit); loadErr != nil {
+			return fmt.Errorf("chainkv load failed: %w", loadErr)
+		}
+		return nil
+	case strings.EqualFold(backend, "pebble"):
+		if cfg.PebbleDBDir == "" {
+			return fmt.Errorf("ld with pebble backend requires pebbleDir in config")
+		}
+		if cfg.LoadDataDir == "" {
+			return fmt.Errorf("ld with pebble backend requires loadDataDir in config")
+		}
+		if err := loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir); err != nil {
+			return fmt.Errorf("pebble load failed: %w", err)
+		}
+		return nil
+	default:
+		if cfg.EthStoreDir == "" {
+			return fmt.Errorf("ld with ethstore backend requires databaseDir in config")
+		}
+		if cfg.LoadDataDir == "" {
+			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
+		}
+		if err := loadAccount(cfg.EthStoreDir, cfg.LoadDataDir, cfg.PebbleDBDir, ldChunkFileSize, ldCacheSize); err != nil {
+			return fmt.Errorf("ethstore load failed: %w", err)
+		}
+
+		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
+		if aolDataFile == "" {
+			// Keep backward-compatible default when config omits AOL source file.
+			aolDataFile = "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
+		}
+		if err := loadAol(cfg.EthStoreDir, aolDataFile); err != nil {
+			return fmt.Errorf("ethstore aol load failed: %w", err)
+		}
+		return nil
+	}
 }
 
 
@@ -1010,10 +1071,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		elapsed := time.Since(start)
 		totalTime += elapsed
 		if opErr != nil {
-			if len(keyBytes) == 0 || (keyBytes[0] != 'o' && keyBytes[0] != 'a') {
-				fmt.Printf("[%s] op %s failed for key %s: %v\n",
-					backend.Name(), opTypeStr, keyHex, opErr)
-			}
+			fmt.Printf("[%s] op %s failed for key %s: %v\n",
+				backend.Name(), opTypeStr, keyHex, opErr)
 		}
 		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
@@ -1032,8 +1091,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 
 func main() {
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld/re/o/lb/rb")
-	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore or chainkv")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/rb")
+	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
 	ldCacheSize := flag.Int("ld-cache-size", 0, "Cache size for ld mode")
@@ -1106,39 +1165,10 @@ func main() {
 	// loadAol(cfg.EthStoreDir, notxFile)
 	// return
 
-	otherRunner := recordTraceStorage // change here when you need a different 'o' workload
-
 	switch *mode {
 	case "ld":
-		if strings.EqualFold(*backend, "chainkv") {
-			dbDir := cfg.ChainKVDir
-			if dbDir == "" {
-				dbDir = cfg.EthStoreDir
-			}
-			if dbDir == "" {
-				log.Fatal("ld with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
-			}
-			dataFile := cfg.LoadDataDir
-			if dataFile == "" {
-				log.Fatal("ld with chainkv backend requires loadDataDir in config")
-			}
-			var prefixes []string
-			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
-				prefixes = strings.Split(*ckvStateKeyPrefixes, ",")
-			}
-			ckv, openErr := NewChainKVLDB(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
-			if openErr != nil {
-				log.Fatalf("failed to open chainkv database: %v", openErr)
-			}
-			defer ckv.Close()
-			if loadErr := chainKVLoadData(ckv, dataFile, *ckvLoadLimit); loadErr != nil {
-				log.Fatalf("chainkv load failed: %v", loadErr)
-			}
-		} else {
-			loadAccount(cfg.EthStoreDir, *ldChunkFileSize, *ldCacheSize)
-			// loadData(cfg.EthStoreDir, cfg.LoadDataDir)
-			// notxFile := "/mnt/ssd/ethstore/database/aol/print_all_output.txt"
-			// loadAol(cfg.EthStoreDir, notxFile, txFile)
+		if err := runLoadData(cfg, *backend, *ldChunkFileSize, *ldCacheSize, *ckvCache, *ckvHandles, *ckvUseState, *ckvStateKeyPrefixes, *ckvLoadLimit); err != nil {
+			log.Fatalf("ld failed: %v", err)
 		}
 	case "re":
 		if strings.EqualFold(*backend, "chainkv") {
@@ -1167,12 +1197,6 @@ func main() {
 			defer ethBackend.Close()
 			replayTrace(ethBackend, traceFile, *maxOps, dbType)
 		}
-	case "ra":
-		replayTraceAccount(cfg.EthStoreDir, traceFile)
-	case "o":
-		otherRunner(traceFile)
-	case "lb":
-		loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir)
 	case "rb":
 		pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir)
 		if pbErr != nil {
@@ -1181,15 +1205,15 @@ func main() {
 		defer pbBackend.Close()
 		replayTrace(pbBackend, traceFile, *maxOps, dbType)
 	default:
-		log.Fatalf("unknown mode %q, use ld, re, o, lb, or rb", *mode)
+		log.Fatalf("unknown mode %q, use ld, re, or rb", *mode)
 	}
 }
 
-func loadbaselineData(pebbleDir string, dataFile string) {
+func loadbaselineData(pebbleDir string, dataFile string) error {
 	tempDir := pebbleDir
 	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
 	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
+		return fmt.Errorf("failed to create PebbleStore: %w", err)
 	}
 	defer store.Close()
 
@@ -1198,7 +1222,7 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
 	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
+		return fmt.Errorf("failed to open test file: %w", err)
 	}
 	defer file.Close()
 
@@ -1231,11 +1255,11 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 
 		keyBytes, err = hex.DecodeString(string(keyBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
+			return fmt.Errorf("failed to decode key: %w", err)
 		}
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
+			return fmt.Errorf("failed to decode value: %w", err)
 		}
 
 		// Perform the Put operation
@@ -1244,13 +1268,15 @@ func loadbaselineData(pebbleDir string, dataFile string) {
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
 		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+			return fmt.Errorf("put operation failed for key %s: %w", keyPart, err)
 		}
 		// Verify the value was stored correctly
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
 	}
+	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+	return nil
 }
 
 // load all data from the key-value file into EthStore
@@ -1325,7 +1351,7 @@ func loadData(dataBaseDir string, dataFile string) {
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 }
 
-func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
+func loadAccount(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int) error {
 	var dir string
 	chunkFileSizeStr := strconv.Itoa(chunkFileSize/1024) + "KB"
 
@@ -1335,23 +1361,29 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 
 	pdb, err := prefixdb.NewPrefixDB(dir, chunkFileSize, uint64(cacheSize), 16)
 	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
+		return fmt.Errorf("failed to create PrefixDB: %w", err)
 	}
 	defer pdb.Close()
 
-	dbPath := "/mnt/ssd2/pebble"
+	dbPath := strings.TrimSpace(pebbleDir)
+	if dbPath == "" {
+		dbPath = "/mnt/ssd2/pebble"
+	}
 	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
-		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
-		return
+		return fmt.Errorf("failed to create PebbleStore instance: %w", err)
 	}
+	defer ps.Close()
 
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+	testFilePath := strings.TrimSpace(dataFile)
+	if testFilePath == "" {
+		testFilePath = "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
+	}
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
 	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
+		return fmt.Errorf("failed to open test file: %w", err)
 	}
 	defer file.Close()
 
@@ -1373,14 +1405,6 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 
 		counter++
 
-		// if counter < 375799415 {
-		// 	continue
-		// }
-
-		// if counter < 560917527 {
-		// 	continue
-		// }
-
 		if counter > 2000000000 {
 			break
 		}
@@ -1400,11 +1424,11 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 
 		keyBytes, err = hex.DecodeString(string(keyBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
+			return fmt.Errorf("failed to decode key: %w", err)
 		}
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
+			return fmt.Errorf("failed to decode value: %w", err)
 		}
 		var accountKey []byte
 
@@ -1457,104 +1481,18 @@ func loadAccount(databaseDir string, chunkFileSize int, cacheSize int) {
 
 	// pdb.SaveTrie()
 	pdb.GCPrefixTree()
+	if err := insertAccountHashindexTopebble(); err != nil {
+		return fmt.Errorf("failed to sync accountHash index to pebble: %w", err)
+	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+	return nil
 }
 
-func replaySSPut() {
-	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
-	dirPath := "/mnt/ssd/ethstore/database"
-	pdb, err := prefixdb.NewPrefixDB(dirPath, 64*1024, 3538944, 16)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer pdb.Close()
-
-	testFilePath := "/mnt/ssd/ethstore/20500000_key_value_pairs.txt"
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	var totalTime time.Duration
-	counter := 0
-	reader := bufio.NewReader(file)
-	// isstore := false
-
-	for {
-		counter++
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		if counter < 1967893668 {
-			continue // Skip the first 1967893668 lines
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value :")
-		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
-			continue
-		}
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		if keyBytes[0] != 'a' && keyBytes[0] != 'o' {
-			continue
-		}
-
-		// if !isstore && keyBytes[0] == 'o' {
-		// 	pdb.SaveTrie()
-		// 	isstore = true
-		// }
-
-		var accountKey []byte
-		if keyBytes[0] == 'o' {
-			accountKey = pdb.GetParentAccountKey(keyBytes)
-		}
-
-		// Perform the Put operation
-		startTime := time.Now()
-		err = pdb.Put(keyBytes, valueBytes, accountKey)
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		}
-		// Verify the value was stored correctly
-
-		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
-		}
-
-	}
-}
-
-func loadAol(dataBaseDir string, notxFile string) {
+func loadAol(dataBaseDir string, notxFile string) error {
 
 	store, err := ethstore.New(dataBaseDir, 6000, "put_test", false, 16*1024, 12*1024*1024, 16)
 	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
+		return fmt.Errorf("failed to create EthStore instance: %w", err)
 	}
 	defer store.Close()
 	fmt.Println("Start aol put test...")
@@ -1562,7 +1500,7 @@ func loadAol(dataBaseDir string, notxFile string) {
 	// Read key-value pairs from the test file
 	notxfile, err := os.Open(notxFile)
 	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
+		return fmt.Errorf("failed to open aol data file: %w", err)
 	}
 	defer notxfile.Close()
 
@@ -1593,11 +1531,11 @@ func loadAol(dataBaseDir string, notxFile string) {
 
 		keyBytes, err = hex.DecodeString(string(keyBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
+			return fmt.Errorf("failed to decode key: %w", err)
 		}
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
+			return fmt.Errorf("failed to decode value: %w", err)
 		}
 
 		// Perform the Put operation
@@ -1612,7 +1550,7 @@ func loadAol(dataBaseDir string, notxFile string) {
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
 		if err != nil {
-			log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+			return fmt.Errorf("aol put operation failed for key %s: %w", keyPart, err)
 		}
 		// Verify the value was stored correctly
 
@@ -1623,7 +1561,7 @@ func loadAol(dataBaseDir string, notxFile string) {
 
 	log.Printf("Total Put operations: %d, Total time: %d ns", counter, totalTime.Nanoseconds())
 	log.Println("Put test completed.")
-	// store.CloseAol()
+	return nil
 }
 
 func TestPrefixGet() {
@@ -2027,597 +1965,6 @@ func replayPebble() {
 	}
 }
 
-func recordTraceStorage(traceFileDir string) {
-	file, err := os.Open(traceFileDir)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	baseDir := "traceNoCache"
-	if strings.Contains(traceFileDir, "withcache") {
-		baseDir = "traceCache"
-	}
-	fmt.Println("Start record trace storage data...", baseDir)
-
-	// 定义操作类型常量
-	const (
-		OpGet    = 0
-		OpPut    = 1
-		OpDelete = 2
-	)
-
-	createBufferedCSV := func(name string) (*os.File, *bufio.Writer) {
-		path := "/mnt/ssd2/ethstore/motivationdata/" + baseDir + "_" + name + ".csv"
-		f, err := os.Create(path)
-		if err != nil {
-			log.Fatalf("Failed to create file: %v", err)
-		}
-		writer := bufio.NewWriter(f)
-		writer.WriteString("linecount,Key,count\n")
-		return f, writer
-	}
-
-	// TrieNodeAccount
-	fTAg, wTAg := createBufferedCSV("trieNodeAccount_get")
-	fTAp, wTAp := createBufferedCSV("trieNodeAccount_put")
-	fTAd, wTAd := createBufferedCSV("trieNodeAccount_delete")
-	defer func() {
-		wTAg.Flush()
-		wTAp.Flush()
-		wTAd.Flush()
-		fTAg.Close()
-		fTAp.Close()
-		fTAd.Close()
-	}()
-
-	// Storage
-	fStorageg, wStorageg := createBufferedCSV("storage_get")
-	fStoragep, wStoragep := createBufferedCSV("storage_put")
-	fStoraged, wStoraged := createBufferedCSV("storage_delete")
-	defer func() {
-		wStorageg.Flush()
-		wStoragep.Flush()
-		wStoraged.Flush()
-		fStorageg.Close()
-		fStoragep.Close()
-		fStoraged.Close()
-	}()
-
-	// SnapshotAccount
-	fSAg, wSAg := createBufferedCSV("snapshotAccount_get")
-	fSAp, wSAp := createBufferedCSV("snapshotAccount_put")
-	fSAd, wSAd := createBufferedCSV("snapshotAccount_delete")
-	defer func() {
-		wSAg.Flush()
-		wSAp.Flush()
-		wSAd.Flush()
-		fSAg.Close()
-		fSAp.Close()
-		fSAd.Close()
-	}()
-
-	// SnapshotStorage
-	fSSg, wSSg := createBufferedCSV("snapshotStorage_get")
-	fSSp, wSSp := createBufferedCSV("snapshotStorage_put")
-	fSSd, wSSd := createBufferedCSV("snapshotStorage_delete")
-	defer func() {
-		wSSg.Flush()
-		wSSp.Flush()
-		wSSd.Flush()
-		fSSg.Close()
-		fSSp.Close()
-		fSSd.Close()
-	}()
-
-	// 辅助选择函数
-	getWriter := func(op int, g, p, d *bufio.Writer) *bufio.Writer {
-		switch op {
-		case OpPut:
-			return p
-		case OpDelete:
-			return d
-		default:
-			return g
-		}
-	}
-
-	// 状态变量
-	var oldStorageHash string
-	var oldStorageOp int
-	var storageCount int
-	var storageStartLine int
-
-	var oldSnapshotHash string
-	var oldSnapshotOp int
-	var snapshotCount int
-	var snapshotStartLine int
-
-	var optypeSet = make(map[string]struct{})
-
-	linecount := 0
-	reader := bufio.NewReader(file)
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		linecount++
-
-		if !strings.Contains(line, "OPType: ") {
-			continue
-		}
-
-		opIdx := strings.Index(line, "OPType: ")
-		opPart := line[opIdx+8:]
-		commaIdx := strings.Index(opPart, ",")
-		if commaIdx == -1 {
-			continue
-		}
-		opTypeStr := opPart[:commaIdx]
-
-		if _, exists := optypeSet[opTypeStr]; !exists {
-			optypeSet[opTypeStr] = struct{}{}
-			// fmt.Printf("Found operation type: %s\n", opTypeStr)
-		}
-
-		var currentOp int
-		switch opTypeStr {
-		case "Put", "BatchPut":
-			currentOp = OpPut
-		case "Delete", "BatchDelete":
-			currentOp = OpDelete
-		case "Get", "Has", "NewIterator", "IteratorNext":
-			currentOp = OpGet
-		default:
-			continue
-		}
-		var keyHex string
-		// 迭代器可能使用 "prefix: "，普通操作使用 "key: "
-		if opTypeStr == "NewIterator" {
-			if pIdx := strings.Index(line, "prefix: "); pIdx != -1 {
-				keyPart := line[pIdx+8:]
-				keyHex = keyPart[:strings.Index(keyPart, ",")]
-			}
-		} else {
-			if kIdx := strings.Index(line, "key: "); kIdx != -1 {
-				keyPart := line[kIdx+5:]
-				keyHex = keyPart[:strings.Index(keyPart, ",")]
-			}
-		}
-		keyBytes, _ := hex.DecodeString(keyHex[:2])
-
-		switch keyBytes[0] {
-		case 'A': // TrieNodeAccount
-			w := getWriter(currentOp, wTAg, wTAp, wTAd)
-			w.WriteString(fmt.Sprintf("%d,%s,1\n", linecount, keyHex))
-
-		case 'O': // Storage (MPT)
-			if len(keyHex) < 66 {
-				continue
-			}
-			storageHash := keyHex[2:66]
-			if oldStorageHash == storageHash && oldStorageOp == currentOp {
-				storageCount++
-			} else {
-				if oldStorageHash != "" {
-					w := getWriter(oldStorageOp, wStorageg, wStoragep, wStoraged)
-					w.WriteString(fmt.Sprintf("%d,%s,%d\n", storageStartLine, oldStorageHash, storageCount))
-				}
-				storageCount = 1
-				storageStartLine = linecount
-				oldStorageHash = storageHash
-				oldStorageOp = currentOp
-			}
-
-		case 'a': // SnapshotAccount
-			if len(keyHex) < 66 {
-				fmt.Println(line)
-				continue
-			}
-			w := getWriter(currentOp, wSAg, wSAp, wSAd)
-			w.WriteString(fmt.Sprintf("%d,%s,1\n", linecount, keyHex[2:66]))
-
-		case 'o': // SnapshotStorage
-			if len(keyHex) < 66 {
-				continue
-			}
-			snapshotHash := keyHex[2:66]
-			if oldSnapshotHash == snapshotHash && oldSnapshotOp == currentOp {
-				snapshotCount++
-			} else {
-				if oldSnapshotHash != "" {
-					w := getWriter(oldSnapshotOp, wSSg, wSSp, wSSd)
-					w.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotStartLine, oldSnapshotHash, snapshotCount))
-				}
-				snapshotCount = 1
-				snapshotStartLine = linecount
-				oldSnapshotHash = snapshotHash
-				oldSnapshotOp = currentOp
-			}
-		}
-	}
-	if oldStorageHash != "" {
-		w := getWriter(oldStorageOp, wStorageg, wStoragep, wStoraged)
-		w.WriteString(fmt.Sprintf("%d,%s,%d\n", storageStartLine, oldStorageHash, storageCount))
-	}
-
-	if oldSnapshotHash != "" {
-		w := getWriter(oldSnapshotOp, wSSg, wSSp, wSSd)
-		w.WriteString(fmt.Sprintf("%d,%s,%d\n", snapshotStartLine, oldSnapshotHash, snapshotCount))
-	}
-	for opType := range optypeSet {
-		fmt.Printf("Detected operation type: %s\n", opType)
-	}
-	fmt.Println("Trace storage data recording completed.")
-}
-
-func recordTraceBlock(traceFileDir string) {
-	fmt.Println("Start recode trace block data...")
-	testFilePath := traceFileDir
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	var baseDir string
-	if strings.Contains(traceFileDir, "withcache") {
-		baseDir = "traceWithCache"
-	} else {
-		baseDir = "traceNoCache"
-	}
-
-	opRegex := regexp.MustCompile(`OPType: (\w+), key: ([0-9a-fA-F]+), size: (\d+)(?:, value: ([0-9a-fA-F]+), size: (\d+))?`)
-	reader := bufio.NewReader(file)
-
-	outFileGet, err := os.Create("../log/" + baseDir + "_get_tx_ops.csv")
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outFileGet.Close()
-	fmt.Fprintf(outFileGet, "opType,block_data_key,lastPutID,opID,distance,dataType\n")
-
-	outFilePut, err := os.Create("../log/" + baseDir + "_put_tx_ops.csv")
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outFilePut.Close()
-	fmt.Fprintf(outFilePut, "block_data_key,distance\n")
-
-	//newBlockID := uint64(20500009)
-	// newBlockID := uint64(20499865) //noCache
-	newBlockID := uint64(20499568) // Cache
-	for {
-		// read line
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err.Error() == "EOF" {
-				fmt.Println("End of file reached")
-				break
-			}
-			log.Printf("error reading trace file: %v", err)
-			break
-		}
-
-		line = strings.TrimSpace(line)
-
-		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") ||
-			!strings.Contains(line, "OPType:") {
-			continue
-		}
-
-		matches := opRegex.FindStringSubmatch(line)
-		if len(matches) < 4 {
-			// 无法解析的行，跳过
-			continue
-		}
-
-		opTypeStr := matches[1]
-		keyHex := matches[2]
-		keySize := 0
-		fmt.Sscanf(matches[3], "%d", &keySize)
-
-		// 检查是否有值部分
-		var valueHex string
-		var valueSize int
-		if len(matches) >= 6 && matches[4] != "" {
-			valueHex = matches[4]
-			fmt.Sscanf(matches[5], "%d", &valueSize)
-		}
-
-		keyBytes, err := hex.DecodeString(keyHex)
-		if err != nil {
-			// 无效的键，跳过
-			continue
-		}
-
-		valueBytes, err := hex.DecodeString(valueHex)
-		if err != nil && valueHex != "" {
-			// 无效的值，跳过
-			continue
-		}
-
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
-		if ethstore.AolHandledDataTypes[dataType] {
-			if dataType != ethstore.TransactionLookupMetadataDataType {
-				continue
-			} else {
-				var blockID uint64
-				var ok bool
-				blockID, ok = ethstore.ParseBlockNumberFromKey(keyBytes, dataType)
-				if ok != true && len(valueBytes) > 0 {
-					blockID, ok = ethstore.ParseBlockNumberFromValue(valueBytes, dataType)
-					if err != nil {
-						continue
-					}
-				} else if ok != true && blockID == 0 {
-					continue
-				}
-				switch opTypeStr {
-				case "Delete", "BatchDelete":
-					distance := int64(newBlockID - blockID)
-					fmt.Fprintf(outFileGet, "%s,%s,%d,%d,%d,%s\n", opTypeStr, keyHex, newBlockID, blockID, distance, ethstore.DataTypeStrings[dataType])
-				case "Put", "BatchPut":
-					if blockID > newBlockID {
-						newBlockID = blockID
-						// fmt.Fprintf(outFilePut, "%d, ", blockID)
-					} else if blockID < newBlockID {
-						// fmt.Fprintf(outFilePut, "put old block")
-						// fmt.Println("put old block")
-					}
-
-				}
-			}
-		}
-
-	}
-
-}
-
-func replayTraceAccount(dataBaseDir string, traceFileDir string) {
-	tempDir := dataBaseDir + "_state"
-	store, err := prefixdb.NewPrefixDB(tempDir, 16*1024, 12*1024*1024, 16)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	dbPath := "/mnt/ssd2/pebble"
-	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
-	if err != nil {
-		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
-		return
-	}
-
-	testFilePath := traceFileDir
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(testFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	// Support both formats:
-	// - OPType: Put, key: ..., size: ..., value: ..., size: ...
-	// - OPType: BatchPutCommit
-	opRegex := regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?`)
-
-	var totalTime time.Duration
-	counter := 0
-	reader := bufio.NewReader(file)
-
-	commitBlock := func() error {
-		store.StorageBatchCommit()
-		return nil
-	}
-	var memStats runtime.MemStats
-
-	// var oldop string
-	// var oldPre string
-	var lineCount int64
-	// store.GCPrefixTree()
-	// store.GCAllStorageChunkFiles()
-	// return
-	fmt.Println("start replay")
-	for {
-		// read line
-		line, err := reader.ReadString('\n')
-		eof := false
-		if err != nil {
-			if err == io.EOF {
-				// last line without trailing '\n'
-				eof = true
-				if len(line) == 0 {
-					fmt.Println("End of file reached")
-					break
-				}
-			} else {
-				fmt.Printf("error reading trace file: %v\n", err)
-				continue
-			}
-		}
-		lineCount++
-
-		line = strings.TrimSpace(line)
-
-		// 跳过非操作行
-		if strings.Contains(line, "Global log file opened successfully") ||
-			!strings.Contains(line, "OPType:") {
-			if eof {
-				fmt.Println("End of file reached")
-				break
-			}
-			continue
-		}
-
-		// Block boundary marker: commit all pending batches when a block ends.
-		if strings.Contains(line, "Processing block (end), ID:") {
-			if err := commitBlock(); err != nil {
-				fmt.Printf("Batch commit on block end failed at trace line %d: %v\n", lineCount, err)
-			}
-			continue
-		}
-
-		matches := opRegex.FindStringSubmatch(line)
-		if len(matches) == 0 {
-			// 无法解析的行，跳过
-			if eof {
-				fmt.Println("End of file reached")
-				break
-			}
-			continue
-		}
-
-		opTypeStr := matches[1]
-		keyHex := ""
-		keySize := 0
-		keyBytes := []byte{}
-		if len(matches) >= 3 && matches[2] != "" {
-			keyHex = matches[2]
-			if len(matches) >= 4 && matches[3] != "" {
-				fmt.Sscanf(matches[3], "%d", &keySize)
-			}
-			keyBytes, err = hex.DecodeString(keyHex)
-			if err != nil {
-				// 无效的键，跳过
-				continue
-			}
-			if len(keyHex) > 0 && (keyBytes[0] == 'O' || keyBytes[0] == 'A') {
-			} else {
-				continue
-			}
-		}
-
-		// if (oldPre != "4f" && opTypeStr == "BatchPutCommit") || opTypeStr == "NewBatch" || (oldPre == "4f" && oldop == "Get" && opTypeStr == "BatchPutCommit") {
-		// 	continue
-		// }
-
-		// 检查是否有值部分
-		// var valueHex string
-		// var valueSize int
-
-		// keyBytes[0] == 'O' storagekvs
-		// keyBytes[0] == 'A' accountkvs
-		// keyBytes[0] == 'a' accountsnapshotkvs
-		// keyBytes[0] == 'o' storagesnapshotkvs
-		// keyBytes[0] == 'c' codekvs
-
-		// if oldop != opTypeStr {
-		// 	if oldop == "Get" && opTypeStr != "Get" {
-		// 		fmt.Println("op changed to "+"Put"+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
-		// 	} else if oldop != "Get" && opTypeStr == "Get" {
-		// 		err := store.BatchCommit()
-		// 		if err != nil {
-		// 			fmt.Printf("BatchCommit failed: %v\n", err)
-		// 		} else {
-		// 			fmt.Printf("BatchCommit success at line %d, total time: %f s\n", lineCount, totalTime.Seconds())
-		// 		}
-		// 		fmt.Println("op changed to "+opTypeStr+" count: "+fmt.Sprintf("%d", counter)+" use time: ", totalTime.Seconds(), "s")
-		// 	}
-		// 	oldop = opTypeStr
-
-		// }
-
-		var accountKey []byte
-		if len(keyBytes) > 0 && keyBytes[0] == 'O' {
-			if accountKey = store.GetParentAccountKey(keyBytes); accountKey == nil {
-				Key, _, err := findKeyValuePair(keyHex[2:66], ps)
-				if Key == "" || err != nil {
-					fmt.Printf("Failed to get parent account key for key %s\n", keyHex)
-					continue
-				}
-				accountKey, err = hex.DecodeString(Key)
-				if err != nil {
-					fmt.Printf("Failed to decode parent account key for key %s: %v\n", keyHex, err)
-					continue
-				}
-				store.InsertAccountHashPebble(keyBytes[1:33], accountKey)
-			}
-		}
-
-		var valueBytes []byte
-		if len(matches) >= 6 && matches[4] != "" {
-			valueHex := matches[4]
-			valueBytes, err = hex.DecodeString(valueHex)
-			if err != nil {
-				// 无效的值，跳过
-				continue
-			}
-		}
-
-		// if opTypeStr == "Get" {
-
-		// } else {
-		// 	continue
-		// }
-		// Perform the operation
-		testKeyhex := "4105020b03010e000d"
-		testKeyBytes, _ := hex.DecodeString(testKeyhex)
-		testAccountKey := store.GetParentAccountKey(testKeyBytes)
-		val, yes, err := store.Get(testKeyBytes, testAccountKey)
-		if err != nil {
-			fmt.Printf("Test Get operation failed for key %s: %v\n", testKeyhex, err)
-		} else if !yes {
-			fmt.Printf("Test Get operation: key %s not found\n", testKeyhex)
-		} else {
-			fmt.Printf("Test Get operation succeeded for key %s, value: %x\n", testKeyhex, val)
-		}
-
-		startTime := time.Now()
-		var opErr error
-		var ok bool
-		switch opTypeStr {
-		case "Get":
-			_, ok, opErr = store.Get(keyBytes, accountKey)
-		case "Has":
-			_, opErr = store.Has(keyBytes, accountKey)
-		case "Put":
-			opErr = store.Put(keyBytes, valueBytes, accountKey)
-		case "BatchPut":
-			if keyBytes[0] == 'O' {
-				opErr = store.StorageBatchPut(keyBytes, valueBytes, accountKey)
-			} else {
-				opErr = store.Put(keyBytes, valueBytes, accountKey)
-			}
-		// case "BatchPutCommit":
-		// 	opErr = store.BatchCommit()
-		case "Delete", "BatchDelete":
-			opErr = store.Delete(keyBytes, accountKey)
-		default:
-			// 未知操作，跳过
-			// fmt.Printf("Unknown operation '%s' at line %d\n", opTypeStr, counter)
-			continue
-		}
-
-		endTime := time.Now()
-		totalTime += endTime.Sub(startTime)
-		if !ok && (opTypeStr == "Get" || opTypeStr == "Has") {
-			fmt.Printf("Get operation: key %s not found\n", keyHex)
-		}
-		if opErr != nil {
-			fmt.Printf("Operation %s failed : %v\n", opTypeStr, opErr)
-			// fmt.Printf("Operation %s failed for key %s: %v\n", opTypeStr, keyHex, opErr)
-		}
-		counter++
-		if counter%10000 == 0 {
-			fmt.Printf("\rProcessed %d operations, total time: %f s", counter, totalTime.Seconds())
-			runtime.ReadMemStats(&memStats)
-			fmt.Printf("GC 次数: %d", memStats.NumGC)
-		}
-
-		if eof {
-			fmt.Println("End of file reached")
-			break
-		}
-	}
-}
-
 func loadPebble() {
 	fmt.Println("Start load pebble...")
 	// tempDir := "/mnt/ssd/ethstore/database/prefixdb"
@@ -2691,187 +2038,6 @@ func loadPebble() {
 
 	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
-}
-
-func repalceAccountHashToAccountKey() {
-	fmt.Println("Start replace account hash to account key...")
-	PebblePath := "/mnt/ssd/ethstore/index/accountHash_key_pebble"
-	store, err := ethstore.NewPebbleStore(PebblePath, 0, 0, "replace_accounthash_to_accountkey", false)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	dbPath := "/mnt/ssd2/pebble"
-
-	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
-	if err != nil {
-		fmt.Printf("Failed to create PebbleStore instance: %v\n", err)
-		return
-	}
-	defer ps.Close()
-
-	inputFilePath := "/mnt/ssd2/ethstore/motivationdata/26_2_7/traceCache_snapshotStorage_get_ave.csv"
-
-	inputFile, err := os.Open(inputFilePath)
-	if err != nil {
-		log.Fatalf("Failed to open input file: %v", err)
-	}
-	defer inputFile.Close()
-
-	outputFilePath := "/mnt/ssd2/ethstore/motivationdata/26_2_7/traceCache_snapshotStorage_get_ave_accountKey.csv"
-
-	outputFile, err := os.Create(outputFilePath)
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outputFile.Close()
-
-	reader := bufio.NewReader(inputFile)
-	// file: accountHash,avg,other...
-	for {
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break
-		}
-
-		//skip first line
-		if strings.HasPrefix(line, "Key") {
-			_, err = outputFile.WriteString(line)
-			if err != nil {
-				log.Fatalf("Failed to write to output file: %v", err)
-			}
-			continue
-		}
-		accountHashHex := strings.Split(line, ",")[0]
-		accountHash, err := hex.DecodeString(accountHashHex)
-		if err != nil {
-			log.Fatalf("Failed to decode account hash: %v", err)
-		}
-		key, err := store.Get(accountHash)
-		var accountKey []byte
-		if err != nil {
-			Key, _, err := findKeyValuePair(accountHashHex, ps)
-			if err != nil {
-				accountKey = accountHash
-			} else {
-				accountKey, err = hex.DecodeString(Key)
-				if err != nil {
-					log.Fatalf("Failed to decode account key from DB key: %v", err)
-				}
-				// store into pebble
-				err = store.Put(accountHash, accountKey)
-				if err != nil {
-					log.Fatalf("Failed to put account hash and key into pebble: %v", err)
-				}
-			}
-		} else {
-			accountKey = key
-		}
-		newLine := strings.Replace(line, accountHashHex, hex.EncodeToString(accountKey), 1)
-		_, err = outputFile.WriteString(newLine)
-		if err != nil {
-			log.Fatalf("Failed to write to output file: %v", err)
-		}
-	}
-}
-
-func recordAccount(traceFileDir string) {
-	fmt.Println("Start replay trace store Account test...")
-
-	file, err := os.Open(traceFileDir)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	baseDir := "traceNoCache"
-	if strings.Contains(traceFileDir, "withcache") {
-		baseDir = "traceCache"
-	}
-
-	createBufferedCSV := func(name string) (*os.File, *bufio.Writer) {
-		f, err := os.Create("../log/" + baseDir + "_" + name + ".csv")
-		if err != nil {
-			log.Fatalf("Failed to create file: %v", err)
-		}
-		writer := bufio.NewWriter(f)
-		writer.WriteString("accountKey\n")
-		return f, writer
-	}
-
-	fGet, wGet := createBufferedCSV("account_get_ops")
-	fPut, wPut := createBufferedCSV("account_put_ops")
-
-	defer func() {
-		wGet.Flush()
-		wPut.Flush()
-		fGet.Close()
-		fPut.Close()
-	}()
-
-	reader := bufio.NewReader(file)
-	linecount := 0
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			fmt.Printf("Error reading at line %d: %v\n", linecount, err)
-			break
-		}
-		linecount++
-
-		if !strings.Contains(line, "OPType: ") {
-			continue
-		}
-
-		opIdx := strings.Index(line, "OPType: ")
-		keyIdx := strings.Index(line, "key: ")
-		if opIdx == -1 || keyIdx == -1 {
-			continue
-		}
-
-		// 解析 OPType (截取到逗号)
-		opPart := line[opIdx+8:]
-		opEnd := strings.Index(opPart, ",")
-		if opEnd == -1 {
-			continue
-		}
-		opTypeStr := opPart[:opEnd]
-
-		// 解析 Key (截取到逗号)
-		keyPart := line[keyIdx+5:]
-		keyEnd := strings.Index(keyPart, ",")
-		var keyHex string
-		if keyEnd == -1 {
-
-			keyHex = strings.TrimSpace(keyPart)
-		} else {
-			keyHex = keyPart[:keyEnd]
-		}
-
-		if len(keyHex) < 2 || keyHex[0] != '4' || keyHex[1] != '1' {
-			continue
-		}
-
-		var target *bufio.Writer
-		switch opTypeStr {
-		case "Has", "Get", "Delete", "BatchDelete":
-			target = wGet
-		case "Put", "BatchPut":
-			target = wPut
-		default:
-			continue
-		}
-
-		target.WriteString(keyHex)
-		target.WriteByte('\n')
-	}
-
-	fmt.Printf("Finished. Total lines processed: %d\n", linecount)
 }
 
 const TrieNodeAccountPrefix = "41"
