@@ -30,7 +30,7 @@ const (
 	segmentedDirNamePrefix            = "storage_seg_"
 	segmentIndexFileName              = "index.meta"
 	segmentIndexCacheThreshold        = 0    // cache indexes larger than 1KB
-	segmentIndexCacheCapacity         = 4096 // number of large index folders retained in memory
+	segmentIndexCacheCapacity         = 40960 // number of large index folders retained in memory
 	storageEntrySize                  = 108
 	storageGCThreshold                = 2 //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
 )

@@ -108,7 +108,7 @@ for storage_mib in "${STORAGE_CACHE_SIZE_CANDIDATES[@]}"; do
 	fi
 
 	# Enforce NODE_CACHE_SIZE relationship required by user.
-	node_mib=$((storage_mib / 4))
+	node_mib=$((storage_mib / 3))
 	if [ "$node_mib" -le 0 ]; then
 		echo "Derived NODE_CACHE_SIZE is invalid for STORAGE_CACHE_SIZE=$storage_mib"
 		exit 1
