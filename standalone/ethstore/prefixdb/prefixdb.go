@@ -303,7 +303,7 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 		return nil, fmt.Errorf("failed to init storage shard: %v", err)
 	}
 
-	nodeCache, err := NewNodeCache(cfg.MaxCacheSize)
+	nodeCache, err := NewNodeCache(effectiveNodeCacheSize(cfg.NodeCacheSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to init node cache: %v", err)
 	}

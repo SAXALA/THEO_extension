@@ -207,12 +207,12 @@ func dataTypeName(dt ethstore.DataType) string {
 // "AOL", "PrefixDB", or the raw data-type name for pebble-handled types.
 func classifyDataType(dt ethstore.DataType) string {
 	if ethstore.AolHandledDataTypes[dt] {
-		return "AOL"
+		return "BlockData"
 	}
 	if ethstore.PrefixDBHandledDataTypes[dt] {
-		return "PrefixDB"
+		return "StateData"
 	}
-	return dataTypeName(dt)
+	return "OtherData"
 }
 
 func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
@@ -295,9 +295,6 @@ func reportHistogramSummary(label string, hist *latencyHistogram) {
 type replayConfig struct {
 	LoadDataDir                  string `json:"loadDataDir"`
 	AolDataFile                  string `json:"aolDataFile"`
-	AccountHashIndexSourceDir    string `json:"accountHashIndexSourceDir"`
-	AccountHashIndexTargetDir    string `json:"accountHashIndexTargetDir"`
-	PebbleAuxDir                 string `json:"pebbleAuxDir"`
 	TraceFile                    string `json:"traceFile"`
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
@@ -532,25 +529,45 @@ func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheS
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
 		}
-		if cfg.PebbleAuxDir == "" {
-			return fmt.Errorf("ld with ethstore backend requires pebbleAuxDir in config")
-		}
-		if cfg.AccountHashIndexSourceDir == "" || cfg.AccountHashIndexTargetDir == "" {
-			return fmt.Errorf("ld with ethstore backend requires accountHashIndexSourceDir and accountHashIndexTargetDir in config")
-		}
-		if err := loadAccount(cfg.EthStoreDir, cfg.LoadDataDir, cfg.PebbleAuxDir, cfg.AccountHashIndexSourceDir, cfg.AccountHashIndexTargetDir, ldChunkFileSize, ldCacheSize); err != nil {
-			return fmt.Errorf("ethstore load failed: %w", err)
-		}
 
 		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
 		if aolDataFile == "" {
 			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
 		}
-		if err := loadAol(cfg.EthStoreDir, aolDataFile); err != nil {
+		if err := loadAol(cfg.EthStoreDir, aolDataFile, ldChunkFileSize, ldCacheSize); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
 		}
 		return nil
 	}
+}
+
+func runGC(backend string, cacheCount int, gcStateDir string, chunkFileSize int, prefixCacheSize int) error {
+	if !strings.EqualFold(backend, "ethstore") {
+		return fmt.Errorf("gc mode currently supports ethstore backend only")
+	}
+	stateDir := strings.TrimSpace(gcStateDir)
+	if stateDir == "" {
+		return fmt.Errorf("gc mode requires -gc-state-dir")
+	}
+	if chunkFileSize <= 0 {
+		chunkFileSize = 16 * 1024
+	}
+	if prefixCacheSize <= 0 {
+		prefixCacheSize = 12 * 1024 * 1024
+	}
+
+	store, err := ethstore.NewStateOnly(stateDir, chunkFileSize, uint64(prefixCacheSize), cacheCount)
+	if err != nil {
+		return fmt.Errorf("gc: failed to open state db: %w", err)
+	}
+	defer store.Close()
+
+	start := time.Now()
+	if err := store.GCPrefixTreeStorage(); err != nil {
+		return fmt.Errorf("gc: failed to run state db GC: %w", err)
+	}
+	fmt.Printf("ethstore state db GC finished in %s\n", time.Since(start))
+	return nil
 }
 
 
@@ -564,17 +581,12 @@ type batchReader interface {
 	BatchGet(key []byte) ([]byte, bool)
 }
 
-// getter is a minimal store read interface used by getWithPebbleBatchOverlay.
-type getter interface {
-	Get(key []byte) ([]byte, error)
-}
-
 // getWithPebbleBatchOverlay returns the value for key by checking the pending
 // batch first (read-your-writes semantics).  When batch is nil or does not
-// implement batchReader it falls back to store.Get.
+// implement batchReader it falls back to fallbackGet.
 // A nil value returned by BatchGet means the key is deleted in the batch,
 // which is reported as ethstore.ErrNotFound.
-func getWithPebbleBatchOverlay(store getter, batch ethdb.Batch, key []byte) ([]byte, error) {
+func getWithPebbleBatchOverlay(batch ethdb.Batch, key []byte, fallbackGet func() ([]byte, error)) ([]byte, error) {
 	if batch != nil {
 		if br, ok := batch.(batchReader); ok {
 			if val, found := br.BatchGet(key); found {
@@ -585,7 +597,7 @@ func getWithPebbleBatchOverlay(store getter, batch ethdb.Batch, key []byte) ([]b
 			}
 		}
 	}
-	return store.Get(key)
+	return fallbackGet()
 }
 
 // ---------------------------------------------------------------------------
@@ -630,8 +642,8 @@ func (w *chainKVIterWrapper) Release()      { w.it.Release() }
 type replayBackend interface {
 	// Name returns a short human-readable backend identifier.
 	Name() string
-	// Get reads key, consulting any pending batch first if applicable.
-	Get(key []byte) ([]byte, error)
+	// Get reads key, consulting pending batch when applicable.
+	Get(key []byte, dataType ethstore.DataType) ([]byte, error)
 	// StagePut stages a put within the current block batch.
 	StagePut(key, value []byte, dataType ethstore.DataType) error
 	// StageDelete stages a delete within the current block batch.
@@ -641,17 +653,13 @@ type replayBackend interface {
 	// NewIterator creates a new iterator for prefix/start.
 	// May return a noopIter when the backend cannot iterate over that prefix.
 	NewIterator(prefix, start []byte) replayIter
-	// SkipByDBType returns true when this op should be skipped based on the
-	// dbType filter.
-	SkipByDBType(dataType ethstore.DataType, dbType DBType) bool
 	// PrintCommitStats prints backend-specific commit-latency histograms.
 	PrintCommitStats()
 	// Close releases backend resources.
 	Close()
 }
 
-// skipByDBType is a shared helper used by pebble-based backends.
-func skipByDBType(dt ethstore.DataType, dbType DBType) bool {
+func shouldSkipByDBType(dt ethstore.DataType, dbType DBType) bool {
 	switch dbType {
 	case AOL:
 		return !ethstore.AolHandledDataTypes[dt]
@@ -684,11 +692,10 @@ func newPebbleBaselineReplayBackend(dir string) (*pebbleBaselineReplayBackend, e
 func (b *pebbleBaselineReplayBackend) Name() string { return "baseline-pebble" }
 func (b *pebbleBaselineReplayBackend) Close()       { b.store.Close() }
 
-func (b *pebbleBaselineReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
-	return skipByDBType(dt, dbType)
-}
-func (b *pebbleBaselineReplayBackend) Get(key []byte) ([]byte, error) {
-	return getWithPebbleBatchOverlay(b.store, b.batch, key)
+func (b *pebbleBaselineReplayBackend) Get(key []byte, _ ethstore.DataType) ([]byte, error) {
+	return getWithPebbleBatchOverlay(b.batch, key, func() ([]byte, error) {
+		return b.store.Get(key)
+	})
 }
 func (b *pebbleBaselineReplayBackend) ensureBatch() ethdb.Batch {
 	if b.batch == nil {
@@ -732,8 +739,14 @@ type ethstoreReplayBackend struct {
 	blockTotalHist     *latencyHistogram
 }
 
-func newEthstoreReplayBackend(dir string, cacheCount int) (*ethstoreReplayBackend, error) {
-	store, err := ethstore.New(dir, 6000, "put_test", false, 16*1024, 12*1024*1024, cacheCount)
+func newEthstoreReplayBackend(dir string, cacheCount int, chunkFileSize int, prefixCacheSize int) (*ethstoreReplayBackend, error) {
+	if chunkFileSize <= 0 {
+		chunkFileSize = 16 * 1024
+	}
+	if prefixCacheSize <= 0 {
+		prefixCacheSize = 12 * 1024 * 1024
+	}
+	store, err := ethstore.New(dir, 6000, "put_test", false, chunkFileSize, uint64(prefixCacheSize), cacheCount)
 	if err != nil {
 		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
 	}
@@ -747,11 +760,16 @@ func newEthstoreReplayBackend(dir string, cacheCount int) (*ethstoreReplayBacken
 
 func (b *ethstoreReplayBackend) Name() string { return "ethstore" }
 func (b *ethstoreReplayBackend) Close()       { b.store.Close() }
-func (b *ethstoreReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
-	return skipByDBType(dt, dbType)
-}
-func (b *ethstoreReplayBackend) Get(key []byte) ([]byte, error) {
-	return getWithPebbleBatchOverlay(b.store, b.pebbleBatch, key)
+func (b *ethstoreReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
+	if ethstore.AolHandledDataTypes[dataType] {
+		return b.store.GetFromAOL(key)
+	}
+	if ethstore.PrefixDBHandledDataTypes[dataType] {
+		return b.store.GetFromPrefixDB(key, dataType)
+	}
+	return getWithPebbleBatchOverlay(b.pebbleBatch, key, func() ([]byte, error) {
+		return b.store.GetFromPebble(key)
+	})
 }
 func (b *ethstoreReplayBackend) ensurePebbleBatch() ethdb.Batch {
 	if b.pebbleBatch == nil {
@@ -759,9 +777,17 @@ func (b *ethstoreReplayBackend) ensurePebbleBatch() ethdb.Batch {
 	}
 	return b.pebbleBatch
 }
+
 func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
-	if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-		err := b.store.BatchPut(key, value, dataType)
+	if ethstore.AolHandledDataTypes[dataType] {
+		err := b.store.BatchPutToAOL(key, value, dataType)
+		if err == nil {
+			b.prefixdbDirty = true
+		}
+		return err
+	}
+	if ethstore.PrefixDBHandledDataTypes[dataType] {
+		err := b.store.BatchPutToPrefixDB(key, value, dataType)
 		if err == nil {
 			b.prefixdbDirty = true
 		}
@@ -770,8 +796,19 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 	return b.ensurePebbleBatch().Put(key, value)
 }
 func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
-	if ethstore.AolHandledDataTypes[dataType] || ethstore.PrefixDBHandledDataTypes[dataType] {
-		return b.store.BatchDelete(key, dataType)
+	if ethstore.AolHandledDataTypes[dataType] {
+		err := b.store.BatchDeleteFromAOL(key, dataType)
+		if err == nil {
+			b.prefixdbDirty = true
+		}
+		return err
+	}
+	if ethstore.PrefixDBHandledDataTypes[dataType] {
+		err := b.store.BatchDeleteFromPrefixDB(key, dataType)
+		if err == nil {
+			b.prefixdbDirty = true
+		}
+		return err
 	}
 	return b.ensurePebbleBatch().Delete(key)
 }
@@ -830,10 +867,9 @@ func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool, st
 func (b *chainKVReplayBackend) Name() string { return "chainkv" }
 func (b *chainKVReplayBackend) Close()       { b.db.Close() }
 
-func (b *chainKVReplayBackend) SkipByDBType(dt ethstore.DataType, dbType DBType) bool {
-	return skipByDBType(dt, dbType)
+func (b *chainKVReplayBackend) Get(key []byte, _ ethstore.DataType) ([]byte, error) {
+	return b.db.Get(key)
 }
-func (b *chainKVReplayBackend) Get(key []byte) ([]byte, error)                  { return b.db.Get(key) }
 
 func (b *chainKVReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
 	if b.db.useStateForKey(key) {
@@ -993,30 +1029,12 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				continue
 			}
 			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
-			lastIterDataType = dataType
 			if matches[8] != "" {
 				iterStartBytes, err = hex.DecodeString(matches[8])
 				if err != nil {
 					continue
 				}
 			}
-		}
-
-		counter++
-		if counter%10000 == 0 {
-			fmt.Printf("\r[%s] ops=%d time=%.2fs read=%d write=%d",
-				backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-		}
-		if maxOps > 0 && counter >= maxOps && !stopAtNextBlockEnd {
-			stopAtNextBlockEnd = true
-			fmt.Printf("\n[%s] Reached max ops %d; waiting for next block boundary.\n",
-				backend.Name(), maxOps)
-		}
-
-		kvTypeStr := classifyDataType(dataType)
-
-		if backend.SkipByDBType(dataType, dbType) {
-			continue
 		}
 
 		var op opType
@@ -1029,19 +1047,35 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			op = opDelete
 		case "NewIterator":
 			op = opNewIterator
+			lastIterDataType = dataType
 		case "IteratorNext":
-			dataType = lastIterDataType
 			op = opIteratorNext
-			kvTypeStr = classifyDataType(dataType)
+			dataType = lastIterDataType
 		default:
 			continue
+		}
+
+		if shouldSkipByDBType(dataType, dbType) {
+			continue
+		}
+		kvTypeStr := classifyDataType(dataType)
+
+		counter++
+		if counter%10000 == 0 {
+			fmt.Printf("\r[%s] ops=%d time=%.2fs read=%d write=%d\n",
+				backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		if maxOps > 0 && counter >= maxOps && !stopAtNextBlockEnd {
+			stopAtNextBlockEnd = true
+			fmt.Printf("\n[%s] Reached max ops %d; waiting for next block boundary.\n",
+				backend.Name(), maxOps)
 		}
 
 		start := time.Now()
 		var opErr error
 		switch op {
 		case opGet:
-			val, getErr := backend.Get(keyBytes)
+			val, getErr := backend.Get(keyBytes, dataType)
 			opErr = getErr
 			if opErr == nil {
 				logicReadSize += int64(len(val))
@@ -1100,7 +1134,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 
 func main() {
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld/re/rb")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc")
 	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
@@ -1113,7 +1147,11 @@ func main() {
 	DBTypeStr := flag.String("db-type", "allDBtypes", "Database type for replay: prefixdb, pebble, or aol")
 	replayTraceFile := flag.String("trace-file", "Cache", "Path to trace file for recording")
 	cacheCount := flag.Int("cache-count", 16, "Number of entries to cache for storage chunk get")
+	nodeCacheSize := flag.Int("node-cache-size", 0, "PrefixDB node cache size override (0 means use config/default)")
+	gcStateDir := flag.String("gc-state-dir", "", "State DB directory for gc mode (direct path, no copy)")
 	flag.Parse()
+
+	prefixdb.SetNodeCacheSizeOverride(*nodeCacheSize)
 
 	cfg, err := loadReplayConfig(*configPath)
 	if err != nil {
@@ -1187,15 +1225,19 @@ func main() {
 			defer pbBackend.Close()
 			replayTrace(pbBackend, traceFile, *maxOps, dbType)
 		} else {
-			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount)
+			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount, *ldChunkFileSize, *ldCacheSize)
 			if ethErr != nil {
 				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 			}
 			defer ethBackend.Close()
 			replayTrace(ethBackend, traceFile, *maxOps, dbType)
 		}
+	case "gc":
+		if err := runGC(*backend, *cacheCount, *gcStateDir, *ldChunkFileSize, *ldCacheSize); err != nil {
+			log.Fatalf("gc failed: %v", err)
+		}
 	default:
-		log.Fatalf("unknown mode %q, use ld or re", *mode)
+		log.Fatalf("unknown mode %q, use ld/re/gc", *mode)
 	}
 }
 
@@ -1477,9 +1519,15 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, accountH
 	return nil
 }
 
-func loadAol(dataBaseDir string, notxFile string) error {
+func loadAol(dataBaseDir string, notxFile string, chunkFileSize int, prefixCacheSize int) error {
+	if chunkFileSize <= 0 {
+		chunkFileSize = 16 * 1024
+	}
+	if prefixCacheSize <= 0 {
+		prefixCacheSize = 12 * 1024 * 1024
+	}
 
-	store, err := ethstore.New(dataBaseDir, 6000, "put_test", false, 16*1024, 12*1024*1024, 16)
+	store, err := ethstore.New(dataBaseDir, 6000, "put_test", false, chunkFileSize, uint64(prefixCacheSize), 16)
 	if err != nil {
 		return fmt.Errorf("failed to create EthStore instance: %w", err)
 	}

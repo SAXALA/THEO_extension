@@ -212,6 +212,25 @@ func New(dirPath string, recentN int, namespace string, readonly bool, chunkFile
 	return db, nil
 }
 
+// NewStateOnly opens only PrefixDB on the provided state directory.
+// It is intended for maintenance tasks such as manual state GC where
+// pebble/aol are not needed.
+func NewStateOnly(stateDir string, chunkFileSize int, prefixTreeCacheSize uint64, cacheCount int) (*Database, error) {
+	logger := log.New("database", stateDir)
+	statePrefixdb, err := prefixdb.NewPrefixDB(stateDir, chunkFileSize, prefixTreeCacheSize, cacheCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize prefixdb (state-only): %w", err)
+	}
+
+	db := &Database{
+		fn:                  stateDir,
+		log:                 logger,
+		statepdb:            statePrefixdb,
+		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
+	}
+	return db, nil
+}
+
 // Close stops the metrics collection and closes all io accesses to the underlying key-value store.
 func (d *Database) Close() error {
 
@@ -321,68 +340,78 @@ func (d *Database) Has(key []byte) (bool, error) {
 }
 
 // Get retrieves the given key if it's present in the key-value store.
-func (d *Database) Get(key []byte) ([]byte, error) {
+func (d *Database) Get(key []byte, dataType DataType) ([]byte, error) {
+	if AolHandledDataTypes[dataType] {
+		return d.GetFromAOL(key)
+	}
+	if PrefixDBHandledDataTypes[dataType] {
+		return d.GetFromPrefixDB(key, dataType)
+	}
+	return d.GetFromPebble(key)
+}
+
+// GetFromAOL reads key from AOL path only.
+func (d *Database) GetFromAOL(key []byte) ([]byte, error) {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
 	if d.closed {
 		return nil, ErrClosed
 	}
+	var valStr string
+	var exists bool
+	var err error
 
-	dataType := GetDataTypeFromKey(key)
-	if AolHandledDataTypes[dataType] {
-		var valStr string
-		var exists bool
-		var err error
-
-		if valStr, exists = d.baolkvs[string(key)]; exists {
-			// Return the found value from temporary storage
-			return []byte(valStr), nil
-		}
-		valStr, exists, err = d.blockAol.Get(string(key))
-		if err != nil {
-			return nil, err
-		}
-		if exists {
-			// If it's a deletion marker, return not found error
-			if valStr == aolDeleteTombstone {
-				return nil, ErrNotFound
-			}
-			// Return the found value
-			return []byte(valStr), nil
-		} else {
+	if valStr, exists = d.baolkvs[string(key)]; exists {
+		return []byte(valStr), nil
+	}
+	valStr, exists, err = d.blockAol.Get(string(key))
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		if valStr == aolDeleteTombstone {
 			return nil, ErrNotFound
 		}
-	} else if PrefixDBHandledDataTypes[dataType] {
-		if d.statepdb == nil {
-
-			return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-
-		// Try to get from PrefixDB
-		if dataType == TrieNodeStorageDataType {
-			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
-
-		}
-		value, exists, err := d.statepdb.Get(key, d.accountKey)
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
-		}
-		if !exists {
-			return nil, ErrNotFound // Key not found in PrefixDB
-		}
-		// Log the found key in PrefixDB
-		d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		return value, nil // Return the found value
+		return []byte(valStr), nil
 	}
-	// Try to get from Pebble
+	return nil, ErrNotFound
+}
 
-	// fmt.Printf("EthStore.Get Pebble: key=%x\n", key)
+// GetFromPrefixDB reads key from PrefixDB path only.
+func (d *Database) GetFromPrefixDB(key []byte, dataType DataType) ([]byte, error) {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+	if d.closed {
+		return nil, ErrClosed
+	}
+	if d.statepdb == nil {
+		return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
+	}
+	if dataType == TrieNodeStorageDataType {
+		d.accountKey = d.GetParentAccountKey(key[1:33])
+	}
+	value, exists, err := d.statepdb.Get(key, d.accountKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	d.log.Trace("Key found in PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	return value, nil
+}
+
+// GetFromPebble reads key from Pebble path only.
+func (d *Database) GetFromPebble(key []byte) ([]byte, error) {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+	if d.closed {
+		return nil, ErrClosed
+	}
 	value, err := d.pebble.Get(key)
-
 	if err != nil {
 		if isNotFoundError(err) {
-			return nil, ErrNotFound // Convert to EthStore specific ErrNotFound
+			return nil, ErrNotFound
 		}
 		return nil, err
 	}
@@ -478,56 +507,61 @@ func (d *Database) Put(key []byte, value []byte) error {
 
 func (d *Database) BatchPut(key []byte, value []byte, dataType DataType) error {
 	if PrefixDBHandledDataTypes[dataType] {
-		if d.statepdb == nil {
-			return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		err := d.statepdb.BatchPut(key, value, nil)
-		if err != nil {
-			return fmt.Errorf("failed to batch put account key %x in PrefixDB: %w", key, err)
-		}
+		return d.BatchPutToPrefixDB(key, value, dataType)
+	}
+	if AolHandledDataTypes[dataType] {
+		return d.BatchPutToAOL(key, value, dataType)
+	}
+	return nil
+}
 
-		d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-	} else if AolHandledDataTypes[dataType] {
-		var blockID uint64
-		var foundBlockID bool
+// BatchPutToPrefixDB writes to PrefixDB batch directly.
+func (d *Database) BatchPutToPrefixDB(key []byte, value []byte, dataType DataType) error {
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
+	}
+	err := d.statepdb.BatchPut(key, value, nil)
+	if err != nil {
+		return fmt.Errorf("failed to batch put account key %x in PrefixDB: %w", key, err)
+	}
+	d.log.Trace("Batch stored key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	return nil
+}
 
-		// Try to get blockID from key
-		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+// BatchPutToAOL writes to AOL batch directly.
+func (d *Database) BatchPutToAOL(key []byte, value []byte, dataType DataType) error {
+	var blockID uint64
+	var foundBlockID bool
 
-		// If not found in key, try from value (for HeaderNumber)
-		if !foundBlockID {
-			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
-		}
-		if foundBlockID {
-			if blockID > d.baolLatestBlock {
-				if d.blockAol == nil {
-					return fmt.Errorf("block append-only log is not initialized")
-				}
-				if d.baolkvs == nil {
-					d.baolkvs = make(map[string]string, 4)
-				}
-				if d.baolLatestBlock != 0 {
-					if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
-						return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-					}
-				}
-				// Reuse the map to avoid per-block allocations.
-				clear(d.baolkvs)
-				d.baolLatestBlock = blockID
-				d.baolkvs[string(key)] = string(value)
-				d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-				return nil // Data stored in AOL
-			} else {
-				if d.baolkvs == nil {
-					d.baolkvs = make(map[string]string, 4)
-				}
-				d.baolkvs[string(key)] = string(value)
-				return nil // Data queued for AOL
-			}
-		}
-		// If blockID couldn't be determined for an AOL-handled type.
+	blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+	if !foundBlockID {
+		blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
+	}
+	if !foundBlockID {
 		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
 	}
+	if blockID > d.baolLatestBlock {
+		if d.blockAol == nil {
+			return fmt.Errorf("block append-only log is not initialized")
+		}
+		if d.baolkvs == nil {
+			d.baolkvs = make(map[string]string, 4)
+		}
+		if d.baolLatestBlock != 0 {
+			if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+				return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
+			}
+		}
+		clear(d.baolkvs)
+		d.baolLatestBlock = blockID
+		d.baolkvs[string(key)] = string(value)
+		d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+		return nil
+	}
+	if d.baolkvs == nil {
+		d.baolkvs = make(map[string]string, 4)
+	}
+	d.baolkvs[string(key)] = string(value)
 	return nil
 }
 
@@ -600,19 +634,31 @@ func (d *Database) Delete(key []byte) error {
 
 func (d *Database) BatchDelete(key []byte, dataType DataType) error {
 	if PrefixDBHandledDataTypes[dataType] {
-		if d.statepdb == nil {
-			return fmt.Errorf("PrefixDB is not initialized, cannot batch delete key %x (type %s)", key, DataTypeStrings[dataType])
-		}
-		// Delete from PrefixDB
-		err := d.statepdb.BatchPut(key, nil, nil)
-		if err != nil {
-			return fmt.Errorf("failed to batch delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
-		}
-		d.log.Trace("Batch deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
-		return nil // Data deleted from PrefixDB
+		return d.BatchDeleteFromPrefixDB(key, dataType)
+	}
+	if AolHandledDataTypes[dataType] {
+		return d.BatchDeleteFromAOL(key, dataType)
 	}
 	return nil
 
+}
+
+// BatchDeleteFromPrefixDB deletes from PrefixDB batch directly.
+func (d *Database) BatchDeleteFromPrefixDB(key []byte, dataType DataType) error {
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot batch delete key %x (type %s)", key, DataTypeStrings[dataType])
+	}
+	err := d.statepdb.BatchPut(key, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to batch delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
+	}
+	d.log.Trace("Batch deleted key via PrefixDB", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType])
+	return nil
+}
+
+// BatchDeleteFromAOL keeps existing replay behavior (no-op for AOL batch delete).
+func (d *Database) BatchDeleteFromAOL(_ []byte, _ DataType) error {
+	return nil
 }
 
 // DeleteRange removes all keys between start and end (exclusive of end).
@@ -822,7 +868,7 @@ func (it *iterator) Value() []byte { // Receiver changed to *iterator
 		return nil
 	}
 	// Fetches from the main Database.Get, which handles AOL/Pebble dispatch
-	value, err := it.db.Get(key)
+	value, err := it.db.Get(key, GetDataTypeFromKey(key))
 	if err != nil {
 		it.err = err
 		return nil

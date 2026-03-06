@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/allegro/bigcache/v3"
 )
@@ -25,9 +26,26 @@ type Config struct {
 	MemcacheAddr  string `json:"memcache_addr"`
 
 	// Cache sizes and other parameters
-	MaxCacheSize   int             `json:"max_cache_size"`
-	WriteBatchSize int             `json:"write_batch_size"`
-	BigCacheConfig bigcache.Config `json:"bigcache_config"`
+	NodeCacheSize int             `json:"node_cache_size"`
+	// DeprecatedMaxCacheSize keeps backward compatibility for older config files.
+	DeprecatedMaxCacheSize int             `json:"max_cache_size,omitempty"`
+	WriteBatchSize          int             `json:"write_batch_size"`
+	BigCacheConfig          bigcache.Config `json:"bigcache_config"`
+}
+
+var nodeCacheSizeOverride atomic.Int64
+
+// SetNodeCacheSizeOverride sets a process-wide NodeCache size override for PrefixDB.
+// Use size <= 0 to clear override and fallback to config/default value.
+func SetNodeCacheSizeOverride(size int) {
+	nodeCacheSizeOverride.Store(int64(size))
+}
+
+func effectiveNodeCacheSize(configValue int) int {
+	if override := int(nodeCacheSizeOverride.Load()); override > 0 {
+		return override
+	}
+	return configValue
 }
 
 // DefaultConfig returns a configuration with default values.
@@ -42,7 +60,7 @@ func DefaultConfig(dirpath string) *Config {
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
 		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
 		MemcacheAddr:   "127.0.0.1:11211",
-		MaxCacheSize:   1 << 18, //
+		NodeCacheSize:  1 << 18,
 		WriteBatchSize: 4096,
 	}
 }
@@ -56,6 +74,9 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.NodeCacheSize <= 0 && cfg.DeprecatedMaxCacheSize > 0 {
+		cfg.NodeCacheSize = cfg.DeprecatedMaxCacheSize
 	}
 	return &cfg, nil
 }
