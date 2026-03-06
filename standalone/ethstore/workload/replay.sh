@@ -29,14 +29,14 @@ DB_TYPE="${DB_TYPE:-all}"
 CACHE_COUNT="${CACHE_COUNT:-32}"
 
 # ethstore load 参数: chunk 文件大小（字节），如 4096/16384/65536/262144
-LD_CHUNK_FILE_SIZE="${LD_CHUNK_FILE_SIZE:-16384}"
-# ethstore load 参数: prefixdb cache 大小（MiB）
-LD_CACHE_SIZE="${LD_CACHE_SIZE:-12}"
+CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
+# ethstore load 参数: storage cache 大小（MiB）
+STORAGE_CACHE_SIZE="${STORAGE_CACHE_SIZE:-12}"
 # PrefixDB node cache 大小（MiB）
 NODE_CACHE_SIZE="${NODE_CACHE_SIZE:-4}"
 
 # Convert MiB inputs to bytes for replayWorkload flags.
-LD_CACHE_SIZE_BYTES=$((LD_CACHE_SIZE * 1024 * 1024))
+STORAGE_CACHE_SIZE_BYTES=$((STORAGE_CACHE_SIZE * 1024 * 1024))
 NODE_CACHE_SIZE_BYTES=$((NODE_CACHE_SIZE * 1024 * 1024))
 
 # chainkv 参数: cache 大小（MB）
@@ -133,7 +133,7 @@ Common env vars:
     TRACE_FILE(cache|nocache|nocache_snap)
     DB_TYPE(all|aol|prefixdb|pebble)
     CACHE_COUNT
-    LD_CHUNK_FILE_SIZE(bytes), LD_CACHE_SIZE(MiB)
+    CHUNK_FILE_SIZE(bytes), STORAGE_CACHE_SIZE(MiB)
     NODE_CACHE_SIZE(MiB)
     CHAINKV_CACHE_MB, CHAINKV_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
@@ -363,7 +363,7 @@ build_run_tag() {
     running_root_tag=$(sanitize_tag_value "$RUNNING_ROOT")
 
     local base_tag
-    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_cc_${CACHE_COUNT}_ldc_${LD_CHUNK_FILE_SIZE}_ldm_${LD_CACHE_SIZE}_lr_${loaded_root_tag}_rr_${running_root_tag}"
+    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_cc_${CACHE_COUNT}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_ncs_${NODE_CACHE_SIZE}"
 
     if [ "$backend" = "chainkv" ]; then
         local ckv_state_tag ckv_prefix_tag
@@ -386,8 +386,8 @@ WORKLOAD_MAX_OPS=${WORKLOAD_MAX_OPS}
 TRACE_FILE=${TRACE_FILE}
 DB_TYPE=${DB_TYPE}
 CACHE_COUNT=${CACHE_COUNT}
-LD_CHUNK_FILE_SIZE=${LD_CHUNK_FILE_SIZE}
-LD_CACHE_SIZE=${LD_CACHE_SIZE} MiB (${LD_CACHE_SIZE_BYTES} bytes)
+CHUNK_FILE_SIZE=${CHUNK_FILE_SIZE}
+STORAGE_CACHE_SIZE=${STORAGE_CACHE_SIZE} MiB (${STORAGE_CACHE_SIZE_BYTES} bytes)
 NODE_CACHE_SIZE=${NODE_CACHE_SIZE} MiB (${NODE_CACHE_SIZE_BYTES} bytes)
 CHAINKV_CACHE_MB=${CHAINKV_CACHE_MB}
 CHAINKV_HANDLES=${CHAINKV_HANDLES}
@@ -448,7 +448,7 @@ run_load() {
         ethstore)
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend ethstore -ld-chunk-file-size "$LD_CHUNK_FILE_SIZE" -ld-cache-size "$LD_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode ld -backend ethstore -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -500,7 +500,7 @@ run_replay() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
-                -ld-chunk-file-size "$LD_CHUNK_FILE_SIZE" -ld-cache-size "$LD_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -525,7 +525,7 @@ run_gc() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
-                -gc-state-dir "$GC_STATE_DIR" -ld-chunk-file-size "$LD_CHUNK_FILE_SIZE" -ld-cache-size "$LD_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -gc-state-dir "$GC_STATE_DIR" -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"
