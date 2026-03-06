@@ -156,14 +156,34 @@ func (db *PrefixDB) StorageBatchCommit() error {
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
 
-	// Merge unresolved entries by resolving their parent account keys now.
 	if len(unresolved) > 0 {
 		for origKeyStr, v := range unresolved {
-			_ = v
-			if len(origKeyStr) > 0 {
-				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
+			origKeyBytes := []byte(origKeyStr)
+			var accountKey []byte
+			if db.ParentKeyResolver != nil {
+				accountKey = db.ParentKeyResolver(origKeyBytes)
 			}
-			continue
+			if accountKey == nil {
+				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
+				continue
+			}
+			storageKey, err := db.normalizeStorageKey(origKeyBytes)
+			if err != nil {
+				return err
+			}
+			accStr := string(accountKey)
+			perAcc := batch[accStr]
+			if perAcc == nil {
+				perAcc = make(map[string][]byte)
+				batch[accStr] = perAcc
+			}
+			storageKeyStr := string(storageKey)
+			// v is already owned by this commit (copied in putUnresolved),
+			// so assign directly to avoid an extra allocation+copy here.
+			perAcc[storageKeyStr] = v
+			if db.storageCache != nil {
+				db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), v)
+			}
 		}
 	}
 
