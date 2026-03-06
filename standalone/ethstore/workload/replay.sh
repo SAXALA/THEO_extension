@@ -562,7 +562,6 @@ main() {
     validate_runtime_requirements
     if [ "$ACTION" != "restore" ]; then
         build_replay_binary
-        exit
     fi
 
     if [ "$BACKEND" = "all" ]; then
