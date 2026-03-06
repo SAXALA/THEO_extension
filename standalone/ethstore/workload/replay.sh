@@ -91,14 +91,21 @@ terminate_pid_tree() {
         return 0
     fi
 
-    # Best effort: stop direct children first, then parent process.
+    # Recursively stop descendants first, then stop the process itself.
     local children
     children=$(pgrep -P "$pid" 2>/dev/null || true)
     if [ -n "$children" ]; then
-        # shellcheck disable=SC2086
-        kill -TERM $children 2>/dev/null || true
+        local child
+        for child in $children; do
+            terminate_pid_tree "$child"
+        done
     fi
+
     kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
 }
 
 cleanup_running_processes() {

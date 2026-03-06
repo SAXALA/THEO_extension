@@ -931,25 +931,6 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 	}()
 
-	keyToSearch := "6f79911817cc107e2149d9d19d34340bd751687366111d57d1fd5a0d9e1e20d6560d72b0071e405982f3261e5c5e9581823d0b313d26cb8971d407be37b75ac2a2"
-	if strings.TrimSpace(keyToSearch) != "" {
-		keyBytes, decodeErr := hex.DecodeString(keyToSearch)
-		if decodeErr != nil {
-			fmt.Printf("[%s] inline get-test decode failed: %v\n", backend.Name(), decodeErr)
-			return
-		}
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
-		value, getErr := backend.Get(keyBytes, dataType)
-		if getErr != nil {
-			fmt.Printf("[%s] inline get-test failed key=%s dataType=%s err=%v\n",
-				backend.Name(), keyToSearch, dataTypeName(dataType), getErr)
-			return
-		}
-		fmt.Printf("[%s] inline get-test success key=%s dataType=%s valueSize=%d\n",
-			backend.Name(), keyToSearch, dataTypeName(dataType), len(value))
-		return
-	}
-
 	for {
 		line, readErr := reader.ReadString('\n')
 		if readErr != nil {
@@ -1181,12 +1162,6 @@ func main() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
-		ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount, *ldChunkFileSize, *ldCacheSize)
-	if ethErr != nil {
-		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
-		}
-	defer ethBackend.Close()
-	replayTrace(ethBackend, traceFile, *maxOps, dbType)
 
 	switch *mode {
 	case "ld":

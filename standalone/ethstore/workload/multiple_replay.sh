@@ -27,6 +27,48 @@ DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
 
+CURRENT_REPLAY_SH_PID=""
+
+terminate_pid_tree() {
+	local pid="$1"
+	if [ -z "$pid" ]; then
+		return 0
+	fi
+	if ! kill -0 "$pid" 2>/dev/null; then
+		return 0
+	fi
+
+	local children
+	children=$(pgrep -P "$pid" 2>/dev/null || true)
+	if [ -n "$children" ]; then
+		local child
+		for child in $children; do
+			terminate_pid_tree "$child"
+		done
+	fi
+
+	kill -TERM "$pid" 2>/dev/null || true
+	sleep 0.2
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -KILL "$pid" 2>/dev/null || true
+	fi
+}
+
+cleanup_running_processes() {
+	terminate_pid_tree "$CURRENT_REPLAY_SH_PID"
+	CURRENT_REPLAY_SH_PID=""
+}
+
+handle_interrupt() {
+	echo
+	echo "Interrupted, stopping running processes..."
+	cleanup_running_processes
+	exit 130
+}
+
+trap 'handle_interrupt' INT TERM
+trap 'cleanup_running_processes' EXIT
+
 usage() {
 	cat <<EOF
 Usage: $0 [action] [backend]
@@ -88,7 +130,10 @@ for storage_mib in "${STORAGE_CACHE_SIZE_CANDIDATES[@]}"; do
 		DB_TYPE="$DB_TYPE" \
 		WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
 		CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
-		./replay.sh "$ACTION" "$BACKEND"
+		./replay.sh "$ACTION" "$BACKEND" &
+		CURRENT_REPLAY_SH_PID=$!
+		wait "$CURRENT_REPLAY_SH_PID"
+		CURRENT_REPLAY_SH_PID=""
 
 		echo "[$run_idx/$total_runs] done"
 		echo
