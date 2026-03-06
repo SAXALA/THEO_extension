@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
 // helper function to create a temporary directory for tests
@@ -26,7 +27,7 @@ func TestNewPebbleStore(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
+	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() error = %v, wantErr %v", err, false)
 	}
@@ -48,7 +49,7 @@ func TestPebbleStore_PutGetDelete(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
+	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("Failed to create PebbleStore: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestPebbleStore_Close(t *testing.T) {
 	dbPath := tempPebbleDBPath(t)
 	defer os.RemoveAll(dbPath)
 
-	ps, err := NewPebbleStore(dbPath, 0, 0, "", false)
+	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore() error = %v", err)
 	}

@@ -26,6 +26,7 @@ import (
 	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
 	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
 
@@ -69,31 +70,34 @@ type latencyHistogram struct {
 }
 
 func newLatencyHistogram() *latencyHistogram {
-	boundsNs := make([]int64, 0, 60)
-	// 1-10 us, step 1 us (9 buckets)
-	for i := int64(1); i < 10; i++ {
-		boundsNs = append(boundsNs, i*1000)
+	boundsNs := make([]int64, 0, 900)
+	// Keep sub-1ms very dense to improve short-latency percentile accuracy.
+	appendRange := func(start, end, step int64) {
+		for v := start; v <= end; v += step {
+			boundsNs = append(boundsNs, v)
+		}
 	}
-	// 10-100 us, step 10 us (9 buckets)
-	for i := int64(10); i < 100; i += 10 {
-		boundsNs = append(boundsNs, i*1000)
-	}
-	// 100-1000 us, step 100 us (9 buckets)
-	for i := int64(100); i < 1000; i += 100 {
-		boundsNs = append(boundsNs, i*1000)
-	}
-	// 1-10 ms, step 1ms (9 buckets)
-	for i := int64(1); i < 10; i++ {
-		boundsNs = append(boundsNs, i*1000*1000)
-	}
-	// 10-100 ms, step 10ms (9 buckets)
-	for i := int64(10); i < 100; i += 10 {
-		boundsNs = append(boundsNs, i*1000*1000)
-	}
-	// 100-1000 ms, step 100ms (9 buckets)
-	for i := int64(100); i < 1000; i += 100 {
-		boundsNs = append(boundsNs, i*1000*1000)
-	}
+
+	us := int64(1000)
+	ms := int64(1000 * 1000)
+	s := int64(1000 * 1000 * 1000)
+
+	// 1us - 100us, step 0.5us
+	appendRange(1*us, 100*us, 500)
+	// 100us - 1ms, step 2us
+	appendRange(102*us, 1*ms, 2*us)
+
+	// >=1ms keeps practical granularity and memory overhead balanced.
+	// 1ms - 10ms, step 100us
+	appendRange(1*ms+100*us, 10*ms, 100*us)
+	// 10ms - 100ms, step 1ms
+	appendRange(11*ms, 100*ms, 1*ms)
+	// 100ms - 1s, step 10ms
+	appendRange(110*ms, 1*s, 10*ms)
+	// 1s - 10s, step 100ms
+	appendRange(1*s+100*ms, 10*s, 100*ms)
+	// 10s - 60s, step 1s
+	appendRange(11*s, 60*s, 1*s)
 
 	return &latencyHistogram{
 		boundsNs: boundsNs,
@@ -324,89 +328,19 @@ type chainKVLDB struct {
 	statePrefixes [][]byte
 }
 
-func NewChainKVLDB(path string, cache int, handles int, useState bool, statePrefixes []string) (*chainKVLDB, error) {
+func NewChainKVLDB(path string, cache int, handles int, useState bool) (*chainKVLDB, error) {
 	db, err := chainkvdb.NewLDBDatabase(path, cache, handles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open chainkv database: %w", err)
 	}
-
-	prefixes := make([][]byte, 0, len(statePrefixes))
-	for _, prefix := range statePrefixes {
-		prefix = strings.TrimSpace(prefix)
-		if prefix == "" {
-			continue
-		}
-		prefixes = append(prefixes, []byte(prefix))
-	}
-
 	return &chainKVLDB{
 		db:            db,
 		useState:      useState,
-		statePrefixes: prefixes,
 	}, nil
 }
 
-func (c *chainKVLDB) useStateForKey(key []byte) bool {
-	if c.useState {
-		return true
-	}
-	for _, prefix := range c.statePrefixes {
-		if bytes.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *chainKVLDB) Put(key, value []byte) error {
-	if c.useStateForKey(key) {
-		return c.db.Put_s(key, value)
-	}
-	return c.db.Put(key, value)
-}
-
-func (c *chainKVLDB) Get(key []byte) ([]byte, error) {
-	if c.useStateForKey(key) {
-		return c.db.Get_s(key)
-	}
-	return c.db.Get(key)
-}
-
-func (c *chainKVLDB) Delete(key []byte) error {
-	return c.db.Delete(key)
-}
-
-func (c *chainKVLDB) NewBatch() chainkvdb.Batch {
-	return c.db.NewBatch()
-}
-
-func (c *chainKVLDB) BatchPut(batch chainkvdb.Batch, key, value []byte) error {
-	if c.useStateForKey(key) {
-		return batch.Put_s(key, value)
-	}
-	return batch.Put(key, value)
-}
-
-func (c *chainKVLDB) BatchDelete(batch chainkvdb.Batch, key []byte) error {
-	if c.useStateForKey(key) {
-		return batch.Put_s(key, nil)
-	}
-	return batch.Put(key, nil)
-}
-
-func (c *chainKVLDB) NewIterator() iterator.Iterator {
-	return c.db.NewIterator()
-}
-
-func (c *chainKVLDB) IteratorNext(it iterator.Iterator) (key, value []byte, valid bool) {
-	if it.Next() {
-		return it.Key(), it.Value(), true
-	}
-	return nil, nil, false
-}
-
-func (c *chainKVLDB) BatchCommit(batch chainkvdb.Batch) error {
-	return batch.Write()
+func (c *chainKVLDB) useStateForDataType(dataType ethstore.DataType) bool {
+	return c.useState && ethstore.PrefixDBHandledDataTypes[dataType]
 }
 
 func (c *chainKVLDB) Close() {
@@ -463,7 +397,13 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 			return fmt.Errorf("failed to decode value: %w", err)
 		}
 
-		if err := db.Put(keyBytes, valueBytes); err != nil {
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		if db.useStateForDataType(dataType) {
+			err = db.db.Put_s(keyBytes, valueBytes)
+		} else {
+			err = db.db.Put(keyBytes, valueBytes)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to put key-value: %w", err)
 		}
 		count++
@@ -487,27 +427,12 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, ckvUseState bool, ckvStateKeyPrefixes string, ckvLoadLimit int) error {
 	switch {
 	case strings.EqualFold(backend, "chainkv"):
-		dbDir := cfg.ChainKVDir
-		if dbDir == "" {
-			dbDir = cfg.EthStoreDir
-		}
-		if dbDir == "" {
-			return fmt.Errorf("ld with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
-		}
-		dataFile := cfg.LoadDataDir
-		if dataFile == "" {
-			return fmt.Errorf("ld with chainkv backend requires loadDataDir in config")
-		}
-		var prefixes []string
-		if strings.TrimSpace(ckvStateKeyPrefixes) != "" {
-			prefixes = strings.Split(ckvStateKeyPrefixes, ",")
-		}
-		ckv, openErr := NewChainKVLDB(dbDir, ckvCache, ckvHandles, ckvUseState, prefixes)
+		ckv, openErr := NewChainKVLDB(cfg.ChainKVDir, ckvCache, ckvHandles, ckvUseState)
 		if openErr != nil {
 			return fmt.Errorf("failed to open chainkv database: %w", openErr)
 		}
 		defer ckv.Close()
-		if loadErr := chainKVLoadData(ckv, dataFile, ckvLoadLimit); loadErr != nil {
+		if loadErr := chainKVLoadData(ckv, cfg.ChainKVDir, ckvLoadLimit); loadErr != nil {
 			return fmt.Errorf("chainkv load failed: %w", loadErr)
 		}
 		return nil
@@ -625,15 +550,17 @@ type ethdbIterWrapper struct{ ethdb.Iterator }
 // chainKVIterWrapper wraps iterator.Iterator to satisfy replayIter while
 // also capturing the value returned by chainKVLDB.IteratorNext.
 type chainKVIterWrapper struct {
-	db      *chainKVLDB
 	it      iterator.Iterator
 	lastVal []byte
 }
 
 func (w *chainKVIterWrapper) Next() bool {
-	_, val, ok := w.db.IteratorNext(w.it)
-	w.lastVal = val
-	return ok
+	if !w.it.Next() {
+		w.lastVal = nil
+		return false
+	}
+	w.lastVal = w.it.Value()
+	return true
 }
 func (w *chainKVIterWrapper) Value() []byte { return w.lastVal }
 func (w *chainKVIterWrapper) Release()      { w.it.Release() }
@@ -672,17 +599,17 @@ func shouldSkipByDBType(dt ethstore.DataType, dbType DBType) bool {
 }
 
 // ---------------------------------------------------------------------------
-// pebbleBaselineReplayBackend – wraps *ethstore.PebbleStore
+// pebbleBaselineReplayBackend – wraps *pebblestore.PebbleStore
 // ---------------------------------------------------------------------------
 
 type pebbleBaselineReplayBackend struct {
-	store      *ethstore.PebbleStore
+	store      *pebblestore.PebbleStore
 	batch      ethdb.Batch
 	commitHist *latencyHistogram
 }
 
 func newPebbleBaselineReplayBackend(dir string) (*pebbleBaselineReplayBackend, error) {
-	store, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
+	store, err := pebblestore.NewPebbleStore(dir, 0, 0, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("newPebbleBaselineReplayBackend: open store: %w", err)
 	}
@@ -734,6 +661,7 @@ type ethstoreReplayBackend struct {
 	store              *ethstore.Database
 	pebbleBatch        ethdb.Batch
 	prefixdbDirty      bool
+	blockdbCommitHist  *latencyHistogram
 	prefixdbCommitHist *latencyHistogram
 	pebbleCommitHist   *latencyHistogram
 	blockTotalHist     *latencyHistogram
@@ -754,6 +682,7 @@ func newEthstoreReplayBackend(dir string, cacheCount int, chunkFileSize int, pre
 		store:              store,
 		prefixdbCommitHist: newLatencyHistogram(),
 		pebbleCommitHist:   newLatencyHistogram(),
+		blockdbCommitHist:  newLatencyHistogram(),
 		blockTotalHist:     newLatencyHistogram(),
 	}, nil
 }
@@ -771,6 +700,7 @@ func (b *ethstoreReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]b
 		return b.store.GetFromPebble(key)
 	})
 }
+
 func (b *ethstoreReplayBackend) ensurePebbleBatch() ethdb.Batch {
 	if b.pebbleBatch == nil {
 		b.pebbleBatch = b.store.NewBatch()
@@ -795,6 +725,7 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 	}
 	return b.ensurePebbleBatch().Put(key, value)
 }
+
 func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
 	if ethstore.AolHandledDataTypes[dataType] {
 		err := b.store.BatchDeleteFromAOL(key, dataType)
@@ -812,8 +743,15 @@ func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataTy
 	}
 	return b.ensurePebbleBatch().Delete(key)
 }
+
 func (b *ethstoreReplayBackend) CommitBlock() error {
 	blockStart := time.Now()
+	start := time.Now()
+	err := b.store.CommitAOLBatch()
+	b.blockdbCommitHist.observe(time.Since(start))
+	if err != nil {
+		return err
+	}
 	if b.prefixdbDirty {
 		start := time.Now()
 		if err := b.store.PrefixdbBatchCommit('O'); err != nil {
@@ -833,12 +771,14 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 	b.blockTotalHist.observe(time.Since(blockStart))
 	return nil
 }
+
 func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
 	if len(prefix) > 0 && prefix[0] == 'O' {
 		return noopIter{}
 	}
 	return ethdbIterWrapper{b.store.NewIterator(prefix, start)}
 }
+
 func (b *ethstoreReplayBackend) PrintCommitStats() {
 	reportHistogramSummary("ethstore commit (PrefixdbBatchCommit)", b.prefixdbCommitHist)
 	reportHistogramSummary("ethstore commit (pebble Batch.Write)", b.pebbleCommitHist)
@@ -853,11 +793,13 @@ type chainKVReplayBackend struct {
 	db            *chainKVLDB
 	stateBatch    chainkvdb.Batch
 	nonStateBatch chainkvdb.Batch
+	statePending  map[string][]byte
+	nonStatePending map[string][]byte
 	commitHist    *latencyHistogram
 }
 
-func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool, statePrefixes []string) (*chainKVReplayBackend, error) {
-	db, err := NewChainKVLDB(dbDir, cache, handles, useState, statePrefixes)
+func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool) (*chainKVReplayBackend, error) {
+	db, err := NewChainKVLDB(dbDir, cache, handles, useState)
 	if err != nil {
 		return nil, fmt.Errorf("newChainKVReplayBackend: open db: %w", err)
 	}
@@ -867,55 +809,81 @@ func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool, st
 func (b *chainKVReplayBackend) Name() string { return "chainkv" }
 func (b *chainKVReplayBackend) Close()       { b.db.Close() }
 
-func (b *chainKVReplayBackend) Get(key []byte, _ ethstore.DataType) ([]byte, error) {
-	return b.db.Get(key)
+func (b *chainKVReplayBackend) pendingOverlay(dataType ethstore.DataType) map[string][]byte {
+	if b.db.useStateForDataType(dataType) {
+		if b.statePending == nil {
+			b.statePending = make(map[string][]byte)
+		}
+		return b.statePending
+	}
+	if b.nonStatePending == nil {
+		b.nonStatePending = make(map[string][]byte)
+	}
+	return b.nonStatePending
 }
 
-func (b *chainKVReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
-	if b.db.useStateForKey(key) {
-		if b.stateBatch == nil {
-			b.stateBatch = b.db.NewBatch()
+func (b *chainKVReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
+	if val, found := b.pendingOverlay(dataType)[string(key)]; found {
+		if val == nil {
+			return nil, ethstore.ErrNotFound
 		}
-		return b.db.BatchPut(b.stateBatch, key, value)
+		return append([]byte(nil), val...), nil
 	}
-	if b.nonStateBatch == nil {
-		b.nonStateBatch = b.db.NewBatch()
+	if b.db.useStateForDataType(dataType) {
+		return b.db.db.Get_s(key)
 	}
-	return b.db.BatchPut(b.nonStateBatch, key, value)
+	return b.db.db.Get(key)
 }
-func (b *chainKVReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
-	if b.db.useStateForKey(key) {
+
+func (b *chainKVReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
+	b.pendingOverlay(dataType)[string(key)] = append([]byte(nil), value...)
+	if b.db.useStateForDataType(dataType) {
 		if b.stateBatch == nil {
-			b.stateBatch = b.db.NewBatch()
+			b.stateBatch = b.db.db.NewBatch()
 		}
-		return b.db.BatchDelete(b.stateBatch, key)
+		return b.stateBatch.Put_s(key, value)
 	}
 	if b.nonStateBatch == nil {
-		b.nonStateBatch = b.db.NewBatch()
+		b.nonStateBatch = b.db.db.NewBatch()
 	}
-	return b.db.BatchDelete(b.nonStateBatch, key)
+	return b.nonStateBatch.Put(key, value)
+}
+func (b *chainKVReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
+	b.pendingOverlay(dataType)[string(key)] = nil
+	if b.db.useStateForDataType(dataType) {
+		if b.stateBatch == nil {
+			b.stateBatch = b.db.db.NewBatch()
+		}
+		return b.stateBatch.Put_s(key, nil)
+	}
+	if b.nonStateBatch == nil {
+		b.nonStateBatch = b.db.db.NewBatch()
+	}
+	return b.nonStateBatch.Put(key, nil)
 }
 func (b *chainKVReplayBackend) CommitBlock() error {
 	if b.stateBatch != nil {
 		start := time.Now()
-		if err := b.db.BatchCommit(b.stateBatch); err != nil {
+		if err := b.stateBatch.Write(); err != nil {
 			fmt.Printf("state batch commit failed: %v\n", err)
 		}
 		b.commitHist.observe(time.Since(start))
 		b.stateBatch = nil
+		b.statePending = nil
 	}
 	if b.nonStateBatch != nil {
 		start := time.Now()
-		if err := b.db.BatchCommit(b.nonStateBatch); err != nil {
+		if err := b.nonStateBatch.Write(); err != nil {
 			fmt.Printf("non-state batch commit failed: %v\n", err)
 		}
 		b.commitHist.observe(time.Since(start))
 		b.nonStateBatch = nil
+		b.nonStatePending = nil
 	}
 	return nil
 }
 func (b *chainKVReplayBackend) NewIterator(_, _ []byte) replayIter {
-	return &chainKVIterWrapper{db: b.db, it: b.db.NewIterator()}
+	return &chainKVIterWrapper{it: b.db.db.NewIterator()}
 }
 func (b *chainKVReplayBackend) PrintCommitStats() {
 	reportHistogramSummary("chainkv commit (Batch.Write)", b.commitHist)
@@ -962,6 +930,25 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			iter.Release()
 		}
 	}()
+
+	keyToSearch := "6f79911817cc107e2149d9d19d34340bd751687366111d57d1fd5a0d9e1e20d6560d72b0071e405982f3261e5c5e9581823d0b313d26cb8971d407be37b75ac2a2"
+	if strings.TrimSpace(keyToSearch) != "" {
+		keyBytes, decodeErr := hex.DecodeString(keyToSearch)
+		if decodeErr != nil {
+			fmt.Printf("[%s] inline get-test decode failed: %v\n", backend.Name(), decodeErr)
+			return
+		}
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		value, getErr := backend.Get(keyBytes, dataType)
+		if getErr != nil {
+			fmt.Printf("[%s] inline get-test failed key=%s dataType=%s err=%v\n",
+				backend.Name(), keyToSearch, dataTypeName(dataType), getErr)
+			return
+		}
+		fmt.Printf("[%s] inline get-test success key=%s dataType=%s valueSize=%d\n",
+			backend.Name(), keyToSearch, dataTypeName(dataType), len(value))
+		return
+	}
 
 	for {
 		line, readErr := reader.ReadString('\n')
@@ -1114,8 +1101,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		elapsed := time.Since(start)
 		totalTime += elapsed
 		if opErr != nil {
-			fmt.Printf("[%s] op %s failed for key %s: %v\n",
-				backend.Name(), opTypeStr, keyHex, opErr)
+			if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
+				fmt.Printf("[%s] op %s failed for key %s: %v\n",
+					backend.Name(), opTypeStr, keyHex, opErr)
+			}
 		}
 		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
@@ -1192,6 +1181,12 @@ func main() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
+		ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount, *ldChunkFileSize, *ldCacheSize)
+	if ethErr != nil {
+		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+		}
+	defer ethBackend.Close()
+	replayTrace(ethBackend, traceFile, *maxOps, dbType)
 
 	switch *mode {
 	case "ld":
@@ -1200,18 +1195,7 @@ func main() {
 		}
 	case "re":
 		if strings.EqualFold(*backend, "chainkv") {
-			dbDir := cfg.ChainKVDir
-			if dbDir == "" {
-				dbDir = cfg.EthStoreDir
-			}
-			if dbDir == "" {
-				log.Fatal("re with chainkv backend requires chainKVDatabaseDir or databaseDir in config")
-			}
-			var prefixes []string
-			if strings.TrimSpace(*ckvStateKeyPrefixes) != "" {
-				prefixes = strings.Split(*ckvStateKeyPrefixes, ",")
-			}
-			ckvBackend, ckvErr := newChainKVReplayBackend(dbDir, *ckvCache, *ckvHandles, *ckvUseState, prefixes)
+			ckvBackend, ckvErr := newChainKVReplayBackend(cfg.ChainKVDir, *ckvCache, *ckvHandles, *ckvUseState)
 			if ckvErr != nil {
 				log.Fatalf("re: failed to open chainkv backend: %v", ckvErr)
 			}
@@ -1243,7 +1227,7 @@ func main() {
 
 func loadbaselineData(pebbleDir string, dataFile string) error {
 	tempDir := pebbleDir
-	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+	store, err := pebblestore.NewPebbleStore(tempDir, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore: %w", err)
 	}
@@ -1400,7 +1384,7 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, accountH
 	if dbPath == "" {
 		return fmt.Errorf("pebble aux dir is required for loadAccount")
 	}
-	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore instance: %w", err)
 	}
@@ -1609,7 +1593,7 @@ func insertAccountHashindexTopebble(sourcePebblePath string, targetPebbleDir str
 		return fmt.Errorf("account hash index source dir is required")
 	}
 
-	accountHashKeyPebble, err := ethstore.NewPebbleStore(pebblePath, 0, 0, "", false)
+	accountHashKeyPebble, err := pebblestore.NewPebbleStore(pebblePath, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to open pebble store: %v", err)
 	}
@@ -1619,7 +1603,7 @@ func insertAccountHashindexTopebble(sourcePebblePath string, targetPebbleDir str
 	if dir == "" {
 		return fmt.Errorf("account hash index target dir is required")
 	}
-	db, err := ethstore.NewPebbleStore(dir, 0, 0, "", false)
+	db, err := pebblestore.NewPebbleStore(dir, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create pebble store: %v", err)
 	}
@@ -1656,7 +1640,7 @@ func replayPebble(tempDir string, testFilePath string) {
 	if tempDir == "" || testFilePath == "" {
 		log.Fatalf("replayPebble requires non-empty tempDir and testFilePath")
 	}
-	store, err := ethstore.NewPebbleStore(tempDir, 0, 0, "", false)
+	store, err := pebblestore.NewPebbleStore(tempDir, 0, 0, "", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1733,7 +1717,7 @@ func loadPebble(dirPath string, testFilePath string) {
 		log.Fatalf("loadPebble requires non-empty dirPath and testFilePath")
 	}
 	fmt.Println("Start load pebble...")
-	pdb, err := ethstore.NewPebbleStore(dirPath, 0, 0, "pebble_load", false)
+	pdb, err := pebblestore.NewPebbleStore(dirPath, 0, 0, "pebble_load", false)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1824,7 +1808,7 @@ func (f fullNode) isNode()  {}
 func (s shortNode) isNode() {}
 func (v valueNode) isNode() {}
 
-func findKeyValuePair(accountHashHex string, ps *ethstore.PebbleStore) (string, string, error) {
+func findKeyValuePair(accountHashHex string, ps *pebblestore.PebbleStore) (string, string, error) {
 	targetPath, err := hexToNibbles(accountHashHex)
 	if err != nil {
 		return "", "", fmt.Errorf("无效的十六进制哈希: %v", err)
@@ -1860,7 +1844,7 @@ func hexToNibbles(h string) ([]byte, error) {
 	return nibbles, nil
 }
 
-func findRecursive(path []byte, pos int, ps *ethstore.PebbleStore) ([]byte, string, error) {
+func findRecursive(path []byte, pos int, ps *pebblestore.PebbleStore) ([]byte, string, error) {
 	// fmt.Printf("递归步骤:\n")
 	// fmt.Printf("  - 当前已走路径 (逻辑): %x\n", path[:pos])
 	// fmt.Printf("  - 剩余待查路径: %x\n", path[pos:])

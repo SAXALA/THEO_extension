@@ -249,9 +249,8 @@ restore_pebble_db() {
 }
 
 ensure_ethstore_permissions() {
-    echo "Fix ethstore permissions (prefixdb + accountHash_key_pebble)..."
+    echo "Fix ethstore permissions (prefixdb)..."
     # Ensure the lock directory exists and is writable to avoid LOCK permission denied.
-    sudo_run mkdir -p "${ETHSTORE_PREFIXDB_DIR}/accountHash_key_pebble"
     sudo_run chmod -R 777 "${ETHSTORE_PREFIXDB_DIR}"
 }
 
@@ -563,6 +562,7 @@ main() {
     validate_runtime_requirements
     if [ "$ACTION" != "restore" ]; then
         build_replay_binary
+        exit
     fi
 
     if [ "$BACKEND" = "all" ]; then

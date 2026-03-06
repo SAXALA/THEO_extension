@@ -20,6 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
 const storageMaxFileSize int64 = 1 << 30 // 1GB
@@ -32,7 +33,6 @@ const (
 	segmentIndexCacheCapacity         = 4096 // number of large index folders retained in memory
 	storageEntrySize                  = 108
 	storageGCThreshold                = 2 //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
-
 )
 
 const (
@@ -148,7 +148,7 @@ type PrefixDB struct {
 	nodeCache *NodeCache
 	batch     *WriteBatch
 	// triePath             string       // path to the prefix tree file
-	accountHashKeyPebble *PebbleStore // pebble store for account hash key index
+	accountHashKeyPebble *pebblestore.PebbleStore // pebble store for account hash key index
 	// hashIndex  hashIndex to aviod hash collision
 	writeMutex sync.Mutex // mutex for writeCommit
 
@@ -258,12 +258,9 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 		return nil, fmt.Errorf("failed to create base dir: %v", err)
 	}
 
-	// pebblePath := filepath.Join("/mnt/ssd/ethstore/index/accountHash_key_pebble")
-
 	// Resolve paths
 	accountFilePath := resolvePath(cfg.BaseDir, cfg.AccountDir)
 	triePath := resolvePath(cfg.BaseDir, cfg.TrieDir)
-	pebblePath := resolvePath(cfg.BaseDir, cfg.PebblePath)
 	storageDir := resolvePath(cfg.BaseDir, cfg.StorageDir)
 
 	// Ensure directories exist
@@ -316,11 +313,6 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 
 	db.prefixTree = prefixTree
 
-	db.accountHashKeyPebble, err = NewPebbleStore(pebblePath, 0, 0, "", false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create PebbleStore: %v", err)
-	}
-
 	indexCache, err := lru.New(segmentIndexCacheCapacity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init segment index cache: %v", err)
@@ -336,8 +328,6 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 	db.startStorageGCWorker()
 
 	// db.startCacheEvictionWorker(db.cacheEvictTickerTime)
-
-	// db.batch.EnableAutoCommit(db, 1024) // enable auto commit with a threshold of 1024 operations
 
 	db.initStorageBatcher()
 
@@ -1335,16 +1325,6 @@ func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
 		return nil
 	}
 	return key
-	// accountHashStr := hex.EncodeToString(accountHash)
-	// item, err := db.memcache.Get(accountHashStr)
-	// if err != nil {
-	// 	if err == memcache.ErrCacheMiss {
-	// 		return nil // account not found in cache
-	// 	}
-	// 	fmt.Printf("Error retrieving account key from mem cache: %v\n", err)
-	// 	return nil
-	// }
-	// return item.Value
 }
 
 func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {

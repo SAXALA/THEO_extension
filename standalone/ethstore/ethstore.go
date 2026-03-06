@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 	"github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
 
@@ -132,7 +133,7 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 // Database is a persistent key-value store based on the append-only log store.
 type Database struct {
 	fn       string             // filename/directory for reporting
-	pebble   *PebbleStore       // Pebble store for non-AOL data
+	pebble   *pebblestore.PebbleStore // Pebble store for non-AOL data
 	statepdb *prefixdb.PrefixDB // world state PrefixDB
 	blockAol *BlockAppendOnlyLog
 
@@ -190,7 +191,7 @@ func New(dirPath string, recentN int, namespace string, readonly bool, chunkFile
 	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
 	// Pass through namespace and readonly from the New function's parameters.
 
-	pebbleStore, err := NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
+	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
 	if err != nil {
 		// Close AOL if Pebble initialization fails
 		db.statepdb.Close()
@@ -540,28 +541,41 @@ func (d *Database) BatchPutToAOL(key []byte, value []byte, dataType DataType) er
 	if !foundBlockID {
 		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
 	}
-	if blockID > d.baolLatestBlock {
-		if d.blockAol == nil {
-			return fmt.Errorf("block append-only log is not initialized")
-		}
-		if d.baolkvs == nil {
-			d.baolkvs = make(map[string]string, 4)
-		}
-		if d.baolLatestBlock != 0 {
-			if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
-				return fmt.Errorf("baol append failed for key %x (type %s, blockID %d): %w", key, DataTypeStrings[dataType], blockID-1, err)
-			}
-		}
-		clear(d.baolkvs)
-		d.baolLatestBlock = blockID
-		d.baolkvs[string(key)] = string(value)
-		d.log.Trace("Stored key via BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
-		return nil
+	if d.blockAol == nil {
+		return fmt.Errorf("block append-only log is not initialized")
 	}
 	if d.baolkvs == nil {
 		d.baolkvs = make(map[string]string, 4)
 	}
+	if d.baolLatestBlock == 0 {
+		d.baolLatestBlock = blockID
+	}
+	if blockID != d.baolLatestBlock {
+		return fmt.Errorf("aol batch spans multiple blocks without commit: current=%d incoming=%d", d.baolLatestBlock, blockID)
+	}
 	d.baolkvs[string(key)] = string(value)
+	d.log.Trace("Buffered key for BlockAppendOnlyLog", "key", common.Bytes2Hex(key), "type", DataTypeStrings[dataType], "blockID", blockID)
+	return nil
+}
+
+// CommitAOLBatch appends buffered AOL kvs as one block and performs explicit
+// data+index flush for durability. This is intended to be called at block
+// boundaries by the replay pipeline.
+func (d *Database) CommitAOLBatch() error {
+	if d.blockAol == nil {
+		return fmt.Errorf("block append-only log is not initialized")
+	}
+	if d.baolLatestBlock == 0 || len(d.baolkvs) == 0 {
+		return nil
+	}
+	if err := d.blockAol.Append(d.baolLatestBlock, d.baolkvs); err != nil {
+		return fmt.Errorf("baol append failed for block %d: %w", d.baolLatestBlock, err)
+	}
+	if err := d.blockAol.FlushDataAndIndex(); err != nil {
+		return fmt.Errorf("baol explicit flush failed for block %d: %w", d.baolLatestBlock, err)
+	}
+	clear(d.baolkvs)
+	d.baolLatestBlock = 0
 	return nil
 }
 

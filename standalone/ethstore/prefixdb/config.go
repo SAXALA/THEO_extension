@@ -19,11 +19,9 @@ type Config struct {
 	// If empty, defaults will be used.
 	AccountDir    string `json:"account_dir"`
 	TrieDir       string `json:"trie_dir"`
-	PebblePath    string `json:"pebble_path"`
 	StorageDir    string `json:"storage_dir"`
 	HotStorageDir string `json:"hot_storage_dir"`
 	SlotIndexFile string `json:"slot_index_file"`
-	MemcacheAddr  string `json:"memcache_addr"`
 
 	// Cache sizes and other parameters
 	NodeCacheSize int             `json:"node_cache_size"`
@@ -56,10 +54,8 @@ func DefaultConfig(dirpath string) *Config {
 		BaseDir:        dirpath,
 		AccountDir:     filepath.Join(prefixDBDir, "na"),
 		TrieDir:        filepath.Join(prefixDBDir, "trie"),
-		PebblePath:     filepath.Join(prefixDBDir, "accountHash_key_pebble"),
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
 		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
-		MemcacheAddr:   "127.0.0.1:11211",
 		NodeCacheSize:  1 << 18,
 		WriteBatchSize: 4096,
 	}

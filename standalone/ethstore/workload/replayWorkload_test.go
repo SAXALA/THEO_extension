@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
+	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
 type fakeGetterStore struct {
@@ -44,7 +45,7 @@ func TestGetWithPebbleBatchOverlay_FallbackToStoreWhenBatchMiss(t *testing.T) {
 func TestGetWithPebbleBatchOverlay_BatchPutAndDeletePrecedence(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "pebble-overlay-workload-test")
-	ps, err := ethstore.NewPebbleStore(dbPath, 0, 0, "", false)
+	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("NewPebbleStore failed: %v", err)
 	}

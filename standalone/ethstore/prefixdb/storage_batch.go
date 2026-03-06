@@ -159,41 +159,11 @@ func (db *PrefixDB) StorageBatchCommit() error {
 	// Merge unresolved entries by resolving their parent account keys now.
 	if len(unresolved) > 0 {
 		for origKeyStr, v := range unresolved {
-			origKeyBytes := []byte(origKeyStr)
-			// Derive parent account key using external resolver if provided
-			// (prefer ethstore.Database.GetParentAccountKey), otherwise use
-			// PrefixDB's local method.
-			var accountKey []byte
-			if db.ParentKeyResolver != nil {
-				accountKey = db.ParentKeyResolver(origKeyBytes)
-			}
-			// if accountKey == nil {
-			// 	accountKey = db.GetParentAccountKey(origKeyBytes)
-			// }
-			if accountKey == nil {
+			_ = v
+			if len(origKeyStr) > 0 {
 				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
-				continue
 			}
-			storageKey, err := db.normalizeStorageKey(origKeyBytes)
-			if err != nil {
-				return err
-			}
-			accStr := string(accountKey)
-			perAcc := batch[accStr]
-			if perAcc == nil {
-				perAcc = make(map[string][]byte)
-				batch[accStr] = perAcc
-			}
-			if v == nil {
-				perAcc[string(storageKey)] = nil
-			} else {
-				// v is already owned by this commit (putUnresolved makes a copy),
-				// so avoid an extra copy here.
-				perAcc[string(storageKey)] = v
-			}
-			if db.storageCache != nil {
-				db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
-			}
+			continue
 		}
 	}
 

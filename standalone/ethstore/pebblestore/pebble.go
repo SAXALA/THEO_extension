@@ -24,7 +24,7 @@ var (
 
 const (
 	metricsGatheringInterval = 3 * time.Second
-	defaultCacheValue        = 64
+	defaultCacheValue        = 16
 	defaultHandlesValue      = 256
 	defaultNamespaceValue    = "pebble"
 )

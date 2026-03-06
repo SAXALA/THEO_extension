@@ -1550,6 +1550,34 @@ func (baol *BlockAppendOnlyLog) FlushIndexBuffer() error {
 	return baol.flushIndexBuffer()
 }
 
+// FlushDataAndIndex explicitly flushes current block data and index updates.
+// It is used by replay block boundaries to avoid relying on background flushes.
+func (baol *BlockAppendOnlyLog) FlushDataAndIndex() error {
+	baol.mu.RLock()
+	defer baol.mu.RUnlock()
+
+	if baol.closed {
+		return fmt.Errorf("append-only log is closed")
+	}
+	if baol.dataWriter != nil {
+		if err := baol.dataWriter.Flush(); err != nil {
+			return fmt.Errorf("failed to flush data writer: %w", err)
+		}
+	}
+	if baol.dataFile != nil {
+		if err := baol.dataFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync data file: %w", err)
+		}
+	}
+	if err := baol.flushIndexBufferWithBlockID(baol.minBlockID); err != nil {
+		return fmt.Errorf("failed to flush index buffer: %w", err)
+	}
+	if err := baol.saveIndexMeta(); err != nil {
+		return fmt.Errorf("failed to save index metadata: %w", err)
+	}
+	return nil
+}
+
 // getBlockIndexEntry retrieves the block index entry for a given block ID.
 func (baol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEntry, bool) {
 	if baol.blockIndex != nil {
