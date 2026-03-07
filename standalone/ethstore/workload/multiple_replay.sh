@@ -23,7 +23,7 @@ STORAGE_CACHE_SIZE_CANDIDATES=(12 48)
 CACHE_COUNT_CANDIDATES=(32)
 SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES=(4)
 BACKEND_CANDIDATES=(ethstore pebble)
-TRACE_FILE_CANDIDATES=(cache nocache_snap)
+TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
@@ -211,9 +211,9 @@ for backend in "${SELECTED_BACKENDS[@]}"; do
 	total_runs=$((total_runs + ${#STORAGE_CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES[@]} * ${#SELECTED_TRACES[@]}))
 done
 
-for backend in "${SELECTED_BACKENDS[@]}"; do
-	mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
-	for trace_file in "${SELECTED_TRACES[@]}"; do
+for trace_file in "${SELECTED_TRACES[@]}"; do
+	for backend in "${SELECTED_BACKENDS[@]}"; do
+		mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
 		for storage_mib in "${STORAGE_CACHE_SIZE_CANDIDATES[@]}"; do
 			if ! [[ "$storage_mib" =~ ^[0-9]+$ ]] || [ "$storage_mib" -le 0 ]; then
 				echo "Invalid STORAGE_CACHE_SIZE candidate: $storage_mib"
@@ -246,7 +246,7 @@ for backend in "${SELECTED_BACKENDS[@]}"; do
 					fi
 
 					run_idx=$((run_idx + 1))
-					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib} CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
+					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
 
 					STORAGE_CACHE_SIZE="$storage_mib" \
 					NODE_CACHE_SIZE="$node_mib" \
