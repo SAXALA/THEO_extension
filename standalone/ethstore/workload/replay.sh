@@ -21,6 +21,9 @@ BACKEND="${2:-${WORKLOAD_BACKEND:-ethstore}}"
 
 # 回放最大操作数；0 代表不限制
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
+# 回放 block 窗口；0 代表不限制（起点从头/终点不限）
+START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
+END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -34,6 +37,8 @@ CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
 STORAGE_CACHE_SIZE="${STORAGE_CACHE_SIZE:-12}"
 # PrefixDB node cache 大小（MiB）
 NODE_CACHE_SIZE="${NODE_CACHE_SIZE:-4}"
+# PrefixDB segment index cache 大小（MiB）
+SEGMENT_INDEX_CACHE_SIZE_MIB="${SEGMENT_INDEX_CACHE_SIZE_MIB:-64}"
 
 # Convert MiB inputs to bytes for replayWorkload flags.
 STORAGE_CACHE_SIZE_BYTES=$((STORAGE_CACHE_SIZE * 1024 * 1024))
@@ -41,6 +46,8 @@ NODE_CACHE_SIZE_BYTES=$((NODE_CACHE_SIZE * 1024 * 1024))
 
 # chainkv 参数: cache 大小（MB）
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
+# pebble 参数: cache 大小（MB）
+PEBBLE_CACHE_MB="${PEBBLE_CACHE_MB:-16}"
 # chainkv 参数: leveldb handles 数量
 CHAINKV_HANDLES="${CHAINKV_HANDLES:-128}"
 # chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
@@ -137,12 +144,15 @@ Current values:
 
 Common env vars:
     WORKLOAD_MAX_OPS(0=unlimited)
+    START_BLOCK_ID(0=from beginning)
+    END_BLOCK_ID(0=no block-id stop)
     TRACE_FILE(cache|nocache|nocache_snap)
     DB_TYPE(all|aol|prefixdb|pebble)
     CACHE_COUNT
     CHUNK_FILE_SIZE(bytes), STORAGE_CACHE_SIZE(MiB)
     NODE_CACHE_SIZE(MiB)
-    CHAINKV_CACHE_MB, CHAINKV_HANDLES
+    SEGMENT_INDEX_CACHE_SIZE_MIB(MiB)
+    CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
     LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
     GC_STATE_DIR
@@ -370,13 +380,15 @@ build_run_tag() {
     running_root_tag=$(sanitize_tag_value "$RUNNING_ROOT")
 
     local base_tag
-    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_cc_${CACHE_COUNT}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_ncs_${NODE_CACHE_SIZE}"
+    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_cc_${CACHE_COUNT}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_ncs_${NODE_CACHE_SIZE}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}_block_${START_BLOCK_ID}-${END_BLOCK_ID}"
 
     if [ "$backend" = "chainkv" ]; then
         local ckv_state_tag ckv_prefix_tag
         ckv_state_tag=$(sanitize_tag_value "$CHAINKV_STATE")
         ckv_prefix_tag=$(sanitize_tag_value "$CHAINKV_STATE_KEY_PREFIXES")
         printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}"
+    elif [ "$backend" = "pebble" ]; then
+        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}"
     else
         printf "%s" "$base_tag"
     fi
@@ -390,13 +402,17 @@ print_param_snapshot() {
 ACTION=${snapshot_action}
 BACKEND=${snapshot_backend}
 WORKLOAD_MAX_OPS=${WORKLOAD_MAX_OPS}
+START_BLOCK_ID=${START_BLOCK_ID}
+END_BLOCK_ID=${END_BLOCK_ID}
 TRACE_FILE=${TRACE_FILE}
 DB_TYPE=${DB_TYPE}
 CACHE_COUNT=${CACHE_COUNT}
 CHUNK_FILE_SIZE=${CHUNK_FILE_SIZE}
 STORAGE_CACHE_SIZE=${STORAGE_CACHE_SIZE} MiB (${STORAGE_CACHE_SIZE_BYTES} bytes)
 NODE_CACHE_SIZE=${NODE_CACHE_SIZE} MiB (${NODE_CACHE_SIZE_BYTES} bytes)
+SEGMENT_INDEX_CACHE_SIZE_MIB=${SEGMENT_INDEX_CACHE_SIZE_MIB}
 CHAINKV_CACHE_MB=${CHAINKV_CACHE_MB}
+PEBBLE_CACHE_MB=${PEBBLE_CACHE_MB}
 CHAINKV_HANDLES=${CHAINKV_HANDLES}
 CHAINKV_STATE=${CHAINKV_STATE}
 CHAINKV_STATE_KEY_PREFIXES=${CHAINKV_STATE_KEY_PREFIXES}
@@ -455,15 +471,15 @@ run_load() {
         ethstore)
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend ethstore -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode ld -backend ethstore -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend pebble -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
     esac
 }
@@ -507,15 +523,16 @@ run_replay() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
-                -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
+                -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
     esac
 }
@@ -532,7 +549,7 @@ run_gc() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
-                -gc-state-dir "$GC_STATE_DIR" -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES"
+                -gc-state-dir "$GC_STATE_DIR" -ld-chunk-file-size "$CHUNK_FILE_SIZE" -ld-cache-size "$STORAGE_CACHE_SIZE_BYTES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"

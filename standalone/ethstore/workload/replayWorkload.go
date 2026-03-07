@@ -52,8 +52,12 @@ const (
 // opRegex is compiled once at init time and reused across all replayTrace calls.
 var opRegex = regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
 
+// blockMarkerRegex parses trace lines like:
+// "Processing block (start), ID: 20500000" / "Processing block (end), ID: 20500000".
+var blockMarkerRegex = regexp.MustCompile(`Processing block \((start|end)\),\s*ID:\s*(\d+)`)
+
 var opTypeNames = map[opType]string{
-	opGet: "Get",
+	opGet:          "Get",
 	opPut:          "Put",
 	opDelete:       "Delete",
 	opNewIterator:  "NewIterator",
@@ -303,8 +307,8 @@ type replayConfig struct {
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
 	EthStoreDir                  string `json:"ethstoreDir"`
-	PebbleDBDir            		 string `json:"pebbleDir"`
-	ChainKVDir           		 string `json:"chainKVDir"`
+	PebbleDBDir                  string `json:"pebbleDir"`
+	ChainKVDir                   string `json:"chainKVDir"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -334,8 +338,8 @@ func NewChainKVLDB(path string, cache int, handles int, useState bool) (*chainKV
 		return nil, fmt.Errorf("failed to open chainkv database: %w", err)
 	}
 	return &chainKVLDB{
-		db:            db,
-		useState:      useState,
+		db:       db,
+		useState: useState,
 	}, nil
 }
 
@@ -424,7 +428,7 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	return nil
 }
 
-func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, ckvUseState bool, ckvStateKeyPrefixes string, ckvLoadLimit int) error {
+func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, pebbleCache int, ckvUseState bool, ckvLoadLimit int) error {
 	switch {
 	case strings.EqualFold(backend, "chainkv"):
 		ckv, openErr := NewChainKVLDB(cfg.ChainKVDir, ckvCache, ckvHandles, ckvUseState)
@@ -443,7 +447,7 @@ func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheS
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with pebble backend requires loadDataDir in config")
 		}
-		if err := loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir); err != nil {
+		if err := loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir, pebbleCache); err != nil {
 			return fmt.Errorf("pebble load failed: %w", err)
 		}
 		return nil
@@ -494,7 +498,6 @@ func runGC(backend string, cacheCount int, gcStateDir string, chunkFileSize int,
 	fmt.Printf("ethstore state db GC finished in %s\n", time.Since(start))
 	return nil
 }
-
 
 // ---------------------------------------------------------------------------
 // Read-your-writes overlay helper
@@ -608,8 +611,8 @@ type pebbleBaselineReplayBackend struct {
 	commitHist *latencyHistogram
 }
 
-func newPebbleBaselineReplayBackend(dir string) (*pebbleBaselineReplayBackend, error) {
-	store, err := pebblestore.NewPebbleStore(dir, 0, 0, "", false)
+func newPebbleBaselineReplayBackend(dir string, cache int) (*pebbleBaselineReplayBackend, error) {
+	store, err := pebblestore.NewPebbleStore(dir, cache, 0, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("newPebbleBaselineReplayBackend: open store: %w", err)
 	}
@@ -780,9 +783,10 @@ func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
 }
 
 func (b *ethstoreReplayBackend) PrintCommitStats() {
-	reportHistogramSummary("ethstore commit (PrefixdbBatchCommit)", b.prefixdbCommitHist)
-	reportHistogramSummary("ethstore commit (pebble Batch.Write)", b.pebbleCommitHist)
-	reportHistogramSummary("ethstore commit (block total)", b.blockTotalHist)
+	reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
+	reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
+	reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+	reportHistogramSummary("ethstore commit (Total)", b.blockTotalHist)
 }
 
 // ---------------------------------------------------------------------------
@@ -790,12 +794,12 @@ func (b *ethstoreReplayBackend) PrintCommitStats() {
 // ---------------------------------------------------------------------------
 
 type chainKVReplayBackend struct {
-	db            *chainKVLDB
-	stateBatch    chainkvdb.Batch
-	nonStateBatch chainkvdb.Batch
-	statePending  map[string][]byte
+	db              *chainKVLDB
+	stateBatch      chainkvdb.Batch
+	nonStateBatch   chainkvdb.Batch
+	statePending    map[string][]byte
 	nonStatePending map[string][]byte
-	commitHist    *latencyHistogram
+	commitHist      *latencyHistogram
 }
 
 func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool) (*chainKVReplayBackend, error) {
@@ -895,7 +899,7 @@ func (b *chainKVReplayBackend) PrintCommitStats() {
 
 // replayTrace replays a workload trace file against the given backend.
 // dbType controls which key types are replayed across all backends.
-func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType) {
+func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType, startBlockID int64, endBlockID int64) {
 	fmt.Printf("[%s] Replaying trace from %s\n", backend.Name(), traceFile)
 	file, err := os.Open(traceFile)
 	if err != nil {
@@ -910,8 +914,13 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		logicReadSize      int64
 		logicWriteSize     int64
 		stopAtNextBlockEnd bool
+		committedAtExit    bool
+		replayStarted      bool
 		lastIterDataType   ethstore.DataType = ethstore.DataType(-1)
 	)
+	if startBlockID <= 0 {
+		replayStarted = true
+	}
 	stats := make(map[string]map[opType]*latencyHistogram)
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
 		if _, ok := stats[kvTypeStr]; !ok {
@@ -946,15 +955,39 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		line = strings.TrimSpace(line)
 		lineCounter++
 
-		if strings.Contains(line, "Processing block (end)") {
-			if commitErr := backend.CommitBlock(); commitErr != nil {
-				fmt.Printf("[%s] block commit failed at line %d: %v\n",
-					backend.Name(), lineCounter, commitErr)
-				break
+		if marker := blockMarkerRegex.FindStringSubmatch(line); len(marker) == 3 {
+			markerType := marker[1]
+			markerID, parseErr := strconv.ParseInt(marker[2], 10, 64)
+			if parseErr == nil {
+				if markerType == "start" && !replayStarted && markerID == startBlockID {
+					replayStarted = true
+					fmt.Printf("[%s] Replay window started at block ID %d (line %d).\n",
+						backend.Name(), markerID, lineCounter)
+				}
+				if markerType == "end" && replayStarted {
+					if commitErr := backend.CommitBlock(); commitErr != nil {
+						fmt.Printf("[%s] block commit failed at line %d: %v\n",
+							backend.Name(), lineCounter, commitErr)
+						break
+					}
+					if endBlockID > 0 && markerID == endBlockID {
+						committedAtExit = true
+						fmt.Printf("[%s] Replay window ended at block ID %d (line %d).\n",
+							backend.Name(), markerID, lineCounter)
+						break
+					}
+					if stopAtNextBlockEnd {
+						committedAtExit = true
+						fmt.Printf("[%s] Reached max ops %d; stopping at block boundary (line %d).\n",
+							backend.Name(), maxOps, lineCounter)
+						break
+					}
+				}
 			}
-			if stopAtNextBlockEnd {
-				fmt.Printf("[%s] Reached max ops %d; stopping at block boundary (line %d).\n",
-					backend.Name(), maxOps, lineCounter)
+			continue
+		}
+		if !replayStarted {
+			if readErr == io.EOF {
 				break
 			}
 			continue
@@ -1081,20 +1114,23 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 		elapsed := time.Since(start)
 		totalTime += elapsed
-		if opErr != nil {
-			if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
-				fmt.Printf("[%s] op %s failed for key %s: %v\n",
-					backend.Name(), opTypeStr, keyHex, opErr)
-			}
-		}
+		// comment to disable operation failed output
+		// if opErr != nil {
+		// 	if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
+		// 		fmt.Printf("[%s] op %s failed for key %s: %v\n",
+		// 			backend.Name(), opTypeStr, keyHex, opErr)
+		// 	}
+		// }
 		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
 			break
 		}
 	}
 
-	if commitErr := backend.CommitBlock(); commitErr != nil {
-		fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
+	if !committedAtExit {
+		if commitErr := backend.CommitBlock(); commitErr != nil {
+			fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
+		}
 	}
 	fmt.Printf("\n[%s] Replay finished. ops=%d time=%.2fs read=%d write=%d\n",
 		backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
@@ -1107,21 +1143,28 @@ func main() {
 	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc")
 	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
+	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
+	endBlockID := flag.Int64("end-block-id", 0, "Replay end block ID (0 means no early stop by block ID)")
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
 	ldCacheSize := flag.Int("ld-cache-size", 0, "Cache size for ld mode")
 	ckvCache := flag.Int("ckv-cache", 16, "ChainKV cache size in MB")
 	ckvHandles := flag.Int("ckv-handles", 128, "ChainKV number of file handles")
+	pebbleCache := flag.Int("pebble-cache", 16, "Pebble cache size in MB")
 	ckvUseState := flag.Bool("ckv-state", true, "ChainKV use state-specific operations (Put_s/Get_s)")
-	ckvStateKeyPrefixes := flag.String("ckv-state-key-prefixes", "", "ChainKV comma-separated key prefixes routed to Put_s/Get_s")
 	ckvLoadLimit := flag.Int("ckv-limit", 0, "ChainKV load limit, 0 means no limit")
 	DBTypeStr := flag.String("db-type", "allDBtypes", "Database type for replay: prefixdb, pebble, or aol")
 	replayTraceFile := flag.String("trace-file", "Cache", "Path to trace file for recording")
 	cacheCount := flag.Int("cache-count", 16, "Number of entries to cache for storage chunk get")
 	nodeCacheSize := flag.Int("node-cache-size", 0, "PrefixDB node cache size override (0 means use config/default)")
+	segmentIndexCacheSizeMiB := flag.Int("segment-index-cache-size-mib", 0, "PrefixDB segment index cache size override in MiB (0 means use config/default)")
 	gcStateDir := flag.String("gc-state-dir", "", "State DB directory for gc mode (direct path, no copy)")
 	flag.Parse()
+	if *startBlockID > 0 && *endBlockID > 0 && *endBlockID < *startBlockID {
+		log.Fatalf("invalid block window: -end-block-id (%d) must be >= -start-block-id (%d)", *endBlockID, *startBlockID)
+	}
 
 	prefixdb.SetNodeCacheSizeOverride(*nodeCacheSize)
+	prefixdb.SetSegmentIndexCacheCapacityMiBOverride(*segmentIndexCacheSizeMiB)
 
 	cfg, err := loadReplayConfig(*configPath)
 	if err != nil {
@@ -1165,7 +1208,7 @@ func main() {
 
 	switch *mode {
 	case "ld":
-		if err := runLoadData(cfg, *backend, *ldChunkFileSize, *ldCacheSize, *ckvCache, *ckvHandles, *ckvUseState, *ckvStateKeyPrefixes, *ckvLoadLimit); err != nil {
+		if err := runLoadData(cfg, *backend, *ldChunkFileSize, *ldCacheSize, *ckvCache, *ckvHandles, *pebbleCache, *ckvUseState, *ckvLoadLimit); err != nil {
 			log.Fatalf("ld failed: %v", err)
 		}
 	case "re":
@@ -1175,21 +1218,21 @@ func main() {
 				log.Fatalf("re: failed to open chainkv backend: %v", ckvErr)
 			}
 			defer ckvBackend.Close()
-			replayTrace(ckvBackend, traceFile, *maxOps, dbType)
+			replayTrace(ckvBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		} else if strings.EqualFold(*backend, "pebble") {
-			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir)
+			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache)
 			if pbErr != nil {
 				log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
 			}
 			defer pbBackend.Close()
-			replayTrace(pbBackend, traceFile, *maxOps, dbType)
+			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		} else {
 			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *cacheCount, *ldChunkFileSize, *ldCacheSize)
 			if ethErr != nil {
 				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 			}
 			defer ethBackend.Close()
-			replayTrace(ethBackend, traceFile, *maxOps, dbType)
+			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		}
 	case "gc":
 		if err := runGC(*backend, *cacheCount, *gcStateDir, *ldChunkFileSize, *ldCacheSize); err != nil {
@@ -1200,9 +1243,9 @@ func main() {
 	}
 }
 
-func loadbaselineData(pebbleDir string, dataFile string) error {
+func loadbaselineData(pebbleDir string, dataFile string, pebbleCache int) error {
 	tempDir := pebbleDir
-	store, err := pebblestore.NewPebbleStore(tempDir, 0, 0, "", false)
+	store, err := pebblestore.NewPebbleStore(tempDir, pebbleCache, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore: %w", err)
 	}

@@ -2,6 +2,7 @@ package prefixdb
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,13 +27,13 @@ import (
 const storageMaxFileSize int64 = 1 << 30 // 1GB
 
 const (
-	segmentedStorageFlag       uint32 = 1 << 31
-	segmentedDirNamePrefix            = "storage_seg_"
-	segmentIndexFileName              = "index.meta"
-	segmentIndexCacheThreshold        = 0    // cache indexes larger than 1KB
-	segmentIndexCacheCapacity         = 40960 // number of large index folders retained in memory
-	storageEntrySize                  = 108
-	storageGCThreshold                = 2 //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
+	segmentedStorageFlag            uint32 = 1 << 31
+	segmentedDirNamePrefix                 = "storage_seg_"
+	segmentIndexFileName                   = "index.meta"
+	segmentIndexCacheThresholdBytes        = 0  // cache all decoded segment indexes
+	segmentIndexCacheCapacityMiB           = 64 // total segment-index cache budget in MiB
+	storageEntrySize                       = 108
+	storageGCThreshold                     = 2 //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
 )
 
 const (
@@ -94,6 +95,94 @@ type storageGCJob struct {
 	folderID uint32
 	fileName string
 	backing  *bufferLease
+}
+
+type segmentIndexCacheEntry struct {
+	folderID  uint32
+	metas     []segmentChunkMeta
+	sizeBytes uint64
+}
+
+type segmentIndexCache struct {
+	capacityBytes uint64
+	usedBytes     uint64
+	ll            *list.List
+	items         map[uint32]*list.Element
+}
+
+func newSegmentIndexCache(capacityMiB int) *segmentIndexCache {
+	if capacityMiB <= 0 {
+		return nil
+	}
+	return &segmentIndexCache{
+		capacityBytes: uint64(capacityMiB) * 1024 * 1024,
+		ll:            list.New(),
+		items:         make(map[uint32]*list.Element),
+	}
+}
+
+func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
+	if c == nil {
+		return nil, false
+	}
+	elem, ok := c.items[folderID]
+	if !ok {
+		return nil, false
+	}
+	c.ll.MoveToFront(elem)
+	entry := elem.Value.(*segmentIndexCacheEntry)
+	return entry.metas, true
+}
+
+func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
+	if c == nil {
+		return
+	}
+	sizeBytes := estimateSegmentChunkMetasMemory(metas)
+	if existing, ok := c.items[folderID]; ok {
+		c.removeElement(existing)
+	}
+	if sizeBytes == 0 || sizeBytes > c.capacityBytes {
+		return
+	}
+	entry := &segmentIndexCacheEntry{
+		folderID:  folderID,
+		metas:     cloneSegmentChunkMetas(metas),
+		sizeBytes: sizeBytes,
+	}
+	elem := c.ll.PushFront(entry)
+	c.items[folderID] = elem
+	c.usedBytes += sizeBytes
+	for c.usedBytes > c.capacityBytes {
+		back := c.ll.Back()
+		if back == nil {
+			break
+		}
+		c.removeElement(back)
+	}
+}
+
+func (c *segmentIndexCache) Remove(folderID uint32) {
+	if c == nil {
+		return
+	}
+	if elem, ok := c.items[folderID]; ok {
+		c.removeElement(elem)
+	}
+}
+
+func (c *segmentIndexCache) removeElement(elem *list.Element) {
+	if c == nil || elem == nil {
+		return
+	}
+	entry := elem.Value.(*segmentIndexCacheEntry)
+	delete(c.items, entry.folderID)
+	c.ll.Remove(elem)
+	if c.usedBytes >= entry.sizeBytes {
+		c.usedBytes -= entry.sizeBytes
+	} else {
+		c.usedBytes = 0
+	}
 }
 
 func (job storageGCJob) key() string {
@@ -175,7 +264,7 @@ type PrefixDB struct {
 	// a index file maybe accessed frequently
 	storageIndexFolderId uint32
 	storageIndexMetas    []segmentChunkMeta
-	storageIndexCache    *lru.Cache
+	storageIndexCache    *segmentIndexCache
 	storageIndexReusable bool
 	storageIndexArena    []byte
 	storageGetCacheCount int
@@ -210,12 +299,13 @@ type PrefixDB struct {
 	// so that PrefixDB can defer resolution to the higher-level store.
 	ParentKeyResolver func([]byte) []byte
 	// for debug
-	totalOps   uint64
-	cachedOps  uint64
-	timeOnRead time.Duration
-	readCount  uint64
-	sortedOps  int
-	GCCount    map[string]int
+	totalOps     uint64
+	cachedOps    uint64
+	timeOnRead   time.Duration
+	readCount    uint64
+	sortedOps    int
+	GCCount      uint64
+	GCWriteBytes uint64
 }
 
 // SerializedTrieNode
@@ -287,7 +377,6 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 		storageGetCacheCount:    storageGetCacheCount,
 		storageChunkSize:        storageChunkFileSize,
 		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
-		GCCount:                 make(map[string]int),
 	}
 
 	if cacheSize > 0 {
@@ -313,11 +402,7 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 
 	db.prefixTree = prefixTree
 
-	indexCache, err := lru.New(segmentIndexCacheCapacity)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init segment index cache: %v", err)
-	}
-	db.storageIndexCache = indexCache
+	db.storageIndexCache = newSegmentIndexCache(effectiveSegmentIndexCacheCapacityMiB())
 
 	storageCache, err := lru.New(int(db.stroageCacheSizeLimit))
 	if err != nil {
@@ -1027,10 +1112,10 @@ func (db *PrefixDB) Close() error {
 
 	db.stopStorageGCWorker()
 
-	// outPut GCCount
-	for floderid, count := range db.GCCount {
-		fmt.Printf("GCCount for folder %s: %d\n", floderid, count)
-	}
+	fmt.Printf("PrefixDB GC stats: count=%d writeBytes=%d\n",
+		atomic.LoadUint64(&db.GCCount),
+		atomic.LoadUint64(&db.GCWriteBytes),
+	)
 
 	if err := db.flushStorageBuffer(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to flush storage buffer: %v", err))
@@ -2803,11 +2888,9 @@ func (db *PrefixDB) readSegmentIndexNoCache(folderID uint32) ([]segmentChunkMeta
 func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool) ([]segmentChunkMeta, error) {
 	if useLRU && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		if cached, ok := db.storageIndexCache.Get(folderID); ok {
-			if metas, ok := cached.([]segmentChunkMeta); ok {
-				db.segmentIndexMu.Unlock()
-				return metas, nil
-			}
+		if metas, ok := db.storageIndexCache.Get(folderID); ok {
+			db.segmentIndexMu.Unlock()
+			return metas, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
@@ -2850,9 +2933,9 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 		}
 	}
 	estimatedSize := estimateSegmentIndexSize(metas)
-	if useLRU && estimatedSize >= segmentIndexCacheThreshold && db.storageIndexCache != nil {
+	if useLRU && estimatedSize >= segmentIndexCacheThresholdBytes && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		db.storageIndexCache.Add(folderID, cloneSegmentChunkMetas(metas))
+		db.storageIndexCache.Add(folderID, metas)
 		db.segmentIndexMu.Unlock()
 	}
 	return metas, nil
@@ -2866,11 +2949,9 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		if cached, ok := db.storageIndexCache.Get(folderID); ok {
-			if metas, ok := cached.([]segmentChunkMeta); ok {
-				db.segmentIndexMu.Unlock()
-				return metas, nil
-			}
+		if metas, ok := db.storageIndexCache.Get(folderID); ok {
+			db.segmentIndexMu.Unlock()
+			return metas, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
@@ -2914,7 +2995,7 @@ func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
 	dst := make([]segmentChunkMeta, len(src))
 	for i := range src {
 		dst[i] = segmentChunkMeta{
-			FileName:  src[i].FileName,
+			FileName:  strings.Clone(src[i].FileName),
 			KVCount:   src[i].KVCount,
 			ChunkSize: src[i].ChunkSize,
 		}
@@ -2922,6 +3003,19 @@ func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
 		dst[i].KeyEnd = cloneBytes(src[i].KeyEnd)
 	}
 	return dst
+}
+
+func estimateSegmentChunkMetasMemory(metas []segmentChunkMeta) uint64 {
+	if len(metas) == 0 {
+		return 0
+	}
+	total := uint64(len(metas)) * uint64(unsafe.Sizeof(segmentChunkMeta{}))
+	for i := range metas {
+		total += uint64(len(metas[i].FileName))
+		total += uint64(len(metas[i].KeyStart))
+		total += uint64(len(metas[i].KeyEnd))
+	}
+	return total
 }
 
 func readVarBytes(buf []byte) ([]byte, int, error) {
@@ -3681,10 +3775,6 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 		return
 	}
 	db.storageGCInFlight[key] = struct{}{}
-	if db.GCCount == nil {
-		db.GCCount = make(map[string]int)
-	}
-	db.GCCount[fmt.Sprint(folderID)]++
 	db.storageGCMu.Unlock()
 
 	select {
@@ -3995,6 +4085,7 @@ func reserveChunkFileName(folderPath string, startOrdinal int) (name string, nex
 // and the next suggested ordinal.
 func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, startOrdinal int, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, int, error) {
 	var err error
+	var bytesWritten uint64
 	if existing == nil {
 		existing, backing, err = db.readSegmentChunkFile(folderID, meta.FileName)
 		if err != nil {
@@ -4010,6 +4101,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath 
 	merged := mergeAndDedupPairs(existing, additions)
 	if len(merged) == 0 {
 		// Nothing left; caller should remove from index. Original file is left as garbage.
+		atomic.AddUint64(&db.GCCount, 1)
 		return nil, startOrdinal, nil
 	}
 	chunks := splitEntriesBySize(merged, db.segmentedChunkTargetSize())
@@ -4040,6 +4132,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath 
 			err = wErr
 			return nil, startOrdinal, wErr
 		}
+		bytesWritten += uint64(chunkSize)
 		result = append(result, segmentChunkMeta{
 			FileName:  name,
 			KeyStart:  cloneBytes(chunk[0].key),
@@ -4048,6 +4141,8 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath 
 			ChunkSize: uint64(chunkSize),
 		})
 	}
+	atomic.AddUint64(&db.GCCount, 1)
+	atomic.AddUint64(&db.GCWriteBytes, bytesWritten)
 	return result, ordinal, nil
 }
 

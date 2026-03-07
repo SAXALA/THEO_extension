@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,5 +87,67 @@ func TestSegmentedChunkSizePolicyFallback(t *testing.T) {
 	}
 	if got := db.segmentedChunkTriggerSize(); got <= 0 {
 		t.Fatalf("trigger size should be positive, got %d", got)
+	}
+}
+
+func TestSegmentIndexCacheRespectsByteBudget(t *testing.T) {
+	cache := newSegmentIndexCache(1)
+	if cache == nil {
+		t.Fatal("expected non-nil cache")
+	}
+
+	metas1 := []segmentChunkMeta{{
+		FileName: strings.Repeat("a", 256*1024),
+		KeyStart: bytes.Repeat([]byte{0x01}, 128*1024),
+		KeyEnd:   bytes.Repeat([]byte{0x02}, 128*1024),
+	}}
+	metas2 := []segmentChunkMeta{{
+		FileName: strings.Repeat("b", 256*1024),
+		KeyStart: bytes.Repeat([]byte{0x03}, 128*1024),
+		KeyEnd:   bytes.Repeat([]byte{0x04}, 128*1024),
+	}}
+
+	cache.Add(1, metas1)
+	if _, ok := cache.Get(1); !ok {
+		t.Fatal("expected first cache entry to exist")
+	}
+
+	cache.Add(2, metas2)
+	if _, ok := cache.Get(2); !ok {
+		t.Fatal("expected second cache entry to exist")
+	}
+	if _, ok := cache.Get(1); ok {
+		t.Fatal("expected first cache entry to be evicted after exceeding byte budget")
+	}
+	if cache.usedBytes > cache.capacityBytes {
+		t.Fatalf("cache exceeds byte budget: used=%d capacity=%d", cache.usedBytes, cache.capacityBytes)
+	}
+}
+
+func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
+	original := []segmentChunkMeta{{
+		FileName: strings.Repeat("chunk", 8),
+		KeyStart: []byte{0x01, 0x02, 0x03},
+		KeyEnd:   []byte{0x04, 0x05, 0x06},
+		KVCount:  7,
+	}}
+
+	cloned := cloneSegmentChunkMetas(original)
+	if len(cloned) != 1 {
+		t.Fatalf("unexpected clone length: %d", len(cloned))
+	}
+
+	original[0].KeyStart[0] = 0xff
+	original[0].KeyEnd[0] = 0xee
+	original[0].FileName = "mutated"
+
+	if cloned[0].KeyStart[0] != 0x01 {
+		t.Fatalf("expected cloned KeyStart to remain unchanged, got %x", cloned[0].KeyStart[0])
+	}
+	if cloned[0].KeyEnd[0] != 0x04 {
+		t.Fatalf("expected cloned KeyEnd to remain unchanged, got %x", cloned[0].KeyEnd[0])
+	}
+	if cloned[0].FileName == "mutated" {
+		t.Fatal("expected cloned FileName to remain independent from source")
 	}
 }

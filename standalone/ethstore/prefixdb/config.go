@@ -31,7 +31,10 @@ type Config struct {
 	BigCacheConfig          bigcache.Config `json:"bigcache_config"`
 }
 
-var nodeCacheSizeOverride atomic.Int64
+var (
+	nodeCacheSizeOverride              atomic.Int64
+	segmentIndexCacheCapacityOverride  atomic.Int64
+)
 
 // SetNodeCacheSizeOverride sets a process-wide NodeCache size override for PrefixDB.
 // Use size <= 0 to clear override and fallback to config/default value.
@@ -39,11 +42,25 @@ func SetNodeCacheSizeOverride(size int) {
 	nodeCacheSizeOverride.Store(int64(size))
 }
 
+// SetSegmentIndexCacheCapacityMiBOverride sets a process-wide segment-index cache
+// capacity override for PrefixDB in MiB.
+// Use sizeMiB <= 0 to clear override and fallback to the built-in default.
+func SetSegmentIndexCacheCapacityMiBOverride(sizeMiB int) {
+	segmentIndexCacheCapacityOverride.Store(int64(sizeMiB))
+}
+
 func effectiveNodeCacheSize(configValue int) int {
 	if override := int(nodeCacheSizeOverride.Load()); override > 0 {
 		return override
 	}
 	return configValue
+}
+
+func effectiveSegmentIndexCacheCapacityMiB() int {
+	if override := int(segmentIndexCacheCapacityOverride.Load()); override > 0 {
+		return override
+	}
+	return segmentIndexCacheCapacityMiB
 }
 
 // DefaultConfig returns a configuration with default values.
