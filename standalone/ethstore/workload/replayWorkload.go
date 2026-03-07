@@ -277,6 +277,48 @@ func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
 	}
 }
 
+func reportGlobalLatencyStats(stats map[opType]*latencyHistogram) {
+	if len(stats) == 0 {
+		return
+	}
+	ops := make([]opType, 0, len(stats))
+	for op := range stats {
+		ops = append(ops, op)
+	}
+	sort.Slice(ops, func(i, j int) bool {
+		return ops[i] < ops[j]
+	})
+
+	for _, op := range ops {
+		hist := stats[op]
+		if hist.totalCount == 0 {
+			continue
+		}
+		totalSec := float64(hist.totalNs) / 1000000000.0
+		throughputK := 0.0
+		if totalSec > 0 {
+			throughputK = float64(hist.totalCount) / totalSec / 1000.0
+		}
+		fmt.Printf("\n[Latency][Global] op=%s count=%d throughput=%.3f K ops/s avg=%s p50=%s p75=%s p90=%s p95=%s p99=%s p99.99=%s p99.999=%s\n",
+			opTypeName(op),
+			hist.totalCount,
+			throughputK,
+			formatDurationCompact(hist.avg()),
+			formatDurationCompact(hist.percentile(50.0)),
+			formatDurationCompact(hist.percentile(75.0)),
+			formatDurationCompact(hist.percentile(90.0)),
+			formatDurationCompact(hist.percentile(95.0)),
+			formatDurationCompact(hist.percentile(99.0)),
+			formatDurationCompact(hist.percentile(99.99)),
+			formatDurationCompact(hist.percentile(99.999)),
+		)
+		fmt.Println("Histogram (<= upper bound):")
+		for _, line := range hist.histogramLines() {
+			fmt.Printf("  %s\n", line)
+		}
+	}
+}
+
 func reportHistogramSummary(label string, hist *latencyHistogram) {
 	if hist == nil || hist.totalCount == 0 {
 		fmt.Printf("\n[Latency] %s: no samples\n", label)
@@ -922,6 +964,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		replayStarted = true
 	}
 	stats := make(map[string]map[opType]*latencyHistogram)
+	globalStats := make(map[opType]*latencyHistogram)
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
 		if _, ok := stats[kvTypeStr]; !ok {
 			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
@@ -930,6 +973,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			stats[kvTypeStr][op] = newLatencyHistogram()
 		}
 		stats[kvTypeStr][op].observe(elapsed)
+		if _, ok := globalStats[op]; !ok {
+			globalStats[op] = newLatencyHistogram()
+		}
+		globalStats[op].observe(elapsed)
 	}
 
 	reader := bufio.NewReader(file)
@@ -1132,9 +1179,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
 		}
 	}
-	fmt.Printf("\n[%s] Replay finished. ops=%d time=%.2fs read=%d write=%d\n",
-		backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+	fmt.Printf("\n[%s] Replay finished. ops=%d time=%.2fs throughput=%.2f ops/s read=%d write=%d\n",
+		backend.Name(), counter, totalTime.Seconds(), float64(counter)/totalTime.Seconds(), logicReadSize, logicWriteSize)
 	reportLatencyStats(stats)
+	reportGlobalLatencyStats(globalStats)
 	backend.PrintCommitStats()
 }
 
