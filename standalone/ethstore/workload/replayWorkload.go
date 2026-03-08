@@ -530,13 +530,20 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
 		}
+
+		// laod block store
 		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
 		if aolDataFile == "" {
 			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
 		}
-		if err := loadStateStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeMiB, contractCacheSizeMiB, nodeCacheSizeMiB, segmentIndexCacheSizeMiB); err != nil {
+		if err := loadBlockStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeMiB, contractCacheSizeMiB, nodeCacheSizeMiB, segmentIndexCacheSizeMiB); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
 		}
+		// load contract account and storage
+		if err := loadPrefixdbAndPebble(cfg.EthStoreDir, cfg.LoadDataDir, contractChunkFileSizeMiB, contractCacheSizeMiB, nodeCacheSizeMiB, 32, segmentIndexCacheSizeMiB); err != nil {
+			return fmt.Errorf("ethstore account load failed: %w", err)
+		}
+
 		return nil
 	default:
 		return fmt.Errorf("unknown backend: %s", backend)
@@ -1523,16 +1530,15 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 }
 
 // load all data from the key-value file into EthStore
-func loadData(dataBaseDir string, dataFile string) {
-	ethStoreDir := dataBaseDir
-	store, err := ethstore.New(ethStoreDir, 1000, "put_test", false, 64*1024, 512*1024*1024, 16)
+func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractCachePrefetchCount int, contractChunkFileSizeMiB int, contractCacheSizeMiB int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) error {
+	store, err := ethstore.NewWithPrefixCacheSettings(dataBaseDir, 6000, "put_test", false, contractChunkFileSizeMiB, contractCacheSizeMiB, contractCachePrefetchCount, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
 	defer store.Close()
 
 	// Read key-value pairs from the test file
-	file, err := os.Open(dataFile)
+	file, err := os.Open(loadDataDir)
 	if err != nil {
 		log.Fatalf("Failed to open test file: %v", err)
 	}
@@ -1541,8 +1547,6 @@ func loadData(dataBaseDir string, dataFile string) {
 	var totalTime time.Duration
 	counter := 0
 	reader := bufio.NewReader(file)
-
-	//isSaveTrie := false
 
 	for {
 
@@ -1576,6 +1580,12 @@ func loadData(dataBaseDir string, dataFile string) {
 		if err != nil {
 			log.Fatalf("Failed to decode value: %v", err)
 		}
+
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		if ethstore.AolHandledDataTypes[dataType] {
+			continue
+		}
+
 		start := time.Now()
 		store.Put(keyBytes, valueBytes)
 		end := time.Now()
@@ -1587,9 +1597,10 @@ func loadData(dataBaseDir string, dataFile string) {
 		}
 	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+	return nil
 }
 
-func loadAccount(databaseDir string, dataFile string, pebbleDir string, accountHashIndexSourceDir string, accountHashIndexTargetDir string, chunkFileSize int, cacheSize int) error {
+func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int) error {
 	var dir string
 	chunkFileSizeStr := strconv.Itoa(chunkFileSize/1024) + "KB"
 
@@ -1719,14 +1730,11 @@ func loadAccount(databaseDir string, dataFile string, pebbleDir string, accountH
 
 	// pdb.SaveTrie()
 	pdb.GCPrefixTree()
-	if err := insertAccountHashindexTopebble(accountHashIndexSourceDir, accountHashIndexTargetDir); err != nil {
-		return fmt.Errorf("failed to sync accountHash index to pebble: %w", err)
-	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }
 
-func loadStateStore(dataBaseDir string, notxFile string, chunkFileSize int, contractCacheSizeMiB int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) error {
+func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, contractCacheSizeMiB int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) error {
 	store, err := ethstore.NewWithPrefixCacheSettings(dataBaseDir, 6000, "put_test", false, chunkFileSize, contractCacheSizeMiB, 16, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
 	if err != nil {
 		return fmt.Errorf("failed to create EthStore instance: %w", err)
