@@ -19,9 +19,9 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 # Fill these arrays with candidate values (MiB / count).
-CACHE_SIZE_CANDIDATES=(16 64)
-CACHE_COUNT_CANDIDATES=(32)
-BACKEND_CANDIDATES=(ethstore pebble)
+CACHE_SIZE_CANDIDATES=(16)
+CACHE_COUNT_CANDIDATES=(16 32 64)
+BACKEND_CANDIDATES=(pebble ethstore)
 TRACE_FILE_CANDIDATES=(cache nocache_snap)
 
 TRACE_SELECTOR="${3:-all}"
@@ -220,22 +220,27 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 				exit 1
 			fi
 
-			# Derive ethstore cache split from total cache budget.
-			storage_mib=$((cache_size_mib * 12 / 16))
-			node_mib=$((cache_size_mib * 3 / 16))
-			segment_index_cache_size_mib=$((cache_size_mib / 16))
+			storage_mib=""
+			node_mib=""
+			segment_index_cache_size_mib=""
+			if [ "$backend" = "ethstore" ]; then
+				# Derive ethstore cache split from total cache budget.
+				storage_mib=$((cache_size_mib * 12 / 16))
+				node_mib=$((cache_size_mib * 3 / 16))
+				segment_index_cache_size_mib=$((cache_size_mib / 16))
 
-			if [ "$storage_mib" -le 0 ]; then
-				echo "Derived STORAGE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
-				exit 1
-			fi
-			if [ "$node_mib" -le 0 ]; then
-				echo "Derived NODE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
-				exit 1
-			fi
-			if [ "$segment_index_cache_size_mib" -le 0 ]; then
-				echo "Derived SEGMENT_INDEX_CACHE_SIZE_MIB is invalid for CACHE_SIZE=$cache_size_mib"
-				exit 1
+				if [ "$storage_mib" -le 0 ]; then
+					echo "Derived STORAGE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
+					exit 1
+				fi
+				if [ "$node_mib" -le 0 ]; then
+					echo "Derived NODE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
+					exit 1
+				fi
+				if [ "$segment_index_cache_size_mib" -le 0 ]; then
+					echo "Derived SEGMENT_INDEX_CACHE_SIZE_MIB is invalid for CACHE_SIZE=$cache_size_mib"
+					exit 1
+				fi
 			fi
 
 			backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
@@ -251,19 +256,35 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 				fi
 
 				run_idx=$((run_idx + 1))
-				echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
-
-				STORAGE_CACHE_SIZE="$storage_mib" \
-				NODE_CACHE_SIZE="$node_mib" \
-				SEGMENT_INDEX_CACHE_SIZE_MIB="$segment_index_cache_size_mib" \
-				CACHE_COUNT="$cache_count" \
-				CHAINKV_CACHE_MB="$backend_cache_mib" \
-				PEBBLE_CACHE_MB="$backend_cache_mib" \
-				TRACE_FILE="$trace_file" \
-				DB_TYPE="$DB_TYPE" \
-				WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-				CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
-				./replay.sh "$ACTION" "$backend" &
+				if [ "$backend" = "ethstore" ]; then
+					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count}"
+					STORAGE_CACHE_SIZE="$storage_mib" \
+					NODE_CACHE_SIZE="$node_mib" \
+					SEGMENT_INDEX_CACHE_SIZE_MIB="$segment_index_cache_size_mib" \
+					CACHE_COUNT="$cache_count" \
+					TRACE_FILE="$trace_file" \
+					DB_TYPE="$DB_TYPE" \
+					WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+					CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+					./replay.sh "$ACTION" "$backend" &
+				else
+					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB"
+					if [ "$backend" = "chainkv" ]; then
+						CHAINKV_CACHE_MB="$backend_cache_mib" \
+						TRACE_FILE="$trace_file" \
+						DB_TYPE="$DB_TYPE" \
+						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+						CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+						./replay.sh "$ACTION" "$backend" &
+					else
+						PEBBLE_CACHE_MB="$backend_cache_mib" \
+						TRACE_FILE="$trace_file" \
+						DB_TYPE="$DB_TYPE" \
+						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+						CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+						./replay.sh "$ACTION" "$backend" &
+					fi
+				fi
 				CURRENT_REPLAY_SH_PID=$!
 				wait "$CURRENT_REPLAY_SH_PID"
 				CURRENT_REPLAY_SH_PID=""

@@ -412,36 +412,40 @@ build_run_tag() {
 print_param_snapshot() {
     local snapshot_action="$1"
     local snapshot_backend="$2"
-    cat <<EOF
-==== Runtime Parameters ====
-ACTION=${snapshot_action}
-BACKEND=${snapshot_backend}
-WORKLOAD_MAX_OPS=${WORKLOAD_MAX_OPS}
-START_BLOCK_ID=${START_BLOCK_ID}
-END_BLOCK_ID=${END_BLOCK_ID}
-TRACE_FILE=${TRACE_FILE}
-DB_TYPE=${DB_TYPE}
-CACHE_COUNT=${CACHE_COUNT}
-CHUNK_FILE_SIZE=${CHUNK_FILE_SIZE}
-STORAGE_CACHE_SIZE=${STORAGE_CACHE_SIZE} MiB (${STORAGE_CACHE_SIZE_BYTES} bytes)
-NODE_CACHE_SIZE=${NODE_CACHE_SIZE} MiB (${NODE_CACHE_SIZE_BYTES} bytes)
-SEGMENT_INDEX_CACHE_SIZE_MIB=${SEGMENT_INDEX_CACHE_SIZE_MIB}
-CHAINKV_CACHE_MB=${CHAINKV_CACHE_MB}
-PEBBLE_CACHE_MB=${PEBBLE_CACHE_MB}
-CHAINKV_HANDLES=${CHAINKV_HANDLES}
-PEBBLE_HANDLES=${PEBBLE_HANDLES}
-CHAINKV_STATE=${CHAINKV_STATE}
-CHAINKV_STATE_KEY_PREFIXES=${CHAINKV_STATE_KEY_PREFIXES}
-CHAINKV_LOAD_LIMIT=${CHAINKV_LOAD_LIMIT}
-RUN_ROUND=${RUN_ROUND}
-RUN_ROUNDS=${RUN_ROUNDS}
-ETHSTORE_PREFIXDB_DIR=${ETHSTORE_PREFIXDB_DIR}
-LOADED_ROOT=${LOADED_ROOT}
-RUNNING_ROOT=${RUNNING_ROOT}
-ETHSTORE_STATEDB_DIRNAME=${ETHSTORE_STATEDB_DIRNAME}
-GC_STATE_DIR=${GC_STATE_DIR}
-============================
-EOF
+    printf '%s\n' "==== Runtime Parameters ===="
+    printf 'ACTION=%s\n' "$snapshot_action"
+    printf 'BACKEND=%s\n' "$snapshot_backend"
+    printf 'WORKLOAD_MAX_OPS=%s\n' "$WORKLOAD_MAX_OPS"
+    printf 'START_BLOCK_ID=%s\n' "$START_BLOCK_ID"
+    printf 'END_BLOCK_ID=%s\n' "$END_BLOCK_ID"
+    printf 'TRACE_FILE=%s\n' "$TRACE_FILE"
+    printf 'DB_TYPE=%s\n' "$DB_TYPE"
+    printf 'RUN_ROUND=%s\n' "$RUN_ROUND"
+    printf 'RUN_ROUNDS=%s\n' "$RUN_ROUNDS"
+    printf 'ETHSTORE_PREFIXDB_DIR=%s\n' "$ETHSTORE_PREFIXDB_DIR"
+    printf 'LOADED_ROOT=%s\n' "$LOADED_ROOT"
+    printf 'RUNNING_ROOT=%s\n' "$RUNNING_ROOT"
+    printf 'ETHSTORE_STATEDB_DIRNAME=%s\n' "$ETHSTORE_STATEDB_DIRNAME"
+    printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
+
+    if [ "$snapshot_backend" = "ethstore" ]; then
+        printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
+        printf 'CHUNK_FILE_SIZE=%s\n' "$CHUNK_FILE_SIZE"
+        printf 'STORAGE_CACHE_SIZE=%s MiB (%s bytes)\n' "$STORAGE_CACHE_SIZE" "$STORAGE_CACHE_SIZE_BYTES"
+        printf 'NODE_CACHE_SIZE=%s MiB (%s bytes)\n' "$NODE_CACHE_SIZE" "$NODE_CACHE_SIZE_BYTES"
+        printf 'SEGMENT_INDEX_CACHE_SIZE_MIB=%s\n' "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+    elif [ "$snapshot_backend" = "chainkv" ]; then
+        printf 'CHAINKV_CACHE_MB=%s\n' "$CHAINKV_CACHE_MB"
+        printf 'CHAINKV_HANDLES=%s\n' "$CHAINKV_HANDLES"
+        printf 'CHAINKV_STATE=%s\n' "$CHAINKV_STATE"
+        printf 'CHAINKV_STATE_KEY_PREFIXES=%s\n' "$CHAINKV_STATE_KEY_PREFIXES"
+        printf 'CHAINKV_LOAD_LIMIT=%s\n' "$CHAINKV_LOAD_LIMIT"
+    elif [ "$snapshot_backend" = "pebble" ]; then
+        printf 'PEBBLE_CACHE_MB=%s\n' "$PEBBLE_CACHE_MB"
+        printf 'PEBBLE_HANDLES=%s\n' "$PEBBLE_HANDLES"
+    fi
+
+    printf '%s\n' "============================"
 }
 
 run_and_monitor() {
@@ -493,11 +497,11 @@ run_load() {
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES"
             ;;
     esac
 }
@@ -546,11 +550,11 @@ run_replay() {
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES"
             ;;
     esac
 }

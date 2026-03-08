@@ -1264,6 +1264,63 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	backend.PrintCommitStats()
 }
 
+func printRuntimeArgsSnapshot(
+	mode string,
+	backend string,
+	configPath string,
+	maxOps int64,
+	startBlockID int64,
+	endBlockID int64,
+	dbTypeStr string,
+	traceFileSelector string,
+	resolvedTraceFile string,
+	ldChunkFileSize int,
+	ldCacheSize int,
+	cacheCount int,
+	nodeCacheSize int,
+	segmentIndexCacheSizeMiB int,
+	ckvCache int,
+	ckvHandles int,
+	pebbleCache int,
+	pebbleHandles int,
+	ckvUseState bool,
+	ckvLoadLimit int,
+	gcStateDir string,
+) {
+	fmt.Println("==== replayWorkload args ====")
+	fmt.Printf("argv=%s\n", strings.Join(os.Args, " "))
+	fmt.Printf("mode=%s\n", mode)
+	fmt.Printf("backend=%s\n", backend)
+	fmt.Printf("config=%s\n", configPath)
+	fmt.Printf("max_ops=%d\n", maxOps)
+	fmt.Printf("start_block_id=%d\n", startBlockID)
+	fmt.Printf("end_block_id=%d\n", endBlockID)
+	fmt.Printf("db_type=%s\n", dbTypeStr)
+	fmt.Printf("trace_file_selector=%s\n", traceFileSelector)
+	fmt.Printf("trace_file_resolved=%s\n", resolvedTraceFile)
+
+	if strings.EqualFold(backend, "ethstore") {
+		fmt.Printf("cache_count=%d\n", cacheCount)
+		fmt.Printf("ld_chunk_file_size=%d\n", ldChunkFileSize)
+		fmt.Printf("ld_cache_size=%d\n", ldCacheSize)
+		fmt.Printf("node_cache_size=%d\n", nodeCacheSize)
+		fmt.Printf("segment_index_cache_size_mib=%d\n", segmentIndexCacheSizeMiB)
+	} else if strings.EqualFold(backend, "chainkv") {
+		fmt.Printf("ckv_cache=%d\n", ckvCache)
+		fmt.Printf("ckv_handles=%d\n", ckvHandles)
+		fmt.Printf("ckv_state=%t\n", ckvUseState)
+		fmt.Printf("ckv_limit=%d\n", ckvLoadLimit)
+	} else if strings.EqualFold(backend, "pebble") {
+		fmt.Printf("pebble_cache=%d\n", pebbleCache)
+		fmt.Printf("pebble_handles=%d\n", pebbleHandles)
+	}
+
+	if mode == "gc" {
+		fmt.Printf("gc_state_dir=%s\n", gcStateDir)
+	}
+	fmt.Println("=============================")
+}
+
 func main() {
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
 	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc")
@@ -1328,12 +1385,36 @@ func main() {
 		log.Fatalf("invalid -trace-file %q (expected: cache, nocache, nocache_snap)", *replayTraceFile)
 	}
 
+	printRuntimeArgsSnapshot(
+		*mode,
+		*backend,
+		*configPath,
+		*maxOps,
+		*startBlockID,
+		*endBlockID,
+		*DBTypeStr,
+		*replayTraceFile,
+		traceFile,
+		*ldChunkFileSize,
+		*ldCacheSize,
+		*cacheCount,
+		*nodeCacheSize,
+		*segmentIndexCacheSizeMiB,
+		*ckvCache,
+		*ckvHandles,
+		*pebbleCache,
+		*pebbleHandles,
+		*ckvUseState,
+		*ckvLoadLimit,
+		*gcStateDir,
+	)
+
 	go func() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
-	// For quick debugging.	
+	// For quick debugging
 	// pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
 	// if pbErr != nil {
 	// 	log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
