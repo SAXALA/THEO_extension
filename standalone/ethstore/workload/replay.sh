@@ -23,7 +23,7 @@ BACKEND="${2:-${WORKLOAD_BACKEND:-ethstore}}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
+END_BLOCK_ID="${END_BLOCK_ID:-20501000}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -58,10 +58,14 @@ CHAINKV_STATE="${CHAINKV_STATE:-true}"
 CHAINKV_STATE_KEY_PREFIXES="${CHAINKV_STATE_KEY_PREFIXES:-}"
 # chainkv load 限制条数；0 代表不限制
 CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
+# 多轮回放参数（由 multiple_replay.sh 注入）
+RUN_ROUND="${RUN_ROUND:-0}"
+RUN_ROUNDS="${RUN_ROUNDS:-0}"
 
 # 已加载数据根目录（source）与回放运行目录（target）
 LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/mnt/ssd2/running}"
+DISK_MOUNT_POINT="/mnt/ssd2"
 
 # ethstore statedb 目录名，可选: database_statedb16KB | database_statedb64KB | database_statedb256KB
 ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-database_statedb16KB_gced}"
@@ -241,6 +245,8 @@ drop_caches() {
     sudo_run sh -c 'echo 1 > /proc/sys/vm/drop_caches'
     sudo_run sh -c 'echo 2 > /proc/sys/vm/drop_caches'
     sudo_run sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+    # Trim the target SSD to minimize the impact of leftover data on performance.
+    sudo_run fstrim -v "$DISK_MOUNT_POINT"
 }
 
 restore_ethstore_db() {
@@ -384,17 +390,22 @@ build_run_tag() {
     local base_tag
     base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_block_${START_BLOCK_ID}-${END_BLOCK_ID}"
 
+    local round_tag=""
+    if [[ "$RUN_ROUND" =~ ^[0-9]+$ ]] && [ "$RUN_ROUND" -gt 0 ]; then
+        round_tag="_r_${RUN_ROUND}"
+    fi
+
     if [ "$backend" = "chainkv" ]; then
         local ckv_state_tag ckv_prefix_tag
         ckv_state_tag=$(sanitize_tag_value "$CHAINKV_STATE")
         ckv_prefix_tag=$(sanitize_tag_value "$CHAINKV_STATE_KEY_PREFIXES")
-        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}"
+        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}"
     elif [ "$backend" = "pebble" ]; then
-        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}"
+        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_cc_${CACHE_COUNT}_ncs_${NODE_CACHE_SIZE}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_cc_${CACHE_COUNT}_ncs_${NODE_CACHE_SIZE}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}${round_tag}"
     else
-        printf "%s" "$base_tag"
+        printf "%s" "${base_tag}${round_tag}"
     fi
 }
 
@@ -422,6 +433,8 @@ PEBBLE_HANDLES=${PEBBLE_HANDLES}
 CHAINKV_STATE=${CHAINKV_STATE}
 CHAINKV_STATE_KEY_PREFIXES=${CHAINKV_STATE_KEY_PREFIXES}
 CHAINKV_LOAD_LIMIT=${CHAINKV_LOAD_LIMIT}
+RUN_ROUND=${RUN_ROUND}
+RUN_ROUNDS=${RUN_ROUNDS}
 ETHSTORE_PREFIXDB_DIR=${ETHSTORE_PREFIXDB_DIR}
 LOADED_ROOT=${LOADED_ROOT}
 RUNNING_ROOT=${RUNNING_ROOT}

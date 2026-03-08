@@ -19,7 +19,7 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 # Fill these arrays with candidate values (MiB / count).
-STORAGE_CACHE_SIZE_CANDIDATES=(12 48)
+CACHE_SIZE_CANDIDATES=(16 64)
 CACHE_COUNT_CANDIDATES=(32)
 BACKEND_CANDIDATES=(ethstore pebble)
 TRACE_FILE_CANDIDATES=(cache nocache_snap)
@@ -92,14 +92,16 @@ backend:    ethstore | chainkv | pebble | all            (default: all when omit
 trace-file: cache | nocache | nocache_snap | all         (default: all for replay when omitted)
 
 Edit arrays in this file:
-  STORAGE_CACHE_SIZE_CANDIDATES=(...)
+	CACHE_SIZE_CANDIDATES=(...)  # values must be multiples of 16
   CACHE_COUNT_CANDIDATES=(...)
 	BACKEND_CANDIDATES=(...)
 	TRACE_FILE_CANDIDATES=(...)
 
-NODE_CACHE_SIZE is derived automatically as STORAGE_CACHE_SIZE/3*(3/4).
-SEGMENT_INDEX_CACHE_SIZE_MIB is derived automatically as NODE_CACHE_SIZE/4.
-CHAINKV_CACHE_MB and PEBBLE_CACHE_MB are derived automatically as STORAGE_CACHE_SIZE*4/3.
+CHAINKV_CACHE_MB and PEBBLE_CACHE_MB are derived automatically as CACHE_SIZE.
+For ethstore:
+	STORAGE_CACHE_SIZE = CACHE_SIZE * 12 / 16
+	NODE_CACHE_SIZE = CACHE_SIZE * 3 / 16
+	SEGMENT_INDEX_CACHE_SIZE_MIB = CACHE_SIZE * 1 / 16
 EOF
 }
 
@@ -108,8 +110,8 @@ if [ "$ACTION" = "-h" ] || [ "$ACTION" = "--help" ]; then
 	exit 0
 fi
 
-if [ "${#STORAGE_CACHE_SIZE_CANDIDATES[@]}" -eq 0 ]; then
-	echo "STORAGE_CACHE_SIZE_CANDIDATES is empty"
+if [ "${#CACHE_SIZE_CANDIDATES[@]}" -eq 0 ]; then
+	echo "CACHE_SIZE_CANDIDATES is empty"
 	exit 1
 fi
 if [ "${#CACHE_COUNT_CANDIDATES[@]}" -eq 0 ]; then
@@ -169,13 +171,13 @@ resolve_traces() {
 
 resolve_backend_cache_mib() {
 	local backend="$1"
-	local storage_mib="$2"
+	local cache_mib="$2"
 	case "$backend" in
 		chainkv)
-			echo $((storage_mib * 4 / 3))
+			echo "$cache_mib"
 			;;
 		pebble)
-			echo $((storage_mib * 4 / 3))
+			echo "$cache_mib"
 			;;
 		*)
 			echo "0"
@@ -202,33 +204,41 @@ run_idx=0
 total_runs=0
 for backend in "${SELECTED_BACKENDS[@]}"; do
 	mapfile -t cache_count_candidates < <(resolve_cache_count_candidates "$backend")
-	total_runs=$((total_runs + ${#STORAGE_CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SELECTED_TRACES[@]}))
+	total_runs=$((total_runs + ${#CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SELECTED_TRACES[@]}))
 done
 
 for trace_file in "${SELECTED_TRACES[@]}"; do
 	for backend in "${SELECTED_BACKENDS[@]}"; do
 		mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
-		for storage_mib in "${STORAGE_CACHE_SIZE_CANDIDATES[@]}"; do
-			if ! [[ "$storage_mib" =~ ^[0-9]+$ ]] || [ "$storage_mib" -le 0 ]; then
-				echo "Invalid STORAGE_CACHE_SIZE candidate: $storage_mib"
+		for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
+			if ! [[ "$cache_size_mib" =~ ^[0-9]+$ ]] || [ "$cache_size_mib" -le 0 ]; then
+				echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
+				exit 1
+			fi
+			if (( cache_size_mib % 16 != 0 )); then
+				echo "CACHE_SIZE candidate must be a multiple of 16, got: $cache_size_mib"
 				exit 1
 			fi
 
-			# Keep node cache proportional to storage cache.
-			node_mib=$((storage_mib / 3 * (3 / 4)))
+			# Derive ethstore cache split from total cache budget.
+			storage_mib=$((cache_size_mib * 12 / 16))
+			node_mib=$((cache_size_mib * 3 / 16))
+			segment_index_cache_size_mib=$((cache_size_mib / 16))
+
+			if [ "$storage_mib" -le 0 ]; then
+				echo "Derived STORAGE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
+				exit 1
+			fi
 			if [ "$node_mib" -le 0 ]; then
-				echo "Derived NODE_CACHE_SIZE is invalid for STORAGE_CACHE_SIZE=$storage_mib"
+				echo "Derived NODE_CACHE_SIZE is invalid for CACHE_SIZE=$cache_size_mib"
 				exit 1
 			fi
-
-			# Segment index cache is derived from node cache.
-			segment_index_cache_size_mib=$((node_mib / 4))
 			if [ "$segment_index_cache_size_mib" -le 0 ]; then
-				echo "Derived SEGMENT_INDEX_CACHE_SIZE_MIB is invalid for NODE_CACHE_SIZE=$node_mib"
+				echo "Derived SEGMENT_INDEX_CACHE_SIZE_MIB is invalid for CACHE_SIZE=$cache_size_mib"
 				exit 1
 			fi
 
-			backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$storage_mib")"
+			backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
 			if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]] || [ "$backend_cache_mib" -lt 0 ]; then
 				echo "Invalid derived backend cache for $backend: $backend_cache_mib"
 				exit 1
@@ -241,7 +251,7 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 				fi
 
 				run_idx=$((run_idx + 1))
-				echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
+				echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
 
 				STORAGE_CACHE_SIZE="$storage_mib" \
 				NODE_CACHE_SIZE="$node_mib" \

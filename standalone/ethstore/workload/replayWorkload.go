@@ -1333,12 +1333,14 @@ func main() {
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
-	pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
-	if pbErr != nil {
-		log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
-	}
-	defer pbBackend.Close()
-	replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// For quick debugging.	
+	// pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
+	// if pbErr != nil {
+	// 	log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
+	// }
+	// defer pbBackend.Close()
+	// replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// return
 
 	switch *mode {
 	case "ld":

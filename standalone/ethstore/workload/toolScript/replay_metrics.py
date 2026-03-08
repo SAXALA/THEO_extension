@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import sys
 from pathlib import Path
@@ -44,6 +45,42 @@ LATENCY_GLOBAL_RE = re.compile(
 )
 
 GC_RE = re.compile(r"PrefixDB GC stats:\s*count=(\d+)\s+writeBytes=(\d+)")
+ROUND_TOKEN_RE = re.compile(r"(?:^|_)r_(\d+)(?:_|$)")
+TRAILING_TIMESTAMP_RE = re.compile(r"_\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$")
+
+
+T_CRITICAL_95: dict[int, float] = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+    11: 2.201,
+    12: 2.179,
+    13: 2.160,
+    14: 2.145,
+    15: 2.131,
+    16: 2.120,
+    17: 2.110,
+    18: 2.101,
+    19: 2.093,
+    20: 2.086,
+    21: 2.080,
+    22: 2.074,
+    23: 2.069,
+    24: 2.064,
+    25: 2.060,
+    26: 2.056,
+    27: 2.052,
+    28: 2.048,
+    29: 2.045,
+    30: 2.042,
+}
 
 
 def parse_latency_to_us(token: str) -> float:
@@ -206,6 +243,25 @@ def normalize_main_log(path: Path) -> Path:
     return path.with_name(base.replace("_io_", "_", 1))
 
 
+def parse_round_from_name(path: Path) -> int | None:
+    stem = path.stem
+    m = ROUND_TOKEN_RE.search(stem)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def build_round_group_key(path: Path) -> str:
+    stem = path.stem
+    stem = TRAILING_TIMESTAMP_RE.sub("", stem)
+    stem = re.sub(r"_r_\d+(?=_|$)", "", stem)
+    stem = re.sub(r"__+", "_", stem).strip("_")
+    return stem
+
+
 def is_replay_log(path: Path) -> bool:
     return "_replay_" in path.name.lower()
 
@@ -303,8 +359,14 @@ def parse_io_log(path: Path) -> dict[str, Any]:
 
 
 def item_to_single_row(item: dict[str, Any], io: dict[str, Any]) -> dict[str, Any]:
+    file_name = Path(item["file"]).name
+    round_idx = parse_round_from_name(Path(item["file"]))
+    round_group = build_round_group_key(Path(item["file"]))
+
     row: dict[str, Any] = {
-        "file": Path(item["file"]).name,
+        "file": file_name,
+        "round": round_idx,
+        "round_group": round_group,
         "backend": item["backend"],
         "ops": item["summary"]["ops"],
         "total_time_s": item["summary"]["total_time_s"],
@@ -359,11 +421,110 @@ def write_csv(rows: list[dict[str, Any]], output: Path | None) -> None:
         w.writerows(rows)
 
 
+def to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def t_critical_95(df: int) -> float:
+    if df <= 0:
+        return 0.0
+    if df in T_CRITICAL_95:
+        return T_CRITICAL_95[df]
+    if df <= 40:
+        return 2.021
+    if df <= 60:
+        return 2.000
+    if df <= 120:
+        return 1.980
+    return 1.960
+
+
+def round_groups_to_merged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get("round_group") or "")
+        if key == "":
+            key = str(row.get("file") or "")
+        grouped.setdefault(key, []).append(row)
+
+    merged_rows: list[dict[str, Any]] = []
+    for key in sorted(grouped.keys()):
+        group_rows = grouped[key]
+        if not group_rows:
+            continue
+
+        rounds = sorted(
+            {
+                int(r["round"])
+                for r in group_rows
+                if r.get("round") is not None and str(r.get("round")).isdigit()
+            }
+        )
+        n = len(group_rows)
+
+        merged: dict[str, Any] = {
+            "round_group": key,
+            "backend": group_rows[0].get("backend"),
+            "sample_count": n,
+            "rounds": "|".join(str(x) for x in rounds),
+            "files": "|".join(str(r.get("file", "")) for r in group_rows),
+        }
+
+        candidate_columns = [
+            c
+            for c in group_rows[0].keys()
+            if c not in {"file", "warnings", "backend", "round", "round_group"}
+        ]
+
+        for col in candidate_columns:
+            vals = [to_float(r.get(col)) for r in group_rows]
+            vals = [v for v in vals if v is not None]
+            if not vals:
+                continue
+
+            mean_val = sum(vals) / len(vals)
+            merged[f"{col}_mean"] = mean_val
+
+            if len(vals) >= 2:
+                ss = sum((v - mean_val) ** 2 for v in vals)
+                sample_var = ss / (len(vals) - 1)
+                sem = math.sqrt(sample_var) / math.sqrt(len(vals))
+                delta = t_critical_95(len(vals) - 1) * sem
+                merged[f"{col}_ci95_low"] = mean_val - delta
+                merged[f"{col}_ci95_high"] = mean_val + delta
+            else:
+                merged[f"{col}_ci95_low"] = None
+                merged[f"{col}_ci95_high"] = None
+
+        merged_warnings = [str(r.get("warnings", "")).strip() for r in group_rows]
+        merged_warnings = [w for w in merged_warnings if w]
+        merged["warnings"] = " | ".join(merged_warnings)
+        merged_rows.append(merged)
+
+    return merged_rows
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Extract replay metrics to one-row-per-log CSV")
     ap.add_argument("files", nargs="+", help="log file path(s)")
     ap.add_argument("--format", choices=["csv"], default="csv", help=argparse.SUPPRESS)
     ap.add_argument("--output", help="write output to file instead of stdout")
+    ap.add_argument(
+        "--merged-output",
+        help="write merged multi-round stats CSV (mean + 95%% t-CI)",
+    )
     ap.add_argument(
         "--only-replay",
         action="store_true",
@@ -394,6 +555,22 @@ def main(argv: list[str]) -> int:
         rows.append(item_to_single_row(item, io_metrics))
 
     write_csv(rows, out_path)
+
+    merged_rows = round_groups_to_merged_rows(rows)
+    merged_path: Path | None = None
+    if args.merged_output:
+        merged_path = Path(args.merged_output)
+    elif out_path is not None:
+        suffix = out_path.suffix if out_path.suffix else ".csv"
+        merged_path = out_path.with_name(f"{out_path.stem}_merged{suffix}")
+
+    if merged_path is not None and merged_rows:
+        write_csv(merged_rows, merged_path)
+    elif out_path is None and merged_rows:
+        print(
+            "[replay_metrics] merged multi-round stats available; use --merged-output to export them.",
+            file=sys.stderr,
+        )
 
     # Do not fail on mixed log sets that include non-replay logs.
     return 0 if rows else 1
