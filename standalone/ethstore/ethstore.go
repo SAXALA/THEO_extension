@@ -21,6 +21,13 @@ func isNotFoundError(err error) bool {
 	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound)
 }
 
+func mibToBytes(sizeMiB int) uint64 {
+	if sizeMiB <= 0 {
+		return 0
+	}
+	return uint64(sizeMiB) * 1024 * 1024
+}
+
 // errorIterator is an ethdb.Iterator that always returns an error or represents an invalid state.
 type errorIterator struct {
 	err error
@@ -153,11 +160,18 @@ type Database struct {
 }
 
 // The namespace is the prefix that the metrics reporting should use.
-func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, cacheCount int) (*Database, error) {
+func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, contractCachePrefetchCount int) (*Database, error) {
+	return NewWithPrefixCacheSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0)
+}
+
+// NewWithPrefixCacheSettings creates Database with explicit PrefixDB node cache
+// (MiB) and segment-index cache (MiB) settings.
+// Use <=0 values to fallback to config/default values.
+func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSizeMiB int, contractCachePrefetchCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDB(dirPathState, chunkFileSize, prefixTreeCacheSize, cacheCount) // Example chunk size and cache size
+	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(dirPathState, chunkFileSize, prefixTreeCacheSizeMiB, contractCachePrefetchCount, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -213,12 +227,11 @@ func New(dirPath string, recentN int, namespace string, readonly bool, chunkFile
 	return db, nil
 }
 
-// NewStateOnly opens only PrefixDB on the provided state directory.
-// It is intended for maintenance tasks such as manual state GC where
-// pebble/aol are not needed.
-func NewStateOnly(stateDir string, chunkFileSize int, prefixTreeCacheSize uint64, cacheCount int) (*Database, error) {
+// NewStateOnlyWithPrefixCacheSettings opens PrefixDB-only Database with explicit
+// node cache(MiB) and segment-index cache(MiB) settings.
+func NewStateOnlyWithPrefixCacheSettings(stateDir string, chunkFileSize int, contractCacheSizeMiB int, contractCachePrefetchCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*Database, error) {
 	logger := log.New("database", stateDir)
-	statePrefixdb, err := prefixdb.NewPrefixDB(stateDir, chunkFileSize, prefixTreeCacheSize, cacheCount)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(stateDir, chunkFileSize, contractCacheSizeMiB, contractCachePrefetchCount, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb (state-only): %w", err)
 	}

@@ -4,9 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sync/atomic"
-
-	"github.com/allegro/bigcache/v3"
 )
 
 // Config holds the configuration for PrefixDB.
@@ -14,53 +11,10 @@ type Config struct {
 	// BaseDir is the root directory for the database.
 	// If empty, it defaults to the directory provided to NewPrefixDB.
 	BaseDir string `json:"base_dir"`
-
 	// Sub-directories or file paths relative to BaseDir (or absolute).
 	// If empty, defaults will be used.
 	AccountDir    string `json:"account_dir"`
-	TrieDir       string `json:"trie_dir"`
 	StorageDir    string `json:"storage_dir"`
-	HotStorageDir string `json:"hot_storage_dir"`
-	SlotIndexFile string `json:"slot_index_file"`
-
-	// Cache sizes and other parameters
-	NodeCacheSize int             `json:"node_cache_size"`
-	// DeprecatedMaxCacheSize keeps backward compatibility for older config files.
-	DeprecatedMaxCacheSize int             `json:"max_cache_size,omitempty"`
-	WriteBatchSize          int             `json:"write_batch_size"`
-	BigCacheConfig          bigcache.Config `json:"bigcache_config"`
-}
-
-var (
-	nodeCacheSizeOverride              atomic.Int64
-	segmentIndexCacheCapacityOverride  atomic.Int64
-)
-
-// SetNodeCacheSizeOverride sets a process-wide NodeCache size override for PrefixDB.
-// Use size <= 0 to clear override and fallback to config/default value.
-func SetNodeCacheSizeOverride(size int) {
-	nodeCacheSizeOverride.Store(int64(size))
-}
-
-// SetSegmentIndexCacheCapacityMiBOverride sets a process-wide segment-index cache
-// capacity override for PrefixDB in MiB.
-// Use sizeMiB <= 0 to clear override and fallback to the built-in default.
-func SetSegmentIndexCacheCapacityMiBOverride(sizeMiB int) {
-	segmentIndexCacheCapacityOverride.Store(int64(sizeMiB))
-}
-
-func effectiveNodeCacheSize(configValue int) int {
-	if override := int(nodeCacheSizeOverride.Load()); override > 0 {
-		return override
-	}
-	return configValue
-}
-
-func effectiveSegmentIndexCacheCapacityMiB() int {
-	if override := int(segmentIndexCacheCapacityOverride.Load()); override > 0 {
-		return override
-	}
-	return segmentIndexCacheCapacityMiB
 }
 
 // DefaultConfig returns a configuration with default values.
@@ -70,11 +24,7 @@ func DefaultConfig(dirpath string) *Config {
 	return &Config{
 		BaseDir:        dirpath,
 		AccountDir:     filepath.Join(prefixDBDir, "na"),
-		TrieDir:        filepath.Join(prefixDBDir, "trie"),
 		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
-		HotStorageDir:  filepath.Join(prefixDBDir, "storagefiles", "hotstorage"),
-		NodeCacheSize:  1 << 18,
-		WriteBatchSize: 4096,
 	}
 }
 
@@ -87,9 +37,6 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
-	}
-	if cfg.NodeCacheSize <= 0 && cfg.DeprecatedMaxCacheSize > 0 {
-		cfg.NodeCacheSize = cfg.DeprecatedMaxCacheSize
 	}
 	return &cfg, nil
 }

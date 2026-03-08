@@ -328,7 +328,14 @@ type segmentIndexFolderLock struct {
   - It initializes the necessary files, directories, caches, and workers based on the provided configuration.
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
-func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, storageGetCacheCount int) (*PrefixDB, error) {
+func NewPrefixDB(dirpath string, storageChunkFileSize int, contractCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
+	return NewPrefixDBWithCacheSettings(dirpath, storageChunkFileSize, contractCacheSizeMiB, storageGetCacheCount, 0, 0)
+}
+
+// NewPrefixDBWithCacheSettings creates PrefixDB with explicit node-cache(bytes)
+// and segment-index-cache(MiB) settings, bypassing process-wide overrides.
+// Use <=0 values to fallback to config/default values.
+func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, contractCacheSizeMiB int, storageGetCacheCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -350,17 +357,12 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 
 	// Resolve paths
 	accountFilePath := resolvePath(cfg.BaseDir, cfg.AccountDir)
-	triePath := resolvePath(cfg.BaseDir, cfg.TrieDir)
 	storageDir := resolvePath(cfg.BaseDir, cfg.StorageDir)
 
 	// Ensure directories exist
 	if err := os.MkdirAll(filepath.Dir(accountFilePath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create account dir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(triePath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create trie dir: %v", err)
-	}
-
 	accountFile, err := os.OpenFile(accountFilePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, errors.New("failed to open normal account file")
@@ -368,19 +370,18 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 
 	db := &PrefixDB{
 		accountFile:             accountFile,
-		batch:                   NewWriteBatch(cfg.WriteBatchSize),
+		batch:                   NewWriteBatch(),
 		writeMutex:              sync.Mutex{},
 		segmentIndexFolderLocks: make(map[uint32]*segmentIndexFolderLock),
 		storageDir:              storageDir,
 		cacheEvictTickerTime:    10 * time.Millisecond,
-		stroageCacheSizeLimit:   8192 * 4,
 		storageGetCacheCount:    storageGetCacheCount,
 		storageChunkSize:        storageChunkFileSize,
 		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
 	}
 
-	if cacheSize > 0 {
-		db.stroageCacheSizeLimit = cacheSize/storageEntrySize + 1
+	if contractCacheSizeMiB > 0 {
+		db.stroageCacheSizeLimit = uint64(contractCacheSizeMiB * 1024 * 1024 / storageEntrySize)
 	}
 	if err := os.MkdirAll(db.storageDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create storage dir: %v", err)
@@ -389,7 +390,8 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 		return nil, fmt.Errorf("failed to init storage shard: %v", err)
 	}
 
-	nodeCache, err := NewNodeCache(effectiveNodeCacheSize(cfg.NodeCacheSize))
+	nodeCacheCapacity := nodeCacheSizeMiB * 1024 * 1024 / NodeEntrySize
+	nodeCache, err := NewNodeCache(nodeCacheCapacity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init node cache: %v", err)
 	}
@@ -402,7 +404,11 @@ func NewPrefixDB(dirpath string, storageChunkFileSize int, cacheSize uint64, sto
 
 	db.prefixTree = prefixTree
 
-	db.storageIndexCache = newSegmentIndexCache(effectiveSegmentIndexCacheCapacityMiB())
+	segmentIndexCapacityMiB := segmentIndexCacheCapacityMiB
+	if segmentIndexCacheSizeMiB > 0 {
+		segmentIndexCapacityMiB = segmentIndexCacheSizeMiB
+	}
+	db.storageIndexCache = newSegmentIndexCache(segmentIndexCapacityMiB)
 
 	storageCache, err := lru.New(int(db.stroageCacheSizeLimit))
 	if err != nil {

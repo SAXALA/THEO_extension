@@ -258,8 +258,8 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 				run_idx=$((run_idx + 1))
 				if [ "$backend" = "ethstore" ]; then
 					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count}"
-					STORAGE_CACHE_SIZE="$storage_mib" \
-					NODE_CACHE_SIZE="$node_mib" \
+					STORAGE_CACHE_SIZE_MIB="$storage_mib" \
+					NODE_CACHE_SIZE_MIB="$node_mib" \
 					SEGMENT_INDEX_CACHE_SIZE_MIB="$segment_index_cache_size_mib" \
 					CACHE_COUNT="$cache_count" \
 					TRACE_FILE="$trace_file" \

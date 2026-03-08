@@ -37,12 +37,11 @@ type WriteOperation struct {
 	storageSize   uint64       // size of the stored data
 }
 
-func NewWriteBatch(threshold int) *WriteBatch {
+func NewWriteBatch() *WriteBatch {
 	return &WriteBatch{
 		operations: make(map[string]WriteOperation),
 
 		autoCommit:  true,
-		threshold:   threshold,                   //dafault threshold for auto commit
 		commitQueue: make(chan *WriteBatch, 100), // buffered channel for commit batches
 		quitCh:      make(chan struct{}),
 		bgCommit:    false,
