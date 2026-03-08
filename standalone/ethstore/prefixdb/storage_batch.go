@@ -2,7 +2,6 @@ package prefixdb
 
 import (
 	"errors"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -164,7 +163,7 @@ func (db *PrefixDB) StorageBatchCommit() error {
 				accountKey = db.ParentKeyResolver(origKeyBytes)
 			}
 			if accountKey == nil {
-				fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
+				// fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
 				continue
 			}
 			storageKey, err := db.normalizeStorageKey(origKeyBytes)
