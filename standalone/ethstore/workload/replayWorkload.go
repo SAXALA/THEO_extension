@@ -574,6 +574,16 @@ type batchReader interface {
 	BatchGet(key []byte) ([]byte, bool)
 }
 
+func ensureQueryableBatch(batch ethdb.Batch, owner string) error {
+	if batch == nil {
+		return fmt.Errorf("%s: nil pebble batch", owner)
+	}
+	if _, ok := batch.(batchReader); !ok {
+		return fmt.Errorf("%s: batch does not implement BatchGet; require map-based queryable batch", owner)
+	}
+	return nil
+}
+
 // getWithPebbleBatchOverlay returns the value for key by checking the pending
 // batch first (read-your-writes semantics).  When batch is nil or does not
 // implement batchReader it falls back to fallbackGet.
@@ -588,6 +598,8 @@ func getWithPebbleBatchOverlay(batch ethdb.Batch, key []byte, fallbackGet func()
 				}
 				return val, nil
 			}
+		} else {
+			return nil, fmt.Errorf("pebble batch must be map-based queryable (BatchGet)")
 		}
 	}
 	return fallbackGet()
@@ -692,17 +704,28 @@ func (b *pebbleBaselineReplayBackend) Get(key []byte, _ ethstore.DataType) ([]by
 		return b.store.Get(key)
 	})
 }
-func (b *pebbleBaselineReplayBackend) ensureBatch() ethdb.Batch {
+func (b *pebbleBaselineReplayBackend) ensureBatch() (ethdb.Batch, error) {
 	if b.batch == nil {
 		b.batch = b.store.NewBatch()
 	}
-	return b.batch
+	if err := ensureQueryableBatch(b.batch, "pebbleBaselineReplayBackend"); err != nil {
+		return nil, err
+	}
+	return b.batch, nil
 }
 func (b *pebbleBaselineReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
-	return b.ensureBatch().Put(key, value)
+	batch, err := b.ensureBatch()
+	if err != nil {
+		return err
+	}
+	return batch.Put(key, value)
 }
 func (b *pebbleBaselineReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
-	return b.ensureBatch().Delete(key)
+	batch, err := b.ensureBatch()
+	if err != nil {
+		return err
+	}
+	return batch.Delete(key)
 }
 func (b *pebbleBaselineReplayBackend) CommitBlock() error {
 	if b.batch == nil {
@@ -769,11 +792,14 @@ func (b *ethstoreReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]b
 	})
 }
 
-func (b *ethstoreReplayBackend) ensurePebbleBatch() ethdb.Batch {
+func (b *ethstoreReplayBackend) ensurePebbleBatch() (ethdb.Batch, error) {
 	if b.pebbleBatch == nil {
 		b.pebbleBatch = b.store.NewBatch()
 	}
-	return b.pebbleBatch
+	if err := ensureQueryableBatch(b.pebbleBatch, "ethstoreReplayBackend"); err != nil {
+		return nil, err
+	}
+	return b.pebbleBatch, nil
 }
 
 func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
@@ -791,7 +817,11 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 		}
 		return err
 	}
-	return b.ensurePebbleBatch().Put(key, value)
+	batch, err := b.ensurePebbleBatch()
+	if err != nil {
+		return err
+	}
+	return batch.Put(key, value)
 }
 
 func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
@@ -809,7 +839,11 @@ func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataTy
 		}
 		return err
 	}
-	return b.ensurePebbleBatch().Delete(key)
+	batch, err := b.ensurePebbleBatch()
+	if err != nil {
+		return err
+	}
+	return batch.Delete(key)
 }
 
 func (b *ethstoreReplayBackend) CommitBlock() error {
@@ -1298,6 +1332,13 @@ func main() {
 		// Start the HTTP server for pprof profiling
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
+
+	pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
+	if pbErr != nil {
+		log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
+	}
+	defer pbBackend.Close()
+	replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 
 	switch *mode {
 	case "ld":

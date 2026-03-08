@@ -21,7 +21,6 @@ BACKEND_SELECTOR="${2:-}"
 # Fill these arrays with candidate values (MiB / count).
 STORAGE_CACHE_SIZE_CANDIDATES=(12 48)
 CACHE_COUNT_CANDIDATES=(32)
-SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES=(4)
 BACKEND_CANDIDATES=(ethstore pebble)
 TRACE_FILE_CANDIDATES=(cache nocache_snap)
 
@@ -95,11 +94,11 @@ trace-file: cache | nocache | nocache_snap | all         (default: all for repla
 Edit arrays in this file:
   STORAGE_CACHE_SIZE_CANDIDATES=(...)
   CACHE_COUNT_CANDIDATES=(...)
-	SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES=(...)
 	BACKEND_CANDIDATES=(...)
 	TRACE_FILE_CANDIDATES=(...)
 
-NODE_CACHE_SIZE is derived automatically as STORAGE_CACHE_SIZE/3.
+NODE_CACHE_SIZE is derived automatically as STORAGE_CACHE_SIZE/3*(3/4).
+SEGMENT_INDEX_CACHE_SIZE_MIB is derived automatically as NODE_CACHE_SIZE/4.
 CHAINKV_CACHE_MB and PEBBLE_CACHE_MB are derived automatically as STORAGE_CACHE_SIZE*4/3.
 EOF
 }
@@ -115,11 +114,6 @@ if [ "${#STORAGE_CACHE_SIZE_CANDIDATES[@]}" -eq 0 ]; then
 fi
 if [ "${#CACHE_COUNT_CANDIDATES[@]}" -eq 0 ]; then
 	echo "CACHE_COUNT_CANDIDATES is empty"
-	exit 1
-fi
-
-if [ "${#SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES[@]}" -eq 0 ]; then
-	echo "SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES is empty"
 	exit 1
 fi
 
@@ -208,7 +202,7 @@ run_idx=0
 total_runs=0
 for backend in "${SELECTED_BACKENDS[@]}"; do
 	mapfile -t cache_count_candidates < <(resolve_cache_count_candidates "$backend")
-	total_runs=$((total_runs + ${#STORAGE_CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES[@]} * ${#SELECTED_TRACES[@]}))
+	total_runs=$((total_runs + ${#STORAGE_CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SELECTED_TRACES[@]}))
 done
 
 for trace_file in "${SELECTED_TRACES[@]}"; do
@@ -221,9 +215,16 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 			fi
 
 			# Keep node cache proportional to storage cache.
-			node_mib=$((storage_mib / 3))
+			node_mib=$((storage_mib / 3 * (3 / 4)))
 			if [ "$node_mib" -le 0 ]; then
 				echo "Derived NODE_CACHE_SIZE is invalid for STORAGE_CACHE_SIZE=$storage_mib"
+				exit 1
+			fi
+
+			# Segment index cache is derived from node cache.
+			segment_index_cache_size_mib=$((node_mib / 4))
+			if [ "$segment_index_cache_size_mib" -le 0 ]; then
+				echo "Derived SEGMENT_INDEX_CACHE_SIZE_MIB is invalid for NODE_CACHE_SIZE=$node_mib"
 				exit 1
 			fi
 
@@ -239,33 +240,26 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 					exit 1
 				fi
 
-				for segment_index_cache_size_mib in "${SEGMENT_INDEX_CACHE_SIZE_MIB_CANDIDATES[@]}"; do
-					if ! [[ "$segment_index_cache_size_mib" =~ ^[0-9]+$ ]] || [ "$segment_index_cache_size_mib" -le 0 ]; then
-						echo "Invalid segment index cache candidate: $segment_index_cache_size_mib"
-						exit 1
-					fi
+				run_idx=$((run_idx + 1))
+				echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
 
-					run_idx=$((run_idx + 1))
-					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file STORAGE_CACHE_SIZE=${storage_mib}MiB NODE_CACHE_SIZE=${node_mib}MiB SEGMENT_INDEX_CACHE_SIZE_MIB=${segment_index_cache_size_mib}MiB CACHE_COUNT=${cache_count} BACKEND_CACHE=${backend_cache_mib}MiB"
+				STORAGE_CACHE_SIZE="$storage_mib" \
+				NODE_CACHE_SIZE="$node_mib" \
+				SEGMENT_INDEX_CACHE_SIZE_MIB="$segment_index_cache_size_mib" \
+				CACHE_COUNT="$cache_count" \
+				CHAINKV_CACHE_MB="$backend_cache_mib" \
+				PEBBLE_CACHE_MB="$backend_cache_mib" \
+				TRACE_FILE="$trace_file" \
+				DB_TYPE="$DB_TYPE" \
+				WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+				CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+				./replay.sh "$ACTION" "$backend" &
+				CURRENT_REPLAY_SH_PID=$!
+				wait "$CURRENT_REPLAY_SH_PID"
+				CURRENT_REPLAY_SH_PID=""
 
-					STORAGE_CACHE_SIZE="$storage_mib" \
-					NODE_CACHE_SIZE="$node_mib" \
-					SEGMENT_INDEX_CACHE_SIZE_MIB="$segment_index_cache_size_mib" \
-					CACHE_COUNT="$cache_count" \
-					CHAINKV_CACHE_MB="$backend_cache_mib" \
-					PEBBLE_CACHE_MB="$backend_cache_mib" \
-					TRACE_FILE="$trace_file" \
-					DB_TYPE="$DB_TYPE" \
-					WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-					CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
-					./replay.sh "$ACTION" "$backend" &
-					CURRENT_REPLAY_SH_PID=$!
-					wait "$CURRENT_REPLAY_SH_PID"
-					CURRENT_REPLAY_SH_PID=""
-
-					echo "[$run_idx/$total_runs] done"
-					echo
-				done
+				echo "[$run_idx/$total_runs] done"
+				echo
 			done
 		done
 	done

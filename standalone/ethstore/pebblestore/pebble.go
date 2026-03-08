@@ -6,11 +6,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -24,6 +27,8 @@ var (
 
 const (
 	metricsGatheringInterval = 3 * time.Second
+	minCache                = 16
+	minHandles              = 16
 	defaultCacheValue        = 16
 	defaultHandlesValue      = 1048576
 	defaultNamespaceValue    = "pebble"
@@ -43,6 +48,7 @@ type PebbleStore struct {
 	diskReadBytes  uint64
 	diskWriteBytes uint64
 	log            log.Logger
+	writeOptions   *pebble.WriteOptions
 }
 
 type panicLogger struct{}
@@ -88,14 +94,49 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 	if handles <= 0 {
 		handles = defaultHandlesValue
 	}
+	if cache < minCache {
+		cache = minCache
+	}
+	if handles < minHandles {
+		handles = minHandles
+	}
 	if namespace == "" {
 		namespace = defaultNamespaceValue
 	}
+
 	logger := log.New("database", file)
-	db := &PebbleStore{fn: file, log: logger, quitChan: make(chan chan error)}
+	logger.Info("Allocated cache and file handles", "cache", common.StorageSize(cache*1024*1024), "handles", handles)
+
+	maxMemTableSize := (1<<31)<<(^uint(0)>>63) - 1
+	memTableLimit := 2
+	memTableSize := cache * 1024 * 1024 / 2 / memTableLimit
+	if memTableSize >= maxMemTableSize {
+		memTableSize = maxMemTableSize - 1
+	}
+
+	db := &PebbleStore{
+		fn:           file,
+		log:          logger,
+		quitChan:     make(chan chan error),
+		writeOptions: &pebble.WriteOptions{Sync: true},
+	}
 	opt := &pebble.Options{
 		Cache:        pebble.NewCache(int64(cache * 1024 * 1024)),
 		MaxOpenFiles: handles,
+		MemTableSize: uint64(memTableSize),
+		MemTableStopWritesThreshold: memTableLimit,
+		MaxConcurrentCompactions: func() int {
+			return runtime.NumCPU()
+		},
+		Levels: []pebble.LevelOptions{
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+		},
 		EventListener: &pebble.EventListener{
 			CompactionBegin: db.onCompactionBegin,
 			CompactionEnd:   db.onCompactionEnd,
@@ -163,18 +204,18 @@ func (d *PebbleStore) Put(key []byte, value []byte) error {
 	if d.quitChan == nil {
 		return ErrClosed
 	}
-	return d.db.Set(key, value, pebble.Sync)
+	return d.db.Set(key, value, d.writeOptions)
 }
 
 func (d *PebbleStore) Delete(key []byte) error {
 	if d.quitChan == nil {
 		return ErrClosed
 	}
-	return d.db.Delete(key, pebble.Sync)
+	return d.db.Delete(key, d.writeOptions)
 }
 
 func (d *PebbleStore) DeleteRange(start, end []byte) error {
-	return d.db.DeleteRange(start, end, pebble.Sync)
+	return d.db.DeleteRange(start, end, d.writeOptions)
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +421,7 @@ func (b *pebbleBatch) Write() (err error) {
 	}
 	// All Put/Delete/DeleteRange ops have already been applied to b.b as they
 	// were called; just commit the batch.
-	return b.b.Commit(pebble.Sync)
+	return b.b.Commit(b.db.writeOptions)
 }
 
 func (b *pebbleBatch) Reset() {
