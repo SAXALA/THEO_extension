@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -319,6 +320,28 @@ func reportGlobalLatencyStats(stats map[opType]*latencyHistogram) {
 	}
 }
 
+func reportReplayReadStats(title string, success map[string]int64, miss map[string]int64, successTotal int64, missTotal int64) {
+	fmt.Printf("[%s][Global] success=%d notfound=%d\n", title, successTotal, missTotal)
+	keys := make([]string, 0, len(success)+len(miss))
+	seen := make(map[string]struct{})
+	for k := range success {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+	for k := range miss {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("[%s] dataType=%s success=%d notfound=%d\n", title, k, success[k], miss[k])
+	}
+}
+
 func reportHistogramSummary(label string, hist *latencyHistogram) {
 	if hist == nil || hist.totalCount == 0 {
 		fmt.Printf("\n[Latency] %s: no samples\n", label)
@@ -470,7 +493,7 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	return nil
 }
 
-func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, pebbleCache int, ckvUseState bool, ckvLoadLimit int) error {
+func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheSize int, ckvCache int, ckvHandles int, pebbleCache int, pebbleHandles int, ckvUseState bool, ckvLoadLimit int) error {
 	switch {
 	case strings.EqualFold(backend, "chainkv"):
 		ckv, openErr := NewChainKVLDB(cfg.ChainKVDir, ckvCache, ckvHandles, ckvUseState)
@@ -489,7 +512,7 @@ func runLoadData(cfg replayConfig, backend string, ldChunkFileSize int, ldCacheS
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with pebble backend requires loadDataDir in config")
 		}
-		if err := loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir, pebbleCache); err != nil {
+		if err := loadbaselineData(cfg.PebbleDBDir, cfg.LoadDataDir, pebbleCache, pebbleHandles); err != nil {
 			return fmt.Errorf("pebble load failed: %w", err)
 		}
 		return nil
@@ -653,8 +676,8 @@ type pebbleBaselineReplayBackend struct {
 	commitHist *latencyHistogram
 }
 
-func newPebbleBaselineReplayBackend(dir string, cache int) (*pebbleBaselineReplayBackend, error) {
-	store, err := pebblestore.NewPebbleStore(dir, cache, 0, "", false)
+func newPebbleBaselineReplayBackend(dir string, cache int, handles int) (*pebbleBaselineReplayBackend, error) {
+	store, err := pebblestore.NewPebbleStore(dir, cache, handles, "", false)
 	if err != nil {
 		return nil, fmt.Errorf("newPebbleBaselineReplayBackend: open store: %w", err)
 	}
@@ -818,9 +841,6 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 }
 
 func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
-	if len(prefix) > 0 && prefix[0] == 'O' {
-		return noopIter{}
-	}
 	return ethdbIterWrapper{b.store.NewIterator(prefix, start)}
 }
 
@@ -965,6 +985,16 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	}
 	stats := make(map[string]map[opType]*latencyHistogram)
 	globalStats := make(map[opType]*latencyHistogram)
+	getSuccessByType := make(map[string]int64)
+	getNotFoundByType := make(map[string]int64)
+	iterNextSuccessByType := make(map[string]int64)
+	iterNextEndByType := make(map[string]int64)
+	var (
+		getSuccessTotal      int64
+		getNotFoundTotal     int64
+		iterNextSuccessTotal int64
+		iterNextEndTotal     int64
+	)
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
 		if _, ok := stats[kvTypeStr]; !ok {
 			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
@@ -1127,6 +1157,11 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			opErr = getErr
 			if opErr == nil {
 				logicReadSize += int64(len(val))
+				getSuccessByType[kvTypeStr]++
+				getSuccessTotal++
+			} else if errors.Is(opErr, ethstore.ErrNotFound) {
+				getNotFoundByType[kvTypeStr]++
+				getNotFoundTotal++
 			}
 		case opPut:
 			if len(keyBytes) == 0 {
@@ -1154,9 +1189,16 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				if ok := iter.Next(); !ok {
 					iter.Release()
 					iter = nil
+					iterNextEndByType[kvTypeStr]++
+					iterNextEndTotal++
 				} else {
 					logicReadSize += int64(len(iter.Value()))
+					iterNextSuccessByType[kvTypeStr]++
+					iterNextSuccessTotal++
 				}
+			} else {
+				iterNextEndByType[kvTypeStr]++
+				iterNextEndTotal++
 			}
 		}
 		elapsed := time.Since(start)
@@ -1183,6 +1225,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		backend.Name(), counter, totalTime.Seconds(), float64(counter)/totalTime.Seconds(), logicReadSize, logicWriteSize)
 	reportLatencyStats(stats)
 	reportGlobalLatencyStats(globalStats)
+	reportReplayReadStats("GetStats", getSuccessByType, getNotFoundByType, getSuccessTotal, getNotFoundTotal)
+	reportReplayReadStats("IteratorNextStats", iterNextSuccessByType, iterNextEndByType, iterNextSuccessTotal, iterNextEndTotal)
 	backend.PrintCommitStats()
 }
 
@@ -1196,8 +1240,9 @@ func main() {
 	ldChunkFileSize := flag.Int("ld-chunk-file-size", 0, "Chunk file size for ld mode")
 	ldCacheSize := flag.Int("ld-cache-size", 0, "Cache size for ld mode")
 	ckvCache := flag.Int("ckv-cache", 16, "ChainKV cache size in MB")
-	ckvHandles := flag.Int("ckv-handles", 128, "ChainKV number of file handles")
+	ckvHandles := flag.Int("ckv-handles", 1048576, "ChainKV number of file handles")
 	pebbleCache := flag.Int("pebble-cache", 16, "Pebble cache size in MB")
+	pebbleHandles := flag.Int("pebble-handles", 1048576, "Pebble number of file handles")
 	ckvUseState := flag.Bool("ckv-state", true, "ChainKV use state-specific operations (Put_s/Get_s)")
 	ckvLoadLimit := flag.Int("ckv-limit", 0, "ChainKV load limit, 0 means no limit")
 	DBTypeStr := flag.String("db-type", "allDBtypes", "Database type for replay: prefixdb, pebble, or aol")
@@ -1256,7 +1301,7 @@ func main() {
 
 	switch *mode {
 	case "ld":
-		if err := runLoadData(cfg, *backend, *ldChunkFileSize, *ldCacheSize, *ckvCache, *ckvHandles, *pebbleCache, *ckvUseState, *ckvLoadLimit); err != nil {
+		if err := runLoadData(cfg, *backend, *ldChunkFileSize, *ldCacheSize, *ckvCache, *ckvHandles, *pebbleCache, *pebbleHandles, *ckvUseState, *ckvLoadLimit); err != nil {
 			log.Fatalf("ld failed: %v", err)
 		}
 	case "re":
@@ -1268,7 +1313,7 @@ func main() {
 			defer ckvBackend.Close()
 			replayTrace(ckvBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		} else if strings.EqualFold(*backend, "pebble") {
-			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache)
+			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
 			if pbErr != nil {
 				log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
 			}
@@ -1291,9 +1336,9 @@ func main() {
 	}
 }
 
-func loadbaselineData(pebbleDir string, dataFile string, pebbleCache int) error {
+func loadbaselineData(pebbleDir string, dataFile string, pebbleCache int, pebbleHandles int) error {
 	tempDir := pebbleDir
-	store, err := pebblestore.NewPebbleStore(tempDir, pebbleCache, 0, "", false)
+	store, err := pebblestore.NewPebbleStore(tempDir, pebbleCache, pebbleHandles, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore: %w", err)
 	}

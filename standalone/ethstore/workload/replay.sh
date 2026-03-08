@@ -48,8 +48,10 @@ NODE_CACHE_SIZE_BYTES=$((NODE_CACHE_SIZE * 1024 * 1024))
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
 # pebble 参数: cache 大小（MB）
 PEBBLE_CACHE_MB="${PEBBLE_CACHE_MB:-16}"
+# pebble 参数: handles 数量
+PEBBLE_HANDLES="${PEBBLE_HANDLES:-1048576}"
 # chainkv 参数: leveldb handles 数量
-CHAINKV_HANDLES="${CHAINKV_HANDLES:-128}"
+CHAINKV_HANDLES="${CHAINKV_HANDLES:-1048576}"
 # chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
 # chainkv 参数: 逗号分隔 key 前缀列表；空字符串表示不过滤
@@ -152,7 +154,7 @@ Common env vars:
     CHUNK_FILE_SIZE(bytes), STORAGE_CACHE_SIZE(MiB)
     NODE_CACHE_SIZE(MiB)
     SEGMENT_INDEX_CACHE_SIZE_MIB(MiB)
-    CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES
+    CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
     LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
     GC_STATE_DIR
@@ -380,7 +382,7 @@ build_run_tag() {
     running_root_tag=$(sanitize_tag_value "$RUNNING_ROOT")
 
     local base_tag
-    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_cc_${CACHE_COUNT}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_ncs_${NODE_CACHE_SIZE}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}_block_${START_BLOCK_ID}-${END_BLOCK_ID}"
+    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_block_${START_BLOCK_ID}-${END_BLOCK_ID}"
 
     if [ "$backend" = "chainkv" ]; then
         local ckv_state_tag ckv_prefix_tag
@@ -388,7 +390,9 @@ build_run_tag() {
         ckv_prefix_tag=$(sanitize_tag_value "$CHAINKV_STATE_KEY_PREFIXES")
         printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}"
     elif [ "$backend" = "pebble" ]; then
-        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}"
+        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}"
+    elif [ "$backend" = "ethstore" ]; then
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE}_cc_${CACHE_COUNT}_ncs_${NODE_CACHE_SIZE}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}"
     else
         printf "%s" "$base_tag"
     fi
@@ -414,6 +418,7 @@ SEGMENT_INDEX_CACHE_SIZE_MIB=${SEGMENT_INDEX_CACHE_SIZE_MIB}
 CHAINKV_CACHE_MB=${CHAINKV_CACHE_MB}
 PEBBLE_CACHE_MB=${PEBBLE_CACHE_MB}
 CHAINKV_HANDLES=${CHAINKV_HANDLES}
+PEBBLE_HANDLES=${PEBBLE_HANDLES}
 CHAINKV_STATE=${CHAINKV_STATE}
 CHAINKV_STATE_KEY_PREFIXES=${CHAINKV_STATE_KEY_PREFIXES}
 CHAINKV_LOAD_LIMIT=${CHAINKV_LOAD_LIMIT}
@@ -479,7 +484,7 @@ run_load() {
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
     esac
 }
@@ -532,7 +537,7 @@ run_replay() {
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" -node-cache-size "$NODE_CACHE_SIZE_BYTES" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
             ;;
     esac
 }
