@@ -188,13 +188,6 @@ func NewBlockAppendOnlyLog(dirPath string, recentN int, logger log.Logger) (*Blo
 }
 
 func (baol *BlockAppendOnlyLog) releaseBootstrapResources() {
-	if baol.indexMapFile != nil {
-		if err := baol.indexMapFile.Close(); err != nil {
-			baol.log.Warn("Failed to close index map file after bootstrap", "error", err)
-		}
-		baol.indexMapFile = nil
-	}
-
 	// Release blockIndex - queries will fall back to disk via getBlockIndexEntry()
 	baol.blockIndex = nil
 
@@ -255,14 +248,10 @@ func (baol *BlockAppendOnlyLog) findBlockIndexEntryOnDisk(blockID uint64) (block
 		return blockIndexEntry{}, false, nil
 	}
 
-	f, err := os.OpenFile(baol.indexMapFilePath, os.O_RDONLY, 0644)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return blockIndexEntry{}, false, nil
-		}
-		return blockIndexEntry{}, false, err
+	f := baol.indexMapFile
+	if f == nil {
+		return blockIndexEntry{}, false, ErrClosed
 	}
-	defer f.Close()
 
 	buf := make([]byte, indexEntrySize)
 	// Use compact storage: position based on offset from minBlockID
@@ -1506,13 +1495,11 @@ func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) e
 	baol.indexBuffer = baol.indexBuffer[:0]
 	baol.indexBufferMu.Unlock()
 
-	f, err := os.OpenFile(baol.indexMapFilePath, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		baol.log.Error("Failed to open index map file during flush", "path", baol.indexMapFilePath, "error", err)
+	f := baol.indexMapFile
+	if f == nil {
 		baol.restoreIndexBuffer(entries)
-		return err
+		return ErrClosed
 	}
-	defer f.Close()
 
 	for _, entry := range entries {
 		buf := make([]byte, indexEntrySize)

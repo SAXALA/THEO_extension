@@ -162,7 +162,7 @@ type storageChunkEntry struct {
 
 type storageChunkBuffer struct {
 	accountKey    string
-	chunks        []*storageChunkEntry
+	chunks        []storageChunkEntry
 	maxChunks     int
 	accessCounter uint64
 	entryPool     [][]kvPair
@@ -230,8 +230,8 @@ func (b *storageChunkBuffer) releaseChunk(chunk *storageChunkEntry) {
 }
 
 func (b *storageChunkBuffer) reset() {
-	for _, chunk := range b.chunks {
-		b.releaseChunk(chunk)
+	for i := range b.chunks {
+		b.releaseChunk(&b.chunks[i])
 	}
 	b.chunks = nil
 	b.accountKey = ""
@@ -282,7 +282,7 @@ func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing 
 		}
 		return
 	}
-	chunk := &storageChunkEntry{
+	chunk := storageChunkEntry{
 		keyStart: entries[0].key,
 		keyEnd:   entries[len(entries)-1].key,
 		entries:  entries,
@@ -292,7 +292,7 @@ func (b *storageChunkBuffer) adopt(accountKey string, entries []kvPair, backing 
 	chunk.lastAccess = b.accessCounter
 	for i, existing := range b.chunks {
 		if bytes.Equal(existing.keyStart, chunk.keyStart) && bytes.Equal(existing.keyEnd, chunk.keyEnd) {
-			b.releaseChunk(existing)
+			b.releaseChunk(&b.chunks[i])
 			b.chunks[i] = chunk
 			return
 		}
@@ -312,8 +312,7 @@ func (b *storageChunkBuffer) evictIfNeeded() {
 				idx = i
 			}
 		}
-		victim := b.chunks[idx]
-		b.releaseChunk(victim)
+		b.releaseChunk(&b.chunks[idx])
 		b.chunks = append(b.chunks[:idx], b.chunks[idx+1:]...)
 	}
 }
@@ -322,7 +321,8 @@ func (b *storageChunkBuffer) lookup(key []byte) ([]byte, bool) {
 	if len(b.chunks) == 0 || len(key) == 0 {
 		return nil, false
 	}
-	for _, chunk := range b.chunks {
+	for i := range b.chunks {
+		chunk := &b.chunks[i]
 		if len(chunk.keyStart) > 0 && bytes.Compare(key, chunk.keyStart) < 0 {
 			continue
 		}

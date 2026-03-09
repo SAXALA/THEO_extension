@@ -774,6 +774,9 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			if _, err := file.ReadAt(hdrBuf, 0); err != nil {
 				return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
 			}
+			if pt.db != nil {
+				pt.db.addReadBytes(len(hdrBuf))
+			}
 			if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
 				return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
 			}
@@ -789,6 +792,9 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 					if _, err := file.ReadAt(tempBuf[:totalDataSize], headerSize); err != nil && err != io.EOF {
 						pt.releaseBuf(tempBuf)
 						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: %w", err)
+					}
+					if pt.db != nil {
+						pt.db.addReadBytes(int(totalDataSize))
 					}
 					bigBuf = tempBuf[:totalDataSize]
 				}

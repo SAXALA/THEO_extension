@@ -50,9 +50,9 @@ CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
 # pebble 参数: cache 大小（MB）
 PEBBLE_CACHE_MB="${PEBBLE_CACHE_MB:-16}"
 # pebble 参数: handles 数量
-PEBBLE_HANDLES="${PEBBLE_HANDLES:-1048576}"
+PEBBLE_HANDLES="${PEBBLE_HANDLES:-16}"
 # chainkv 参数: leveldb handles 数量
-CHAINKV_HANDLES="${CHAINKV_HANDLES:-1048576}"
+CHAINKV_HANDLES="${CHAINKV_HANDLES:-16}"
 # chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
 # chainkv 参数: 逗号分隔 key 前缀列表；空字符串表示不过滤

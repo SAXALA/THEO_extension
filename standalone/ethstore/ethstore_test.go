@@ -32,6 +32,17 @@ import (
 	"github.com/stretchr/testify/require" // For assertions that should fail the test immediately
 )
 
+const testPrefixCacheSizeBytes = 16 * 1024 * 1024
+
+// keyValueStoreAdapter bridges Database.Get(key, dataType) to ethdb.KeyValueStore.Get(key).
+type keyValueStoreAdapter struct {
+	*Database
+}
+
+func (a keyValueStoreAdapter) Get(key []byte) ([]byte, error) {
+	return a.Database.Get(key, GetDataTypeFromKey(key))
+}
+
 func TestEthStore(t *testing.T) {
 	t.Run("DatabaseSuite", func(t *testing.T) {
 		dbtest.TestDatabaseSuite(t, func() ethdb.KeyValueStore {
@@ -40,11 +51,11 @@ func TestEthStore(t *testing.T) {
 
 			// Use the actual New constructor from ethstore.go
 			// Parameters for New: dirPath string, recentN int, namespace string, readonly bool
-			db, err := New(tempDir, 10, "testdb", false, 0, 0, 16)
+			db, err := New(tempDir, 10, "testdb", false, 0, testPrefixCacheSizeBytes, 16)
 			if err != nil {
 				t.Fatalf("Failed to create database with New: %v", err)
 			}
-			return db // The *Database instance itself should implement KeyValueStore
+			return keyValueStoreAdapter{Database: db}
 		})
 	})
 }
@@ -56,11 +67,11 @@ func BenchmarkEthStore(b *testing.B) {
 			b.Fatalf("Failed to create temp dir for benchmark: %v", err)
 		}
 
-		db, err := New(tempDir, 10, "benchdb", false, 0, 0, 16)
+		db, err := New(tempDir, 10, "benchdb", false, 0, testPrefixCacheSizeBytes, 16)
 		if err != nil {
 			b.Fatalf("Failed to create database with New for benchmark: %v", err)
 		}
-		return db
+		return keyValueStoreAdapter{Database: db}
 	})
 }
 
@@ -70,7 +81,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		tempDir := t.TempDir()
 		// Call the actual New constructor
 		// For "in-memory" like behavior with AppendOnlyLog, we still need a path.
-		store, err := New(tempDir, 10, "lifecycle_mem_test", false, 0, 0, 16)
+		store, err := New(tempDir, 10, "lifecycle_mem_test", false, 0, testPrefixCacheSizeBytes, 16)
 		require.NoError(t, err, "New with temp path should not fail")
 		require.NotNil(t, store, "Opened store should not be nil")
 
@@ -82,7 +93,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		tempDir := t.TempDir()
 		dbPath := tempDir // AppendOnlyLog uses the directory directly
 
-		store1, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, 0, 16)
+		store1, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, testPrefixCacheSizeBytes, 16)
 		require.NoError(t, err, "New with a new path should not fail")
 		require.NotNil(t, store1, "Opened store1 should not be nil")
 
@@ -93,18 +104,18 @@ func TestEthStore_Lifecycle(t *testing.T) {
 		err = store1.Put(testKey, testValue)
 		require.NoError(t, err, "store1.Put operation should not fail")
 
-		retrievedValue, err := store1.Get(testKey)
+		retrievedValue, err := store1.Get(testKey, GetDataTypeFromKey(testKey))
 		require.NoError(t, err, "store1.Get operation should not fail")
 		assert.Equal(t, testValue, retrievedValue, "Retrieved value should match the put value")
 
 		err = store1.Close()
 		assert.NoError(t, err, "store1.Close() should not fail")
 
-		store2, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, 0, 16) // Reopen
+		store2, err := New(dbPath, 10, "lifecycle_persist_test", false, 0, testPrefixCacheSizeBytes, 16) // Reopen
 		require.NoError(t, err, "Reopening persistent DB should not fail")
 		require.NotNil(t, store2, "Reopened store2 should not be nil")
 
-		retrievedValueAfterReopen, err := store2.Get(testKey)
+		retrievedValueAfterReopen, err := store2.Get(testKey, GetDataTypeFromKey(testKey))
 		require.NoError(t, err, "store2.Get after reopen should not fail")
 		assert.Equal(t, testValue, retrievedValueAfterReopen, "Value should persist after reopen")
 
@@ -117,7 +128,7 @@ func TestEthStore_Lifecycle(t *testing.T) {
 // assuming your ethstore.Database struct has such methods (e.g., from blockStore.go logic).
 func TestEthStore_SpecificBlockOperations(t *testing.T) {
 	tempDir := t.TempDir()
-	store, err := New(tempDir, 10, "specific_ops_test", false, 0, 0, 16) // Using temp dir
+	store, err := New(tempDir, 10, "specific_ops_test", false, 0, testPrefixCacheSizeBytes, 16) // Using temp dir
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	defer store.Close() // Ensure the database is closed at the end
@@ -192,7 +203,7 @@ func TestPutAndGet(t *testing.T) {
 
 func TestOther(t *testing.T) {
 	tempDir := t.TempDir()
-	store, err := New(tempDir, 10, "put_test", false, 0, 0, 16)
+	store, err := New(tempDir, 10, "put_test", false, 0, testPrefixCacheSizeBytes, 16)
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	defer store.Close()
@@ -209,7 +220,7 @@ func TestOther(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put operation failed for key %s: %v", key, err)
 	}
-	retrievedValue, err := store.Get(key)
+	retrievedValue, err := store.Get(key, GetDataTypeFromKey(key))
 	if err != nil {
 		t.Fatalf("Get operation failed for key %s: %v", key, err)
 	}

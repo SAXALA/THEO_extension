@@ -258,6 +258,7 @@ type PrefixDB struct {
 	storageCurFile   *os.File
 	storageCurFileID uint32
 	storageCurSize   int64
+	fileHandleCache  *fileHandleCache
 	storageBuf       storageOpBuffer
 	segmentDirSeq    uint32
 
@@ -287,8 +288,6 @@ type PrefixDB struct {
 
 	storageCache            *lru.Cache
 	stroageCacheSizeLimit   uint64
-	cacheEvictTicker        *time.Ticker
-	cacheEvictTickerTime    time.Duration
 	storageChunkSize        int
 	segmentedChunkHardLimit int // hard cap for individual chunk files
 
@@ -306,6 +305,17 @@ type PrefixDB struct {
 	sortedOps    int
 	GCCount      uint64
 	GCWriteBytes uint64
+
+	commitOldKVReadCount uint64
+	commitOldKVReadBytes uint64
+	totalReadBytes       uint64
+	getReadReqCount      uint64
+	getReadBytesSum      uint64
+
+	trieStorageCachePairs uint64
+	trieStorageCacheBytes uint64
+	trieStorageLogPairs   uint64
+	trieStorageLogBytes   uint64
 }
 
 // SerializedTrieNode
@@ -373,8 +383,8 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 		batch:                   NewWriteBatch(),
 		writeMutex:              sync.Mutex{},
 		segmentIndexFolderLocks: make(map[uint32]*segmentIndexFolderLock),
+		fileHandleCache:         getGlobalFileHandleCache(),
 		storageDir:              storageDir,
-		cacheEvictTickerTime:    10 * time.Millisecond,
 		storageGetCacheCount:    storageGetCacheCount,
 		storageChunkSize:        storageChunkFileSize,
 		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
@@ -418,8 +428,6 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 
 	db.startStorageGCWorker()
 
-	// db.startCacheEvictionWorker(db.cacheEvictTickerTime)
-
 	db.initStorageBatcher()
 
 	fmt.Println(dirpath + " prefixDB Initialized.")
@@ -427,6 +435,15 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 }
 
 func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
+	readBefore := atomic.LoadUint64(&db.totalReadBytes)
+	defer func() {
+		readAfter := atomic.LoadUint64(&db.totalReadBytes)
+		if readAfter >= readBefore {
+			atomic.AddUint64(&db.getReadBytesSum, readAfter-readBefore)
+		}
+		atomic.AddUint64(&db.getReadReqCount, 1)
+	}()
+
 	keyType, err := db.getKeyType(key)
 	if err != nil {
 		return nil, false, err
@@ -499,15 +516,17 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 				return nil, false, nil
 			}
 			valueBytes := value.([]byte)
+			db.addTrieStorageFetchStats(true, valueBytes)
 			return valueBytes, true, nil
 		}
 
-		value, ok, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
+		value, ok, fromCache, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
 		if err != nil {
 			fmt.Println("Error ensuring account storage buffered:", err)
 			return nil, false, err
 		}
 		if ok {
+			db.addTrieStorageFetchStats(fromCache, value)
 			return value, true, nil
 		}
 		return nil, false, nil
@@ -701,7 +720,7 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 		if v, ok := db.storageCache.Get(db.storageCacheKey(accountKey, storageKey)); ok {
 			return v != nil, nil
 		}
-		_, ok, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
+		_, ok, _, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
 		if err != nil {
 			fmt.Println("Error ensuring account storage buffered:", err)
 			return false, err
@@ -1081,10 +1100,11 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 		header = header[:4]
 	}
 
-	_, err := file.ReadAt(header, offset)
+	n, err := file.ReadAt(header, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read header at offset %d: %v", offset, err)
 	}
+	db.addReadBytes(n)
 
 	keySize := int(uint16(header[0])<<8 | uint16(header[1]))
 	valueSize := int(uint16(header[2])<<8 | uint16(header[3]))
@@ -1094,15 +1114,44 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 	combinedData := getDataBuffer(totalSize)
 	defer putDataBuffer(combinedData)
 
-	_, err = file.ReadAt(combinedData, offset+4)
+	n, err = file.ReadAt(combinedData, offset+4)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("failed to read combined data at offset %d: %v", offset+6, err)
 	}
+	db.addReadBytes(n)
 
 	value := make([]byte, valueSize)
 	copy(value, combinedData[keySize:totalSize])
 
 	return value, nil
+}
+
+func (db *PrefixDB) addCommitOldKVReadStats(pairCount int, bytes uint64) {
+	if pairCount > 0 {
+		atomic.AddUint64(&db.commitOldKVReadCount, uint64(pairCount))
+	}
+	if bytes > 0 {
+		atomic.AddUint64(&db.commitOldKVReadBytes, bytes)
+	}
+}
+
+func (db *PrefixDB) addReadBytes(n int) {
+	if n > 0 {
+		atomic.AddUint64(&db.totalReadBytes, uint64(n))
+	}
+}
+
+func (db *PrefixDB) addTrieStorageFetchStats(fromCache bool, value []byte) {
+	if len(value) == 0 {
+		return
+	}
+	if fromCache {
+		atomic.AddUint64(&db.trieStorageCachePairs, 1)
+		atomic.AddUint64(&db.trieStorageCacheBytes, uint64(len(value)))
+		return
+	}
+	atomic.AddUint64(&db.trieStorageLogPairs, 1)
+	atomic.AddUint64(&db.trieStorageLogBytes, uint64(len(value)))
 }
 
 func (db *PrefixDB) Close() error {
@@ -1121,6 +1170,27 @@ func (db *PrefixDB) Close() error {
 	fmt.Printf("PrefixDB GC stats: count=%d writeBytes=%d\n",
 		atomic.LoadUint64(&db.GCCount),
 		atomic.LoadUint64(&db.GCWriteBytes),
+	)
+	getReqs := atomic.LoadUint64(&db.getReadReqCount)
+	getReadBytes := atomic.LoadUint64(&db.getReadBytesSum)
+	avgGetReadBytes := float64(0)
+	if getReqs > 0 {
+		avgGetReadBytes = float64(getReadBytes) / float64(getReqs)
+	}
+	fmt.Printf("PrefixDB commit old KV read stats: pairs=%d bytes=%d\n",
+		atomic.LoadUint64(&db.commitOldKVReadCount),
+		atomic.LoadUint64(&db.commitOldKVReadBytes),
+	)
+	fmt.Printf("PrefixDB get read stats: requests=%d totalBytes=%d avgBytes=%.2f\n",
+		getReqs,
+		getReadBytes,
+		avgGetReadBytes,
+	)
+	fmt.Printf("PrefixDB TrieNodeStorage fetch stats: cachePairs=%d cacheBytes=%d logPairs=%d logBytes=%d\n",
+		atomic.LoadUint64(&db.trieStorageCachePairs),
+		atomic.LoadUint64(&db.trieStorageCacheBytes),
+		atomic.LoadUint64(&db.trieStorageLogPairs),
+		atomic.LoadUint64(&db.trieStorageLogBytes),
 	)
 
 	if err := db.flushStorageBuffer(); err != nil {
@@ -1653,6 +1723,7 @@ func (db *PrefixDB) persistStorageEntries(kvs []kvPair, existingFileID uint32, e
 		if err != nil {
 			return 0, 0, 0, err
 		}
+		db.addCommitOldKVReadStats(len(existingEntries), existingSize)
 		if backing != nil {
 			existingBacking = backing
 		}
@@ -1977,6 +2048,7 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, me
 		if err != nil {
 			return nil, false, err
 		}
+		db.addCommitOldKVReadStats(len(existing), meta.ChunkSize)
 	}
 	if backing != nil {
 		defer backing.Release()
@@ -3108,11 +3180,10 @@ func (db *PrefixDB) readSegmentChunkPayload(folderID uint32, fileName string) ([
 
 func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) (*bufferLease, error) {
 	fullPath := filepath.Join(db.segmentedFolderPath(folderID), fileName)
-	f, err := os.Open(fullPath)
+	f, err := db.openCachedReadOnlyFile(fullPath)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -3130,6 +3201,7 @@ func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) (*bu
 		putDataBuffer(buf)
 		return nil, err
 	}
+	db.addReadBytes(intSize)
 	return newBufferLease(buf[:intSize]), nil
 }
 
@@ -3145,9 +3217,9 @@ func (db *PrefixDB) maybeNormalizeChunkEntries(entries []kvPair, meta *segmentCh
 
 // ensureAccountStorageBuffered loads (and optionally returns) the storage chunk entry for storageKey
 // so repeated GET/Has calls over the same account avoid redundant chunk scans.
-func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) ([]byte, bool, error) {
+func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) ([]byte, bool, bool, error) {
 	if len(accountKey) == 0 {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	ak := string(accountKey)
 
@@ -3156,34 +3228,34 @@ func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) 
 		value, ok := db.storageChunk.lookup(storageKey)
 		if ok {
 			db.storageBufLock.Unlock()
-			return value, ok, nil
+			return value, ok, true, nil
 		}
 	}
 	db.storageBufLock.Unlock()
 
 	cacheInfo, err := db.resolveAccountStoragePointer(accountKey)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	if cacheInfo.storageFileID == 0 {
 		db.adoptStorageBuffer(ak, nil, nil)
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	if isSegmentedStorage(cacheInfo.storageFileID) {
 		val := db.readSegmentedChunkToCache(cacheInfo.storageFileID, accountKey, storageKey)
 		if val == nil {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
-		return val, true, nil
+		return val, true, false, nil
 
 	} else {
 		val := db.readStorageSegmentFile(cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize, accountKey, storageKey)
 		if val == nil {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
-		return val, true, nil
+		return val, true, false, nil
 	}
 }
 
@@ -3317,11 +3389,10 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 	}
 	p, _ := db.storagePathByFileID(fileID)
 
-	f, err := os.Open(p)
+	f, err := db.openCachedReadOnlyFile(p)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 
 	if size == 0 {
 		return nil
@@ -3337,12 +3408,14 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 		if err != nil {
 			if err == io.EOF && read+n == total {
 				read += n
+				db.addReadBytes(n)
 				break
 			}
 			putDataBuffer(buf)
 			return nil
 		}
 		read += n
+		db.addReadBytes(n)
 	}
 	if read != total {
 		putDataBuffer(buf)
@@ -3419,11 +3492,10 @@ func (db *PrefixDB) readStorageSegmentPayload(fileID uint32, offset int64, size 
 		return db.readSegmentedStoragePayload(fileID)
 	}
 	p, _ := db.storagePathByFileID(fileID)
-	f, err := os.Open(p)
+	f, err := db.openCachedReadOnlyFile(p)
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	defer f.Close()
 	if size == 0 {
 		return nil, 0, nil, nil
 	}
@@ -3435,12 +3507,14 @@ func (db *PrefixDB) readStorageSegmentPayload(fileID uint32, offset int64, size 
 		if err != nil {
 			if err == io.EOF && read+n == total {
 				read += n
+				db.addReadBytes(n)
 				break
 			}
 			putDataBuffer(buf)
 			return nil, 0, nil, err
 		}
 		read += n
+		db.addReadBytes(n)
 	}
 	if read != total {
 		putDataBuffer(buf)
@@ -3599,11 +3673,10 @@ func (db *PrefixDB) GetStorageCount(accountKey []byte) (int, uint64, error) {
 
 	p, _ := db.storagePathByFileID(node.storageFileID)
 
-	f, err := os.Open(p)
+	f, err := db.openCachedReadOnlyFile(p)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer f.Close()
 
 	if node.storageSize == 0 {
 		return 0, 0, nil
@@ -3616,6 +3689,7 @@ func (db *PrefixDB) GetStorageCount(accountKey []byte) (int, uint64, error) {
 	if err != nil && err != io.EOF {
 		return 0, 0, err
 	}
+	db.addReadBytes(n)
 	buf = buf[:n]
 
 	var kvCount int
@@ -3641,6 +3715,13 @@ func (db *PrefixDB) storagePathByFileID(fileID uint32) (path string, realID uint
 	}
 	realID = fileID
 	return filepath.Join(db.storageDir, fmt.Sprintf("storage_%08d.dat", realID)), realID
+}
+
+func (db *PrefixDB) openCachedReadOnlyFile(path string) (*os.File, error) {
+	if db != nil && db.fileHandleCache != nil {
+		return db.fileHandleCache.Open(path, os.O_RDONLY)
+	}
+	return os.Open(path)
 }
 
 func bytesToString(b []byte) string {
