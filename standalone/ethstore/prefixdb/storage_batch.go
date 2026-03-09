@@ -239,8 +239,8 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 			return err
 		}
 		db.nodeCache.StoreMetadata(accountKey, accOff, StorageInfo{})
-		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(accountKey, StorageInfo{})
+		if db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(accountKey, StorageInfo{})
 		}
 		db.invalidateStorageBuffer(accountKey)
 		return nil
@@ -259,8 +259,8 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		return err
 	}
 	db.nodeCache.StoreMetadata(accountKey, accOff, info)
-	if db.batch != nil {
-		_ = db.batch.updateStoragePointer(accountKey, info)
+	if db.accountBatch != nil {
+		_ = db.accountBatch.updateStoragePointer(accountKey, info)
 	}
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))

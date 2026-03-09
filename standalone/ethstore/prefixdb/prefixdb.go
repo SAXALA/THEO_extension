@@ -30,8 +30,7 @@ const (
 	segmentIndexFileName                   = "index.meta"
 	segmentIndexCacheThresholdBytes        = 0  // cache all decoded segment indexes
 	segmentIndexCacheCapacityMiB           = 64 // total segment-index cache budget in MiB
-	storageEntrySize                       = 108
-	storageGCThreshold                     = 2 //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
+	storageGCThreshold                     = 2  //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
 )
 
 const (
@@ -144,8 +143,8 @@ type PrefixDB struct {
 	accountFile *os.File
 	// slotFile    *os.File
 
-	nodeCache *NodeCache
-	batch     *WriteBatch
+	nodeCache    *NodeCache
+	accountBatch *WriteBatch
 	// triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *pebblestore.PebbleStore // pebble store for account hash key index
 	// hashIndex  hashIndex to aviod hash collision
@@ -290,7 +289,6 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, tota
 
 	db := &PrefixDB{
 		accountFile:             accountFile,
-		batch:                   NewWriteBatch(),
 		writeMutex:              sync.Mutex{},
 		segmentIndexFolderLocks: make(map[uint32]*segmentIndexFolderLock),
 		fileHandleCache:         getGlobalFileHandleCache(),
@@ -300,6 +298,7 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, tota
 		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
 	}
 
+	db.accountBatch = NewWriteBatch(db)
 	sharedCacheBudgetMiB := segmentIndexCacheCapacityMiB
 	if totalCacheSizeMiB > 0 {
 		sharedCacheBudgetMiB = totalCacheSizeMiB
@@ -356,8 +355,8 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 			return entry.Value, true, nil
 		}
 
-		if db.batch != nil {
-			if value, _, ok := db.batch.get(key); ok {
+		if db.accountBatch != nil {
+			if value, _, ok := db.accountBatch.get(key); ok {
 				return value, true, nil
 			}
 		}
@@ -472,8 +471,8 @@ func (db *PrefixDB) Put(key, value, accountKey []byte) error {
 			// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))
 
 		}
-		if db.batch != nil {
-			db.batch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
+		if db.accountBatch != nil {
+			db.accountBatch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
 		}
 
 	case TrieStorage:
@@ -531,8 +530,8 @@ func (db *PrefixDB) BatchPut(key, value, accountKey []byte) error {
 				StorageInfo:   stroageInfo,
 			})
 		}
-		if db.batch != nil {
-			db.batch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
+		if db.accountBatch != nil {
+			db.accountBatch.add(key, value, stroageInfo.storageFileID, stroageInfo.storageOffset, stroageInfo.storageSize, ValueModified)
 		}
 		return nil
 	case TrieStorage:
@@ -542,8 +541,8 @@ func (db *PrefixDB) BatchPut(key, value, accountKey []byte) error {
 }
 
 func (db *PrefixDB) BatchCommit() error {
-	if db.batch != nil {
-		if err := db.batch.CommitBatch(); err != nil {
+	if db.accountBatch != nil {
+		if err := db.accountBatch.CommitBatch(); err != nil {
 			return err
 		}
 	}
@@ -567,8 +566,8 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 			return true, nil
 		}
 
-		if db.batch != nil {
-			if _, _, ok := db.batch.get(key); ok {
+		if db.accountBatch != nil {
+			if _, _, ok := db.accountBatch.get(key); ok {
 				return true, nil
 			}
 		}
@@ -642,8 +641,8 @@ func (db *PrefixDB) Delete(key []byte, accountKey []byte) error {
 
 	switch keyType {
 	case TrieAccount:
-		if db.batch != nil {
-			db.batch.delete(key)
+		if db.accountBatch != nil {
+			db.accountBatch.delete(key)
 		}
 		if db.nodeCache != nil {
 			db.nodeCache.Delete(string(key))
@@ -726,8 +725,8 @@ func (db *PrefixDB) flushStorageBuffer() error {
 			return err
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{})
-		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(buf.accountKey, StorageInfo{})
+		if db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(buf.accountKey, StorageInfo{})
 		}
 	} else {
 		fileID, off, sz, err := db.persistStorageEntries(buf.storagekvs, existingFileID, existingOffset, existingSize)
@@ -746,8 +745,8 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		// cacheKeyHex := hex.EncodeToString([]byte(buf.accountKey))
 		// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", fileID) + ", offset:" + fmt.Sprintf("%d", off) + ", size:" + fmt.Sprintf("%d", sz))
 
-		if db.batch != nil {
-			_ = db.batch.updateStoragePointer(buf.accountKey, StorageInfo{
+		if db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(buf.accountKey, StorageInfo{
 				storageFileID: fileID,
 				storageOffset: off,
 				storageSize:   sz,
@@ -1108,18 +1107,18 @@ func (db *PrefixDB) Close() error {
 	// }
 
 	// forbid further writes to the database
-	if db.batch != nil {
-		db.batch.DisableAutoCommit()
+	if db.accountBatch != nil {
+		db.accountBatch.DisableAutoCommit()
 
 		// wait for any ongoing background commit to finish
-		if db.batch.bgCommit {
-			db.batch.DisableBackgroundCommit()
+		if db.accountBatch.bgCommit {
+			db.accountBatch.DisableBackgroundCommit()
 		}
 	}
 
-	if db.batch != nil {
-		if len(db.batch.operations) > 0 {
-			if err := db.WriteCommit(db.batch); err != nil {
+	if db.accountBatch != nil {
+		if len(db.accountBatch.operations) > 0 {
+			if err := db.WriteCommit(db.accountBatch); err != nil {
 				fmt.Printf("Error committing batch operations: %v\n", err)
 			}
 		}
@@ -1143,7 +1142,7 @@ func (db *PrefixDB) Close() error {
 	}
 
 	db.nodeCache = nil
-	db.batch = nil
+	db.accountBatch = nil
 
 	if db.storageCurFile != nil {
 		_ = db.storageCurFile.Sync()

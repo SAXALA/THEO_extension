@@ -858,7 +858,7 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 	}
 	if b.prefixdbDirty {
 		start := time.Now()
-		if err := b.store.PrefixdbBatchCommit('O'); err != nil {
+		if err := b.store.PrefixdbBatchCommit(); err != nil {
 			return err
 		}
 		b.prefixdbCommitHist.observe(time.Since(start))

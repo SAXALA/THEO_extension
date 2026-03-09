@@ -592,20 +592,17 @@ func (d *Database) CommitAOLBatch() error {
 	return nil
 }
 
-func (d *Database) PrefixdbBatchCommit(prefix byte) error {
-	switch prefix {
-	case 'O':
-		if d.statepdb == nil {
-			return fmt.Errorf("PrefixDB is not initialized, cannot commit batch for prefix %c", prefix)
-		}
-		err := d.statepdb.StorageBatchCommit()
-		if err != nil {
-			return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
-		}
-		d.log.Trace("Committed batch for PrefixDB", "prefix", prefix)
-	default:
-		return fmt.Errorf("unsupported prefix %c for batch commit", prefix)
+func (d *Database) PrefixdbBatchCommit() error {
+
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot commit batch")
 	}
+	err := d.statepdb.BatchCommit()
+	if err != nil {
+		return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
+	}
+	d.log.Trace("Committed batch for PrefixDB", "prefix")
+
 	return nil
 }
 
@@ -979,7 +976,7 @@ func (d *Database) SyncKeyValue() error {
 	}
 
 	if d.statepdb != nil {
-		if err := d.statepdb.StorageBatchCommit(); err != nil {
+		if err := d.statepdb.BatchCommit(); err != nil {
 			return fmt.Errorf("failed to sync PrefixDB batch: %w", err)
 		}
 	}

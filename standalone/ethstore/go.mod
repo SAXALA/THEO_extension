@@ -3,7 +3,6 @@ module github.com/tinoryj/EthStore/standalone/ethstore
 go 1.24.2
 
 require (
-	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/ethereum/go-ethereum v1.16.8
 	github.com/hashicorp/golang-lru v1.0.2
