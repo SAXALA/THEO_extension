@@ -3,8 +3,7 @@ package prefixdb
 import (
 	"bytes"
 	"sync"
-
-	lru "github.com/hashicorp/golang-lru"
+	"unsafe"
 )
 
 // NodeCacheEntry mirrors the data kept in the prefix tree plus the cached value.
@@ -28,25 +27,25 @@ type nodeCacheRecord struct {
 	storageInfo   StorageInfo
 }
 
-// NodeCache is a thin wrapper around hashicorp's LRU cache implementation.
+// NodeCache is a typed view over the shared byte-budgeted LRU implementation.
 type NodeCache struct {
-	lock  sync.RWMutex
-	cache *lru.Cache
+	lock   sync.RWMutex
+	shared *sharedByteCache
 }
 
 // NewNodeCache instantiates an LRU cache with the provided capacity.
-func NewNodeCache(capacity int) (*NodeCache, error) {
-	if capacity <= 0 {
-		capacity = 1
-	}
-	lruCache, err := lru.New(capacity)
-	if err != nil {
-		return nil, err
-	}
-	return &NodeCache{cache: lruCache}, nil
+func NewNodeCache(capacityBytes uint64) (*NodeCache, error) {
+	return newSharedNodeCache(newSharedByteCache(capacityBytes)), nil
 }
 
 func (nc *NodeCache) Close() {}
+
+func newSharedNodeCache(shared *sharedByteCache) *NodeCache {
+	if shared == nil {
+		return nil
+	}
+	return &NodeCache{shared: shared}
+}
 
 // Get returns the cached entry when present.
 func (nc *NodeCache) Get(key string) (NodeCacheEntry, bool) {
@@ -55,7 +54,7 @@ func (nc *NodeCache) Get(key string) (NodeCacheEntry, bool) {
 	}
 	nc.lock.RLock()
 	defer nc.lock.RUnlock()
-	if raw, ok := nc.cache.Get(key); ok {
+	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
 		rec := raw.(*nodeCacheRecord)
 		return NodeCacheEntry{
 			Key:           key,
@@ -75,11 +74,12 @@ func (nc *NodeCache) Put(entry NodeCacheEntry) {
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	nc.cache.Add(entry.Key, &nodeCacheRecord{
+	rec := &nodeCacheRecord{
 		value:         cloneBytes(entry.Value),
 		accountOffset: entry.AccountOffset,
 		storageInfo:   entry.StorageInfo,
-	})
+	}
+	nc.shared.Add(sharedCacheNamespaceNode, entry.Key, rec, estimateNodeCacheRecordSize(entry.Key, rec))
 }
 
 // StoreMetadata records node metadata while preserving any cached value.
@@ -89,16 +89,12 @@ func (nc *NodeCache) StoreMetadata(key string, accountOffset int64, storageInfo 
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	if raw, ok := nc.cache.Get(key); ok {
-		rec := raw.(*nodeCacheRecord)
-		rec.accountOffset = accountOffset
-		rec.storageInfo = storageInfo
-		return
+	rec := &nodeCacheRecord{accountOffset: accountOffset, storageInfo: storageInfo}
+	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
+		current := raw.(*nodeCacheRecord)
+		rec.value = cloneBytes(current.value)
 	}
-	nc.cache.Add(key, &nodeCacheRecord{
-		accountOffset: accountOffset,
-		storageInfo:   storageInfo,
-	})
+	nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 }
 
 // UpdateValue refreshes the cached payload when the entry already exists.
@@ -108,9 +104,14 @@ func (nc *NodeCache) UpdateValue(key string, value []byte) {
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	if raw, ok := nc.cache.Get(key); ok {
-		rec := raw.(*nodeCacheRecord)
-		rec.value = cloneBytes(value)
+	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
+		current := raw.(*nodeCacheRecord)
+		rec := &nodeCacheRecord{
+			value:         cloneBytes(value),
+			accountOffset: current.accountOffset,
+			storageInfo:   current.storageInfo,
+		}
+		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 	}
 }
 
@@ -120,9 +121,14 @@ func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64) {
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	if raw, ok := nc.cache.Get(key); ok {
-		rec := raw.(*nodeCacheRecord)
-		rec.accountOffset = accountOffset
+	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
+		current := raw.(*nodeCacheRecord)
+		rec := &nodeCacheRecord{
+			value:         cloneBytes(current.value),
+			accountOffset: accountOffset,
+			storageInfo:   current.storageInfo,
+		}
+		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 	}
 }
 
@@ -133,9 +139,14 @@ func (nc *NodeCache) UpdateStoragePointer(key string, storageInfo StorageInfo) {
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	if raw, ok := nc.cache.Get(key); ok {
-		rec := raw.(*nodeCacheRecord)
-		rec.storageInfo = storageInfo
+	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
+		current := raw.(*nodeCacheRecord)
+		rec := &nodeCacheRecord{
+			value:         cloneBytes(current.value),
+			accountOffset: current.accountOffset,
+			storageInfo:   storageInfo,
+		}
+		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 	}
 }
 
@@ -146,7 +157,18 @@ func (nc *NodeCache) Delete(key string) {
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	nc.cache.Remove(key)
+	nc.shared.Remove(sharedCacheNamespaceNode, key)
+}
+
+func estimateNodeCacheRecordSize(key string, rec *nodeCacheRecord) uint64 {
+	if rec == nil {
+		return 1
+	}
+	total := uint64(len(key)) + uint64(len(rec.value)) + uint64(unsafe.Sizeof(nodeCacheRecord{}))
+	if total == 0 {
+		return 1
+	}
+	return total
 }
 
 const defaultStorageBufferChunks = 16

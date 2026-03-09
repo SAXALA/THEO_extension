@@ -21,7 +21,7 @@ const (
 	FileNodeMagic         = 0x50544E46 // "PTNF" - file node magic number
 	MaxKeySize            = 32         // maximum key size in bytes
 	TreeFileMagic         = 0x50545246 // "PTRF" - prefix tree file magic number
-	maxCacheFiles         = 1024
+	maxCacheFilesHandles  = 65536
 	fileNodeCacheCapacity = 64
 	maxPooledBufferSize   = 1024 * 1024 // 1MB
 	globalFileName        = "global.node"
@@ -122,7 +122,7 @@ type PrefixTree struct {
 	mergeStop chan struct{}
 	mergeWait sync.WaitGroup
 
-	fileCache       *lru.Cache
+	fileHandleCache *lru.Cache
 	fileNodeCache   *lru.Cache
 	fileNodeCacheMu sync.RWMutex
 	fileStripeLocks stripedRWLocks // striped locks for file operations
@@ -397,7 +397,7 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		return nil, fmt.Errorf("creat node file path failed: %w", err)
 	}
 
-	fileCache, err := lru.NewWithEvict(maxCacheFiles, func(key interface{}, value interface{}) {
+	fileCache, err := lru.NewWithEvict(maxCacheFilesHandles, func(key interface{}, value interface{}) {
 		if file, ok := value.(*os.File); ok {
 			file.Close()
 		}
@@ -412,8 +412,8 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		fileNodeDir:  fileNodeDir,
 		globalFileID: globalFileName,
 		// bucketPrefixLength: MaxPrefixDepth - 1,
-		mergeStop: make(chan struct{}),
-		fileCache: fileCache,
+		mergeStop:       make(chan struct{}),
+		fileHandleCache: fileCache,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, NodeEntrySize*512)
@@ -711,8 +711,8 @@ func (pt *PrefixTree) Close() error {
 	}
 	pt.mergeWait.Wait()
 
-	if pt.fileCache != nil {
-		pt.fileCache.Purge()
+	if pt.fileHandleCache != nil {
+		pt.fileHandleCache.Purge()
 	}
 
 	return nil
@@ -903,17 +903,17 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 }
 
 func (pt *PrefixTree) dropFileHandles(fileID string) {
-	if pt.fileCache == nil {
+	if pt.fileHandleCache == nil {
 		return
 	}
 	flags := []int{os.O_RDONLY, os.O_RDWR, os.O_RDWR | os.O_CREATE}
 	for _, flag := range flags {
 		key := fmt.Sprintf("%s|%d", fileID, flag)
-		if v, ok := pt.fileCache.Get(key); ok {
+		if v, ok := pt.fileHandleCache.Get(key); ok {
 			if f, _ := v.(*os.File); f != nil {
 				_ = f.Close()
 			}
-			pt.fileCache.Remove(key)
+			pt.fileHandleCache.Remove(key)
 		}
 	}
 }
@@ -949,7 +949,7 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 	cacheKey := fmt.Sprintf("%s|%d", fileID, flag)
 
 	// get from cache
-	if handle, ok := pt.fileCache.Get(cacheKey); ok {
+	if handle, ok := pt.fileHandleCache.Get(cacheKey); ok {
 		return handle.(*os.File), nil
 	}
 
@@ -960,7 +960,7 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 	}
 
 	// add to cache
-	pt.fileCache.Add(cacheKey, file)
+	pt.fileHandleCache.Add(cacheKey, file)
 	return file, nil
 }
 

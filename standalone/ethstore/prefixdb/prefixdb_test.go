@@ -124,6 +124,61 @@ func TestSegmentIndexCacheRespectsByteBudget(t *testing.T) {
 	}
 }
 
+func TestSharedCacheEvictsAcrossCacheTypes(t *testing.T) {
+	shared := newSharedByteCache(1024)
+	nodeCache := newSharedNodeCache(shared)
+	storageCache := newSharedStorageValueCache(shared)
+	segmentCache := newSharedSegmentIndexCache(shared)
+
+	nodeCache.Put(NodeCacheEntry{
+		Key:   "node",
+		Value: bytes.Repeat([]byte{0x01}, 360),
+	})
+	if _, ok := nodeCache.Get("node"); !ok {
+		t.Fatal("expected node cache entry to exist")
+	}
+
+	storageCache.Add("storage", bytes.Repeat([]byte{0x02}, 360))
+	if _, ok := storageCache.Get("storage"); !ok {
+		t.Fatal("expected storage cache entry to exist")
+	}
+
+	segmentCache.Add(7, []segmentChunkMeta{{
+		FileName: strings.Repeat("c", 220),
+		KeyStart: bytes.Repeat([]byte{0x03}, 120),
+		KeyEnd:   bytes.Repeat([]byte{0x04}, 120),
+	}})
+	if _, ok := segmentCache.Get(7); !ok {
+		t.Fatal("expected segment index cache entry to exist")
+	}
+
+	if _, ok := nodeCache.Get("node"); ok {
+		t.Fatal("expected oldest node-cache entry to be evicted by shared budget")
+	}
+	if _, ok := storageCache.Get("storage"); !ok {
+		t.Fatal("expected newer storage cache entry to remain resident")
+	}
+	if _, ok := segmentCache.Get(7); !ok {
+		t.Fatal("expected newest segment index cache entry to remain resident")
+	}
+
+	usedTotal := uint64(0)
+	for _, namespace := range []sharedCacheNamespace{
+		sharedCacheNamespaceNode,
+		sharedCacheNamespaceStorage,
+		sharedCacheNamespaceSegmentIndex,
+	} {
+		used, capacity := shared.NamespaceStats(namespace)
+		usedTotal += used
+		if capacity != 1024 {
+			t.Fatalf("unexpected shared capacity for namespace %d: got %d want %d", namespace, capacity, 1024)
+		}
+	}
+	if usedTotal > 1024 {
+		t.Fatalf("shared cache exceeds total budget: used=%d capacity=%d", usedTotal, 1024)
+	}
+}
+
 func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	original := []segmentChunkMeta{{
 		FileName: strings.Repeat("chunk", 8),

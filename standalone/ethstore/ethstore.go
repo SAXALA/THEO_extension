@@ -139,9 +139,9 @@ func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logge
 
 // Database is a persistent key-value store based on the append-only log store.
 type Database struct {
-	fn       string             // filename/directory for reporting
+	fn       string                   // filename/directory for reporting
 	pebble   *pebblestore.PebbleStore // Pebble store for non-AOL data
-	statepdb *prefixdb.PrefixDB // world state PrefixDB
+	statepdb *prefixdb.PrefixDB       // world state PrefixDB
 	blockAol *BlockAppendOnlyLog
 
 	accountHashKeyCache *accountHashToKeyCache // in-memory cache: accountHash(32) -> accountKey(max64)
@@ -161,17 +161,17 @@ type Database struct {
 
 // The namespace is the prefix that the metrics reporting should use.
 func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, contractCachePrefetchCount int) (*Database, error) {
-	return NewWithPrefixCacheSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0)
+	return NewWithPrefixCacheSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount)
 }
 
-// NewWithPrefixCacheSettings creates Database with explicit PrefixDB node cache
-// (MiB) and segment-index cache (MiB) settings.
-// Use <=0 values to fallback to config/default values.
-func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSizeMiB int, contractCachePrefetchCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*Database, error) {
+// NewWithPrefixCacheSettings creates Database with a single shared PrefixDB
+// cache budget in MiB. All PrefixDB caches share this total budget.
+// Use <=0 values to fallback to the default shared cache size.
+func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(dirPathState, chunkFileSize, prefixTreeCacheSizeMiB, contractCachePrefetchCount, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -227,11 +227,11 @@ func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, r
 	return db, nil
 }
 
-// NewStateOnlyWithPrefixCacheSettings opens PrefixDB-only Database with explicit
-// node cache(MiB) and segment-index cache(MiB) settings.
-func NewStateOnlyWithPrefixCacheSettings(stateDir string, chunkFileSize int, contractCacheSizeMiB int, contractCachePrefetchCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*Database, error) {
+// NewStateOnlyWithPrefixCacheSettings opens PrefixDB-only Database with a
+// single shared cache budget in MiB.
+func NewStateOnlyWithPrefixCacheSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int) (*Database, error) {
 	logger := log.New("database", stateDir)
-	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(stateDir, chunkFileSize, contractCacheSizeMiB, contractCachePrefetchCount, nodeCacheSizeMiB, segmentIndexCacheSizeMiB)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithCacheSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb (state-only): %w", err)
 	}

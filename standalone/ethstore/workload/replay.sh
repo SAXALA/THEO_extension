@@ -33,17 +33,11 @@ CACHE_COUNT="${CACHE_COUNT:-32}"
 
 # ethstore load 参数: chunk 文件大小（字节），如 4096/16384/65536/262144
 CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
-# ethstore load 参数: storage cache 大小（MiB）
-STORAGE_CACHE_SIZE_MIB="${STORAGE_CACHE_SIZE_MIB:-12}"
-# PrefixDB node cache 大小（MiB）
-NODE_CACHE_SIZE_MIB="${NODE_CACHE_SIZE_MIB:-4}"
-# PrefixDB segment index cache 大小（MiB）
-SEGMENT_INDEX_CACHE_SIZE_MIB="${SEGMENT_INDEX_CACHE_SIZE_MIB:-64}"
+# ethstore 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
+TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-80}"
 
 # Keep byte conversions for logging only; Go now receives MiB and converts internally.
-STORAGE_CACHE_SIZE_BYTES=$((STORAGE_CACHE_SIZE_MIB * 1024 * 1024))
-NODE_CACHE_SIZE_BYTES=$((NODE_CACHE_SIZE_MIB * 1024 * 1024))
-SEGMENT_INDEX_CACHE_SIZE_BYTES=$((SEGMENT_INDEX_CACHE_SIZE_MIB * 1024 * 1024))
+TOTAL_CACHE_SIZE_BYTES=$((TOTAL_CACHE_SIZE_MIB * 1024 * 1024))
 
 # chainkv 参数: cache 大小（MB）
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
@@ -156,9 +150,7 @@ Common env vars:
     TRACE_FILE(cache|nocache|nocache_snap)
     DB_TYPE(all|aol|prefixdb|pebble)
     CACHE_COUNT
-    CHUNK_FILE_SIZE(bytes), STORAGE_CACHE_SIZE_MIB(MiB)
-    NODE_CACHE_SIZE_MIB(MiB)
-    SEGMENT_INDEX_CACHE_SIZE_MIB(MiB)
+    CHUNK_FILE_SIZE(bytes), TOTAL_CACHE_SIZE_MIB(MiB)
     CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
     LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
@@ -404,7 +396,7 @@ build_run_tag() {
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_scs_${STORAGE_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}_ncs_${NODE_CACHE_SIZE_MIB}_sics_${SEGMENT_INDEX_CACHE_SIZE_MIB}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}${round_tag}"
     else
         printf "%s" "${base_tag}${round_tag}"
     fi
@@ -432,9 +424,7 @@ print_param_snapshot() {
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
         printf 'CHUNK_FILE_SIZE=%s\n' "$CHUNK_FILE_SIZE"
-        printf 'STORAGE_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$STORAGE_CACHE_SIZE_MIB" "$STORAGE_CACHE_SIZE_BYTES"
-        printf 'NODE_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$NODE_CACHE_SIZE_MIB" "$NODE_CACHE_SIZE_BYTES"
-        printf 'SEGMENT_INDEX_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$SEGMENT_INDEX_CACHE_SIZE_MIB" "$SEGMENT_INDEX_CACHE_SIZE_BYTES"
+        printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
     elif [ "$snapshot_backend" = "chainkv" ]; then
         printf 'CHAINKV_CACHE_MB=%s\n' "$CHAINKV_CACHE_MB"
         printf 'CHAINKV_HANDLES=%s\n' "$CHAINKV_HANDLES"
@@ -494,7 +484,7 @@ run_load() {
         ethstore)
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -contract-cache-size-mib "$STORAGE_CACHE_SIZE_MIB" -node-cache-size-mib "$NODE_CACHE_SIZE_MIB" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -549,7 +539,7 @@ run_replay() {
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
                 -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
-                -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -contract-cache-size-mib "$STORAGE_CACHE_SIZE_MIB" -node-cache-size-mib "$NODE_CACHE_SIZE_MIB" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -574,7 +564,7 @@ run_gc() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
-                -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -contract-cache-size-mib "$STORAGE_CACHE_SIZE_MIB" -node-cache-size-mib "$NODE_CACHE_SIZE_MIB" -segment-index-cache-size-mib "$SEGMENT_INDEX_CACHE_SIZE_MIB"
+                -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"

@@ -2,7 +2,6 @@ package prefixdb
 
 import (
 	"bytes"
-	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -20,7 +19,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-	lru "github.com/hashicorp/golang-lru"
 	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
@@ -95,94 +93,6 @@ type storageGCJob struct {
 	folderID uint32
 	fileName string
 	backing  *bufferLease
-}
-
-type segmentIndexCacheEntry struct {
-	folderID  uint32
-	metas     []segmentChunkMeta
-	sizeBytes uint64
-}
-
-type segmentIndexCache struct {
-	capacityBytes uint64
-	usedBytes     uint64
-	ll            *list.List
-	items         map[uint32]*list.Element
-}
-
-func newSegmentIndexCache(capacityMiB int) *segmentIndexCache {
-	if capacityMiB <= 0 {
-		return nil
-	}
-	return &segmentIndexCache{
-		capacityBytes: uint64(capacityMiB) * 1024 * 1024,
-		ll:            list.New(),
-		items:         make(map[uint32]*list.Element),
-	}
-}
-
-func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
-	if c == nil {
-		return nil, false
-	}
-	elem, ok := c.items[folderID]
-	if !ok {
-		return nil, false
-	}
-	c.ll.MoveToFront(elem)
-	entry := elem.Value.(*segmentIndexCacheEntry)
-	return entry.metas, true
-}
-
-func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
-	if c == nil {
-		return
-	}
-	sizeBytes := estimateSegmentChunkMetasMemory(metas)
-	if existing, ok := c.items[folderID]; ok {
-		c.removeElement(existing)
-	}
-	if sizeBytes == 0 || sizeBytes > c.capacityBytes {
-		return
-	}
-	entry := &segmentIndexCacheEntry{
-		folderID:  folderID,
-		metas:     cloneSegmentChunkMetas(metas),
-		sizeBytes: sizeBytes,
-	}
-	elem := c.ll.PushFront(entry)
-	c.items[folderID] = elem
-	c.usedBytes += sizeBytes
-	for c.usedBytes > c.capacityBytes {
-		back := c.ll.Back()
-		if back == nil {
-			break
-		}
-		c.removeElement(back)
-	}
-}
-
-func (c *segmentIndexCache) Remove(folderID uint32) {
-	if c == nil {
-		return
-	}
-	if elem, ok := c.items[folderID]; ok {
-		c.removeElement(elem)
-	}
-}
-
-func (c *segmentIndexCache) removeElement(elem *list.Element) {
-	if c == nil || elem == nil {
-		return
-	}
-	entry := elem.Value.(*segmentIndexCacheEntry)
-	delete(c.items, entry.folderID)
-	c.ll.Remove(elem)
-	if c.usedBytes >= entry.sizeBytes {
-		c.usedBytes -= entry.sizeBytes
-	} else {
-		c.usedBytes = 0
-	}
 }
 
 func (job storageGCJob) key() string {
@@ -286,7 +196,7 @@ type PrefixDB struct {
 	storageGCWait     sync.WaitGroup
 	storageGCMu       sync.Mutex
 
-	storageCache            *lru.Cache
+	storageCache            *storageValueCache
 	stroageCacheSizeLimit   uint64
 	storageChunkSize        int
 	segmentedChunkHardLimit int // hard cap for individual chunk files
@@ -338,14 +248,14 @@ type segmentIndexFolderLock struct {
   - It initializes the necessary files, directories, caches, and workers based on the provided configuration.
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
-func NewPrefixDB(dirpath string, storageChunkFileSize int, contractCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithCacheSettings(dirpath, storageChunkFileSize, contractCacheSizeMiB, storageGetCacheCount, 0, 0)
+func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
+	return NewPrefixDBWithCacheSettings(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount)
 }
 
-// NewPrefixDBWithCacheSettings creates PrefixDB with explicit node-cache(bytes)
-// and segment-index-cache(MiB) settings, bypassing process-wide overrides.
-// Use <=0 values to fallback to config/default values.
-func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, contractCacheSizeMiB int, storageGetCacheCount int, nodeCacheSizeMiB int, segmentIndexCacheSizeMiB int) (*PrefixDB, error) {
+// NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
+// budget in MiB. All PrefixDB caches share this total budget.
+// Use <=0 values to fallback to the default shared cache size.
+func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -390,9 +300,11 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
 	}
 
-	if contractCacheSizeMiB > 0 {
-		db.stroageCacheSizeLimit = uint64(contractCacheSizeMiB * 1024 * 1024 / storageEntrySize)
+	sharedCacheBudgetMiB := segmentIndexCacheCapacityMiB
+	if totalCacheSizeMiB > 0 {
+		sharedCacheBudgetMiB = totalCacheSizeMiB
 	}
+	db.stroageCacheSizeLimit = uint64(sharedCacheBudgetMiB) * 1024 * 1024
 	if err := os.MkdirAll(db.storageDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create storage dir: %v", err)
 	}
@@ -400,12 +312,9 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 		return nil, fmt.Errorf("failed to init storage shard: %v", err)
 	}
 
-	nodeCacheCapacity := nodeCacheSizeMiB * 1024 * 1024 / NodeEntrySize
-	nodeCache, err := NewNodeCache(nodeCacheCapacity)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init node cache: %v", err)
-	}
-	db.nodeCache = nodeCache
+	sharedCache := newSharedByteCache(db.stroageCacheSizeLimit)
+
+	db.nodeCache = newSharedNodeCache(sharedCache)
 
 	prefixTree, err := NewPrefixTree(db, dirpath)
 	if err != nil {
@@ -414,17 +323,8 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, cont
 
 	db.prefixTree = prefixTree
 
-	segmentIndexCapacityMiB := segmentIndexCacheCapacityMiB
-	if segmentIndexCacheSizeMiB > 0 {
-		segmentIndexCapacityMiB = segmentIndexCacheSizeMiB
-	}
-	db.storageIndexCache = newSegmentIndexCache(segmentIndexCapacityMiB)
-
-	storageCache, err := lru.New(int(db.stroageCacheSizeLimit))
-	if err != nil {
-		return nil, fmt.Errorf("failed to init storage cache: %v", err)
-	}
-	db.storageCache = storageCache
+	db.storageIndexCache = newSharedSegmentIndexCache(sharedCache)
+	db.storageCache = newSharedStorageValueCache(sharedCache)
 
 	db.startStorageGCWorker()
 
