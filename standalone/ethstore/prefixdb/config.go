@@ -15,6 +15,13 @@ type Config struct {
 	// If empty, defaults will be used.
 	AccountDir    string `json:"account_dir"`
 	StorageDir    string `json:"storage_dir"`
+	// NodeFileGCUnsortedRatioThreshold triggers file-node GC when
+	// unsorted_count / sorted_count reaches this ratio.
+	// Values <= 0 fall back to the default 1.0.
+	NodeFileGCUnsortedRatioThreshold float64 `json:"node_file_gc_unsorted_ratio_threshold"`
+	// NodeFileGCWorkers controls the number of concurrent PrefixTree GC workers.
+	// Values <= 0 use an automatic worker count.
+	NodeFileGCWorkers int `json:"node_file_gc_workers"`
 }
 
 // DefaultConfig returns a configuration with default values.
@@ -22,9 +29,10 @@ type Config struct {
 func DefaultConfig(dirpath string) *Config {
 	prefixDBDir := filepath.Join(dirpath, "prefixdb")
 	return &Config{
-		BaseDir:        dirpath,
-		AccountDir:     filepath.Join(prefixDBDir, "na"),
-		StorageDir:     filepath.Join(prefixDBDir, "storagefiles"),
+		BaseDir:                           dirpath,
+		AccountDir:                        filepath.Join(prefixDBDir, "na"),
+		StorageDir:                        filepath.Join(prefixDBDir, "storagefiles"),
+		NodeFileGCUnsortedRatioThreshold: 1.0,
 	}
 }
 

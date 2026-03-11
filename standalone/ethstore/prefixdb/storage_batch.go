@@ -242,7 +242,6 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		if db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(accountKey, StorageInfo{})
 		}
-		db.invalidateStorageBuffer(accountKey)
 		return nil
 	}
 
@@ -265,7 +264,6 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))
 	// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", info.storageFileID) + ", offset:" + fmt.Sprintf("%d", info.storageOffset) + ", size:" + fmt.Sprintf("%d", info.storageSize))
-	db.invalidateStorageBuffer(accountKey)
 	return nil
 }
 

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -204,5 +207,91 @@ func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	}
 	if cloned[0].FileName == "mutated" {
 		t.Fatal("expected cloned FileName to remain independent from source")
+	}
+}
+
+func TestPrefixTreeShouldScheduleGCUsesRatioThreshold(t *testing.T) {
+	pt := &PrefixTree{gcRatioThreshold: 1.5}
+	if pt.shouldScheduleGC(10, 14) {
+		t.Fatal("expected GC to stay idle below configured ratio")
+	}
+	if !pt.shouldScheduleGC(10, 15) {
+		t.Fatal("expected GC when unsorted/sorted reaches configured ratio")
+	}
+	if !pt.shouldScheduleGC(0, 1) {
+		t.Fatal("expected GC when only unsorted entries exist")
+	}
+	if pt.shouldScheduleGC(10, 0) {
+		t.Fatal("did not expect GC without unsorted entries")
+	}
+}
+
+func TestPrefixTreeGCWorkerConcurrency(t *testing.T) {
+	pt := &PrefixTree{gcWorkerCount: 3}
+	if got := pt.gcWorkerConcurrency(); got != 3 {
+		t.Fatalf("worker count mismatch: got %d want %d", got, 3)
+	}
+	pt.gcWorkerCount = 0
+	expected := runtime.NumCPU() / 2
+	if expected < 1 {
+		expected = 1
+	}
+	if expected > maxPrefixTreeGCWorkers {
+		expected = maxPrefixTreeGCWorkers
+	}
+	if got := pt.gcWorkerConcurrency(); got != expected {
+		t.Fatalf("unexpected automatic worker count: got %d want %d", got, expected)
+	}
+}
+
+func TestPrefixTreeGetDuringGCInFlightUsesSnapshot(t *testing.T) {
+	baseDir := t.TempDir()
+	db := &PrefixDB{}
+	pt, err := NewPrefixTree(db, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	key := bytes.Repeat([]byte{0x01}, 32)
+	fileID := pt.fileIDForKey(key)
+	if err := pt.putIntoFileNode(fileID, key, 123, 7, 11, 13); err != nil {
+		t.Fatalf("putIntoFileNode failed: %v", err)
+	}
+
+	state, err := pt.buildGCStateFromFile(fileID)
+	if err != nil {
+		t.Fatalf("buildGCStateFromFile failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected non-nil GC state")
+	}
+
+	pt.gcMu.Lock()
+	pt.gcInFlight[fileID] = state
+	pt.gcMu.Unlock()
+	defer pt.finishGC(fileID)
+
+	node, found, err := pt.getFromFileNode(fileID, key)
+	if err != nil {
+		t.Fatalf("getFromFileNode during GC returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected key to remain readable during GC")
+	}
+	if node.accountOffset != 123 || node.storageFileID != 7 || node.storageOffset != 11 || node.storageSize != 13 {
+		t.Fatalf("unexpected node info during GC: %+v", node)
+	}
+
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("failed to remove file node: %v", err)
+	}
+	node, found, err = pt.getFromFileNode(fileID, key)
+	if err != nil {
+		t.Fatalf("getFromFileNode after file removal during GC returned error: %v", err)
+	}
+	if !found || node.accountOffset != 123 {
+		t.Fatalf("expected GC snapshot to keep data readable after file removal, found=%t node=%+v", found, node)
 	}
 }

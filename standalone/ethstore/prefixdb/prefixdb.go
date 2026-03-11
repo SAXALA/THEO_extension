@@ -150,9 +150,6 @@ type PrefixDB struct {
 	// hashIndex  hashIndex to aviod hash collision
 	writeMutex sync.Mutex // mutex for writeCommit
 
-	storageBufLock sync.Mutex
-	storageChunk   storageChunkBuffer
-
 	// segmentedMu coordinates readers with segmented storage rewrites (GC / index updates).
 	// Readers take RLock across index selection + chunk read; writers take Lock.
 	segmentedMu sync.RWMutex
@@ -195,6 +192,9 @@ type PrefixDB struct {
 	storageGCWait     sync.WaitGroup
 	storageGCMu       sync.Mutex
 
+	nodeFileGCUnsortedRatioThreshold float64
+	nodeFileGCWorkers                int
+
 	storageCache            *storageValueCache
 	stroageCacheSizeLimit   uint64
 	storageChunkSize        int
@@ -225,6 +225,17 @@ type PrefixDB struct {
 	trieStorageCacheBytes uint64
 	trieStorageLogPairs   uint64
 	trieStorageLogBytes   uint64
+
+	// nodeCache access stats (read path)
+	nodeCacheLookups uint64
+	nodeCacheHits    uint64
+	nodeCacheMisses  uint64
+	// Served means we returned from nodeCache without consulting PrefixTree/NodeFile.
+	nodeCacheServed uint64
+	// NodeFile (PrefixTree) access after nodeCache lookup.
+	nodeCacheToNodeFile            uint64
+	nodeCacheMissToNodeFile        uint64
+	nodeCacheHitFallbackToNodeFile uint64
 }
 
 // SerializedTrieNode
@@ -248,13 +259,17 @@ type segmentIndexFolderLock struct {
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
 func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithCacheSettings(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0)
 }
 
 // NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
 // budget in MiB. All PrefixDB caches share this total budget.
 // Use <=0 values to fallback to the default shared cache size.
 func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0)
+}
+
+func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -288,14 +303,22 @@ func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, tota
 	}
 
 	db := &PrefixDB{
-		accountFile:             accountFile,
-		writeMutex:              sync.Mutex{},
-		segmentIndexFolderLocks: make(map[uint32]*segmentIndexFolderLock),
-		fileHandleCache:         getGlobalFileHandleCache(),
-		storageDir:              storageDir,
-		storageGetCacheCount:    storageGetCacheCount,
-		storageChunkSize:        storageChunkFileSize,
-		segmentedChunkHardLimit: storageChunkFileSize * storageGCThreshold,
+		accountFile:                      accountFile,
+		writeMutex:                       sync.Mutex{},
+		segmentIndexFolderLocks:          make(map[uint32]*segmentIndexFolderLock),
+		fileHandleCache:                  getGlobalFileHandleCache(),
+		storageDir:                       storageDir,
+		storageGetCacheCount:             storageGetCacheCount,
+		storageChunkSize:                 storageChunkFileSize,
+		segmentedChunkHardLimit:          storageChunkFileSize * storageGCThreshold,
+		nodeFileGCUnsortedRatioThreshold: cfg.NodeFileGCUnsortedRatioThreshold,
+		nodeFileGCWorkers:                cfg.NodeFileGCWorkers,
+	}
+	if nodeFileGCRatioThreshold > 0 {
+		db.nodeFileGCUnsortedRatioThreshold = nodeFileGCRatioThreshold
+	}
+	if nodeFileGCWorkers > 0 {
+		db.nodeFileGCWorkers = nodeFileGCWorkers
 	}
 
 	db.accountBatch = NewWriteBatch(db)
@@ -419,13 +442,13 @@ func (db *PrefixDB) Get(key []byte, accountKey []byte) ([]byte, bool, error) {
 			return valueBytes, true, nil
 		}
 
-		value, ok, fromCache, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
+		value, ok, err := db.readAccountStorageValue(accountKey, storageKey)
 		if err != nil {
-			fmt.Println("Error ensuring account storage buffered:", err)
+			fmt.Println("Error reading account storage:", err)
 			return nil, false, err
 		}
 		if ok {
-			db.addTrieStorageFetchStats(fromCache, value)
+			db.addTrieStorageFetchStats(false, value)
 			return value, true, nil
 		}
 		return nil, false, nil
@@ -619,9 +642,9 @@ func (db *PrefixDB) Has(key []byte, accountKey []byte) (bool, error) {
 		if v, ok := db.storageCache.Get(db.storageCacheKey(accountKey, storageKey)); ok {
 			return v != nil, nil
 		}
-		_, ok, _, err := db.ensureAccountStorageBuffered(accountKey, storageKey)
+		_, ok, err := db.readAccountStorageValue(accountKey, storageKey)
 		if err != nil {
-			fmt.Println("Error ensuring account storage buffered:", err)
+			fmt.Println("Error reading account storage:", err)
 			return false, err
 		}
 		if ok {
@@ -753,7 +776,6 @@ func (db *PrefixDB) flushStorageBuffer() error {
 			})
 		}
 	}
-	db.invalidateStorageBuffer(buf.accountKey)
 	buf.reset()
 	return nil
 }
@@ -1091,12 +1113,24 @@ func (db *PrefixDB) Close() error {
 		atomic.LoadUint64(&db.trieStorageLogPairs),
 		atomic.LoadUint64(&db.trieStorageLogBytes),
 	)
+	lookups := atomic.LoadUint64(&db.nodeCacheLookups)
+	hits := atomic.LoadUint64(&db.nodeCacheHits)
+	misses := atomic.LoadUint64(&db.nodeCacheMisses)
+	served := atomic.LoadUint64(&db.nodeCacheServed)
+	toNodeFile := atomic.LoadUint64(&db.nodeCacheToNodeFile)
+	missToNodeFile := atomic.LoadUint64(&db.nodeCacheMissToNodeFile)
+	hitFallbackToNodeFile := atomic.LoadUint64(&db.nodeCacheHitFallbackToNodeFile)
+	fallback := uint64(0)
+	if hits >= served {
+		fallback = hits - served
+	}
+	fmt.Printf("PrefixDB nodeCache stats: lookups=%d hits=%d misses=%d served=%d fallback=%d toNodeFile=%d missToNodeFile=%d hitFallbackToNodeFile=%d\n",
+		lookups, hits, misses, served, fallback, toNodeFile, missToNodeFile, hitFallbackToNodeFile,
+	)
 
 	if err := db.flushStorageBuffer(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to flush storage buffer: %v", err))
 	}
-
-	db.releaseStorageBuffer()
 
 	if db.nodeCache != nil {
 		db.nodeCache.Close()
@@ -1393,8 +1427,13 @@ func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
 
 func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 	cacheKey := string(key)
+	atomic.AddUint64(&db.nodeCacheLookups, 1)
+	cacheHit := false
 	if entry, ok := db.nodeCache.Get(cacheKey); ok {
+		cacheHit = true
+		atomic.AddUint64(&db.nodeCacheHits, 1)
 		if entry.StorageInfo.storageFileID != 0 {
+			atomic.AddUint64(&db.nodeCacheServed, 1)
 			return &TrieNode{
 				storageFileID: entry.StorageInfo.storageFileID,
 				storageOffset: entry.StorageInfo.storageOffset,
@@ -1402,8 +1441,16 @@ func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 				offset:        entry.AccountOffset,
 			}, nil
 		}
+	} else {
+		atomic.AddUint64(&db.nodeCacheMisses, 1)
 	}
 
+	atomic.AddUint64(&db.nodeCacheToNodeFile, 1)
+	if cacheHit {
+		atomic.AddUint64(&db.nodeCacheHitFallbackToNodeFile, 1)
+	} else {
+		atomic.AddUint64(&db.nodeCacheMissToNodeFile, 1)
+	}
 	nodeInfo, found, err := db.prefixTree.Get(key)
 	if err != nil {
 		return nil, err
@@ -1443,8 +1490,13 @@ func (db *PrefixDB) getNode(key []byte) (*TrieNode, error) {
 
 func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 	cacheKey := string(key)
+	atomic.AddUint64(&db.nodeCacheLookups, 1)
+	cacheHit := false
 	if entry, ok := db.nodeCache.Get(cacheKey); ok {
+		cacheHit = true
+		atomic.AddUint64(&db.nodeCacheHits, 1)
 		if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
+			atomic.AddUint64(&db.nodeCacheServed, 1)
 			return &TrieNode{
 				storageFileID: entry.StorageInfo.storageFileID,
 				storageOffset: entry.StorageInfo.storageOffset,
@@ -1452,6 +1504,15 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 				offset:        entry.AccountOffset,
 			}, nil
 		}
+	} else {
+		atomic.AddUint64(&db.nodeCacheMisses, 1)
+	}
+
+	atomic.AddUint64(&db.nodeCacheToNodeFile, 1)
+	if cacheHit {
+		atomic.AddUint64(&db.nodeCacheHitFallbackToNodeFile, 1)
+	} else {
+		atomic.AddUint64(&db.nodeCacheMissToNodeFile, 1)
 	}
 
 	nodeInfo, found, err := db.prefixTree.Get(key)
@@ -3096,7 +3157,11 @@ func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) (*bu
 	}
 	intSize := int(size)
 	buf := getDataBuffer(intSize)
-	if _, err := io.ReadFull(f, buf[:intSize]); err != nil {
+	// NOTE: file handles may be reused via fileHandleCache. Do not rely on the
+	// shared file offset (Read/Seek). Use a ReaderAt-based reader to always read
+	// from offset 0.
+	sr := io.NewSectionReader(f, 0, size)
+	if _, err := io.ReadFull(sr, buf[:intSize]); err != nil {
 		putDataBuffer(buf)
 		return nil, err
 	}
@@ -3114,102 +3179,71 @@ func (db *PrefixDB) maybeNormalizeChunkEntries(entries []kvPair, meta *segmentCh
 	return normalizeStorageEntries(entries)
 }
 
-// ensureAccountStorageBuffered loads (and optionally returns) the storage chunk entry for storageKey
-// so repeated GET/Has calls over the same account avoid redundant chunk scans.
-func (db *PrefixDB) ensureAccountStorageBuffered(accountKey, storageKey []byte) ([]byte, bool, bool, error) {
+func (db *PrefixDB) readAccountStorageValue(accountKey, storageKey []byte) ([]byte, bool, error) {
 	if len(accountKey) == 0 {
-		return nil, false, false, nil
+		return nil, false, nil
 	}
-	ak := string(accountKey)
-
-	db.storageBufLock.Lock()
-	if db.storageChunk.accountKey == ak && db.storageChunk.covers(ak, storageKey) {
-		value, ok := db.storageChunk.lookup(storageKey)
-		if ok {
-			db.storageBufLock.Unlock()
-			return value, ok, true, nil
-		}
-	}
-	db.storageBufLock.Unlock()
 
 	cacheInfo, err := db.resolveAccountStoragePointer(accountKey)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
 
 	if cacheInfo.storageFileID == 0 {
-		db.adoptStorageBuffer(ak, nil, nil)
-		return nil, false, false, nil
+		return nil, false, nil
 	}
 
 	if isSegmentedStorage(cacheInfo.storageFileID) {
 		val := db.readSegmentedChunkToCache(cacheInfo.storageFileID, accountKey, storageKey)
 		if val == nil {
-			return nil, false, false, nil
+			return nil, false, nil
 		}
-		return val, true, false, nil
+		return val, true, nil
 
 	} else {
 		val := db.readStorageSegmentFile(cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize, accountKey, storageKey)
 		if val == nil {
-			return nil, false, false, nil
+			return nil, false, nil
 		}
-		return val, true, false, nil
+		return val, true, nil
 	}
 }
 
-func (db *PrefixDB) adoptStorageBuffer(accountKey string, entries []kvPair, backing *bufferLease) {
-	db.storageBufLock.Lock()
-	defer db.storageBufLock.Unlock()
-	db.storageChunk.adopt(accountKey, entries, backing)
-}
-
-func (db *PrefixDB) borrowStorageEntries(count int) []kvPair {
+func borrowStorageEntries(count int) []kvPair {
 	if count <= 0 {
 		return nil
 	}
-	db.storageBufLock.Lock()
-	entries := db.storageChunk.borrowEntries(count)
-	db.storageBufLock.Unlock()
-	return entries
+	if buf := kvPairEntryPool.Get(); buf != nil {
+		entries := buf.([]kvPair)
+		if cap(entries) >= count {
+			return entries[:count]
+		}
+	}
+	return make([]kvPair, count)
 }
 
-func (db *PrefixDB) releaseStorageEntries(entries []kvPair) {
+func releaseStorageEntries(entries []kvPair) {
 	if entries == nil {
 		return
 	}
-	db.storageBufLock.Lock()
-	db.storageChunk.returnEntries(entries)
-	db.storageBufLock.Unlock()
+	for i := range entries {
+		entries[i] = kvPair{}
+	}
+	kvPairEntryPool.Put(entries[:0])
 }
 
 func (db *PrefixDB) buildStorageEntries(payload []byte, kvCount int) ([]kvPair, error) {
 	if kvCount == 0 {
 		return nil, nil
 	}
-	entries := db.borrowStorageEntries(kvCount)
+	entries := borrowStorageEntries(kvCount)
 	decoded, err := buildPairsFromPayload(payload, kvCount, entries)
 	if err != nil {
-		db.releaseStorageEntries(entries)
+		releaseStorageEntries(entries)
 		return nil, err
 	}
 	return decoded, nil
 	// return normalizeStorageEntries(decoded), nil
-}
-
-func (db *PrefixDB) invalidateStorageBuffer(accountKey string) {
-	if accountKey == "" {
-		return
-	}
-	db.storageBufLock.Lock()
-	db.storageChunk.invalidate(accountKey)
-	db.storageBufLock.Unlock()
-}
-
-func (db *PrefixDB) releaseStorageBuffer() {
-	db.storageBufLock.Lock()
-	db.storageChunk.reset()
-	db.storageBufLock.Unlock()
 }
 
 func normalizeStorageEntries(entries []kvPair) []kvPair {
@@ -3873,20 +3907,20 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 		if backings[backingIdx] != nil {
 			payload, kvCount, pErr := parseSegmentBuffer(backings[backingIdx].Bytes())
 			if pErr == nil {
-				entries := db.borrowStorageEntries(kvCount)
+				entries := borrowStorageEntries(kvCount)
 				if decoded, decErr := buildPairsFromPayload(payload, kvCount, entries); decErr == nil {
 					preloaded = decoded
 					preloadBacking = backings[backingIdx]
 					backings[backingIdx] = nil
 				} else {
-					db.releaseStorageEntries(entries)
+					releaseStorageEntries(entries)
 				}
 			}
 		}
 
 		chunkMetas, next, rErr := db.rewriteChunkWithDedupToNewFiles(folderID, folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
 		if preloaded != nil {
-			db.releaseStorageEntries(preloaded)
+			releaseStorageEntries(preloaded)
 		}
 		if rErr != nil {
 			return rErr
@@ -3983,13 +4017,13 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	if job.backing != nil {
 		payload, kvCount, err := parseSegmentBuffer(job.backing.Bytes())
 		if err == nil {
-			entries := db.borrowStorageEntries(kvCount)
+			entries := borrowStorageEntries(kvCount)
 			if decoded, decErr := buildPairsFromPayload(payload, kvCount, entries); decErr == nil {
 				preloaded = decoded
 				preloadBacking = job.backing
 				job.backing = nil
 			} else {
-				db.releaseStorageEntries(entries)
+				releaseStorageEntries(entries)
 			}
 		}
 		if job.backing != nil {
@@ -4000,7 +4034,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 
 	chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(job.folderID, folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
 	if preloaded != nil {
-		db.releaseStorageEntries(preloaded)
+		releaseStorageEntries(preloaded)
 	}
 	if err != nil {
 		return err

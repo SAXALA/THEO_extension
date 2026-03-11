@@ -9,22 +9,26 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
-	MaxPrefixDepth        = 6          // the maximum depth of the prefix tree
-	NodeEntrySize         = 76         // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
-	FileNodeMagic         = 0x50544E46 // "PTNF" - file node magic number
-	MaxKeySize            = 32         // maximum key size in bytes
-	TreeFileMagic         = 0x50545246 // "PTRF" - prefix tree file magic number
-	maxCacheFilesHandles  = 65536
-	fileNodeCacheCapacity = 64
-	maxPooledBufferSize   = 1024 * 1024 // 1MB
-	globalFileName        = "global.node"
+	MaxPrefixDepth                  = 6          // the maximum depth of the prefix tree
+	NodeEntrySize                   = 76         // (1 + 32 + 8 + 4 + 8 + 8 + 8 + 4 + 3) bytes
+	FileNodeMagic                   = 0x50544E46 // "PTNF" - file node magic number
+	MaxKeySize                      = 32         // maximum key size in bytes
+	TreeFileMagic                   = 0x50545246 // "PTRF" - prefix tree file magic number
+	maxCacheFilesHandles            = 65536
+	fileNodeCacheCapacity           = 64
+	maxPooledBufferSize             = 1024 * 1024 // 1MB
+	globalFileName                  = "global.node"
+	defaultNodeFileGCRatioThreshold = 1.0
+	maxPrefixTreeGCWorkers          = 128
 )
 
 type NodeType byte
@@ -127,14 +131,64 @@ type PrefixTree struct {
 	fileNodeCacheMu sync.RWMutex
 	fileStripeLocks stripedRWLocks // striped locks for file operations
 
+	// node file access stats (read path)
+	fileNodeCacheHits           uint64
+	fileNodeCacheMisses         uint64
+	fileHandleCacheHits         uint64
+	fileHandleCacheMisses       uint64
+	nodeFileDiskLoads           uint64 // times we had to read from a node file due to fileNodeCache miss
+	nodeFileReadOps             uint64 // number of os.File.ReadAt calls
+	nodeFileReadBytes           uint64
+	globalFileNodeCacheHits     uint64
+	globalFileNodeCacheMisses   uint64
+	globalFileHandleCacheHits   uint64
+	globalFileHandleCacheMisses uint64
+	globalNodeFileDiskLoads     uint64
+	globalNodeFileReadOps       uint64
+	globalNodeFileReadBytes     uint64
+
 	bufPool sync.Pool
 
 	gcCount int
 
-	gcQueue       chan gcJob
-	gcInFlight    map[string]*gcState
-	gcWriteBlocks map[string]int
-	gcMu          sync.Mutex
+	gcQueue          chan gcJob
+	gcInFlight       map[string]*gcState
+	gcWriteBlocks    map[string]int
+	gcMu             sync.Mutex
+	gcRatioThreshold float64
+	gcWorkerCount    int
+}
+
+func sanitizeNodeFileGCRatioThreshold(threshold float64) float64 {
+	if threshold <= 0 {
+		return defaultNodeFileGCRatioThreshold
+	}
+	return threshold
+}
+
+func sanitizePrefixTreeGCWorkerCount(workers int) int {
+	if workers <= 0 {
+		workers = runtime.NumCPU() / 2
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > maxPrefixTreeGCWorkers {
+		workers = maxPrefixTreeGCWorkers
+	}
+	return workers
+}
+
+func (pt *PrefixTree) shouldScheduleGC(sortedCount, unsortedCount uint32) bool {
+	if unsortedCount == 0 {
+		return false
+	}
+	threshold := sanitizeNodeFileGCRatioThreshold(pt.gcRatioThreshold)
+	return float64(unsortedCount)/float64(sortedCount) >= threshold
+}
+
+func (pt *PrefixTree) gcWorkerConcurrency() int {
+	return sanitizePrefixTreeGCWorkerCount(pt.gcWorkerCount)
 }
 
 func (pt *PrefixTree) fileIDForKey(key []byte) string {
@@ -419,9 +473,11 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 				return make([]byte, NodeEntrySize*512)
 			},
 		},
-		gcQueue:       make(chan gcJob, 64),
-		gcInFlight:    make(map[string]*gcState),
-		gcWriteBlocks: make(map[string]int),
+		gcQueue:          make(chan gcJob, 64),
+		gcInFlight:       make(map[string]*gcState),
+		gcWriteBlocks:    make(map[string]int),
+		gcRatioThreshold: sanitizeNodeFileGCRatioThreshold(db.nodeFileGCUnsortedRatioThreshold),
+		gcWorkerCount:    sanitizePrefixTreeGCWorkerCount(db.nodeFileGCWorkers),
 	}
 	fileNodeCache, err := lru.NewWithEvict(fileNodeCacheCapacity, func(key interface{}, value interface{}) {
 		entry, _ := value.(*fileNodeCacheEntry)
@@ -680,25 +736,72 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 
 // StartMergeWorker starts the background merge worker
 func (pt *PrefixTree) startMergeWorker() {
-	pt.mergeWait.Add(1)
-	go func() {
-		defer pt.mergeWait.Done()
-		for {
-			select {
-			case job := <-pt.gcQueue:
-				pt.processGCJob(job)
-			case <-pt.mergeStop:
-				for {
-					select {
-					case job := <-pt.gcQueue:
-						pt.processGCJob(job)
-					default:
-						return
+	workerCount := pt.gcWorkerConcurrency()
+	pt.mergeWait.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer pt.mergeWait.Done()
+			for {
+				select {
+				case job := <-pt.gcQueue:
+					pt.processGCJob(job)
+				case <-pt.mergeStop:
+					for {
+						select {
+						case job := <-pt.gcQueue:
+							pt.processGCJob(job)
+						default:
+							return
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
+}
+
+func (pt *PrefixTree) runGCJobsInParallel(jobs []gcJob) int {
+	if len(jobs) == 0 {
+		return 0
+	}
+	workerCount := pt.gcWorkerConcurrency()
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
+	}
+	jobCh := make(chan gcJob, len(jobs))
+	resultCh := make(chan int, workerCount)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			completed := 0
+			for job := range jobCh {
+				if job.state == nil {
+					continue
+				}
+				if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
+					fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
+					pt.finishGC(job.fileID)
+					continue
+				}
+				pt.finishGC(job.fileID)
+				completed++
+			}
+			resultCh <- completed
+		}()
+	}
+	for _, job := range jobs {
+		jobCh <- job
+	}
+	close(jobCh)
+	wg.Wait()
+	close(resultCh)
+	total := 0
+	for completed := range resultCh {
+		total += completed
+	}
+	return total
 }
 
 // Close closes the prefix tree and stops the merge worker
@@ -710,6 +813,25 @@ func (pt *PrefixTree) Close() error {
 		close(pt.mergeStop)
 	}
 	pt.mergeWait.Wait()
+
+	fmt.Printf("PrefixTree nodefile stats: fileNodeCache hits=%d misses=%d handleCache hits=%d misses=%d diskLoads=%d readOps=%d readBytes=%d\n",
+		atomic.LoadUint64(&pt.fileNodeCacheHits),
+		atomic.LoadUint64(&pt.fileNodeCacheMisses),
+		atomic.LoadUint64(&pt.fileHandleCacheHits),
+		atomic.LoadUint64(&pt.fileHandleCacheMisses),
+		atomic.LoadUint64(&pt.nodeFileDiskLoads),
+		atomic.LoadUint64(&pt.nodeFileReadOps),
+		atomic.LoadUint64(&pt.nodeFileReadBytes),
+	)
+	fmt.Printf("PrefixTree global.node stats: fileNodeCache hits=%d misses=%d handleCache hits=%d misses=%d diskLoads=%d readOps=%d readBytes=%d\n",
+		atomic.LoadUint64(&pt.globalFileNodeCacheHits),
+		atomic.LoadUint64(&pt.globalFileNodeCacheMisses),
+		atomic.LoadUint64(&pt.globalFileHandleCacheHits),
+		atomic.LoadUint64(&pt.globalFileHandleCacheMisses),
+		atomic.LoadUint64(&pt.globalNodeFileDiskLoads),
+		atomic.LoadUint64(&pt.globalNodeFileReadOps),
+		atomic.LoadUint64(&pt.globalNodeFileReadBytes),
+	)
 
 	if pt.fileHandleCache != nil {
 		pt.fileHandleCache.Purge()
@@ -752,6 +874,17 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			}
 		}
 		if cacheLocked {
+			atomic.AddUint64(&pt.fileNodeCacheHits, 1)
+			if fileID == globalFileName {
+				atomic.AddUint64(&pt.globalFileNodeCacheHits, 1)
+			}
+		} else {
+			atomic.AddUint64(&pt.fileNodeCacheMisses, 1)
+			if fileID == globalFileName {
+				atomic.AddUint64(&pt.globalFileNodeCacheMisses, 1)
+			}
+		}
+		if cacheLocked {
 			defer pt.fileNodeCacheMu.RUnlock()
 			if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
 				return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
@@ -761,6 +894,10 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			}
 		} else {
 			pt.fileNodeCacheMu.RUnlock()
+			atomic.AddUint64(&pt.nodeFileDiskLoads, 1)
+			if fileID == globalFileName {
+				atomic.AddUint64(&pt.globalNodeFileDiskLoads, 1)
+			}
 			file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -771,7 +908,18 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 
 			headerSize := int64(binary.Size(header))
 			hdrBuf = make([]byte, headerSize)
-			if _, err := file.ReadAt(hdrBuf, 0); err != nil {
+			n, err := file.ReadAt(hdrBuf, 0)
+			atomic.AddUint64(&pt.nodeFileReadOps, 1)
+			if n > 0 {
+				atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n))
+				if fileID == globalFileName {
+					atomic.AddUint64(&pt.globalNodeFileReadBytes, uint64(n))
+				}
+			}
+			if fileID == globalFileName {
+				atomic.AddUint64(&pt.globalNodeFileReadOps, 1)
+			}
+			if err != nil {
 				return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
 			}
 			if pt.db != nil {
@@ -789,7 +937,18 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 				totalDataSize := int64(totalEntries) * NodeEntrySize
 				tempBuf := pt.borrowBuf(int(totalDataSize))
 				if tempBuf != nil {
-					if _, err := file.ReadAt(tempBuf[:totalDataSize], headerSize); err != nil && err != io.EOF {
+					n2, err := file.ReadAt(tempBuf[:totalDataSize], headerSize)
+					atomic.AddUint64(&pt.nodeFileReadOps, 1)
+					if n2 > 0 {
+						atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n2))
+						if fileID == globalFileName {
+							atomic.AddUint64(&pt.globalNodeFileReadBytes, uint64(n2))
+						}
+					}
+					if fileID == globalFileName {
+						atomic.AddUint64(&pt.globalNodeFileReadOps, 1)
+					}
+					if err != nil && err != io.EOF {
 						pt.releaseBuf(tempBuf)
 						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: %w", err)
 					}
@@ -808,7 +967,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			sortedBytes := int64(header.SortedEntryCount) * NodeEntrySize
 			sortedSlice = bigBuf[:sortedBytes]
 			unsortedSlice = bigBuf[sortedBytes:]
-			if header.UnsortedEntryCount > 0 && header.UnsortedEntryCount >= header.SortedEntryCount {
+			if pt.shouldScheduleGC(header.SortedEntryCount, header.UnsortedEntryCount) {
 				scheduleJob = true
 				scheduleGC = func() {
 					pt.maybeScheduleGC(fileID, header, sortedSlice, unsortedSlice)
@@ -950,7 +1109,15 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 
 	// get from cache
 	if handle, ok := pt.fileHandleCache.Get(cacheKey); ok {
+		atomic.AddUint64(&pt.fileHandleCacheHits, 1)
+		if fileID == globalFileName {
+			atomic.AddUint64(&pt.globalFileHandleCacheHits, 1)
+		}
 		return handle.(*os.File), nil
+	}
+	atomic.AddUint64(&pt.fileHandleCacheMisses, 1)
+	if fileID == globalFileName {
+		atomic.AddUint64(&pt.globalFileHandleCacheMisses, 1)
 	}
 
 	filePath := filepath.Join(pt.fileNodeDir, fileID)
@@ -970,22 +1137,17 @@ func (pt *PrefixTree) GC() int {
 	defer pt.lock.Unlock()
 
 	pt.gcMu.Lock()
-	gcJobs := make([]gcJob, 0, len(pt.gcInFlight))
-	for fileID, state := range pt.gcInFlight {
-		gcJobs = append(gcJobs, gcJob{fileID: fileID, state: state})
+	pending := make([]*gcState, 0, len(pt.gcInFlight))
+	for _, state := range pt.gcInFlight {
+		if state != nil {
+			pending = append(pending, state)
+		}
 	}
 	pt.gcMu.Unlock()
 
 	count := 0
-	for _, job := range gcJobs {
-		if job.state == nil {
-			continue
-		}
-		if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
-			fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
-			continue
-		}
-		pt.finishGC(job.fileID)
+	for _, state := range pending {
+		<-state.done
 		count++
 	}
 	entries, err := os.ReadDir(pt.fileNodeDir)
@@ -993,6 +1155,7 @@ func (pt *PrefixTree) GC() int {
 		fmt.Printf("PrefixTree GC scan failed: %v\n", err)
 		return count
 	}
+	jobs := make([]gcJob, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -1013,13 +1176,7 @@ func (pt *PrefixTree) GC() int {
 		}
 		pt.gcInFlight[fileID] = state
 		pt.gcMu.Unlock()
-		if err := pt.compactFileFromState(fileID, state); err != nil {
-			fmt.Printf("PrefixTree GC failed for %s: %v\n", fileID, err)
-			pt.finishGC(fileID)
-			continue
-		}
-		pt.finishGC(fileID)
-		count++
+		jobs = append(jobs, gcJob{fileID: fileID, state: state})
 	}
-	return count
+	return count + pt.runGCJobsInParallel(jobs)
 }

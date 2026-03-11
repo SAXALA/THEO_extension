@@ -22,9 +22,7 @@ type fileHandleCacheKey struct {
 }
 
 type fileHandleCache struct {
-	mu      sync.Mutex
-	cache   *lru.Cache
-	entries map[fileHandleCacheKey]*os.File
+	cache *lru.Cache
 }
 
 var (
@@ -65,7 +63,7 @@ func newFileHandleCache(capacity int) (*fileHandleCache, error) {
 	if capacity < minFileHandleCacheSize {
 		capacity = minFileHandleCacheSize
 	}
-	fhc := &fileHandleCache{entries: make(map[fileHandleCacheKey]*os.File)}
+	fhc := &fileHandleCache{}
 	cache, err := lru.NewWithEvict(capacity, func(key interface{}, value interface{}) {
 		if f, ok := value.(*os.File); ok && f != nil {
 			_ = f.Close()
@@ -99,32 +97,22 @@ func (c *fileHandleCache) Open(path string, flag int) (*os.File, error) {
 		return os.OpenFile(path, flag, 0644)
 	}
 	key := fileHandleCacheKey{path: normalizeOpenPath(path), flag: flag}
-
-	c.mu.Lock()
-	if f, ok := c.entries[key]; ok {
-		c.cache.Get(key)
-		c.mu.Unlock()
+	if v, ok := c.cache.Get(key); ok {
 		atomic.AddUint64(&globalHandleCacheHits, 1)
-		return f, nil
+		return v.(*os.File), nil
 	}
-	c.mu.Unlock()
 
 	f, err := os.OpenFile(key.path, flag, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	c.mu.Lock()
-	if existing, ok := c.entries[key]; ok {
-		c.cache.Get(key)
-		c.mu.Unlock()
+	if prev, ok, _ := c.cache.PeekOrAdd(key, f); ok {
+		// Another goroutine won the race; avoid leaking the extra file.
 		_ = f.Close()
 		atomic.AddUint64(&globalHandleCacheHits, 1)
-		return existing, nil
+		return prev.(*os.File), nil
 	}
-	c.entries[key] = f
-	c.cache.Add(key, f)
-	c.mu.Unlock()
 	atomic.AddUint64(&globalHandleCacheMisses, 1)
 	return f, nil
 }
@@ -134,26 +122,23 @@ func (c *fileHandleCache) InvalidatePath(path string) {
 		return
 	}
 	normalized := normalizeOpenPath(path)
-	c.mu.Lock()
-	keys := make([]fileHandleCacheKey, 0, 4)
-	for k := range c.entries {
+	keys := c.cache.Keys()
+	for _, kAny := range keys {
+		k, ok := kAny.(fileHandleCacheKey)
+		if !ok {
+			continue
+		}
 		if k.path == normalized {
-			keys = append(keys, k)
+			// Remove triggers the on-evict callback and closes the file.
+			c.cache.Remove(k)
 		}
 	}
-	for _, k := range keys {
-		delete(c.entries, k)
-		c.cache.Remove(k)
-	}
-	c.mu.Unlock()
 }
 
 func (c *fileHandleCache) Purge() {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	c.entries = make(map[fileHandleCacheKey]*os.File)
+	// Purge triggers the on-evict callback and closes all cached files.
 	c.cache.Purge()
-	c.mu.Unlock()
 }
