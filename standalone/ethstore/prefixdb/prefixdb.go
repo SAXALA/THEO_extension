@@ -144,6 +144,7 @@ type PrefixDB struct {
 	// slotFile    *os.File
 
 	nodeCache    *NodeCache
+	sharedCache  *sharedByteCache
 	accountBatch *WriteBatch
 	// triePath             string       // path to the prefix tree file
 	accountHashKeyPebble *pebblestore.PebbleStore // pebble store for account hash key index
@@ -236,6 +237,39 @@ type PrefixDB struct {
 	nodeCacheToNodeFile            uint64
 	nodeCacheMissToNodeFile        uint64
 	nodeCacheHitFallbackToNodeFile uint64
+	diskIOStats                    [diskIOUsageCount]diskIOCounters
+}
+
+type diskIOUsage uint8
+
+const (
+	diskIOUsageAccountData diskIOUsage = iota
+	diskIOUsageNodeFileLookup
+	diskIOUsageNodeFileMutation
+	diskIOUsageNodeFileGC
+	diskIOUsageStorageCommonLogs
+	diskIOUsageStorageSeparatedLogs
+	diskIOUsageStorageGC
+	diskIOUsageStorageSegmentIndex
+	diskIOUsageCount
+)
+
+var diskIOUsageNames = [...]string{
+	"account-data",
+	"nodefile-lookup",
+	"nodefile-mutation",
+	"nodefile-gc",
+	"storage-common-logs",
+	"storage-separated-logs",
+	"storage-gc",
+	"storage-segment-index",
+}
+
+type diskIOCounters struct {
+	readOps    uint64
+	readBytes  uint64
+	writeOps   uint64
+	writeBytes uint64
 }
 
 // SerializedTrieNode
@@ -335,6 +369,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 	}
 
 	sharedCache := newSharedByteCache(db.stroageCacheSizeLimit)
+	db.sharedCache = sharedCache
 
 	db.nodeCache = newSharedNodeCache(sharedCache)
 
@@ -1025,7 +1060,7 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read header at offset %d: %v", offset, err)
 	}
-	db.addReadBytes(n)
+	db.addDiskRead(diskIOUsageAccountData, n)
 
 	keySize := int(uint16(header[0])<<8 | uint16(header[1]))
 	valueSize := int(uint16(header[2])<<8 | uint16(header[3]))
@@ -1039,7 +1074,7 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("failed to read combined data at offset %d: %v", offset+6, err)
 	}
-	db.addReadBytes(n)
+	db.addDiskRead(diskIOUsageAccountData, n)
 
 	value := make([]byte, valueSize)
 	copy(value, combinedData[keySize:totalSize])
@@ -1060,6 +1095,70 @@ func (db *PrefixDB) addReadBytes(n int) {
 	if n > 0 {
 		atomic.AddUint64(&db.totalReadBytes, uint64(n))
 	}
+}
+
+func (db *PrefixDB) addDiskRead(usage diskIOUsage, n int) {
+	if db == nil || usage >= diskIOUsageCount {
+		return
+	}
+	atomic.AddUint64(&db.diskIOStats[usage].readOps, 1)
+	if n > 0 {
+		atomic.AddUint64(&db.diskIOStats[usage].readBytes, uint64(n))
+		db.addReadBytes(n)
+	}
+}
+
+func (db *PrefixDB) addDiskWrite(usage diskIOUsage, n int) {
+	if db == nil || usage >= diskIOUsageCount {
+		return
+	}
+	atomic.AddUint64(&db.diskIOStats[usage].writeOps, 1)
+	if n > 0 {
+		atomic.AddUint64(&db.diskIOStats[usage].writeBytes, uint64(n))
+	}
+}
+
+func (db *PrefixDB) readFileWithStats(path string, usage diskIOUsage) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		db.addDiskRead(usage, len(data))
+	}
+	return data, err
+}
+
+func (db *PrefixDB) writeFileWithStats(path string, data []byte, perm os.FileMode, usage diskIOUsage) error {
+	if err := os.WriteFile(path, data, perm); err != nil {
+		return err
+	}
+	db.addDiskWrite(usage, len(data))
+	return nil
+}
+
+func (db *PrefixDB) printDiskIOStats() {
+	if db == nil {
+		return
+	}
+	var totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes uint64
+	for usage := diskIOUsage(0); usage < diskIOUsageCount; usage++ {
+		stats := &db.diskIOStats[usage]
+		readOps := atomic.LoadUint64(&stats.readOps)
+		readBytes := atomic.LoadUint64(&stats.readBytes)
+		writeOps := atomic.LoadUint64(&stats.writeOps)
+		writeBytes := atomic.LoadUint64(&stats.writeBytes)
+		totalReadOps += readOps
+		totalReadBytes += readBytes
+		totalWriteOps += writeOps
+		totalWriteBytes += writeBytes
+		if readOps == 0 && readBytes == 0 && writeOps == 0 && writeBytes == 0 {
+			continue
+		}
+		fmt.Printf("PrefixDB disk IO stats [%s]: readOps=%d readBytes=%d writeOps=%d writeBytes=%d\n",
+			diskIOUsageNames[usage], readOps, readBytes, writeOps, writeBytes,
+		)
+	}
+	fmt.Printf("PrefixDB disk IO stats [total]: readOps=%d readBytes=%d writeOps=%d writeBytes=%d\n",
+		totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes,
+	)
 }
 
 func (db *PrefixDB) addTrieStorageFetchStats(fromCache bool, value []byte) {
@@ -1184,6 +1283,7 @@ func (db *PrefixDB) Close() error {
 		db.storageCurFile = nil
 	}
 	// db.accountHashKeyPebble = nil
+	db.printDiskIOStats()
 
 	if len(errs) > 0 {
 		fmt.Printf("Errors occurred during closing: %v\n", errs)
@@ -1663,6 +1763,7 @@ func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset in
 	if _, err := db.storageCurFile.WriteAt(seg, offset); err != nil {
 		return 0, 0, 0, err
 	}
+	db.addDiskWrite(diskIOUsageStorageCommonLogs, len(seg))
 	db.storageCurSize += need
 	return db.storageCurFileID, offset, uint64(need), nil
 }
@@ -1743,7 +1844,7 @@ func (db *PrefixDB) appendSegmentedStorage(kvs []kvPair) (uint32, int64, uint64,
 		defer release()
 		name := fmt.Sprintf("chunk_%04d.dat", chunkIdx)
 		fullPath := filepath.Join(folderPath, name)
-		if err := os.WriteFile(fullPath, seg, 0644); err != nil {
+		if err := db.writeFileWithStats(fullPath, seg, 0644, diskIOUsageStorageSeparatedLogs); err != nil {
 			return err
 		}
 		meta := segmentChunkMeta{
@@ -1975,6 +2076,7 @@ func (db *PrefixDB) appendChunkFile(path string, currentCount uint32, additions 
 	if _, err := f.WriteAt(header[:], 0); err != nil {
 		return err
 	}
+	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(header))
 	seg, release, _, err := db.serializeStorageSegment(additions)
 	if err != nil {
 		return err
@@ -1984,6 +2086,7 @@ func (db *PrefixDB) appendChunkFile(path string, currentCount uint32, additions 
 	if _, err := f.WriteAt(data, currentSize); err != nil {
 		return err
 	}
+	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(data))
 	return nil
 }
 
@@ -2152,6 +2255,10 @@ func (db *PrefixDB) segmentedChunkTriggerSize() int {
 }
 
 func (db *PrefixDB) writeChunkFile(folderPath, fileName string, entries []kvPair) (int, error) {
+	return db.writeChunkFileWithUsage(folderPath, fileName, entries, diskIOUsageStorageSeparatedLogs)
+}
+
+func (db *PrefixDB) writeChunkFileWithUsage(folderPath, fileName string, entries []kvPair, usage diskIOUsage) (int, error) {
 	seg, release, chunkSize, err := db.serializeStorageSegment(entries)
 	if err != nil {
 		return 0, err
@@ -2170,6 +2277,7 @@ func (db *PrefixDB) writeChunkFile(folderPath, fileName string, entries []kvPair
 		_ = os.Remove(tmpPath)
 		return 0, err
 	}
+	db.addDiskWrite(usage, len(seg))
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return 0, err
@@ -2310,12 +2418,12 @@ func encodeSegmentChunkMetas(metas []segmentChunkMeta) ([]byte, error) {
 	return buf, nil
 }
 
-func writeFileIfChanged(path string, data []byte) error {
+func writeFileIfChanged(db *PrefixDB, path string, data []byte) error {
 	fi, err := os.Stat(path)
 	if err == nil {
 		// Fast path: if sizes differ, content differs.
 		if fi.Size() == int64(len(data)) {
-			same, cmpErr := fileContentEqualsBytes(path, data)
+			same, cmpErr := fileContentEqualsBytes(db, path, data)
 			if cmpErr == nil && same {
 				return nil
 			}
@@ -2323,10 +2431,10 @@ func writeFileIfChanged(path string, data []byte) error {
 	} else if !os.IsNotExist(err) {
 		// Preserve prior behavior: on read/stat errors, fall back to writing.
 	}
-	return writeFileAtomic(path, data)
+	return writeFileAtomic(db, path, data)
 }
 
-func fileContentEqualsBytes(path string, data []byte) (bool, error) {
+func fileContentEqualsBytes(db *PrefixDB, path string, data []byte) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
@@ -2347,6 +2455,9 @@ func fileContentEqualsBytes(path string, data []byte) (bool, error) {
 			}
 			return false, err
 		}
+		if db != nil {
+			db.addDiskRead(diskIOUsageStorageSegmentIndex, need)
+		}
 		if !bytes.Equal(buf[:need], data[offset:offset+need]) {
 			return false, nil
 		}
@@ -2355,6 +2466,9 @@ func fileContentEqualsBytes(path string, data []byte) (bool, error) {
 
 	// Ensure the file doesn't contain extra bytes (handles races between Stat/Open).
 	if n, err := f.Read(buf[:1]); n > 0 {
+		if db != nil {
+			db.addDiskRead(diskIOUsageStorageSegmentIndex, n)
+		}
 		return false, nil
 	} else if err == io.EOF {
 		return true, nil
@@ -2364,10 +2478,13 @@ func fileContentEqualsBytes(path string, data []byte) (bool, error) {
 	return true, nil
 }
 
-func writeFileAtomic(path string, data []byte) error {
+func writeFileAtomic(db *PrefixDB, path string, data []byte) error {
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err
+	}
+	if db != nil {
+		db.addDiskWrite(diskIOUsageStorageSegmentIndex, len(data))
 	}
 	return os.Rename(tmpPath, path)
 }
@@ -2603,7 +2720,7 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 
 func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayout, error) {
 	indexPath := filepath.Join(folderPath, segmentIndexFileName)
-	data, err := os.ReadFile(indexPath)
+	data, err := db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return segmentIndexLayout{mode: indexLayoutFlat, nextMetaID: 1}, nil
@@ -2748,7 +2865,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			return err
 		}
 		indexPath := filepath.Join(folderPath, segmentIndexFileName)
-		if err := writeFileIfChanged(indexPath, buf); err != nil {
+		if err := writeFileIfChanged(db, indexPath, buf); err != nil {
 			return err
 		}
 		db.bumpSegmentIndexGenerationLocked(entry)
@@ -2827,7 +2944,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			}
 			// We already decided the content changed (or file is missing), so avoid an extra
 			// ReadFile+bytes.Equal pass.
-			if err := writeFileAtomic(path, buf); err != nil {
+			if err := writeFileAtomic(db, path, buf); err != nil {
 				return err
 			}
 		}
@@ -2851,7 +2968,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			return err
 		}
 		indexPath := filepath.Join(folderPath, segmentIndexFileName)
-		if err := writeFileIfChanged(indexPath, buf); err != nil {
+		if err := writeFileIfChanged(db, indexPath, buf); err != nil {
 			return err
 		}
 	}
@@ -2946,7 +3063,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 		metas = make([]segmentChunkMeta, 0, total)
 		var arena []byte
 		for idx, entry := range layout.entries {
-			data, err := os.ReadFile(level2IndexFilePath(folderPath, entry.MetaID))
+			data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -2959,7 +3076,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 		data := layout.flatData
 		if len(data) == 0 {
 			indexPath := filepath.Join(folderPath, segmentIndexFileName)
-			data, err = os.ReadFile(indexPath)
+			data, err = db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -3007,7 +3124,7 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
-	data, err := os.ReadFile(level2IndexFilePath(folderPath, entry.MetaID))
+	data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -3108,7 +3225,11 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 }
 
 func (db *PrefixDB) readSegmentChunkFile(folderID uint32, fileName string) ([]kvPair, *bufferLease, error) {
-	lease, err := db.readSegmentFileBuffer(folderID, fileName)
+	return db.readSegmentChunkFileWithUsage(folderID, fileName, diskIOUsageStorageSeparatedLogs)
+}
+
+func (db *PrefixDB) readSegmentChunkFileWithUsage(folderID uint32, fileName string, usage diskIOUsage) ([]kvPair, *bufferLease, error) {
+	lease, err := db.readSegmentFileBufferWithUsage(folderID, fileName, usage)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3126,7 +3247,11 @@ func (db *PrefixDB) readSegmentChunkFile(folderID uint32, fileName string) ([]kv
 }
 
 func (db *PrefixDB) readSegmentChunkPayload(folderID uint32, fileName string) ([]byte, int, *bufferLease, error) {
-	lease, err := db.readSegmentFileBuffer(folderID, fileName)
+	return db.readSegmentChunkPayloadWithUsage(folderID, fileName, diskIOUsageStorageSeparatedLogs)
+}
+
+func (db *PrefixDB) readSegmentChunkPayloadWithUsage(folderID uint32, fileName string, usage diskIOUsage) ([]byte, int, *bufferLease, error) {
+	lease, err := db.readSegmentFileBufferWithUsage(folderID, fileName, usage)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -3139,6 +3264,10 @@ func (db *PrefixDB) readSegmentChunkPayload(folderID uint32, fileName string) ([
 }
 
 func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) (*bufferLease, error) {
+	return db.readSegmentFileBufferWithUsage(folderID, fileName, diskIOUsageStorageSeparatedLogs)
+}
+
+func (db *PrefixDB) readSegmentFileBufferWithUsage(folderID uint32, fileName string, usage diskIOUsage) (*bufferLease, error) {
 	fullPath := filepath.Join(db.segmentedFolderPath(folderID), fileName)
 	f, err := db.openCachedReadOnlyFile(fullPath)
 	if err != nil {
@@ -3165,7 +3294,7 @@ func (db *PrefixDB) readSegmentFileBuffer(folderID uint32, fileName string) (*bu
 		putDataBuffer(buf)
 		return nil, err
 	}
-	db.addReadBytes(intSize)
+	db.addDiskRead(usage, intSize)
 	return newBufferLease(buf[:intSize]), nil
 }
 
@@ -3341,14 +3470,14 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 		if err != nil {
 			if err == io.EOF && read+n == total {
 				read += n
-				db.addReadBytes(n)
+				db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 				break
 			}
 			putDataBuffer(buf)
 			return nil
 		}
 		read += n
-		db.addReadBytes(n)
+		db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 	}
 	if read != total {
 		putDataBuffer(buf)
@@ -3440,14 +3569,14 @@ func (db *PrefixDB) readStorageSegmentPayload(fileID uint32, offset int64, size 
 		if err != nil {
 			if err == io.EOF && read+n == total {
 				read += n
-				db.addReadBytes(n)
+				db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 				break
 			}
 			putDataBuffer(buf)
 			return nil, 0, nil, err
 		}
 		read += n
-		db.addReadBytes(n)
+		db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 	}
 	if read != total {
 		putDataBuffer(buf)
@@ -3622,7 +3751,7 @@ func (db *PrefixDB) GetStorageCount(accountKey []byte) (int, uint64, error) {
 	if err != nil && err != io.EOF {
 		return 0, 0, err
 	}
-	db.addReadBytes(n)
+	db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 	buf = buf[:n]
 
 	var kvCount int
@@ -4107,7 +4236,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath 
 	var err error
 	var bytesWritten uint64
 	if existing == nil {
-		existing, backing, err = db.readSegmentChunkFile(folderID, meta.FileName)
+		existing, backing, err = db.readSegmentChunkFileWithUsage(folderID, meta.FileName, diskIOUsageStorageGC)
 		if err != nil {
 			return nil, startOrdinal, err
 		}
@@ -4147,7 +4276,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath 
 		}
 		reserved = append(reserved, name)
 		ordinal = next
-		chunkSize, wErr := db.writeChunkFile(folderPath, name, chunk)
+		chunkSize, wErr := db.writeChunkFileWithUsage(folderPath, name, chunk, diskIOUsageStorageGC)
 		if wErr != nil {
 			err = wErr
 			return nil, startOrdinal, wErr
@@ -4453,7 +4582,7 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 		folderPath := db.segmentedFolderPath(folderID)
 		allEntries := make([]kvPair, 0)
 		for _, meta := range metas {
-			entries, backing, err := db.readSegmentChunkFile(folderID, meta.FileName)
+			entries, backing, err := db.readSegmentChunkFileWithUsage(folderID, meta.FileName, diskIOUsageStorageGC)
 			if err != nil {
 				db.segmentedMu.Unlock()
 				return err
@@ -4482,7 +4611,7 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
 			for i, chunk := range chunks {
 				fileName := fmt.Sprintf("chunk_%04d.dat", i)
-				chunkSize, err := db.writeChunkFile(folderPath, fileName, chunk)
+				chunkSize, err := db.writeChunkFileWithUsage(folderPath, fileName, chunk, diskIOUsageStorageGC)
 				if err != nil {
 					db.segmentedMu.Unlock()
 					return err

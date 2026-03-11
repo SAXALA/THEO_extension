@@ -13,7 +13,7 @@ import (
 
 const (
 	minFileHandleCacheSize = 128
-	maxFileHandleCacheSize = 65536
+	maxFileHandleCacheSize = 1048576
 )
 
 type fileHandleCacheKey struct {

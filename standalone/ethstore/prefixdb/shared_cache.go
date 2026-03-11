@@ -13,7 +13,12 @@ const (
 	sharedCacheNamespaceNode sharedCacheNamespace = iota
 	sharedCacheNamespaceStorage
 	sharedCacheNamespaceSegmentIndex
+	sharedCacheNamespaceFileNode
 )
+
+type sharedCacheEvictor interface {
+	onSharedCacheEvict()
+}
 
 type sharedCacheCompositeKey struct {
 	namespace sharedCacheNamespace
@@ -125,6 +130,9 @@ func (c *sharedByteCache) removeElementLocked(elem *list.Element) {
 		return
 	}
 	entry := elem.Value.(*sharedCacheEntry)
+	if evictor, ok := entry.value.(sharedCacheEvictor); ok {
+		evictor.onSharedCacheEvict()
+	}
 	lookup := sharedCacheCompositeKey{namespace: entry.namespace, key: entry.key}
 	delete(c.items, lookup)
 	c.ll.Remove(elem)

@@ -345,6 +345,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
 		if err != nil {
 			return err
 		}
+		db.addDiskWrite(diskIOUsageAccountData, len(NAEntry))
 	}
 	return nil
 }

@@ -1250,12 +1250,12 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		elapsed := time.Since(start)
 		totalTime += elapsed
 		// comment to disable operation failed output
-		if opErr != nil {
-			if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
-				fmt.Printf("[%s] op %s failed for key %s: %v\n",
-					backend.Name(), opTypeStr, keyHex, opErr)
-			}
-		}
+		// if opErr != nil {
+		// 	if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
+		// 		fmt.Printf("[%s] op %s failed for key %s: %v\n",
+		// 			backend.Name(), opTypeStr, keyHex, opErr)
+		// 	}
+		// }
 		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
 			break
@@ -1423,14 +1423,14 @@ func main() {
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
-	// For quick debugging
-	ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, *nodeFileGCWorkers)
-	if ethErr != nil {
-		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
-	}
-	defer ethBackend.Close()
-	replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
-	// return
+	// // For quick debugging
+	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, *nodeFileGCWorkers)
+	// if ethErr != nil {
+	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+	// }
+	// defer ethBackend.Close()
+	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// // return
 
 	switch *mode {
 	case "ld":

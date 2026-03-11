@@ -182,6 +182,32 @@ func TestSharedCacheEvictsAcrossCacheTypes(t *testing.T) {
 	}
 }
 
+func TestFileNodeCacheUsesSharedBudget(t *testing.T) {
+	shared := newSharedByteCache(1024)
+	pt := &PrefixTree{sharedCache: shared}
+
+	pt.setFileNodeCache("filenode", bytes.Repeat([]byte{0x05}, 32), bytes.Repeat([]byte{0x06}, 220))
+	entry, ok := pt.getFileNodeCache("filenode")
+	if !ok {
+		t.Fatal("expected file node cache entry to exist")
+	}
+	entry.Release()
+
+	used, capacity := shared.NamespaceStats(sharedCacheNamespaceFileNode)
+	if used == 0 {
+		t.Fatal("expected file node cache to consume shared budget")
+	}
+	if capacity != 1024 {
+		t.Fatalf("unexpected shared capacity for file node namespace: got %d want %d", capacity, 1024)
+	}
+
+	shared.Remove(sharedCacheNamespaceFileNode, "filenode")
+	used, _ = shared.NamespaceStats(sharedCacheNamespaceFileNode)
+	if used != 0 {
+		t.Fatalf("expected file node cache budget to be released, got %d", used)
+	}
+}
+
 func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	original := []segmentChunkMeta{{
 		FileName: strings.Repeat("chunk", 8),

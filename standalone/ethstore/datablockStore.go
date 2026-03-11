@@ -12,6 +12,7 @@ import (
 	"sort" // Add this import
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Added testing import
@@ -37,6 +38,34 @@ const (
 	initialBufferSize = 4096  // Initial buffer size for writers
 	IgnoredThreshold  = 10000 // Threshold for ignoring very old blocks in Get (e.g., if blockID is more than 10k behind latestBlockID, treat as non-existent)
 )
+
+type baolDiskIOUsage uint8
+
+const (
+	baolDiskIOUsageBootstrap baolDiskIOUsage = iota
+	baolDiskIOUsageDataQuery
+	baolDiskIOUsageDataMutation
+	baolDiskIOUsageIndexLookup
+	baolDiskIOUsageIndexMutation
+	baolDiskIOUsageIndexMeta
+	baolDiskIOUsageCount
+)
+
+var baolDiskIOUsageNames = [...]string{
+	"bootstrap",
+	"data-query",
+	"data-mutation",
+	"index-lookup",
+	"index-mutation",
+	"index-meta",
+}
+
+type baolDiskIOCounters struct {
+	readOps    uint64
+	readBytes  uint64
+	writeOps   uint64
+	writeBytes uint64
+}
 
 // BlockAppendOnlyLog implements the append-only log store with skiplist indexing for recent blocks.
 type BlockAppendOnlyLog struct {
@@ -70,6 +99,8 @@ type BlockAppendOnlyLog struct {
 
 	mu     sync.RWMutex
 	closed bool
+
+	diskIOStats [baolDiskIOUsageCount]baolDiskIOCounters
 
 	// opCount   uint64 // for debugging
 	// failedOps uint64 // for debugging
@@ -257,6 +288,7 @@ func (baol *BlockAppendOnlyLog) findBlockIndexEntryOnDisk(blockID uint64) (block
 	// Use compact storage: position based on offset from minBlockID
 	pos := int64(blockID-baol.minBlockID) * int64(indexEntrySize)
 	n, readErr := f.ReadAt(buf, pos)
+	baol.addDiskRead(baolDiskIOUsageIndexLookup, n)
 	if readErr != nil {
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			return blockIndexEntry{}, false, nil
@@ -311,6 +343,7 @@ func (baol *BlockAppendOnlyLog) loadIndexMeta() error {
 
 	buf := make([]byte, indexMetaSize)
 	n, err := io.ReadFull(file, buf)
+	baol.addDiskRead(baolDiskIOUsageIndexMeta, n)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			// Empty or incomplete file, treat as new
@@ -345,12 +378,74 @@ func (baol *BlockAppendOnlyLog) saveIndexMeta() error {
 	if _, err := file.Write(buf); err != nil {
 		return fmt.Errorf("failed to write index meta: %w", err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageIndexMeta, len(buf))
 	if err := file.Sync(); err != nil {
+		baol.addDiskWrite(baolDiskIOUsageIndexMeta, 0)
 		return fmt.Errorf("failed to sync index meta: %w", err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageIndexMeta, 0)
 
 	baol.log.Debug("Saved index metadata", "minBlockID", baol.minBlockID, "maxBlockID", baol.latestBlockID)
 	return nil
+}
+
+func (baol *BlockAppendOnlyLog) addDiskRead(usage baolDiskIOUsage, n int) {
+	if baol == nil || usage >= baolDiskIOUsageCount {
+		return
+	}
+	atomic.AddUint64(&baol.diskIOStats[usage].readOps, 1)
+	if n > 0 {
+		atomic.AddUint64(&baol.diskIOStats[usage].readBytes, uint64(n))
+	}
+}
+
+func (baol *BlockAppendOnlyLog) addDiskWrite(usage baolDiskIOUsage, n int) {
+	if baol == nil || usage >= baolDiskIOUsageCount {
+		return
+	}
+	atomic.AddUint64(&baol.diskIOStats[usage].writeOps, 1)
+	if n > 0 {
+		atomic.AddUint64(&baol.diskIOStats[usage].writeBytes, uint64(n))
+	}
+}
+
+func (baol *BlockAppendOnlyLog) readAtWithStats(file *os.File, buf []byte, offset int64, usage baolDiskIOUsage) (int, error) {
+	n, err := file.ReadAt(buf, offset)
+	baol.addDiskRead(usage, n)
+	return n, err
+}
+
+func (baol *BlockAppendOnlyLog) writeAtWithStats(file *os.File, buf []byte, offset int64, usage baolDiskIOUsage) (int, error) {
+	n, err := file.WriteAt(buf, offset)
+	baol.addDiskWrite(usage, n)
+	return n, err
+}
+
+func (baol *BlockAppendOnlyLog) printDiskIOStats() {
+	if baol == nil {
+		return
+	}
+	var totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes uint64
+	for usage := baolDiskIOUsage(0); usage < baolDiskIOUsageCount; usage++ {
+		stats := &baol.diskIOStats[usage]
+		readOps := atomic.LoadUint64(&stats.readOps)
+		readBytes := atomic.LoadUint64(&stats.readBytes)
+		writeOps := atomic.LoadUint64(&stats.writeOps)
+		writeBytes := atomic.LoadUint64(&stats.writeBytes)
+		totalReadOps += readOps
+		totalReadBytes += readBytes
+		totalWriteOps += writeOps
+		totalWriteBytes += writeBytes
+		if readOps == 0 && readBytes == 0 && writeOps == 0 && writeBytes == 0 {
+			continue
+		}
+		fmt.Printf("BlockStore disk IO stats [%s]: readOps=%d readBytes=%d writeOps=%d writeBytes=%d\n",
+			baolDiskIOUsageNames[usage], readOps, readBytes, writeOps, writeBytes,
+		)
+	}
+	fmt.Printf("BlockStore disk IO stats [total]: readOps=%d readBytes=%d writeOps=%d writeBytes=%d\n",
+		totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes,
+	)
 }
 
 // loadBlockIndex reads the index map file into memory using compact storage based on minBlockID.
@@ -365,6 +460,7 @@ func (baol *BlockAppendOnlyLog) loadBlockIndex() error {
 
 	for {
 		n, err := io.ReadFull(reader, buf)
+		baol.addDiskRead(baolDiskIOUsageBootstrap, n)
 		if err == io.EOF {
 			break
 		}
@@ -620,6 +716,7 @@ func (baol *BlockAppendOnlyLog) Append(blockID uint64, kvs map[string]string) er
 		baol.log.Error("Failed to write block data to buffer", "blockID", blockID, "error", err)
 		return fmt.Errorf("failed to write block %d data: %w", blockID, err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageDataMutation, n)
 	if n != len(blockBytes) {
 		baol.log.Error("Incomplete write for block data", "blockID", blockID, "written", n, "expected", len(blockBytes))
 		return fmt.Errorf("incomplete write for block %d data", blockID)
@@ -859,6 +956,7 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 		baol.log.Error("Failed to write tombstone block data to buffer", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to write tombstone block %d data: %w", blockIDForDelete, err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageDataMutation, n)
 	if n != len(blockBytes) {
 		baol.log.Error("Incomplete write for tombstone block data", "blockID", blockIDForDelete, "written", n, "expected", len(blockBytes))
 		return fmt.Errorf("incomplete write for tombstone block %d data", blockIDForDelete)
@@ -884,9 +982,11 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 		return fmt.Errorf("failed to flush data writer for tombstone block %d: %w", blockIDForDelete, err)
 	}
 	if err := baol.dataFile.Sync(); err != nil {
+		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 		baol.log.Error("Failed to sync data file after tombstone", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to sync data file for tombstone block %d: %w", blockIDForDelete, err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	if err := baol.flushIndexBuffer(); err != nil {
 		baol.log.Error("Failed to flush index map buffer after tombstone", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to flush index map buffer for tombstone block %d: %w", blockIDForDelete, err)
@@ -933,7 +1033,7 @@ func (baol *BlockAppendOnlyLog) DeleteByPrefixInBlock(targetBlockID uint64, pref
 	}
 
 	blockData = make([]byte, size)
-	_, readErr = baol.dataFile.ReadAt(blockData, indexEntry.StartOffset)
+	_, readErr = baol.readAtWithStats(baol.dataFile, blockData, indexEntry.StartOffset, baolDiskIOUsageDataQuery)
 	baol.mu.RUnlock() // Release RLock after reading data (or attempting to)
 
 	if readErr != nil {
@@ -999,7 +1099,7 @@ func (baol *BlockAppendOnlyLog) GetByBlock(blockID uint64) (map[string]string, e
 		size := indexEntry.EndOffset - indexEntry.StartOffset
 		if size > 0 {
 			blockData := make([]byte, size)
-			if _, err := baol.dataFile.ReadAt(blockData, indexEntry.StartOffset); err != nil {
+			if _, err := baol.readAtWithStats(baol.dataFile, blockData, indexEntry.StartOffset, baolDiskIOUsageDataQuery); err != nil {
 				return nil, fmt.Errorf("failed to read block data for %d from offset %d: %w", blockID, indexEntry.StartOffset, err)
 			}
 			reader := bytes.NewReader(blockData)
@@ -1208,6 +1308,7 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		baol.log.Error("Failed to write new block data to buffer", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to write new block %d data: %w", newBlockID, err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageDataMutation, n)
 	if n != len(blockBytes) {
 		baol.log.Error("Incomplete write for new block data", "assignedBlockID", newBlockID, "written", n, "expected", len(blockBytes))
 		return 0, fmt.Errorf("incomplete write for new block %d data", newBlockID)
@@ -1240,9 +1341,11 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		return 0, fmt.Errorf("failed to flush data writer for new block %d: %w", newBlockID, err)
 	}
 	if err := baol.dataFile.Sync(); err != nil {
+		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 		baol.log.Error("Failed to sync data file after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to sync data file for new block %d: %w", newBlockID, err)
 	}
+	baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	if err := baol.flushIndexBuffer(); err != nil {
 		baol.log.Error("Failed to flush index map buffer after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to flush index map buffer for new block %d: %w", newBlockID, err)
@@ -1309,7 +1412,7 @@ func (baol *BlockAppendOnlyLog) readValueBytesFromPointer(pointer *kvPointer) ([
 
 	valueBytes := make([]byte, valueLen)
 	valueOffset := pointer.Offset + int64(headerSize) + int64(keyLen)
-	if _, err := f.ReadAt(valueBytes, valueOffset); err != nil {
+	if _, err := baol.readAtWithStats(f, valueBytes, valueOffset, baolDiskIOUsageDataQuery); err != nil {
 		return nil, fmt.Errorf("ReadAt for value failed at offset %d (len %d): %w", valueOffset, valueLen, err)
 	}
 	return valueBytes, nil
@@ -1357,8 +1460,10 @@ func (baol *BlockAppendOnlyLog) Close() error {
 	if baol.dataFile != nil {
 		// Sync data file before closing, to ensure all writes are flushed.
 		if err := baol.dataFile.Sync(); err != nil {
+			baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 			errs = append(errs, fmt.Errorf("failed to sync data file on close: %w", err))
 		}
+		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 		if err := baol.dataFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close data file: %w", err))
 		}
@@ -1367,13 +1472,17 @@ func (baol *BlockAppendOnlyLog) Close() error {
 
 	if baol.indexMapFile != nil {
 		if err := baol.indexMapFile.Sync(); err != nil {
+			baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
 			errs = append(errs, fmt.Errorf("failed to sync index map file on close: %w", err))
 		}
+		baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
 		if err := baol.indexMapFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close index map file: %w", err))
 		}
 		baol.indexMapFile = nil
 	}
+
+	baol.printDiskIOStats()
 
 	// Combine errors if any occurred
 	if len(errs) > 0 {
@@ -1516,7 +1625,7 @@ func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) e
 		// Use compact storage: position based on offset from minBlockID.
 		// minBlockID can be 0 for valid block-0 based datasets.
 		pos := int64(entry.BlockID-minBlockID) * int64(indexEntrySize)
-		if _, err := f.WriteAt(buf, pos); err != nil {
+		if _, err := baol.writeAtWithStats(f, buf, pos, baolDiskIOUsageIndexMutation); err != nil {
 			baol.log.Error("Failed to write index entry during flush", "error", err)
 			baol.restoreIndexBuffer(entries)
 			return err
@@ -1524,10 +1633,12 @@ func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) e
 	}
 
 	if err := f.Sync(); err != nil {
+		baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
 		baol.log.Error("Failed to sync index file after buffer flush", "error", err)
 		baol.restoreIndexBuffer(entries)
 		return err
 	}
+	baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
 
 	baol.log.Debug("Successfully flushed index buffer", "entries", len(entries))
 	return nil
@@ -1553,8 +1664,10 @@ func (baol *BlockAppendOnlyLog) FlushDataAndIndex() error {
 	}
 	if baol.dataFile != nil {
 		if err := baol.dataFile.Sync(); err != nil {
+			baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 			return fmt.Errorf("failed to sync data file: %w", err)
 		}
+		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	}
 	if err := baol.flushIndexBufferWithBlockID(baol.minBlockID); err != nil {
 		return fmt.Errorf("failed to flush index buffer: %w", err)
@@ -1603,7 +1716,7 @@ func (baol *BlockAppendOnlyLog) readAndIndexBlockFrom(indexEntry blockIndexEntry
 	f := baol.dataFile
 
 	blockData := make([]byte, size)
-	if _, err := f.ReadAt(blockData, indexEntry.StartOffset); err != nil {
+	if _, err := baol.readAtWithStats(f, blockData, indexEntry.StartOffset, baolDiskIOUsageBootstrap); err != nil {
 		return fmt.Errorf("failed to read block data for %d from offset %d: %w", indexEntry.BlockID, indexEntry.StartOffset, err)
 	}
 
@@ -1635,7 +1748,7 @@ func (baol *BlockAppendOnlyLog) findKeyInOneBlock(f *os.File, indexEntry blockIn
 		return "", false, nil
 	}
 	blockData := make([]byte, size)
-	if _, err := f.ReadAt(blockData, indexEntry.StartOffset); err != nil {
+	if _, err := baol.readAtWithStats(f, blockData, indexEntry.StartOffset, baolDiskIOUsageDataQuery); err != nil {
 		return "", false, fmt.Errorf("Get: failed to read data for block %d: %w", indexEntry.BlockID, err)
 	}
 	reader := bytes.NewReader(blockData)
@@ -1678,7 +1791,7 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 	if pointer.BlockID != 0 {
 		if mainEntry, ok := baol.getBlockIndexEntry(pointer.BlockID); ok {
 			if pointer.Offset >= mainEntry.StartOffset && pointer.Offset+int64(headerSize) <= mainEntry.EndOffset {
-				if _, err := baol.dataFile.ReadAt(headerBytes, pointer.Offset); err == nil {
+				if _, err := baol.readAtWithStats(baol.dataFile, headerBytes, pointer.Offset, baolDiskIOUsageDataQuery); err == nil {
 					keyLen := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
 					valLen := binary.BigEndian.Uint32(headerBytes[blockIDSize+keyLenSize:])
 					return baol.dataFile, headerSize, keyLen, valLen, nil
@@ -1686,7 +1799,7 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 			}
 		}
 	}
-	if _, err := baol.dataFile.ReadAt(headerBytes, pointer.Offset); err == nil {
+	if _, err := baol.readAtWithStats(baol.dataFile, headerBytes, pointer.Offset, baolDiskIOUsageDataQuery); err == nil {
 		keyLen := binary.BigEndian.Uint32(headerBytes[blockIDSize : blockIDSize+keyLenSize])
 		valLen := binary.BigEndian.Uint32(headerBytes[blockIDSize+keyLenSize:])
 		return baol.dataFile, headerSize, keyLen, valLen, nil
@@ -1874,7 +1987,7 @@ func (it *baolStreamIterator) readKVAt(offset int64, blockEnd int64) ([]byte, []
 	}
 
 	hdr := make([]byte, headerSize)
-	if _, err := it.baol.dataFile.ReadAt(hdr, offset); err != nil {
+	if _, err := it.baol.readAtWithStats(it.baol.dataFile, hdr, offset, baolDiskIOUsageDataQuery); err != nil {
 		return nil, nil, 0, err
 	}
 
@@ -1892,11 +2005,11 @@ func (it *baolStreamIterator) readKVAt(offset int64, blockEnd int64) ([]byte, []
 	}
 
 	key := make([]byte, int(keyLen))
-	if _, err := it.baol.dataFile.ReadAt(key, offset+headerSize); err != nil {
+	if _, err := it.baol.readAtWithStats(it.baol.dataFile, key, offset+headerSize, baolDiskIOUsageDataQuery); err != nil {
 		return nil, nil, 0, err
 	}
 	value := make([]byte, int(valueLen))
-	if _, err := it.baol.dataFile.ReadAt(value, offset+headerSize+keyLen); err != nil {
+	if _, err := it.baol.readAtWithStats(it.baol.dataFile, value, offset+headerSize+keyLen, baolDiskIOUsageDataQuery); err != nil {
 		return nil, nil, 0, err
 	}
 	return key, value, entrySize, nil

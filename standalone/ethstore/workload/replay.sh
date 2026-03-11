@@ -31,7 +31,7 @@ DB_TYPE="${DB_TYPE:-all}"
 # ethstore 回放参数，storage chunk cache 数量
 CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
-NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.5}"
+NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
 # PrefixTree node file GC 并发 worker 数；默认使用系统 CPU 数量的一半，最少 1
 DEFAULT_NODE_FILE_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
 if [ "$DEFAULT_NODE_FILE_GC_WORKERS" -lt 1 ]; then
