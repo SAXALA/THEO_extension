@@ -500,7 +500,7 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 	return nil
 }
 
-func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int, totalCacheSizeMiB int, ckvCache int, ckvHandles int, pebbleCache int, pebbleHandles int, ckvUseState bool, ckvLoadLimit int) error {
+func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int, totalCacheSizeMiB int, ckvCache int, ckvHandles int, pebbleCache int, pebbleHandles int, ckvUseState bool, ckvLoadLimit int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) error {
 	switch {
 	case strings.EqualFold(backend, "chainkv"):
 		ckv, openErr := NewChainKVLDB(cfg.ChainKVDir, ckvCache, ckvHandles, ckvUseState)
@@ -536,11 +536,11 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 		if aolDataFile == "" {
 			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
 		}
-		if err := loadBlockStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeMiB, totalCacheSizeMiB); err != nil {
+		if err := loadBlockStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeMiB, totalCacheSizeMiB, nodeFileGCRatioThreshold, nodeFileGCWorkers); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
 		}
 		// load contract account and storage
-		if err := loadPrefixdbAndPebble(cfg.EthStoreDir, cfg.LoadDataDir, contractChunkFileSizeMiB, totalCacheSizeMiB, 32); err != nil {
+		if err := loadPrefixdbAndPebble(cfg.EthStoreDir, cfg.LoadDataDir, contractChunkFileSizeMiB, totalCacheSizeMiB, 32, nodeFileGCRatioThreshold, nodeFileGCWorkers); err != nil {
 			return fmt.Errorf("ethstore account load failed: %w", err)
 		}
 
@@ -550,7 +550,7 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 	}
 }
 
-func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, chunkFileSize int, totalCacheSizeMiB int) error {
+func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, chunkFileSize int, totalCacheSizeMiB int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) error {
 	if !strings.EqualFold(backend, "ethstore") {
 		return fmt.Errorf("gc mode currently supports ethstore backend only")
 	}
@@ -558,7 +558,7 @@ func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, ch
 	if stateDir == "" {
 		return fmt.Errorf("gc mode requires -gc-state-dir")
 	}
-	store, err := ethstore.NewStateOnlyWithPrefixCacheSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount)
+	store, err := ethstore.NewStateOnlyWithPrefixGCSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, nodeFileGCWorkers)
 	if err != nil {
 		return fmt.Errorf("gc: failed to open state db: %w", err)
 	}
@@ -766,8 +766,8 @@ type ethstoreReplayBackend struct {
 	blockTotalHist     *latencyHistogram
 }
 
-func newEthstoreReplayBackend(dir string, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int) (*ethstoreReplayBackend, error) {
-	store, err := ethstore.NewWithPrefixCacheSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount)
+func newEthstoreReplayBackend(dir string, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) (*ethstoreReplayBackend, error) {
+	store, err := ethstore.NewWithPrefixGCSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, nodeFileGCWorkers)
 	if err != nil {
 		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
 	}
@@ -1185,6 +1185,16 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				backend.Name(), maxOps)
 		}
 
+		//debug
+		// testKeyHex := "4f37d65eaa92c6bc4c13a5ec45527f0c18ea8932588728769ec7aecfe6d9f32e420e02030c"
+		// testKeyBytes, _ := hex.DecodeString(testKeyHex)
+		// val, err := backend.Get(testKeyBytes, ethstore.TrieNodeStorageDataType)
+		// if err != nil && !errors.Is(err, ethstore.ErrNotFound) {
+		// 	fmt.Printf("Debug: Get error for key %s: %v\n", testKeyHex, err)
+		// } else if err == nil {
+		// 	fmt.Printf("Debug: Get success for key %s: value length %d\n", testKeyHex, len(val))
+		// }
+
 		start := time.Now()
 		var opErr error
 		switch op {
@@ -1240,12 +1250,12 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		elapsed := time.Since(start)
 		totalTime += elapsed
 		// comment to disable operation failed output
-		// if opErr != nil {
-		// 	if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
-		// 		fmt.Printf("[%s] op %s failed for key %s: %v\n",
-		// 			backend.Name(), opTypeStr, keyHex, opErr)
-		// 	}
-		// }
+		if opErr != nil {
+			if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
+				fmt.Printf("[%s] op %s failed for key %s: %v\n",
+					backend.Name(), opTypeStr, keyHex, opErr)
+			}
+		}
 		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
 			break
@@ -1279,6 +1289,8 @@ func printRuntimeArgsSnapshot(
 	contractChunkFileSizeMiB int,
 	totalCacheSizeMiB int,
 	contractCachePrefetchCount int,
+	nodeFileGCRatioThreshold float64,
+	nodeFileGCWorkers int,
 	ckvCache int,
 	ckvHandles int,
 	pebbleCache int,
@@ -1303,6 +1315,8 @@ func printRuntimeArgsSnapshot(
 		fmt.Printf("state_cache_prefetch_count=%d\n", contractCachePrefetchCount)
 		fmt.Printf("contract_chunk_file_mib=%d\n", contractChunkFileSizeMiB)
 		fmt.Printf("total_cache_size_mib=%d\n", totalCacheSizeMiB)
+		fmt.Printf("node_file_gc_unsorted_ratio_threshold=%g\n", nodeFileGCRatioThreshold)
+		fmt.Printf("node_file_gc_workers=%d\n", nodeFileGCWorkers)
 	} else if strings.EqualFold(backend, "chainkv") {
 		fmt.Printf("ckv_cache=%d\n", ckvCache)
 		fmt.Printf("ckv_handles=%d\n", ckvHandles)
@@ -1337,6 +1351,8 @@ func main() {
 	DBTypeStr := flag.String("db-type", "allDBtypes", "Database type for replay: prefixdb, pebble, or aol")
 	replayTraceFile := flag.String("trace-file", "Cache", "Path to trace file for recording")
 	contractCachePrefetchCount := flag.Int("cache-count", 16, "Number of entries to cache for storage chunk get")
+	nodeFileGCRatioThreshold := flag.Float64("node-file-gc-unsorted-ratio-threshold", 1.0, "Trigger PrefixTree node-file GC when unsorted_count/sorted_count reaches this ratio")
+	nodeFileGCWorkers := flag.Int("node-file-gc-workers", 0, "Concurrent PrefixTree GC workers (0 means auto)")
 	gcStateDir := flag.String("gc-state-dir", "", "State DB directory for gc mode (direct path, no copy)")
 	flag.Parse()
 	if *startBlockID > 0 && *endBlockID > 0 && *endBlockID < *startBlockID {
@@ -1391,6 +1407,8 @@ func main() {
 		*contractChunkFileSizeMiB,
 		*totalCacheSizeMiB,
 		*contractCachePrefetchCount,
+		*nodeFileGCRatioThreshold,
+		*nodeFileGCWorkers,
 		*ckvCache,
 		*ckvHandles,
 		*pebbleCache,
@@ -1406,17 +1424,17 @@ func main() {
 	}()
 
 	// For quick debugging
-	// pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
-	// if pbErr != nil {
-	// 	log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
-	// }
-	// defer pbBackend.Close()
-	// replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, *nodeFileGCWorkers)
+	if ethErr != nil {
+		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+	}
+	defer ethBackend.Close()
+	replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 	// return
 
 	switch *mode {
 	case "ld":
-		if err := runLoadData(cfg, *backend, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *ckvCache, *ckvHandles, *pebbleCache, *pebbleHandles, *ckvUseState, *ckvLoadLimit); err != nil {
+		if err := runLoadData(cfg, *backend, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *ckvCache, *ckvHandles, *pebbleCache, *pebbleHandles, *ckvUseState, *ckvLoadLimit, *nodeFileGCRatioThreshold, *nodeFileGCWorkers); err != nil {
 			log.Fatalf("ld failed: %v", err)
 		}
 	case "re":
@@ -1435,7 +1453,7 @@ func main() {
 			defer pbBackend.Close()
 			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		} else {
-			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeMiB, *totalCacheSizeMiB)
+			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, *nodeFileGCWorkers)
 			if ethErr != nil {
 				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 			}
@@ -1443,7 +1461,7 @@ func main() {
 			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 		}
 	case "gc":
-		if err := runGC(*backend, *contractCachePrefetchCount, *gcStateDir, *contractChunkFileSizeMiB, *totalCacheSizeMiB); err != nil {
+		if err := runGC(*backend, *contractCachePrefetchCount, *gcStateDir, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, *nodeFileGCWorkers); err != nil {
 			log.Fatalf("gc failed: %v", err)
 		}
 	default:
@@ -1522,8 +1540,8 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 }
 
 // load all data from the key-value file into EthStore
-func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunkFileSizeMiB int, totalCacheSizeMiB int, contractCachePrefetchCount int) error {
-	store, err := ethstore.NewWithPrefixCacheSettings(dataBaseDir, 6000, "put_test", false, contractChunkFileSizeMiB, totalCacheSizeMiB, contractCachePrefetchCount)
+func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunkFileSizeMiB int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) error {
+	store, err := ethstore.NewWithPrefixGCSettings(dataBaseDir, 6000, "put_test", false, contractChunkFileSizeMiB, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, nodeFileGCWorkers)
 	if err != nil {
 		log.Fatalf("Failed to create EthStore instance: %v", err)
 	}
@@ -1726,8 +1744,8 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 	return nil
 }
 
-func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, totalCacheSizeMiB int) error {
-	store, err := ethstore.NewWithPrefixCacheSettings(dataBaseDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, 16)
+func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, totalCacheSizeMiB int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) error {
+	store, err := ethstore.NewWithPrefixGCSettings(dataBaseDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, 16, nodeFileGCRatioThreshold, nodeFileGCWorkers)
 	if err != nil {
 		return fmt.Errorf("failed to create EthStore instance: %w", err)
 	}

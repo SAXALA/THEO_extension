@@ -7,7 +7,7 @@ fi
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$script_dir" || exit 1
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # 可执行动作: load(加载数据) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC)
 ACTIONS="load restore replay gc"
@@ -30,11 +30,19 @@ TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 DB_TYPE="${DB_TYPE:-all}"
 # ethstore 回放参数，storage chunk cache 数量
 CACHE_COUNT="${CACHE_COUNT:-32}"
+# PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
+NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.5}"
+# PrefixTree node file GC 并发 worker 数；默认使用系统 CPU 数量的一半，最少 1
+DEFAULT_NODE_FILE_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
+if [ "$DEFAULT_NODE_FILE_GC_WORKERS" -lt 1 ]; then
+    DEFAULT_NODE_FILE_GC_WORKERS=1
+fi
+NODE_FILE_GC_WORKERS="${NODE_FILE_GC_WORKERS:-$DEFAULT_NODE_FILE_GC_WORKERS}"
 
 # ethstore load 参数: chunk 文件大小（字节），如 4096/16384/65536/262144
 CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
 # ethstore 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
-TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-80}"
+TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-512}"
 
 # Keep byte conversions for logging only; Go now receives MiB and converts internally.
 TOTAL_CACHE_SIZE_BYTES=$((TOTAL_CACHE_SIZE_MIB * 1024 * 1024))
@@ -90,6 +98,27 @@ sudo_run() {
     fi
 }
 
+report_error() {
+    local exit_code="$1"
+    local line_no="$2"
+    local cmd="$3"
+    echo "replay.sh failed at line ${line_no}: ${cmd} (exit=${exit_code})" >&2
+}
+
+trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+sudo_rsync_run() {
+    set +e
+    sudo_run rsync "$@"
+    local rc=$?
+    set -e
+    if [ "$rc" -eq 24 ]; then
+        echo "rsync exited with code 24 (source files vanished during transfer); continuing" >&2
+        return 0
+    fi
+    return "$rc"
+}
+
 terminate_pid_tree() {
     local pid="$1"
     if [ -z "$pid" ]; then
@@ -117,8 +146,19 @@ terminate_pid_tree() {
 }
 
 cleanup_running_processes() {
-    terminate_pid_tree "$CURRENT_MONITOR_PID"
-    terminate_pid_tree "$CURRENT_REPLAY_PID"
+    local monitor_pid="$CURRENT_MONITOR_PID"
+    local replay_pid="$CURRENT_REPLAY_PID"
+
+    terminate_pid_tree "$monitor_pid"
+    terminate_pid_tree "$replay_pid"
+
+    if [ -n "$monitor_pid" ]; then
+        wait "$monitor_pid" 2>/dev/null || true
+    fi
+    if [ -n "$replay_pid" ]; then
+        wait "$replay_pid" 2>/dev/null || true
+    fi
+
     CURRENT_MONITOR_PID=""
     CURRENT_REPLAY_PID=""
 }
@@ -150,6 +190,7 @@ Common env vars:
     TRACE_FILE(cache|nocache|nocache_snap)
     DB_TYPE(all|aol|prefixdb|pebble)
     CACHE_COUNT
+    NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD NODE_FILE_GC_WORKERS
     CHUNK_FILE_SIZE(bytes), TOTAL_CACHE_SIZE_MIB(MiB)
     CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
@@ -246,23 +287,23 @@ restore_ethstore_db() {
     echo "Restore ethstore database..."
     local src_root="${LOADED_ROOT}/ethstore"
     local dst_prefix="${RUNNING_ROOT}/ethstore"
-    sudo_run rsync -avP --delete "${src_root}/database_aol/" "${dst_prefix}_aol/"
+    sudo_rsync_run -avP --delete "${src_root}/database_aol/" "${dst_prefix}_aol/"
     sudo_run chmod -R 777 "${dst_prefix}_aol/"
-    sudo_run rsync -avP --delete "${src_root}/database_pebble/" "${dst_prefix}_pebble/"
+    sudo_rsync_run -avP --delete "${src_root}/database_pebble/" "${dst_prefix}_pebble/"
     sudo_run chmod -R 777 "${dst_prefix}_pebble/"
-    sudo_run rsync -avP --delete "${src_root}/${ETHSTORE_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
+    sudo_rsync_run -avP --delete "${src_root}/${ETHSTORE_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
     sudo_run chmod -R 777 "${dst_prefix}_state/"
 }
 
 restore_chainkv_db() {
     echo "Restore chainkv baseline database..."
-    sudo_run rsync -avP --delete "${LOADED_ROOT}/chainkv/" "${RUNNING_ROOT}/chainkv/"
+    sudo_rsync_run -avP --delete "${LOADED_ROOT}/chainkv/" "${RUNNING_ROOT}/chainkv/"
     sudo_run chmod -R 777 "${RUNNING_ROOT}/chainkv/"
 }
 
 restore_pebble_db() {
     echo "Restore pebble baseline database..."
-    sudo_run rsync -avP --delete "${LOADED_ROOT}/pebble/" "${RUNNING_ROOT}/pebble/"
+    sudo_rsync_run -avP --delete "${LOADED_ROOT}/pebble/" "${RUNNING_ROOT}/pebble/"
     sudo_run chmod -R 777 "${RUNNING_ROOT}/pebble/"
 }
 
@@ -298,17 +339,17 @@ sync_ethstore_loaded_to_running() {
 
     echo "Sync ethstore data: ${src_root} -> ${dst_prefix}{_aol,_pebble,_state}"
     sudo_run mkdir -p "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
-    sudo_run rsync -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
-    sudo_run rsync -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
-    sudo_run rsync -avP --delete "${src_state}/" "${dst_prefix}_state/"
+    sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
+    sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
+    sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
     sudo_run chmod -R 777 "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
 
     # Print destination sizes for quick sync validation.
-    echo "Synced destination usage:"
-    sudo_run du -sh "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state" 2>/dev/null || true
-    if [ -d "${dst_prefix}_state/prefixdb" ]; then
-        sudo_run du -sh "${dst_prefix}_state/prefixdb" 2>/dev/null || true
-    fi
+    # echo "Synced destination usage:"
+    # sudo_run du -sh "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state" 2>/dev/null || true
+    # if [ -d "${dst_prefix}_state/prefixdb" ]; then
+    #     sudo_run du -sh "${dst_prefix}_state/prefixdb" 2>/dev/null || true
+    # fi
 }
 
 sync_chainkv_loaded_to_running() {
@@ -320,7 +361,7 @@ sync_chainkv_loaded_to_running() {
     fi
     echo "Sync chainkv data: ${src} -> ${dst}"
     sudo_run mkdir -p "${dst}"
-    sudo_run rsync -avP --delete "${src}/" "${dst}/"
+    sudo_rsync_run -avP --delete "${src}/" "${dst}/"
     sudo_run chmod -R 777 "${dst}"
 }
 
@@ -333,7 +374,7 @@ sync_pebble_loaded_to_running() {
     fi
     echo "Sync pebble data: ${src} -> ${dst}"
     sudo_run mkdir -p "${dst}"
-    sudo_run rsync -avP --delete "${src}/" "${dst}/"
+    sudo_rsync_run -avP --delete "${src}/" "${dst}/"
     sudo_run chmod -R 777 "${dst}"
 }
 
@@ -396,7 +437,7 @@ build_run_tag() {
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_ngcw_${NODE_FILE_GC_WORKERS}${round_tag}"
     else
         printf "%s" "${base_tag}${round_tag}"
     fi
@@ -423,6 +464,8 @@ print_param_snapshot() {
 
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
+        printf 'NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD=%s\n' "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD"
+        printf 'NODE_FILE_GC_WORKERS=%s\n' "$NODE_FILE_GC_WORKERS"
         printf 'CHUNK_FILE_SIZE=%s\n' "$CHUNK_FILE_SIZE"
         printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
     elif [ "$snapshot_backend" = "chainkv" ]; then
@@ -467,7 +510,11 @@ run_and_monitor() {
     ./bin/replayWorkload "$@" >> "$log_file" 2>&1 &
     CURRENT_REPLAY_PID=$!
     echo "${backend} monitor target PID: ${CURRENT_REPLAY_PID}"
-    sudo_run ./monitor.sh "$CURRENT_REPLAY_PID" 1 "$io_file" &
+    (
+        trap - ERR INT TERM EXIT
+        set +e
+        sudo_run ./monitor.sh "$CURRENT_REPLAY_PID" 1 "$io_file"
+    ) &
     CURRENT_MONITOR_PID=$!
 
     wait "$CURRENT_REPLAY_PID"
@@ -484,7 +531,8 @@ run_load() {
         ethstore)
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
+                -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -539,7 +587,8 @@ run_replay() {
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
                 -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
-                -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
+                -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -564,7 +613,8 @@ run_gc() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
-                -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
+                -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"
