@@ -572,6 +572,28 @@ func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, ch
 	return nil
 }
 
+func runUpgradeIndex(backend string, upgradeStateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) error {
+	if !strings.EqualFold(backend, "ethstore") {
+		return fmt.Errorf("upgrade-index mode currently supports ethstore backend only")
+	}
+	stateDir := strings.TrimSpace(upgradeStateDir)
+	if stateDir == "" {
+		return fmt.Errorf("upgrade-index mode requires -upgrade-state-dir")
+	}
+	store, err := ethstore.NewStateOnlyWithPrefixGCSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold)
+	if err != nil {
+		return fmt.Errorf("upgrade-index: failed to open state db: %w", err)
+	}
+	defer store.Close()
+
+	start := time.Now()
+	if err := store.UpgradeSegmentIndexFiles(); err != nil {
+		return fmt.Errorf("upgrade-index: failed to upgrade segment index files: %w", err)
+	}
+	fmt.Printf("ethstore segment index upgrade finished in %s\n", time.Since(start))
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Read-your-writes overlay helper
 // ---------------------------------------------------------------------------
@@ -1332,12 +1354,15 @@ func printRuntimeArgsSnapshot(
 	if mode == "gc" {
 		fmt.Printf("gc_state_dir=%s\n", gcStateDir)
 	}
+	if mode == "upgrade-index" {
+		fmt.Printf("upgrade_state_dir=%s\n", gcStateDir)
+	}
 	fmt.Println("=============================")
 }
 
 func main() {
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc/upgrade-index")
 	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
@@ -1358,6 +1383,7 @@ func main() {
 	legacyNodeFileGCWorkers := flag.Int("node-file-gc-workers", 0, "Deprecated alias for -gc-workers")
 	storageGCThreshold := flag.Float64("storage-gc-threshold", 2.0, "Trigger segmented storage GC when chunk_file_size >= target_chunk_size * threshold")
 	gcStateDir := flag.String("gc-state-dir", "", "State DB directory for gc mode (direct path, no copy)")
+	upgradeStateDir := flag.String("upgrade-state-dir", "", "State DB directory for upgrade-index mode (direct path, no copy)")
 	flag.Parse()
 	resolvedGCWorkers := *gcWorkers
 	if resolvedGCWorkers <= 0 {
@@ -1424,7 +1450,12 @@ func main() {
 		*pebbleHandles,
 		*ckvUseState,
 		*ckvLoadLimit,
-		*gcStateDir,
+		func() string {
+			if *mode == "upgrade-index" && strings.TrimSpace(*upgradeStateDir) != "" {
+				return *upgradeStateDir
+			}
+			return *gcStateDir
+		}(),
 	)
 
 	go func() {
@@ -1473,8 +1504,12 @@ func main() {
 		if err := runGC(*backend, *contractCachePrefetchCount, *gcStateDir, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold); err != nil {
 			log.Fatalf("gc failed: %v", err)
 		}
+	case "upgrade-index":
+		if err := runUpgradeIndex(*backend, *upgradeStateDir, *contractChunkFileSizeMiB, *totalCacheSizeMiB, *contractCachePrefetchCount, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold); err != nil {
+			log.Fatalf("upgrade-index failed: %v", err)
+		}
 	default:
-		log.Fatalf("unknown mode %q, use ld/re/gc", *mode)
+		log.Fatalf("unknown mode %q, use ld/re/gc/upgrade-index", *mode)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,9 +124,9 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		MaxOpenFiles: handles,
 		// MemTableSize: uint64(memTableSize),
 		// MemTableStopWritesThreshold: memTableLimit,
-		// MaxConcurrentCompactions: func() int {
-		// 	return runtime.NumCPU()
-		// },
+		MaxConcurrentCompactions: func() int {
+			return runtime.NumCPU() / 2
+		},
 		// Levels: []pebble.LevelOptions{
 		// 	{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
 		// 	{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},

@@ -1057,6 +1057,17 @@ func (d *Database) GCPrefixTreeStorage() error {
 	return nil
 }
 
+func (d *Database) UpgradeSegmentIndexFiles() error {
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot upgrade segment index files")
+	}
+	if err := d.statepdb.UpgradeSegmentIndexFiles(); err != nil {
+		return fmt.Errorf("failed to upgrade segment index files: %w", err)
+	}
+	d.log.Trace("Upgraded segment index files")
+	return nil
+}
+
 func (d *Database) InsertAccountHashPebble(key []byte, accounthash []byte) error {
 	if d.accountHashKeyCache != nil {
 		d.accountHashKeyCache.Put(accounthash, key)

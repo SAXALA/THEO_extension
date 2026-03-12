@@ -9,8 +9,8 @@ cd "$script_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 可执行动作: load(加载数据) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC)
-ACTIONS="load restore replay gc"
+# 可执行动作: load(加载数据) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
+ACTIONS="load restore replay gc upgrade-index"
 # 后端类型: ethstore | chainkv | pebble | all(依次执行前三者)
 BACKENDS="ethstore chainkv pebble all"
 
@@ -54,9 +54,9 @@ CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
 # pebble 参数: cache 大小（MB）
 PEBBLE_CACHE_MB="${PEBBLE_CACHE_MB:-16}"
 # pebble 参数: handles 数量
-PEBBLE_HANDLES="${PEBBLE_HANDLES:-16}"
+PEBBLE_HANDLES="${PEBBLE_HANDLES:-1048576}"
 # chainkv 参数: leveldb handles 数量
-CHAINKV_HANDLES="${CHAINKV_HANDLES:-16}"
+CHAINKV_HANDLES="${CHAINKV_HANDLES:-1048576}"
 # chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
 # chainkv 参数: 逗号分隔 key 前缀列表；空字符串表示不过滤
@@ -77,6 +77,8 @@ ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-database_statedb16KB_gced}
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
 GC_STATE_DIR="${GC_STATE_DIR:-/mnt/ssd2/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
+# segment index 升级目录：直接在该 statedb 目录执行，不进行复制
+UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
 
 # ethstore prefixdb 目录（用于权限预检查）
 ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-${RUNNING_ROOT}/ethstore_state/prefixdb}"
@@ -179,7 +181,7 @@ export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
 usage() {
     cat <<EOF
-Usage: $0 [load|restore|replay|gc] [ethstore|chainkv|pebble|all]
+Usage: $0 [load|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|all]
 
 Current values:
   action=${ACTION}
@@ -198,12 +200,14 @@ Common env vars:
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
     LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
     GC_STATE_DIR
+    UPGRADE_STATE_DIR
     ETHSTORE_PREFIXDB_DIR SUDO_PASSWD
 
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
     load/replay ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
     gc: backend must be ethstore, and GC_STATE_DIR must be provided
+    upgrade-index: backend must be ethstore, and UPGRADE_STATE_DIR must be provided
 EOF
 }
 
@@ -248,8 +252,8 @@ validate_runtime_requirements() {
         fi
     fi
 
-    if [ "$ACTION" = "gc" ] && [ "$BACKEND" != "ethstore" ]; then
-        echo "gc 仅支持 ethstore backend（当前 BACKEND=${BACKEND}）"
+    if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "ethstore" ]; then
+        echo "${ACTION} 仅支持 ethstore backend（当前 BACKEND=${BACKEND}）"
         exit 1
     fi
     if [ "$ACTION" = "gc" ]; then
@@ -259,6 +263,17 @@ validate_runtime_requirements() {
         fi
         if [ ! -d "$GC_STATE_DIR" ]; then
             echo "GC_STATE_DIR 不存在: ${GC_STATE_DIR}"
+            exit 1
+        fi
+    fi
+
+    if [ "$ACTION" = "upgrade-index" ]; then
+        if [ -z "$UPGRADE_STATE_DIR" ]; then
+            echo "upgrade-index 需要 UPGRADE_STATE_DIR（直接指定 statedb 目录）"
+            exit 1
+        fi
+        if [ ! -d "$UPGRADE_STATE_DIR" ]; then
+            echo "UPGRADE_STATE_DIR 不存在: ${UPGRADE_STATE_DIR}"
             exit 1
         fi
     fi
@@ -463,6 +478,7 @@ print_param_snapshot() {
     printf 'RUNNING_ROOT=%s\n' "$RUNNING_ROOT"
     printf 'ETHSTORE_STATEDB_DIRNAME=%s\n' "$ETHSTORE_STATEDB_DIRNAME"
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
+    printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
 
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
@@ -626,6 +642,28 @@ run_gc() {
     esac
 }
 
+run_upgrade_index() {
+    local backend="$1"
+    local run_tag
+    run_tag=$(build_run_tag "upgrade-index" "$backend")
+    local log_file="./replayLog/${run_tag}_${log_date}.log"
+    local io_file="./replayLog/${run_tag}_io_${log_date}.log"
+
+    case "$backend" in
+        ethstore)
+            ensure_ethstore_permissions
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode upgrade-index -backend ethstore -upgrade-state-dir "$UPGRADE_STATE_DIR" \
+                -cache-count "$CACHE_COUNT" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD"
+            ;;
+        *)
+            echo "upgrade-index 仅支持 ethstore backend"
+            exit 1
+            ;;
+    esac
+}
+
 run_action() {
     local backend="$1"
     case "$ACTION" in
@@ -640,6 +678,9 @@ run_action() {
             ;;
         gc)
             run_gc "$backend"
+            ;;
+        upgrade-index)
+            run_upgrade_index "$backend"
             ;;
     esac
 }
