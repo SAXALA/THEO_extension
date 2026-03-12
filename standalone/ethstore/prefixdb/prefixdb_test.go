@@ -210,6 +210,67 @@ func TestFileNodeCacheUsesSharedBudget(t *testing.T) {
 	}
 }
 
+func writeAccountRecordForTest(t *testing.T, file *os.File, key []byte, value []byte) int64 {
+	t.Helper()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	offset := info.Size()
+	buf := make([]byte, 4+len(key)+len(value))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key)))
+	binary.BigEndian.PutUint16(buf[2:4], uint16(len(value)))
+	copy(buf[4:4+len(key)], key)
+	copy(buf[4+len(key):], value)
+	if _, err := file.WriteAt(buf, offset); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	return offset
+}
+
+func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	shortKey := []byte("A1234")
+	shortValue := []byte("short-value")
+	shortOffset := writeAccountRecordForTest(t, db.accountFile, shortKey, shortValue)
+	if err := db.storeNode(shortKey, &TrieNode{offset: shortOffset}); err != nil {
+		t.Fatalf("storeNode shortKey failed: %v", err)
+	}
+	value, found, err := db.Get(shortKey, nil)
+	if err != nil {
+		t.Fatalf("Get shortKey failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, shortValue) {
+		t.Fatalf("unexpected shortKey result: found=%t value=%q", found, value)
+	}
+	if _, ok := db.nodeCache.Get(string(shortKey)); ok {
+		t.Fatal("expected global.node-backed key to bypass nodeCache")
+	}
+
+	longKey := []byte("A12345")
+	longValue := []byte("long-value")
+	longOffset := writeAccountRecordForTest(t, db.accountFile, longKey, longValue)
+	if err := db.storeNode(longKey, &TrieNode{offset: longOffset}); err != nil {
+		t.Fatalf("storeNode longKey failed: %v", err)
+	}
+	value, found, err = db.Get(longKey, nil)
+	if err != nil {
+		t.Fatalf("Get longKey failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, longValue) {
+		t.Fatalf("unexpected longKey result: found=%t value=%q", found, value)
+	}
+	if _, ok := db.nodeCache.Get(string(longKey)); !ok {
+		t.Fatal("expected bucket-backed key to keep using nodeCache")
+	}
+}
+
 func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	original := []segmentChunkMeta{{
 		FileName: strings.Repeat("chunk", 8),
@@ -472,6 +533,97 @@ func TestMigrateLegacySegmentIndexFormatsMigratesLegacyLevel2Files(t *testing.T)
 	}
 	if !segmentChunkMetasEqual(decoded, append(group1, group2...)) {
 		t.Fatalf("decoded metas mismatch after level2 migration: got %+v", decoded)
+	}
+}
+
+func TestUpgradeSegmentIndexFilesRebuildsUsingCurrentLayoutConstants(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderPath := db.segmentedFolderPath(3)
+	if err := os.MkdirAll(folderPath, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	group1 := []segmentChunkMeta{{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}, KeyEnd: []byte{0x02}, KVCount: 1, ChunkSize: 128}}
+	group2 := []segmentChunkMeta{{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}, KeyEnd: []byte{0x04}, KVCount: 2, ChunkSize: 256}}
+	layout := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 3,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 1, KeyStart: cloneBytes(group1[0].KeyStart), KeyEnd: cloneBytes(group1[0].KeyEnd), ChunkCount: 1},
+			{MetaID: 2, KeyStart: cloneBytes(group2[0].KeyStart), KeyEnd: cloneBytes(group2[0].KeyEnd), ChunkCount: 1},
+		},
+	}
+	topBuf, err := encodeTopLevelIndex(layout)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex failed: %v", err)
+	}
+	indexPath := filepath.Join(folderPath, segmentIndexFileName)
+	if err := os.WriteFile(indexPath, topBuf, 0644); err != nil {
+		t.Fatalf("WriteFile top-level failed: %v", err)
+	}
+	l2Buf1, err := encodeSegmentChunkMetas(group1)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas group1 failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 1), l2Buf1, 0644); err != nil {
+		t.Fatalf("WriteFile level2 #1 failed: %v", err)
+	}
+	l2Buf2, err := encodeSegmentChunkMetas(group2)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas group2 failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 2), l2Buf2, 0644); err != nil {
+		t.Fatalf("WriteFile level2 #2 failed: %v", err)
+	}
+	beforeInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat before upgrade failed: %v", err)
+	}
+	l2Info1, err := os.Stat(level2IndexFilePath(folderPath, 1))
+	if err != nil {
+		t.Fatalf("Stat level2 #1 before upgrade failed: %v", err)
+	}
+	l2Info2, err := os.Stat(level2IndexFilePath(folderPath, 2))
+	if err != nil {
+		t.Fatalf("Stat level2 #2 before upgrade failed: %v", err)
+	}
+	beforeTotalSize := beforeInfo.Size() + l2Info1.Size() + l2Info2.Size()
+
+	if err := db.UpgradeSegmentIndexFiles(); err != nil {
+		t.Fatalf("UpgradeSegmentIndexFiles failed: %v", err)
+	}
+	afterBuf, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile upgraded index failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(afterBuf[:4]); got != segmentIndexFlatMagic {
+		t.Fatalf("expected rebuilt flat index magic, got 0x%x", got)
+	}
+	afterInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat after upgrade failed: %v", err)
+	}
+	afterTotalSize := afterInfo.Size()
+	if afterTotalSize >= beforeTotalSize {
+		t.Fatalf("expected rebuilt index footprint to shrink, before=%d after=%d", beforeTotalSize, afterTotalSize)
+	}
+	if _, err := os.Stat(level2IndexFilePath(folderPath, 1)); !os.IsNotExist(err) {
+		t.Fatalf("expected level2 file #1 to be removed, err=%v", err)
+	}
+	if _, err := os.Stat(level2IndexFilePath(folderPath, 2)); !os.IsNotExist(err) {
+		t.Fatalf("expected level2 file #2 to be removed, err=%v", err)
+	}
+	decoded, err := db.readSegmentIndexNoCache(3)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed after upgrade: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, append(group1, group2...)) {
+		t.Fatalf("decoded metas mismatch after rebuild: got %+v", decoded)
 	}
 }
 

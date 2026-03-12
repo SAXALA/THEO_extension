@@ -33,7 +33,7 @@ CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
 # segmented storage GC 阈值：当 chunk_file_size >= target_chunk_size * threshold 时触发 GC
-STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-1.2}"
+STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-1.5}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
 DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then

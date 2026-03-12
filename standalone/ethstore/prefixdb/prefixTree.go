@@ -671,7 +671,7 @@ func (pt *PrefixTree) getFromGlobalNode(key []byte) (NodeInfo, bool, error) {
 	if pt.globalNodeIndex == nil {
 		return NodeInfo{}, false, nil
 	}
-	elem := pt.globalNodeIndex.Get(string(key))
+	elem := pt.globalNodeIndex.Get(bytesToString(key))
 	if elem == nil {
 		return NodeInfo{}, false, nil
 	}
