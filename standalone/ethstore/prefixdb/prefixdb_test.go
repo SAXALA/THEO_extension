@@ -2,7 +2,9 @@ package prefixdb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -236,6 +238,243 @@ func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	}
 }
 
+func encodeLegacySegmentChunkMetasForTest(t *testing.T, metas []segmentChunkMeta) []byte {
+	t.Helper()
+	buf := make([]byte, 0, 4+len(metas)*32)
+	var tmp32 [4]byte
+	var tmp64 [8]byte
+	writeUint32BE(tmp32[:], uint32(len(metas)))
+	buf = append(buf, tmp32[:]...)
+	for _, meta := range metas {
+		var err error
+		if buf, err = appendVarBytes(buf, []byte(meta.FileName)); err != nil {
+			t.Fatalf("append FileName failed: %v", err)
+		}
+		if buf, err = appendVarBytes(buf, meta.KeyStart); err != nil {
+			t.Fatalf("append KeyStart failed: %v", err)
+		}
+		if buf, err = appendVarBytes(buf, meta.KeyEnd); err != nil {
+			t.Fatalf("append KeyEnd failed: %v", err)
+		}
+		writeUint32BE(tmp32[:], meta.KVCount)
+		buf = append(buf, tmp32[:]...)
+		writeUint64BE(tmp64[:], meta.ChunkSize)
+		buf = append(buf, tmp64[:]...)
+	}
+	return buf
+}
+
+func TestEncodeSegmentChunkMetasUsesCompactFormat(t *testing.T) {
+	metas := []segmentChunkMeta{{
+		FileName:  "chunk_0012.dat",
+		KeyStart:  []byte{0x01, 0x02},
+		KeyEnd:    []byte{0x03, 0x04},
+		KVCount:   7,
+		ChunkSize: 1024,
+	}}
+
+	buf, err := encodeSegmentChunkMetas(metas)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
+		t.Fatalf("expected compact flat magic, got 0x%x", got)
+	}
+	if len(buf) != estimateSegmentIndexSize(metas) {
+		t.Fatalf("encoded size mismatch: got %d want %d", len(buf), estimateSegmentIndexSize(metas))
+	}
+
+	var decoded []segmentChunkMeta
+	var arena []byte
+	if err := decodeSegmentIndexBuffer(buf, &decoded, &arena, false, ""); err != nil {
+		t.Fatalf("decodeSegmentIndexBuffer failed: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
+	}
+	if len(buf) >= len(encodeLegacySegmentChunkMetasForTest(t, metas)) {
+		t.Fatalf("expected compact encoding to be smaller than legacy encoding, got compact=%d legacy=%d", len(buf), len(encodeLegacySegmentChunkMetasForTest(t, metas)))
+	}
+}
+
+func TestDecodeSegmentIndexBufferSupportsLegacyFormat(t *testing.T) {
+	metas := []segmentChunkMeta{{
+		FileName:  "chunk_0042.dat",
+		KeyStart:  []byte{0x0a},
+		KeyEnd:    []byte{0x0f},
+		KVCount:   3,
+		ChunkSize: 4096,
+	}}
+
+	buf := encodeLegacySegmentChunkMetasForTest(t, metas)
+	var decoded []segmentChunkMeta
+	var arena []byte
+	if err := decodeLegacySegmentIndexBuffer(buf, &decoded, &arena, false, ""); err != nil {
+		t.Fatalf("decode legacy segment index failed: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
+	}
+}
+
+func TestDecodeSegmentIndexBufferRejectsLegacyFormat(t *testing.T) {
+	buf := encodeLegacySegmentChunkMetasForTest(t, []segmentChunkMeta{{
+		FileName:  "chunk_0042.dat",
+		KeyStart:  []byte{0x0a},
+		KeyEnd:    []byte{0x0f},
+		KVCount:   3,
+		ChunkSize: 4096,
+	}})
+	var decoded []segmentChunkMeta
+	var arena []byte
+	if err := decodeSegmentIndexBuffer(buf, &decoded, &arena, false, ""); err == nil {
+		t.Fatal("expected normal decode path to reject legacy segment index format")
+	}
+}
+
+func TestEncodeSegmentChunkMetasRejectsUnsafeCompactEncoding(t *testing.T) {
+	t.Run("non ordinal file name", func(t *testing.T) {
+		metas := []segmentChunkMeta{{
+			FileName:  "legacy-name.dat",
+			KeyStart:  []byte{0x01},
+			KeyEnd:    []byte{0x02},
+			KVCount:   1,
+			ChunkSize: 128,
+		}}
+
+		buf, err := encodeSegmentChunkMetas(metas)
+		if err == nil {
+			t.Fatalf("expected compact encoding rejection, got buffer len %d", len(buf))
+		}
+	})
+
+	t.Run("chunk size overflow", func(t *testing.T) {
+		metas := []segmentChunkMeta{{
+			FileName:  "chunk_0007.dat",
+			KeyStart:  []byte{0x03},
+			KeyEnd:    []byte{0x04},
+			KVCount:   2,
+			ChunkSize: uint64(math.MaxUint32) + 1,
+		}}
+
+		buf, err := encodeSegmentChunkMetas(metas)
+		if err == nil {
+			t.Fatalf("expected compact encoding rejection, got buffer len %d", len(buf))
+		}
+	})
+}
+
+func TestMigrateLegacySegmentIndexFormatsMigratesFlatIndex(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderPath := db.segmentedFolderPath(1)
+	if err := os.MkdirAll(folderPath, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := []segmentChunkMeta{
+		{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}, KeyEnd: []byte{0x02}, KVCount: 1, ChunkSize: 128},
+		{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}, KeyEnd: []byte{0x04}, KVCount: 2, ChunkSize: 256},
+	}
+	indexPath := filepath.Join(folderPath, segmentIndexFileName)
+	if err := os.WriteFile(indexPath, encodeLegacySegmentChunkMetasForTest(t, metas), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if err := db.MigrateLegacySegmentIndexFormats(); err != nil {
+		t.Fatalf("MigrateLegacySegmentIndexFormats failed: %v", err)
+	}
+	buf, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
+		t.Fatalf("expected migrated flat magic, got 0x%x", got)
+	}
+	decoded, err := db.readSegmentIndexNoCache(1)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed after migration: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch after migration: got %+v want %+v", decoded, metas)
+	}
+}
+
+func TestMigrateLegacySegmentIndexFormatsMigratesLegacyLevel2Files(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderPath := db.segmentedFolderPath(2)
+	if err := os.MkdirAll(folderPath, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	group1 := []segmentChunkMeta{{
+		FileName:  "chunk_0001.dat",
+		KeyStart:  bytes.Repeat([]byte{0x01}, 5000),
+		KeyEnd:    bytes.Repeat([]byte{0x02}, 5000),
+		KVCount:   1,
+		ChunkSize: 128,
+	}}
+	group2 := []segmentChunkMeta{{
+		FileName:  "chunk_0002.dat",
+		KeyStart:  bytes.Repeat([]byte{0x03}, 5000),
+		KeyEnd:    bytes.Repeat([]byte{0x04}, 5000),
+		KVCount:   2,
+		ChunkSize: 256,
+	}}
+	layout := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 3,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 1, KeyStart: cloneBytes(group1[0].KeyStart), KeyEnd: cloneBytes(group1[0].KeyEnd), ChunkCount: 1},
+			{MetaID: 2, KeyStart: cloneBytes(group2[0].KeyStart), KeyEnd: cloneBytes(group2[0].KeyEnd), ChunkCount: 1},
+		},
+	}
+	topBuf, err := encodeTopLevelIndex(layout)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(folderPath, segmentIndexFileName), topBuf, 0644); err != nil {
+		t.Fatalf("WriteFile top-level failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 1), encodeLegacySegmentChunkMetasForTest(t, group1), 0644); err != nil {
+		t.Fatalf("WriteFile level2 #1 failed: %v", err)
+	}
+	buf2, err := encodeSegmentChunkMetas(group2)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas for group2 failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 2), buf2, 0644); err != nil {
+		t.Fatalf("WriteFile level2 #2 failed: %v", err)
+	}
+
+	if err := db.MigrateLegacySegmentIndexFormats(); err != nil {
+		t.Fatalf("MigrateLegacySegmentIndexFormats failed: %v", err)
+	}
+	buf, err := os.ReadFile(level2IndexFilePath(folderPath, 1))
+	if err != nil {
+		t.Fatalf("ReadFile migrated level2 failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
+		t.Fatalf("expected migrated level2 flat magic, got 0x%x", got)
+	}
+	decoded, err := db.readSegmentIndexNoCache(2)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed after level2 migration: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, append(group1, group2...)) {
+		t.Fatalf("decoded metas mismatch after level2 migration: got %+v", decoded)
+	}
+}
+
 func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 	shared := newSharedByteCache(4096)
 	db := &PrefixDB{
@@ -275,7 +514,7 @@ func TestCompactFileFromStateRefreshesFileNodeCache(t *testing.T) {
 			SortedEntryCount:   1,
 			UnsortedEntryCount: 1,
 		},
-		sorted: append([]byte(nil), encodeNodeEntry(NodeInfo{key: []byte{0x01}, accountOffset: 1, storageFileID: 1, storageOffset: 11, storageSize: 22})...),
+		sorted:   append([]byte(nil), encodeNodeEntry(NodeInfo{key: []byte{0x01}, accountOffset: 1, storageFileID: 1, storageOffset: 11, storageSize: 22})...),
 		unsorted: append([]byte(nil), encodeNodeEntry(NodeInfo{key: []byte{0x01}, accountOffset: 2, storageFileID: 3, storageOffset: 33, storageSize: 44})...),
 	}
 
@@ -290,6 +529,281 @@ func TestCompactFileFromStateRefreshesFileNodeCache(t *testing.T) {
 	used, _ := shared.NamespaceStats(sharedCacheNamespaceFileNode)
 	if used == 0 {
 		t.Fatal("expected refreshed file node cache to consume shared budget")
+	}
+}
+
+func TestNewPrefixTreeLoadsGlobalNodeIntoSkipList(t *testing.T) {
+	baseDir := t.TempDir()
+	fileNodeDir := filepath.Join(baseDir, "prefixdb", "filenodes")
+	if err := os.MkdirAll(fileNodeDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	filePath := filepath.Join(fileNodeDir, globalFileName)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: 2, SortedEntryCount: 1, UnsortedEntryCount: 1}
+	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+		_ = file.Close()
+		t.Fatalf("write header failed: %v", err)
+	}
+	key := []byte{0x01, 0x02, 0x03}
+	if _, err := file.Write(encodeNodeEntry(NodeInfo{key: key, accountOffset: 10, storageFileID: 1, storageOffset: 11, storageSize: 12})); err != nil {
+		_ = file.Close()
+		t.Fatalf("write sorted entry failed: %v", err)
+	}
+	if _, err := file.Write(encodeNodeEntry(NodeInfo{key: key, accountOffset: 20, storageFileID: 2, storageOffset: 21, storageSize: 22})); err != nil {
+		_ = file.Close()
+		t.Fatalf("write unsorted entry failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file failed: %v", err)
+	}
+
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	if pt.globalNodeIndex == nil || pt.globalNodeIndex.Len() != 1 {
+		t.Fatalf("unexpected global skiplist state: %+v", pt.globalNodeIndex)
+	}
+	node, found, err := pt.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected global node entry to be loaded")
+	}
+	if node.accountOffset != 20 || node.storageFileID != 2 || node.storageOffset != 21 || node.storageSize != 22 {
+		t.Fatalf("unexpected loaded node info: %+v", node)
+	}
+	if _, ok := pt.getFileNodeCache(globalFileName); ok {
+		t.Fatal("global.node should not use the shared file node cache")
+	}
+}
+
+func TestGlobalNodePutAppendsAndUpdatesSkipList(t *testing.T) {
+	baseDir := t.TempDir()
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	key := []byte{0x0a, 0x0b, 0x0c}
+	headerSize := int64(binary.Size(FileNodeHeader{}))
+	if err := pt.Put(key, 11, 1, 101, 1001); err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+	if pt.globalHeader.UnsortedEntryCount != 1 {
+		t.Fatalf("unexpected unsorted count after first append: %d", pt.globalHeader.UnsortedEntryCount)
+	}
+	if err := pt.Put(key, 22, 2, 202, 2002); err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+	if pt.globalHeader.UnsortedEntryCount != 2 {
+		t.Fatalf("unexpected unsorted count after second append: %d", pt.globalHeader.UnsortedEntryCount)
+	}
+	if pt.globalNodeIndex.Len() != 1 {
+		t.Fatalf("expected one deduplicated key in skiplist, got %d", pt.globalNodeIndex.Len())
+	}
+	node, found, err := pt.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected key in global skiplist")
+	}
+	if node.accountOffset != 22 || node.storageFileID != 2 || node.storageOffset != 202 || node.storageSize != 2002 {
+		t.Fatalf("unexpected node after append updates: %+v", node)
+	}
+	stat, err := os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if stat.Size() != headerSize+2*NodeEntrySize {
+		t.Fatalf("unexpected global.node size: got %d want %d", stat.Size(), headerSize+2*NodeEntrySize)
+	}
+	if _, ok := pt.getFileNodeCache(globalFileName); ok {
+		t.Fatal("global.node should bypass the shared file node cache")
+	}
+}
+
+func TestGlobalNodeDeleteRewritesDedicatedFile(t *testing.T) {
+	baseDir := t.TempDir()
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	key1 := []byte{0x01}
+	key2 := []byte{0x02}
+	if err := pt.Put(key1, 11, 1, 101, 1001); err != nil {
+		t.Fatalf("Put key1 failed: %v", err)
+	}
+	if err := pt.Put(key2, 22, 2, 202, 2002); err != nil {
+		t.Fatalf("Put key2 failed: %v", err)
+	}
+	deleted, err := pt.Delete(key1)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if !deleted {
+		t.Fatal("expected global node delete to remove the key")
+	}
+	if pt.globalHeader.SortedEntryCount != 1 || pt.globalHeader.UnsortedEntryCount != 0 {
+		t.Fatalf("unexpected global header after rewrite: %+v", pt.globalHeader)
+	}
+	if pt.globalNodeIndex.Len() != 1 {
+		t.Fatalf("unexpected skiplist size after delete: %d", pt.globalNodeIndex.Len())
+	}
+	if _, found, err := pt.Get(key1); err != nil || found {
+		t.Fatalf("expected deleted key to disappear, found=%t err=%v", found, err)
+	}
+	node, found, err := pt.Get(key2)
+	if err != nil {
+		t.Fatalf("Get key2 failed: %v", err)
+	}
+	if !found || node.accountOffset != 22 {
+		t.Fatalf("expected surviving key to remain readable, found=%t node=%+v", found, node)
+	}
+}
+
+func TestGlobalNodeCommitFlushesOnceAtEnd(t *testing.T) {
+	baseDir := t.TempDir()
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	headerSize := int64(binary.Size(FileNodeHeader{}))
+	key1 := []byte{0x01}
+	key2 := []byte{0x02}
+
+	pt.beginGlobalCommit()
+	if err := pt.Put(key1, 11, 1, 101, 1001); err != nil {
+		t.Fatalf("Put key1 failed: %v", err)
+	}
+	if err := pt.Put(key2, 22, 2, 202, 2002); err != nil {
+		t.Fatalf("Put key2 failed: %v", err)
+	}
+	stat, err := os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
+	if err != nil {
+		t.Fatalf("Stat during commit failed: %v", err)
+	}
+	if stat.Size() != headerSize {
+		t.Fatalf("expected no global.node payload before commit flush, got %d", stat.Size())
+	}
+	if pt.globalHeader.SortedEntryCount != 0 || pt.globalHeader.UnsortedEntryCount != 0 {
+		t.Fatalf("unexpected header before deferred flush: %+v", pt.globalHeader)
+	}
+	if err := pt.endGlobalCommit(); err != nil {
+		t.Fatalf("endGlobalCommit failed: %v", err)
+	}
+	stat, err = os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
+	if err != nil {
+		t.Fatalf("Stat after commit failed: %v", err)
+	}
+	if stat.Size() != headerSize+2*NodeEntrySize {
+		t.Fatalf("unexpected global.node size after single flush: got %d want %d", stat.Size(), headerSize+2*NodeEntrySize)
+	}
+	if pt.globalHeader.SortedEntryCount != 0 || pt.globalHeader.UnsortedEntryCount != 2 {
+		t.Fatalf("unexpected header after deferred append flush: %+v", pt.globalHeader)
+	}
+	if node, found, err := pt.Get(key1); err != nil || !found || node.accountOffset != 11 {
+		t.Fatalf("expected key1 after deferred flush, found=%t node=%+v err=%v", found, node, err)
+	}
+	if node, found, err := pt.Get(key2); err != nil || !found || node.accountOffset != 22 {
+		t.Fatalf("expected key2 after deferred flush, found=%t node=%+v err=%v", found, node, err)
+	}
+}
+
+func TestGlobalNodeNestedCommitFlushesOnOuterEnd(t *testing.T) {
+	baseDir := t.TempDir()
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	headerSize := int64(binary.Size(FileNodeHeader{}))
+	key := []byte{0x03}
+
+	pt.beginGlobalCommit()
+	pt.beginGlobalCommit()
+	if err := pt.Put(key, 33, 3, 303, 3003); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := pt.endGlobalCommit(); err != nil {
+		t.Fatalf("inner endGlobalCommit failed: %v", err)
+	}
+	stat, err := os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
+	if err != nil {
+		t.Fatalf("Stat after inner commit failed: %v", err)
+	}
+	if stat.Size() != headerSize {
+		t.Fatalf("expected nested commit to defer flush until outer end, got %d", stat.Size())
+	}
+	if err := pt.endGlobalCommit(); err != nil {
+		t.Fatalf("outer endGlobalCommit failed: %v", err)
+	}
+	stat, err = os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
+	if err != nil {
+		t.Fatalf("Stat after outer commit failed: %v", err)
+	}
+	if stat.Size() != headerSize+NodeEntrySize {
+		t.Fatalf("unexpected global.node size after outer flush: got %d want %d", stat.Size(), headerSize+NodeEntrySize)
+	}
+	if pt.globalHeader.SortedEntryCount != 0 || pt.globalHeader.UnsortedEntryCount != 1 {
+		t.Fatalf("unexpected header after nested append flush: %+v", pt.globalHeader)
+	}
+}
+
+func TestGlobalNodeCloseCompactsDeferredUpdates(t *testing.T) {
+	baseDir := t.TempDir()
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+
+	headerSize := int64(binary.Size(FileNodeHeader{}))
+	key1 := []byte{0x04}
+	key2 := []byte{0x05}
+	pt.beginGlobalCommit()
+	if err := pt.Put(key1, 44, 4, 404, 4004); err != nil {
+		t.Fatalf("Put key1 failed: %v", err)
+	}
+	if err := pt.Put(key2, 55, 5, 505, 5005); err != nil {
+		t.Fatalf("Put key2 failed: %v", err)
+	}
+	if err := pt.endGlobalCommit(); err != nil {
+		t.Fatalf("endGlobalCommit failed: %v", err)
+	}
+	if pt.globalHeader.SortedEntryCount != 0 || pt.globalHeader.UnsortedEntryCount != 2 {
+		t.Fatalf("expected deferred append state before close, got %+v", pt.globalHeader)
+	}
+	if err := pt.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	stat, err := os.Stat(filepath.Join(baseDir, "prefixdb", "filenodes", globalFileName))
+	if err != nil {
+		t.Fatalf("Stat after close failed: %v", err)
+	}
+	if stat.Size() != headerSize+2*NodeEntrySize {
+		t.Fatalf("unexpected global.node size after close compact: got %d want %d", stat.Size(), headerSize+2*NodeEntrySize)
+	}
+	pt2, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixTree failed: %v", err)
+	}
+	defer pt2.Close()
+	if pt2.globalHeader.SortedEntryCount != 2 || pt2.globalHeader.UnsortedEntryCount != 0 {
+		t.Fatalf("expected compacted header after reopen, got %+v", pt2.globalHeader)
 	}
 }
 

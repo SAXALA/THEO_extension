@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/huandu/skiplist"
 )
 
 const (
@@ -76,8 +77,8 @@ type NodeInfo struct {
 }
 
 type fileNodeCacheEntry struct {
-	hdrBuf []byte
-	buf    []byte
+	hdrBuf  []byte
+	buf     []byte
 	release func([]byte)
 	mu      sync.Mutex
 	refs    int
@@ -145,6 +146,9 @@ type gcState struct {
 }
 
 func (pt *PrefixTree) invalidateFileNodeCache(fileID string) {
+	if fileID == pt.globalFileID {
+		return
+	}
 	if pt.sharedCache == nil || fileID == "" {
 		return
 	}
@@ -152,6 +156,9 @@ func (pt *PrefixTree) invalidateFileNodeCache(fileID string) {
 }
 
 func (pt *PrefixTree) setFileNodeCache(fileID string, hdrBuf []byte, buf []byte) {
+	if fileID == pt.globalFileID {
+		return
+	}
 	if pt.sharedCache == nil || fileID == "" {
 		return
 	}
@@ -160,6 +167,9 @@ func (pt *PrefixTree) setFileNodeCache(fileID string, hdrBuf []byte, buf []byte)
 }
 
 func (pt *PrefixTree) getFileNodeCache(fileID string) (*fileNodeCacheEntry, bool) {
+	if fileID == pt.globalFileID {
+		return nil, false
+	}
 	if pt.sharedCache == nil || fileID == "" {
 		return nil, false
 	}
@@ -185,6 +195,27 @@ func estimateFileNodeCacheEntrySize(fileID string, entry *fileNodeCacheEntry) ui
 	return total
 }
 
+func cloneNodeInfo(nodeInfo NodeInfo) NodeInfo {
+	cloned := nodeInfo
+	if len(nodeInfo.key) > 0 {
+		cloned.key = append([]byte(nil), nodeInfo.key...)
+	}
+	return cloned
+}
+
+func mergeNodeInfoForAppend(previous NodeInfo, next NodeInfo) NodeInfo {
+	merged := cloneNodeInfo(next)
+	if previous.storageFileID != 0 && merged.storageFileID == 0 {
+		merged.storageFileID = previous.storageFileID
+		merged.storageOffset = previous.storageOffset
+		merged.storageSize = previous.storageSize
+		if merged.accountOffset < previous.accountOffset {
+			merged.accountOffset = previous.accountOffset
+		}
+	}
+	return merged
+}
+
 // PrefixTree
 type PrefixTree struct {
 	lock        sync.RWMutex
@@ -200,9 +231,17 @@ type PrefixTree struct {
 	mergeStop chan struct{}
 	mergeWait sync.WaitGroup
 
-	fileHandleCache *lru.Cache
-	sharedCache     *sharedByteCache
-	fileStripeLocks stripedRWLocks // striped locks for file operations
+	fileHandleCache    *lru.Cache
+	sharedCache        *sharedByteCache
+	fileStripeLocks    stripedRWLocks // striped locks for file operations
+	globalNodeMu       sync.RWMutex
+	globalNodeIndex    *skiplist.SkipList
+	globalFile         *os.File
+	globalHeader       FileNodeHeader
+	globalCommitDepth  int
+	globalCommitDirty  bool
+	globalCommitBatch  map[string]NodeInfo
+	globalNeedsRewrite bool
 
 	// node file access stats (read path)
 	fileNodeCacheHits           uint64
@@ -305,6 +344,9 @@ func (pt *PrefixTree) beginFileMutation(fileID string) func() {
 }
 
 func (pt *PrefixTree) maybeScheduleGC(fileID string, header FileNodeHeader, sortedSlice, unsortedSlice []byte) {
+	if fileID == pt.globalFileID {
+		return
+	}
 	if fileID == "" || len(unsortedSlice) == 0 {
 		return
 	}
@@ -466,6 +508,26 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 		_ = dirf.Sync()
 		_ = dirf.Close()
 	}
+	if fileID == pt.globalFileID {
+		pt.globalNodeMu.Lock()
+		defer pt.globalNodeMu.Unlock()
+		if pt.globalFile != nil {
+			_ = pt.globalFile.Close()
+			pt.globalFile = nil
+		}
+		pt.globalHeader = newHdr
+		pt.globalNodeIndex = skiplist.New(skiplist.String)
+		for _, entry := range entries {
+			pt.globalNodeIndex.Set(string(entry.key), cloneNodeInfo(entry))
+		}
+		file, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("reopen global node file failed: %w", err)
+		}
+		pt.globalFile = file
+		pt.gcCount++
+		return nil
+	}
 	var hdrBuf bytes.Buffer
 	if err := binary.Write(&hdrBuf, binary.BigEndian, &newHdr); err == nil {
 		cacheData := make([]byte, len(entries)*NodeEntrySize)
@@ -533,6 +595,284 @@ func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []
 	return entries
 }
 
+func (pt *PrefixTree) loadGlobalNodeIndex() error {
+	filePath := filepath.Join(pt.fileNodeDir, pt.globalFileID)
+	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+
+	stat, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: 2}
+	index := skiplist.New(skiplist.String)
+	if stat.Size() == 0 {
+		if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("write global node header failed: %w", err)
+		}
+		if pt.db != nil {
+			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
+		}
+	} else {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("seek global node failed: %w", err)
+		}
+		if err := binary.Read(file, binary.BigEndian, &header); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("read global node header failed: %w", err)
+		}
+		if pt.db != nil {
+			pt.db.addDiskRead(diskIOUsageNodeFileLookup, binary.Size(header))
+		}
+		if header.Magic != FileNodeMagic {
+			_ = file.Close()
+			return fmt.Errorf("invalid global node magic")
+		}
+
+		totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
+		if totalEntries > 0 {
+			payloadSize := int(totalEntries) * NodeEntrySize
+			payload := make([]byte, payloadSize)
+			if _, err := io.ReadFull(file, payload); err != nil {
+				_ = file.Close()
+				return fmt.Errorf("read global node payload failed: %w", err)
+			}
+			if pt.db != nil {
+				pt.db.addDiskRead(diskIOUsageNodeFileLookup, len(payload))
+			}
+			sortedBytes := int(header.SortedEntryCount) * NodeEntrySize
+			entries := buildEntriesFromSlices(header, payload[:sortedBytes], payload[sortedBytes:])
+			for _, entry := range entries {
+				index.Set(string(entry.key), cloneNodeInfo(entry))
+			}
+		}
+	}
+
+	pt.globalNodeMu.Lock()
+	if pt.globalFile != nil {
+		_ = pt.globalFile.Close()
+	}
+	pt.globalFile = file
+	pt.globalHeader = header
+	pt.globalNodeIndex = index
+	pt.globalNodeMu.Unlock()
+	return nil
+}
+
+func (pt *PrefixTree) getFromGlobalNode(key []byte) (NodeInfo, bool, error) {
+	pt.globalNodeMu.RLock()
+	defer pt.globalNodeMu.RUnlock()
+	if pt.globalNodeIndex == nil {
+		return NodeInfo{}, false, nil
+	}
+	elem := pt.globalNodeIndex.Get(string(key))
+	if elem == nil {
+		return NodeInfo{}, false, nil
+	}
+	nodeInfo, ok := elem.Value.(NodeInfo)
+	if !ok {
+		return NodeInfo{}, false, fmt.Errorf("invalid global node entry type")
+	}
+	return cloneNodeInfo(nodeInfo), true, nil
+}
+
+func (pt *PrefixTree) beginGlobalCommit() {
+	pt.globalNodeMu.Lock()
+	pt.globalCommitDepth++
+	if pt.globalCommitBatch == nil {
+		pt.globalCommitBatch = make(map[string]NodeInfo)
+	}
+	pt.globalNodeMu.Unlock()
+}
+
+func (pt *PrefixTree) endGlobalCommit() error {
+	pt.globalNodeMu.Lock()
+	defer pt.globalNodeMu.Unlock()
+	if pt.globalCommitDepth == 0 {
+		return nil
+	}
+	pt.globalCommitDepth--
+	if pt.globalCommitDepth > 0 || !pt.globalCommitDirty {
+		return nil
+	}
+	defer func() {
+		pt.globalCommitDirty = false
+		pt.globalNeedsRewrite = false
+		clear(pt.globalCommitBatch)
+	}()
+	if pt.globalNeedsRewrite {
+		return pt.rewriteGlobalNodeFileLocked()
+	}
+	if len(pt.globalCommitBatch) == 0 {
+		return nil
+	}
+	entries := make([]NodeInfo, 0, len(pt.globalCommitBatch))
+	for _, entry := range pt.globalCommitBatch {
+		entries = append(entries, cloneNodeInfo(entry))
+	}
+	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
+	return pt.appendGlobalNodeEntries(entries)
+}
+
+func (pt *PrefixTree) appendGlobalNodeEntry(nodeInfo NodeInfo) error {
+	return pt.appendGlobalNodeEntries([]NodeInfo{nodeInfo})
+}
+
+func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if pt.globalFile == nil {
+		return errors.New("global node file is not initialized")
+	}
+	writeOffset := int64(binary.Size(pt.globalHeader)) + int64(pt.globalHeader.SortedEntryCount+pt.globalHeader.UnsortedEntryCount)*NodeEntrySize
+	buf := make([]byte, 0, len(entries)*NodeEntrySize)
+	for _, entry := range entries {
+		buf = append(buf, encodeNodeEntry(entry)...)
+	}
+	if _, err := pt.globalFile.WriteAt(buf, writeOffset); err != nil {
+		return fmt.Errorf("write global node entries failed: %w", err)
+	}
+	if pt.db != nil {
+		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(buf))
+	}
+	pt.globalHeader.UnsortedEntryCount += uint32(len(entries))
+	if _, err := pt.globalFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek global node header failed: %w", err)
+	}
+	if err := binary.Write(pt.globalFile, binary.BigEndian, &pt.globalHeader); err != nil {
+		return fmt.Errorf("update global node header failed: %w", err)
+	}
+	if pt.db != nil {
+		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(pt.globalHeader))
+	}
+	return nil
+}
+
+func (pt *PrefixTree) putIntoGlobalFileNode(key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
+	pt.globalNodeMu.Lock()
+	defer pt.globalNodeMu.Unlock()
+	if pt.globalNodeIndex == nil {
+		pt.globalNodeIndex = skiplist.New(skiplist.String)
+	}
+	next := NodeInfo{
+		key:           append([]byte(nil), key...),
+		accountOffset: accountOffset,
+		storageFileID: storageFileID,
+		storageOffset: storageOffset,
+		storageSize:   storageSize,
+	}
+	if elem := pt.globalNodeIndex.Get(string(key)); elem != nil {
+		if previous, ok := elem.Value.(NodeInfo); ok {
+			next = mergeNodeInfoForAppend(previous, next)
+		}
+	}
+	pt.globalNodeIndex.Set(string(key), cloneNodeInfo(next))
+	if pt.globalCommitDepth > 0 {
+		if pt.globalCommitBatch == nil {
+			pt.globalCommitBatch = make(map[string]NodeInfo)
+		}
+		pt.globalCommitBatch[string(key)] = cloneNodeInfo(next)
+		pt.globalCommitDirty = true
+		return nil
+	}
+	if err := pt.appendGlobalNodeEntry(next); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (pt *PrefixTree) rewriteGlobalNodeFileLocked() error {
+	if pt.globalNodeIndex == nil {
+		pt.globalNodeIndex = skiplist.New(skiplist.String)
+	}
+	entries := make([]NodeInfo, 0, pt.globalNodeIndex.Len())
+	for elem := pt.globalNodeIndex.Front(); elem != nil; elem = elem.Next() {
+		nodeInfo, ok := elem.Value.(NodeInfo)
+		if !ok {
+			return fmt.Errorf("invalid global node entry type during rewrite")
+		}
+		entries = append(entries, cloneNodeInfo(nodeInfo))
+	}
+	filePath := filepath.Join(pt.fileNodeDir, pt.globalFileID)
+	tmp := filePath + ".tmp"
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: 2, SortedEntryCount: uint32(len(entries))}
+	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create global node tmp file failed: %w", err)
+	}
+	if err := binary.Write(tf, binary.BigEndian, &header); err != nil {
+		_ = tf.Close()
+		return fmt.Errorf("write global node tmp header failed: %w", err)
+	}
+	if pt.db != nil {
+		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
+	}
+	for _, entry := range entries {
+		encoded := encodeNodeEntry(entry)
+		if _, err := tf.Write(encoded); err != nil {
+			_ = tf.Close()
+			return fmt.Errorf("write global node tmp entry failed: %w", err)
+		}
+		if pt.db != nil {
+			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(encoded))
+		}
+	}
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		return fmt.Errorf("fsync global node tmp file failed: %w", err)
+	}
+	if err := tf.Close(); err != nil {
+		return fmt.Errorf("close global node tmp file failed: %w", err)
+	}
+	if err := os.Rename(tmp, filePath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename global node tmp file failed: %w", err)
+	}
+	if dirf, err := os.Open(filepath.Dir(filePath)); err == nil {
+		_ = dirf.Sync()
+		_ = dirf.Close()
+	}
+	if pt.globalFile != nil {
+		_ = pt.globalFile.Close()
+	}
+	file, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen global node file failed: %w", err)
+	}
+	pt.globalFile = file
+	pt.globalHeader = header
+	return nil
+}
+
+func (pt *PrefixTree) deleteFromGlobalFileNode(key []byte) (bool, error) {
+	pt.globalNodeMu.Lock()
+	defer pt.globalNodeMu.Unlock()
+	if pt.globalNodeIndex == nil {
+		return false, nil
+	}
+	if pt.globalNodeIndex.Get(string(key)) == nil {
+		return false, nil
+	}
+	pt.globalNodeIndex.Remove(string(key))
+	if pt.globalCommitDepth > 0 {
+		delete(pt.globalCommitBatch, string(key))
+		pt.globalCommitDirty = true
+		pt.globalNeedsRewrite = true
+		return true, nil
+	}
+	if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // FileNodeHeader  file node header structure
 type FileNodeHeader struct {
 	Magic              uint32 // file magic number
@@ -582,6 +922,10 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		gcWriteBlocks:    make(map[string]int),
 		gcRatioThreshold: sanitizeNodeFileGCRatioThreshold(db.nodeFileGCUnsortedRatioThreshold),
 		gcWorkerCount:    sanitizePrefixTreeGCWorkerCount(db.gcWorkers),
+		globalNodeIndex:  skiplist.New(skiplist.String),
+	}
+	if err := pt.loadGlobalNodeIndex(); err != nil {
+		return nil, fmt.Errorf("load global node index failed: %w", err)
 	}
 	pt.startMergeWorker()
 
@@ -679,6 +1023,9 @@ func (pt *PrefixTree) Put(key []byte, accountOffset int64, storageFileID uint32,
 }
 
 func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset int64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
+	if fileID == pt.globalFileID {
+		return pt.putIntoGlobalFileNode(key, accountOffset, storageFileID, storageOffset, storageSize)
+	}
 	release := pt.beginFileMutation(fileID)
 	defer release()
 
@@ -771,6 +1118,9 @@ func (pt *PrefixTree) Delete(key []byte) (bool, error) {
 
 // deleteFromFileNode deletes a key from a file node
 func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error) {
+	if fileID == pt.globalFileID {
+		return pt.deleteFromGlobalFileNode(key)
+	}
 	release := pt.beginFileMutation(fileID)
 	defer release()
 
@@ -957,11 +1307,47 @@ func (pt *PrefixTree) Close() error {
 	if pt.fileHandleCache != nil {
 		pt.fileHandleCache.Purge()
 	}
+	pt.globalNodeMu.Lock()
+	if pt.globalCommitDirty {
+		if pt.globalNeedsRewrite {
+			if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+				pt.globalNodeMu.Unlock()
+				return err
+			}
+		} else if len(pt.globalCommitBatch) > 0 {
+			entries := make([]NodeInfo, 0, len(pt.globalCommitBatch))
+			for _, entry := range pt.globalCommitBatch {
+				entries = append(entries, cloneNodeInfo(entry))
+			}
+			sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
+			if err := pt.appendGlobalNodeEntries(entries); err != nil {
+				pt.globalNodeMu.Unlock()
+				return err
+			}
+		}
+		pt.globalCommitDirty = false
+		pt.globalNeedsRewrite = false
+		clear(pt.globalCommitBatch)
+	}
+	if pt.globalHeader.UnsortedEntryCount > 0 {
+		if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+			pt.globalNodeMu.Unlock()
+			return err
+		}
+	}
+	if pt.globalFile != nil {
+		_ = pt.globalFile.Close()
+		pt.globalFile = nil
+	}
+	pt.globalNodeMu.Unlock()
 
 	return nil
 }
 
 func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeInfo, found bool, err error) {
+	if fileID == pt.globalFileID {
+		return pt.getFromGlobalNode(Key)
+	}
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
 	fl.RLock()
 	scheduleGC := func() {}

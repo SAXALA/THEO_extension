@@ -139,9 +139,17 @@ func (db *PrefixDB) StorageBatchPut(key, value, accountKey []byte) error {
 }
 
 // StorageBatchCommit persists all staged storage kvs and waits for storage GC completion.
-func (db *PrefixDB) StorageBatchCommit() error {
+func (db *PrefixDB) StorageBatchCommit() (err error) {
 	if db.storageBatch == nil {
 		return nil
+	}
+	if db.prefixTree != nil {
+		db.prefixTree.beginGlobalCommit()
+		defer func() {
+			if endErr := db.prefixTree.endGlobalCommit(); err == nil {
+				err = endErr
+			}
+		}()
 	}
 	batch, unresolved := db.storageBatch.drain()
 	if len(batch) == 0 && len(unresolved) == 0 {

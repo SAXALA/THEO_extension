@@ -280,7 +280,15 @@ func (wb *WriteBatch) updateValue(key []byte, value []byte) error {
 }
 
 // Commit writes all operations in the batch to the database
-func (db *PrefixDB) WriteCommit(batch *WriteBatch) error {
+func (db *PrefixDB) WriteCommit(batch *WriteBatch) (err error) {
+	if db.prefixTree != nil {
+		db.prefixTree.beginGlobalCommit()
+		defer func() {
+			if endErr := db.prefixTree.endGlobalCommit(); err == nil {
+				err = endErr
+			}
+		}()
+	}
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
 
