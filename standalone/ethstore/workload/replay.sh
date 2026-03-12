@@ -32,12 +32,14 @@ DB_TYPE="${DB_TYPE:-all}"
 CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
-# PrefixTree node file GC 并发 worker 数；默认使用系统 CPU 数量的一半，最少 1
-DEFAULT_NODE_FILE_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
-if [ "$DEFAULT_NODE_FILE_GC_WORKERS" -lt 1 ]; then
-    DEFAULT_NODE_FILE_GC_WORKERS=1
+# segmented storage GC 阈值：当 chunk_file_size >= target_chunk_size * threshold 时触发 GC
+STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-1.2}"
+# 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
+DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
+if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
+    DEFAULT_GC_WORKERS=1
 fi
-NODE_FILE_GC_WORKERS="${NODE_FILE_GC_WORKERS:-$DEFAULT_NODE_FILE_GC_WORKERS}"
+GC_WORKERS="${GC_WORKERS:-${NODE_FILE_GC_WORKERS:-$DEFAULT_GC_WORKERS}}"
 
 # ethstore load 参数: chunk 文件大小（字节），如 4096/16384/65536/262144
 CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
@@ -190,7 +192,7 @@ Common env vars:
     TRACE_FILE(cache|nocache|nocache_snap)
     DB_TYPE(all|aol|prefixdb|pebble)
     CACHE_COUNT
-    NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD NODE_FILE_GC_WORKERS
+    NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD GC_WORKERS STORAGE_GC_THRESHOLD
     CHUNK_FILE_SIZE(bytes), TOTAL_CACHE_SIZE_MIB(MiB)
     CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
@@ -437,7 +439,7 @@ build_run_tag() {
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_ngcw_${NODE_FILE_GC_WORKERS}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}${round_tag}"
     else
         printf "%s" "${base_tag}${round_tag}"
     fi
@@ -465,7 +467,8 @@ print_param_snapshot() {
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
         printf 'NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD=%s\n' "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD"
-        printf 'NODE_FILE_GC_WORKERS=%s\n' "$NODE_FILE_GC_WORKERS"
+        printf 'GC_WORKERS=%s\n' "$GC_WORKERS"
+        printf 'STORAGE_GC_THRESHOLD=%s\n' "$STORAGE_GC_THRESHOLD"
         printf 'CHUNK_FILE_SIZE=%s\n' "$CHUNK_FILE_SIZE"
         printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
     elif [ "$snapshot_backend" = "chainkv" ]; then
@@ -532,7 +535,7 @@ run_load() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
-                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -588,7 +591,7 @@ run_replay() {
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
                 -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
                 -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
-                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -614,7 +617,7 @@ run_gc() {
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
                 -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
-                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -node-file-gc-workers "$NODE_FILE_GC_WORKERS"
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"

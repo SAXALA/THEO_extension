@@ -404,6 +404,8 @@ func (pt *PrefixTree) processGCJob(job gcJob) {
 	if job.state == nil {
 		return
 	}
+	release := pt.db.acquireSharedGCWorker()
+	defer release()
 	if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
 		fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
 	}
@@ -464,7 +466,19 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 		_ = dirf.Sync()
 		_ = dirf.Close()
 	}
-	pt.invalidateFileNodeCache(fileID)
+	var hdrBuf bytes.Buffer
+	if err := binary.Write(&hdrBuf, binary.BigEndian, &newHdr); err == nil {
+		cacheData := make([]byte, len(entries)*NodeEntrySize)
+		cursor := 0
+		for _, entry := range entries {
+			encoded := encodeNodeEntry(entry)
+			copy(cacheData[cursor:], encoded)
+			cursor += NodeEntrySize
+		}
+		pt.setFileNodeCache(fileID, hdrBuf.Bytes(), cacheData)
+	} else {
+		pt.invalidateFileNodeCache(fileID)
+	}
 	pt.dropFileHandles(fileID)
 	pt.gcCount++
 	return nil
@@ -567,7 +581,7 @@ func NewPrefixTree(db *PrefixDB, dirPath string) (*PrefixTree, error) {
 		gcInFlight:       make(map[string]*gcState),
 		gcWriteBlocks:    make(map[string]int),
 		gcRatioThreshold: sanitizeNodeFileGCRatioThreshold(db.nodeFileGCUnsortedRatioThreshold),
-		gcWorkerCount:    sanitizePrefixTreeGCWorkerCount(db.nodeFileGCWorkers),
+		gcWorkerCount:    sanitizePrefixTreeGCWorkerCount(db.gcWorkers),
 	}
 	pt.startMergeWorker()
 
@@ -884,11 +898,14 @@ func (pt *PrefixTree) runGCJobsInParallel(jobs []gcJob) int {
 				if job.state == nil {
 					continue
 				}
+				release := pt.db.acquireSharedGCWorker()
 				if err := pt.compactFileFromState(job.fileID, job.state); err != nil {
+					release()
 					fmt.Printf("PrefixTree GC failed for %s: %v\n", job.fileID, err)
 					pt.finishGC(job.fileID)
 					continue
 				}
+				release()
 				pt.finishGC(job.fileID)
 				completed++
 			}

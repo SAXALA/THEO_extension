@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -30,7 +31,8 @@ const (
 	segmentIndexFileName                   = "index.meta"
 	segmentIndexCacheThresholdBytes        = 0  // cache all decoded segment indexes
 	segmentIndexCacheCapacityMiB           = 64 // total segment-index cache budget in MiB
-	storageGCThreshold                     = 2  //when chunk file size > chunkSize * storageGCThreshold, trigger GC for the segment
+	defaultStorageGCThreshold              = 2.0 // when chunk file size > chunkSize * threshold, trigger GC for the segment
+	storageGCQueueMultiplier               = 8
 )
 
 const (
@@ -192,9 +194,10 @@ type PrefixDB struct {
 	storageGCStop     chan struct{}
 	storageGCWait     sync.WaitGroup
 	storageGCMu       sync.Mutex
+	gcWorkerLimiter   chan struct{}
 
 	nodeFileGCUnsortedRatioThreshold float64
-	nodeFileGCWorkers                int
+	gcWorkers                        int
 
 	storageCache            *storageValueCache
 	stroageCacheSizeLimit   uint64
@@ -293,17 +296,17 @@ type segmentIndexFolderLock struct {
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
 func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0)
 }
 
 // NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
 // budget in MiB. All PrefixDB caches share this total budget.
 // Use <=0 values to fallback to the default shared cache size.
 func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0)
 }
 
-func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) (*PrefixDB, error) {
+func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -316,6 +319,17 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		if cfg.BaseDir == "" {
 			cfg.BaseDir = dirpath
 		}
+		if cfg.GCWorkers == 0 {
+			cfg.GCWorkers = cfg.NodeFileGCWorkers
+		}
+		if cfg.StorageGCThreshold == 0 {
+			cfg.StorageGCThreshold = DefaultConfig(dirpath).StorageGCThreshold
+		}
+	}
+
+	resolvedStorageGCThreshold := sanitizeStorageGCThreshold(cfg.StorageGCThreshold)
+	if storageGCThreshold > 0 {
+		resolvedStorageGCThreshold = sanitizeStorageGCThreshold(storageGCThreshold)
 	}
 
 	// Ensure base directory exists
@@ -344,16 +358,17 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		storageDir:                       storageDir,
 		storageGetCacheCount:             storageGetCacheCount,
 		storageChunkSize:                 storageChunkFileSize,
-		segmentedChunkHardLimit:          storageChunkFileSize * storageGCThreshold,
+		segmentedChunkHardLimit:          computeSegmentedChunkHardLimit(storageChunkFileSize, resolvedStorageGCThreshold),
 		nodeFileGCUnsortedRatioThreshold: cfg.NodeFileGCUnsortedRatioThreshold,
-		nodeFileGCWorkers:                cfg.NodeFileGCWorkers,
+		gcWorkers:                        cfg.GCWorkers,
 	}
 	if nodeFileGCRatioThreshold > 0 {
 		db.nodeFileGCUnsortedRatioThreshold = nodeFileGCRatioThreshold
 	}
-	if nodeFileGCWorkers > 0 {
-		db.nodeFileGCWorkers = nodeFileGCWorkers
+	if gcWorkers > 0 {
+		db.gcWorkers = gcWorkers
 	}
+	db.gcWorkerLimiter = make(chan struct{}, sanitizePrefixTreeGCWorkerCount(db.gcWorkers))
 
 	db.accountBatch = NewWriteBatch(db)
 	sharedCacheBudgetMiB := segmentIndexCacheCapacityMiB
@@ -2254,6 +2269,34 @@ func (db *PrefixDB) segmentedChunkTriggerSize() int {
 	return db.segmentedChunkTargetSize()
 }
 
+func sanitizeStorageGCThreshold(threshold float64) float64 {
+	if threshold <= 0 {
+		return defaultStorageGCThreshold
+	}
+	return threshold
+}
+
+func computeSegmentedChunkHardLimit(storageChunkFileSize int, threshold float64) int {
+	if storageChunkFileSize <= 0 {
+		return 0
+	}
+	return int(math.Ceil(float64(storageChunkFileSize) * sanitizeStorageGCThreshold(threshold)))
+}
+
+func storageGCQueueCapacity(workers int) int {
+	return sanitizePrefixTreeGCWorkerCount(workers) * storageGCQueueMultiplier
+}
+
+func (db *PrefixDB) acquireSharedGCWorker() func() {
+	if db == nil || db.gcWorkerLimiter == nil {
+		return func() {}
+	}
+	db.gcWorkerLimiter <- struct{}{}
+	return func() {
+		<-db.gcWorkerLimiter
+	}
+}
+
 func (db *PrefixDB) writeChunkFile(folderPath, fileName string, entries []kvPair) (int, error) {
 	return db.writeChunkFileWithUsage(folderPath, fileName, entries, diskIOUsageStorageSeparatedLogs)
 }
@@ -3014,6 +3057,38 @@ func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
 			db.storageIndexLayoutPath = ""
 			db.storageIndexLayoutCache = segmentIndexLayout{}
 		}
+	}
+}
+
+func (db *PrefixDB) refreshSegmentIndexCache(folderID uint32, metas []segmentChunkMeta) {
+	unlock := db.lockSegmentIndexFolder(folderID)
+	defer unlock()
+	if folderID == 0 {
+		return
+	}
+	cloned := cloneSegmentChunkMetas(metas)
+	db.segmentIndexMu.Lock()
+	defer db.segmentIndexMu.Unlock()
+	if db.storageIndexFolderId == folderID {
+		db.storageIndexFolderId = folderID
+		db.storageIndexMetas = cloneSegmentChunkMetas(cloned)
+		db.storageIndexReusable = true
+		db.storageIndexArena = nil
+	}
+	if db.storageIndexPartialFolder == folderID {
+		db.storageIndexPartialFolder = 0
+		db.storageIndexPartialMetaID = 0
+		db.storageIndexPartialMetas = nil
+		db.storageIndexPartialReusable = true
+		db.storageIndexPartialArena = nil
+	}
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.Add(folderID, cloned)
+	}
+	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == db.segmentedFolderPath(folderID) {
+		db.storageIndexLayoutReady = false
+		db.storageIndexLayoutPath = ""
+		db.storageIndexLayoutCache = segmentIndexLayout{}
 	}
 }
 
@@ -3822,23 +3897,36 @@ func (db *PrefixDB) startStorageGCWorker() {
 	if db.storageGCQueue != nil {
 		return
 	}
-	db.storageGCQueue = make(chan storageGCJob, 64)
+	db.storageGCQueue = make(chan storageGCJob, storageGCQueueCapacity(db.gcWorkers))
 	db.storageGCInFlight = make(map[string]struct{})
 	db.storageGCStop = make(chan struct{})
 	db.storageGCWait.Add(1)
 	go func() {
 		defer db.storageGCWait.Done()
+		var batchWait sync.WaitGroup
 		pending := make(map[uint32][]storageGCJob)
-		processAllPending := func() {
-			for len(pending) > 0 {
-				var folderID uint32
-				for id := range pending {
-					folderID = id
-					break
-				}
-				jobs := pending[folderID]
-				delete(pending, folderID)
+		active := make(map[uint32]struct{})
+		batchDone := make(chan uint32, storageGCQueueCapacity(db.gcWorkers))
+		launchBatch := func(folderID uint32) {
+			jobs := pending[folderID]
+			if len(jobs) == 0 {
+				return
+			}
+			if _, exists := active[folderID]; exists {
+				return
+			}
+			delete(pending, folderID)
+			active[folderID] = struct{}{}
+			batchWait.Add(1)
+			go func(id uint32, jobs []storageGCJob) {
+				defer batchWait.Done()
 				db.processStorageGCBatch(jobs)
+				batchDone <- id
+			}(folderID, jobs)
+		}
+		launchAllReady := func() {
+			for folderID := range pending {
+				launchBatch(folderID)
 			}
 		}
 		drainQueue := func() {
@@ -3851,18 +3939,29 @@ func (db *PrefixDB) startStorageGCWorker() {
 				}
 			}
 		}
+		stopRequested := false
 		for {
+			if stopRequested && len(active) == 0 {
+				launchAllReady()
+				if len(active) == 0 && len(pending) == 0 {
+					break
+				}
+			}
 			select {
 			case job := <-db.storageGCQueue:
 				pending[job.folderID] = append(pending[job.folderID], job)
 				drainQueue()
-				processAllPending()
+				launchAllReady()
+			case folderID := <-batchDone:
+				delete(active, folderID)
+				launchBatch(folderID)
 			case <-db.storageGCStop:
+				stopRequested = true
 				drainQueue()
-				processAllPending()
-				return
+				launchAllReady()
 			}
 		}
+		batchWait.Wait()
 	}()
 }
 
@@ -3934,6 +4033,8 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 }
 
 func (db *PrefixDB) processStorageGCJob(job storageGCJob) {
+	release := db.acquireSharedGCWorker()
+	defer release()
 	defer db.finishStorageGCJob(job)
 	if err := db.runStorageGCJob(job); err != nil {
 		fmt.Printf("storage GC failed for folder %d file %s: %v\n", job.folderID, job.fileName, err)
@@ -3944,6 +4045,8 @@ func (db *PrefixDB) processStorageGCBatch(jobs []storageGCJob) {
 	if len(jobs) == 0 {
 		return
 	}
+	release := db.acquireSharedGCWorker()
+	defer release()
 	for i := range jobs {
 		job := jobs[i]
 		defer db.finishStorageGCJob(job)
@@ -4091,7 +4194,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
 		return err
 	}
-	db.invalidateSegmentIndexCache(folderID)
+	db.refreshSegmentIndexCache(folderID, updated)
 	return nil
 }
 
@@ -4204,7 +4307,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
 		return err
 	}
-	db.invalidateSegmentIndexCache(job.folderID)
+	db.refreshSegmentIndexCache(job.folderID, updated)
 	// Option B: do NOT delete the original chunk file. It becomes garbage and can be cleaned later.
 	return nil
 }

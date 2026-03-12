@@ -236,6 +236,63 @@ func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	}
 }
 
+func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
+	shared := newSharedByteCache(4096)
+	db := &PrefixDB{
+		storageDir:           t.TempDir(),
+		storageIndexCache:    newSharedSegmentIndexCache(shared),
+		storageIndexFolderId: 7,
+		storageIndexMetas:    []segmentChunkMeta{{FileName: "old.dat"}},
+	}
+	metas := []segmentChunkMeta{{
+		FileName:  "chunk_0001.dat",
+		KeyStart:  []byte{0x01},
+		KeyEnd:    []byte{0x02},
+		KVCount:   1,
+		ChunkSize: 128,
+	}}
+
+	db.refreshSegmentIndexCache(7, metas)
+
+	if got, ok := db.storageIndexCache.Get(7); !ok || len(got) != 1 || got[0].FileName != "chunk_0001.dat" {
+		t.Fatalf("segment index cache not refreshed correctly: ok=%t metas=%v", ok, got)
+	}
+	if len(db.storageIndexMetas) != 1 || db.storageIndexMetas[0].FileName != "chunk_0001.dat" {
+		t.Fatalf("in-memory segment index snapshot not refreshed: %+v", db.storageIndexMetas)
+	}
+}
+
+func TestCompactFileFromStateRefreshesFileNodeCache(t *testing.T) {
+	shared := newSharedByteCache(4096)
+	pt := &PrefixTree{
+		sharedCache: shared,
+		fileNodeDir: t.TempDir(),
+	}
+	state := &gcState{
+		header: FileNodeHeader{
+			Magic:              FileNodeMagic,
+			Version:            2,
+			SortedEntryCount:   1,
+			UnsortedEntryCount: 1,
+		},
+		sorted: append([]byte(nil), encodeNodeEntry(NodeInfo{key: []byte{0x01}, accountOffset: 1, storageFileID: 1, storageOffset: 11, storageSize: 22})...),
+		unsorted: append([]byte(nil), encodeNodeEntry(NodeInfo{key: []byte{0x01}, accountOffset: 2, storageFileID: 3, storageOffset: 33, storageSize: 44})...),
+	}
+
+	if err := pt.compactFileFromState("bucket.node", state); err != nil {
+		t.Fatalf("compactFileFromState failed: %v", err)
+	}
+	entry, ok := pt.getFileNodeCache("bucket.node")
+	if !ok {
+		t.Fatal("expected compacted file to refresh file node cache")
+	}
+	entry.Release()
+	used, _ := shared.NamespaceStats(sharedCacheNamespaceFileNode)
+	if used == 0 {
+		t.Fatal("expected refreshed file node cache to consume shared budget")
+	}
+}
+
 func TestPrefixTreeShouldScheduleGCUsesRatioThreshold(t *testing.T) {
 	pt := &PrefixTree{gcRatioThreshold: 1.5}
 	if pt.shouldScheduleGC(10, 14) {
@@ -267,6 +324,26 @@ func TestPrefixTreeGCWorkerConcurrency(t *testing.T) {
 	}
 	if got := pt.gcWorkerConcurrency(); got != expected {
 		t.Fatalf("unexpected automatic worker count: got %d want %d", got, expected)
+	}
+}
+
+func TestStorageGCQueueCapacity(t *testing.T) {
+	if got := storageGCQueueCapacity(4); got != 32 {
+		t.Fatalf("queue capacity mismatch: got %d want %d", got, 32)
+	}
+
+	autoWorkers := sanitizePrefixTreeGCWorkerCount(0)
+	if got := storageGCQueueCapacity(0); got != autoWorkers*storageGCQueueMultiplier {
+		t.Fatalf("unexpected automatic queue capacity: got %d want %d", got, autoWorkers*storageGCQueueMultiplier)
+	}
+}
+
+func TestComputeSegmentedChunkHardLimit(t *testing.T) {
+	if got := computeSegmentedChunkHardLimit(1024, 1.5); got != 1536 {
+		t.Fatalf("hard limit mismatch: got %d want %d", got, 1536)
+	}
+	if got := computeSegmentedChunkHardLimit(1024, 0); got != 2048 {
+		t.Fatalf("default hard limit mismatch: got %d want %d", got, 2048)
 	}
 }
 

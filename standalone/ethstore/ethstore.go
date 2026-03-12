@@ -161,21 +161,21 @@ type Database struct {
 
 // The namespace is the prefix that the metrics reporting should use.
 func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, contractCachePrefetchCount int) (*Database, error) {
-	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0)
+	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0, 0)
 }
 
 // NewWithPrefixCacheSettings creates Database with a single shared PrefixDB
 // cache budget in MiB. All PrefixDB caches share this total budget.
 // Use <=0 values to fallback to the default shared cache size.
 func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int) (*Database, error) {
-	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, 0, 0)
+	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, 0, 0, 0)
 }
 
-func NewWithPrefixGCSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) (*Database, error) {
+func NewWithPrefixGCSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, nodeFileGCWorkers)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -234,12 +234,12 @@ func NewWithPrefixGCSettings(dirPath string, recentN int, namespace string, read
 // NewStateOnlyWithPrefixCacheSettings opens PrefixDB-only Database with a
 // single shared cache budget in MiB.
 func NewStateOnlyWithPrefixCacheSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int) (*Database, error) {
-	return NewStateOnlyWithPrefixGCSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, 0, 0)
+	return NewStateOnlyWithPrefixGCSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, 0, 0, 0)
 }
 
-func NewStateOnlyWithPrefixGCSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, nodeFileGCWorkers int) (*Database, error) {
+func NewStateOnlyWithPrefixGCSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) (*Database, error) {
 	logger := log.New("database", stateDir)
-	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, nodeFileGCWorkers)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb (state-only): %w", err)
 	}
