@@ -1045,11 +1045,17 @@ func (d *Database) GetParentAccountKey(key []byte) []byte {
 	return val
 }
 
-func (d *Database) GCPrefixTreeStorage() error {
+func (d *Database) GCPrefixTree() error {
 	if d.statepdb == nil {
 		return fmt.Errorf("PrefixDB is not initialized, cannot perform GC on prefix tree storage")
 	}
-	err := d.statepdb.GCAllStorageChunkFiles()
+
+	err := d.statepdb.GCPrefixTree()
+	if err != nil {
+		return fmt.Errorf("failed to perform GC on prefix tree storage: %w", err)
+	}
+
+	err = d.statepdb.GCAllStorageChunkFiles()
 	if err != nil {
 		return fmt.Errorf("failed to perform GC on prefix tree storage: %w", err)
 	}

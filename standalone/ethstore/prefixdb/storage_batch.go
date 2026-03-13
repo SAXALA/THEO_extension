@@ -7,6 +7,18 @@ import (
 	"time"
 )
 
+type storageCommitPlan struct {
+	accountKey    string
+	accountOffset int64
+	storageInfo   StorageInfo
+}
+
+type preparedAccountCommit struct {
+	entries   map[string][]byte
+	order     []string
+	totalSize int
+}
+
 type storageBatcher struct {
 	mu      sync.Mutex
 	pending map[string]map[string][]byte
@@ -221,6 +233,173 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	}
 
 	return db.waitForStorageGCIdle()
+}
+
+func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (*preparedAccountCommit, error) {
+	prepared := &preparedAccountCommit{
+		entries: make(map[string][]byte, len(accountOps)),
+	}
+	if len(accountOps) == 0 {
+		return prepared, nil
+	}
+	prepared.order = make([]string, 0, len(accountOps))
+	for key, op := range accountOps {
+		if op.modifiedType == None {
+			continue
+		}
+		prepared.order = append(prepared.order, key)
+	}
+	sort.Strings(prepared.order)
+	for _, key := range prepared.order {
+		op := accountOps[key]
+		if op.value == nil {
+			continue
+		}
+		entry, err := db.ConvertKV([]byte(key), op.value)
+		if err != nil {
+			return nil, err
+		}
+		prepared.entries[key] = entry
+		prepared.totalSize += len(entry)
+	}
+	return prepared, nil
+}
+
+func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte, unresolved map[string][]byte, accountOps map[string]WriteOperation) ([]storageCommitPlan, error) {
+	if db.storageBatch == nil && len(batch) == 0 && len(unresolved) == 0 {
+		return nil, nil
+	}
+	if batch == nil {
+		batch = make(map[string]map[string][]byte)
+	}
+	if err := db.resolveUnresolvedStorageBatch(batch, unresolved); err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 {
+		return nil, nil
+	}
+
+	accountKeys := make([]string, 0, len(batch))
+	for accountKey := range batch {
+		if op, ok := accountOps[accountKey]; ok && op.value == nil {
+			continue
+		}
+		accountKeys = append(accountKeys, accountKey)
+	}
+	if len(accountKeys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(accountKeys)
+
+	plans := make([]storageCommitPlan, len(accountKeys))
+	workerCount := sanitizePrefixTreeGCWorkerCount(db.gcWorkers)
+	if workerCount > len(accountKeys) {
+		workerCount = len(accountKeys)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	jobs := make(chan int, len(accountKeys))
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				plan, err := db.buildStorageCommitPlan(accountKeys[idx], batch[accountKeys[idx]])
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				plans[idx] = plan
+			}
+		}()
+	}
+	for idx := range accountKeys {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+	return plans, nil
+}
+
+func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]byte, unresolved map[string][]byte) error {
+	if len(unresolved) == 0 {
+		return nil
+	}
+	for origKeyStr, v := range unresolved {
+		origKeyBytes := []byte(origKeyStr)
+		var accountKey []byte
+		if db.ParentKeyResolver != nil {
+			accountKey = db.ParentKeyResolver(origKeyBytes)
+		}
+		if accountKey == nil {
+			continue
+		}
+		storageKey, err := db.normalizeStorageKey(origKeyBytes)
+		if err != nil {
+			return err
+		}
+		accStr := string(accountKey)
+		perAcc := batch[accStr]
+		if perAcc == nil {
+			perAcc = make(map[string][]byte)
+			batch[accStr] = perAcc
+		}
+		perAcc[string(storageKey)] = v
+		if db.storageCache != nil {
+			db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), v)
+		}
+	}
+	return nil
+}
+
+func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[string][]byte) (storageCommitPlan, error) {
+	plan := storageCommitPlan{accountKey: accountKey}
+	accountKeyBytes := []byte(accountKey)
+	node, err := db.getNode(accountKeyBytes)
+	if err != nil {
+		return plan, err
+	}
+	var (
+		existingFileID uint32
+		existingOffset int64
+		existingSize   uint64
+	)
+	if node != nil {
+		plan.accountOffset = node.offset
+		existingFileID = node.storageFileID
+		existingOffset = node.storageOffset
+		existingSize = node.storageSize
+	}
+	if len(perAccount) == 0 {
+		return plan, nil
+	}
+	kvs := make([]kvPair, 0, len(perAccount))
+	for key, value := range perAccount {
+		kvs = append(kvs, kvPair{key: []byte(key), val: value})
+	}
+	sortKVPairs(kvs)
+	fileID, offset, size, err := db.persistStorageEntries(kvs, existingFileID, existingOffset, existingSize)
+	if err != nil {
+		return plan, err
+	}
+	plan.storageInfo = StorageInfo{
+		storageFileID: fileID,
+		storageOffset: offset,
+		storageSize:   size,
+	}
+	return plan, nil
 }
 
 func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) error {

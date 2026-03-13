@@ -6,5 +6,7 @@
   "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot-10K-blocks",
   "ethstoreDir": "/mnt/ssd2/running/ethstore",
   "pebbleDir": "/mnt/ssd2/running/pebble",
-  "chainKVDir": "/mnt/ssd2/running/chainkv"
+  "chainKVDir": "/mnt/ssd2/running/chainkv",
+  "accountHashKeyPebbleDir": "/mnt/ramdisk/accountHash_key_pebble",
+  "loadedEthStoreDir": "/mnt/ssd2/loaded/ethstore"
 }

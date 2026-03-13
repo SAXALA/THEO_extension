@@ -41,8 +41,8 @@ const (
 	segmentIndexLevel2MaxSize       = 4 * 1024
 	segmentIndexFlatMagic           = 0x464c4958 // 'FLIX'
 	segmentIndexMultiLevelMagic     = 0x4d4c4958 // 'MLIX'
-	segmentIndexFormatVersion       = 1
-	segmentIndexFlatVersion         = 1
+	segmentIndexFormatVersion       = 2
+	segmentIndexFlatVersion         = 2
 )
 
 const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
@@ -166,6 +166,7 @@ type PrefixDB struct {
 	segmentIndexFolderLocks   map[uint32]*segmentIndexFolderLock
 
 	storageDir       string
+	storageFileMu    sync.Mutex
 	storageCurFile   *os.File
 	storageCurFileID uint32
 	storageCurSize   int64
@@ -599,14 +600,123 @@ func (db *PrefixDB) BatchCommit() (err error) {
 			}
 		}()
 	}
+
+	var accountOps map[string]WriteOperation
 	if db.accountBatch != nil {
-		if err := db.accountBatch.CommitBatch(); err != nil {
+		accountOps = db.accountBatch.drainOperations()
+	}
+	var (
+		storageBatch      map[string]map[string][]byte
+		storageUnresolved map[string][]byte
+	)
+	if db.storageBatch != nil {
+		storageBatch, storageUnresolved = db.storageBatch.drain()
+	}
+	if len(accountOps) == 0 && len(storageBatch) == 0 && len(storageUnresolved) == 0 {
+		return nil
+	}
+
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+
+	prepared := &preparedAccountCommit{}
+	storagePlans := make([]storageCommitPlan, 0)
+	var accountErr error
+	var storageErr error
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		prepared, accountErr = db.prepareAccountCommit(accountOps)
+	}()
+
+	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			storagePlans, storageErr = db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
+		}()
+	}
+	wg.Wait()
+	if accountErr != nil {
+		return accountErr
+	}
+	if storageErr != nil {
+		return storageErr
+	}
+
+	for _, plan := range storagePlans {
+		if op, ok := accountOps[plan.accountKey]; ok {
+			if op.value != nil {
+				op.storageFileID = plan.storageInfo.storageFileID
+				op.storageOffset = plan.storageInfo.storageOffset
+				op.storageSize = plan.storageInfo.storageSize
+				accountOps[plan.accountKey] = op
+			}
+			continue
+		}
+		if err := db.prefixTree.Put([]byte(plan.accountKey), plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
 			return err
 		}
+		if db.nodeCache != nil {
+			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
+		}
 	}
-	if err := db.StorageBatchCommit(); err != nil {
 
-		return err
+	trieAccountOffset, _ := db.accountFile.Seek(0, io.SeekEnd)
+	if trieAccountOffset == 0 {
+		trieAccountOffset = 1
+	}
+
+	naEntry := make([]byte, 0, prepared.totalSize)
+	for _, key := range prepared.order {
+		op := accountOps[key]
+		keyBytes := []byte(key)
+		if op.modifiedType == None {
+			continue
+		}
+		if op.value == nil {
+			if db.nodeCache != nil {
+				db.nodeCache.Delete(key)
+			}
+			if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		entry := prepared.entries[key]
+		offset := trieAccountOffset + int64(len(naEntry))
+		naEntry = append(naEntry, entry...)
+
+		node := &TrieNode{
+			storageFileID: op.storageFileID,
+			storageOffset: op.storageOffset,
+			storageSize:   op.storageSize,
+			offset:        offset,
+		}
+		if err := db.storeNode(keyBytes, node); err != nil {
+			return err
+		}
+		if db.nodeCache != nil {
+			db.nodeCache.StoreMetadata(key, offset, StorageInfo{
+				storageFileID: op.storageFileID,
+				storageOffset: op.storageOffset,
+				storageSize:   op.storageSize,
+			})
+		}
+	}
+
+	if len(naEntry) > 0 {
+		_, err := db.accountFile.WriteAt(naEntry, trieAccountOffset)
+		if err != nil {
+			return err
+		}
+		db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
+	}
+	if len(storagePlans) > 0 {
+		return db.waitForStorageGCIdle()
 	}
 	return nil
 }
@@ -1671,6 +1781,12 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 }
 
 func (db *PrefixDB) openOrCreateStorageFile() error {
+	db.storageFileMu.Lock()
+	defer db.storageFileMu.Unlock()
+	return db.openOrCreateStorageFileLocked()
+}
+
+func (db *PrefixDB) openOrCreateStorageFileLocked() error {
 	// find max FileID
 	entries, err := os.ReadDir(db.storageDir)
 	if err != nil {
@@ -1727,12 +1843,18 @@ func (db *PrefixDB) openOrCreateStorageFile() error {
 }
 
 func (db *PrefixDB) ensureStorageCapacity(need int64) error {
+	db.storageFileMu.Lock()
+	defer db.storageFileMu.Unlock()
+	return db.ensureStorageCapacityLocked(need)
+}
+
+func (db *PrefixDB) ensureStorageCapacityLocked(need int64) error {
 	// if need > storageMaxFileSize {
 	// 	return errors.New("need size lager than storageMaxFileSize")
 	// }
 
 	if db.storageCurFile == nil {
-		return db.openOrCreateStorageFile()
+		return db.openOrCreateStorageFileLocked()
 	}
 	if db.storageCurSize+need > storageMaxFileSize {
 		db.storageCurFile.Close()
@@ -1790,7 +1912,9 @@ func (db *PrefixDB) appendStorageSegment(kvs []kvPair) (fileID uint32, offset in
 	}
 	defer release()
 	need := int64(len(seg))
-	if err := db.ensureStorageCapacity(need); err != nil {
+	db.storageFileMu.Lock()
+	defer db.storageFileMu.Unlock()
+	if err := db.ensureStorageCapacityLocked(need); err != nil {
 		return 0, 0, 0, err
 	}
 	offset = db.storageCurSize
@@ -2000,23 +2124,29 @@ func findChunkIndexForKey(metas []segmentChunkMeta, key []byte, start int) int {
 	if len(metas) == 0 {
 		return -1
 	}
+	if len(key) == 0 {
+		return 0
+	}
 	if start < 0 {
 		start = 0
 	} else if start >= len(metas) {
 		start = len(metas) - 1
 	}
-	for i := start; i < len(metas); i++ {
-		meta := metas[i]
-		startOK := len(meta.KeyStart) == 0 || bytes.Compare(key, meta.KeyStart) >= 0
-		endOK := len(meta.KeyEnd) == 0 || bytes.Compare(key, meta.KeyEnd) <= 0
-		if startOK && endOK {
-			return i
+	for start+1 < len(metas) {
+		next := metas[start+1].KeyStart
+		if len(next) > 0 && bytes.Compare(key, next) < 0 {
+			break
 		}
-		if len(meta.KeyEnd) > 0 && bytes.Compare(key, meta.KeyEnd) < 0 {
-			return i
-		}
+		start++
 	}
-	return len(metas) - 1
+	for start > 0 {
+		cur := metas[start].KeyStart
+		if len(cur) == 0 || bytes.Compare(key, cur) >= 0 {
+			break
+		}
+		start--
+	}
+	return start
 }
 
 type chunkFileAllocator struct {
@@ -2462,9 +2592,9 @@ func canUseCompactSegmentEncoding(metas []segmentChunkMeta) bool {
 
 func estimateSegmentEntrySize(meta segmentChunkMeta) int {
 	if segmentChunkMetaCanUseCompactEncoding(meta) {
-		return 4 + 2 + len(meta.KeyStart) + 2 + len(meta.KeyEnd) + 4 + 4
+		return 4 + 2 + len(meta.KeyStart) + 4
 	}
-	return 2 + len(meta.FileName) + 2 + len(meta.KeyStart) + 2 + len(meta.KeyEnd) + 4 + 8
+	return 2 + len(meta.FileName) + 2 + len(meta.KeyStart) + 8
 }
 
 func estimateSegmentIndexSize(metas []segmentChunkMeta) int {
@@ -2500,11 +2630,6 @@ func encodeSegmentChunkMetas(metas []segmentChunkMeta) ([]byte, error) {
 		if buf, err = appendVarBytes(buf, meta.KeyStart); err != nil {
 			return nil, err
 		}
-		if buf, err = appendVarBytes(buf, meta.KeyEnd); err != nil {
-			return nil, err
-		}
-		writeUint32BE(tmp32[:], meta.KVCount)
-		buf = append(buf, tmp32[:]...)
 		writeUint32BE(tmp32[:], uint32(meta.ChunkSize))
 		buf = append(buf, tmp32[:]...)
 	}
@@ -2588,13 +2713,10 @@ func fileExists(path string) bool {
 }
 
 func segmentChunkMetaEqual(a, b segmentChunkMeta) bool {
-	if a.FileName != b.FileName || a.KVCount != b.KVCount || a.ChunkSize != b.ChunkSize {
+	if a.FileName != b.FileName || a.ChunkSize != b.ChunkSize {
 		return false
 	}
-	if !bytes.Equal(a.KeyStart, b.KeyStart) {
-		return false
-	}
-	return bytes.Equal(a.KeyEnd, b.KeyEnd)
+	return bytes.Equal(a.KeyStart, b.KeyStart)
 }
 
 func segmentChunkMetasEqual(a, b []segmentChunkMeta) bool {
@@ -2696,56 +2818,33 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 		return &entries[0]
 	}
 	idx := sort.Search(len(entries), func(i int) bool {
-		end := entries[i].KeyEnd
-		if len(end) == 0 {
-			return true
+		start := entries[i].KeyStart
+		if len(start) == 0 {
+			return false
 		}
-		return bytes.Compare(key, end) <= 0
+		return bytes.Compare(start, key) > 0
 	})
-	if idx == len(entries) {
-		idx = len(entries) - 1
+	if idx == 0 {
+		return &entries[0]
 	}
-	entry := &entries[idx]
-	if len(entry.KeyStart) == 0 || bytes.Compare(key, entry.KeyStart) >= 0 {
-		return entry
-	}
-	for i := idx - 1; i >= 0; i-- {
-		startOK := len(entries[i].KeyStart) == 0 || bytes.Compare(key, entries[i].KeyStart) >= 0
-		endOK := len(entries[i].KeyEnd) == 0 || bytes.Compare(key, entries[i].KeyEnd) <= 0
-		if startOK && endOK {
-			return &entries[i]
-		}
-	}
-	for i := idx + 1; i < len(entries); i++ {
-		startOK := len(entries[i].KeyStart) == 0 || bytes.Compare(key, entries[i].KeyStart) >= 0
-		endOK := len(entries[i].KeyEnd) == 0 || bytes.Compare(key, entries[i].KeyEnd) <= 0
-		if startOK && endOK {
-			return &entries[i]
-		}
-		if len(entries[i].KeyStart) > 0 && bytes.Compare(key, entries[i].KeyStart) < 0 {
-			break
-		}
-	}
-	return &entries[len(entries)-1]
+	return &entries[idx-1]
 }
 
 func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) error {
 	if len(data) < 4 {
 		return fmt.Errorf("invalid segment index payload")
 	}
-	cursor := 0
-	if binary.BigEndian.Uint32(data[:4]) == segmentIndexFlatMagic {
-		if len(data) < 12 {
-			return fmt.Errorf("corrupted compact segment index header")
-		}
-		version := binary.BigEndian.Uint16(data[4:6])
-		if version != segmentIndexFlatVersion {
-			return fmt.Errorf("unsupported flat index version %d", version)
-		}
-		cursor = 12
-	} else {
+	if binary.BigEndian.Uint32(data[:4]) != segmentIndexFlatMagic {
 		return fmt.Errorf("unsupported legacy segment index format")
 	}
+	if len(data) < 12 {
+		return fmt.Errorf("corrupted compact segment index header")
+	}
+	version := binary.BigEndian.Uint16(data[4:6])
+	if version != 1 && version != segmentIndexFlatVersion {
+		return fmt.Errorf("unsupported flat index version %d", version)
+	}
+	cursor := 12
 	count := int(binary.BigEndian.Uint32(data[cursor-4 : cursor]))
 	if count == 0 {
 		if !appendExisting {
@@ -2783,19 +2882,22 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 			return err
 		}
 		cursor += n
-		end, n, err := readVarBytes(data[cursor:])
-		if err != nil {
-			return err
+		meta := segmentChunkMeta{FileName: fileName, KeyStart: start}
+		if version == 1 {
+			end, n, err := readVarBytes(data[cursor:])
+			if err != nil {
+				return err
+			}
+			cursor += n
+			meta.KeyEnd = end
+			if cursor+4 > len(data) {
+				return io.ErrUnexpectedEOF
+			}
+			meta.KVCount = readUint32BE(data[cursor : cursor+4])
+			cursor += 4
 		}
-		cursor += n
-		if cursor+4 > len(data) {
-			return io.ErrUnexpectedEOF
-		}
-		kvCount := readUint32BE(data[cursor : cursor+4])
-		cursor += 4
-		var chunkSize uint64
 		if cursor+4 <= len(data) {
-			chunkSize = uint64(readUint32BE(data[cursor : cursor+4]))
+			meta.ChunkSize = uint64(readUint32BE(data[cursor : cursor+4]))
 			cursor += 4
 		} else if chunkDir != "" {
 			chunkPath := filepath.Join(chunkDir, fileName)
@@ -2803,20 +2905,10 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 			if err != nil {
 				return err
 			}
-			chunkSize = uint64(info.Size())
+			meta.ChunkSize = uint64(info.Size())
 		} else {
 			return io.ErrUnexpectedEOF
 		}
-		meta := segmentChunkMeta{
-			FileName:  fileName,
-			KVCount:   kvCount,
-			ChunkSize: chunkSize,
-		}
-		// Avoid copying into the arena: KeyStart/KeyEnd can safely reference the
-		// index buffer. This eliminates a lot of growslice/memmove work when decoding
-		// large indexes.
-		meta.KeyStart = start
-		meta.KeyEnd = end
 		*metas = append(*metas, meta)
 	}
 	return nil
@@ -2905,8 +2997,22 @@ func isCompactSegmentIndexBuffer(data []byte) bool {
 	return len(data) >= 4 && binary.BigEndian.Uint32(data[:4]) == segmentIndexFlatMagic
 }
 
+func compactSegmentIndexVersion(data []byte) (uint16, bool) {
+	if len(data) < 6 || !isCompactSegmentIndexBuffer(data) {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(data[4:6]), true
+}
+
 func isMultiLevelSegmentIndexBuffer(data []byte) bool {
 	return len(data) >= 4 && binary.BigEndian.Uint32(data[:4]) == segmentIndexMultiLevelMagic
+}
+
+func multiLevelSegmentIndexVersion(data []byte) (uint16, bool) {
+	if len(data) < 6 || !isMultiLevelSegmentIndexBuffer(data) {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(data[4:6]), true
 }
 
 func (db *PrefixDB) decodeSegmentIndexBufferForMigration(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) (bool, error) {
@@ -2964,7 +3070,7 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 	cursor := 4
 	version := binary.BigEndian.Uint16(data[cursor : cursor+2])
 	cursor += 2
-	if version != segmentIndexFormatVersion {
+	if version != 1 && version != segmentIndexFormatVersion {
 		return segmentIndexLayout{}, fmt.Errorf("unsupported index meta version %d", version)
 	}
 	cursor += 2 // reserved
@@ -2985,11 +3091,14 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 			return segmentIndexLayout{}, err
 		}
 		cursor += n
-		end, n, err := readVarBytes(data[cursor:])
-		if err != nil {
-			return segmentIndexLayout{}, err
+		var end []byte
+		if version == 1 {
+			end, n, err = readVarBytes(data[cursor:])
+			if err != nil {
+				return segmentIndexLayout{}, err
+			}
+			cursor += n
 		}
-		cursor += n
 		layout.entries = append(layout.entries, segmentIndexL1Entry{
 			MetaID:     metaID,
 			KeyStart:   start,
@@ -3028,9 +3137,6 @@ func encodeTopLevelIndex(layout segmentIndexLayout) ([]byte, error) {
 		if buf, err = appendVarBytes(buf, entry.KeyStart); err != nil {
 			return nil, err
 		}
-		if buf, err = appendVarBytes(buf, entry.KeyEnd); err != nil {
-			return nil, err
-		}
 	}
 	return buf, nil
 }
@@ -3043,7 +3149,7 @@ func layoutEntriesEqual(a, b []segmentIndexL1Entry) bool {
 		if a[i].MetaID != b[i].MetaID || a[i].ChunkCount != b[i].ChunkCount {
 			return false
 		}
-		if !bytes.Equal(a[i].KeyStart, b[i].KeyStart) || !bytes.Equal(a[i].KeyEnd, b[i].KeyEnd) {
+		if !bytes.Equal(a[i].KeyStart, b[i].KeyStart) {
 			return false
 		}
 	}
@@ -3167,7 +3273,6 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			ChunkCount: uint32(len(group)),
 		}
 		entry.KeyStart = cloneBytes(group[0].KeyStart)
-		entry.KeyEnd = cloneBytes(group[len(group)-1].KeyEnd)
 		newEntries = append(newEntries, entry)
 	}
 	newLayout := segmentIndexLayout{
@@ -3452,36 +3557,16 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 		return &metas[0]
 	}
 	idx := sort.Search(len(metas), func(i int) bool {
-		end := metas[i].KeyEnd
-		if len(end) == 0 {
-			return true
+		start := metas[i].KeyStart
+		if len(start) == 0 {
+			return false
 		}
-		return bytes.Compare(key, end) <= 0
+		return bytes.Compare(start, key) > 0
 	})
-	if idx == len(metas) {
-		idx = len(metas) - 1
+	if idx == 0 {
+		return &metas[0]
 	}
-	if meta := metas[idx]; len(meta.KeyStart) == 0 || bytes.Compare(key, meta.KeyStart) >= 0 {
-		return &metas[idx]
-	}
-	for i := idx - 1; i >= 0; i-- {
-		startOK := len(metas[i].KeyStart) == 0 || bytes.Compare(key, metas[i].KeyStart) >= 0
-		endOK := len(metas[i].KeyEnd) == 0 || bytes.Compare(key, metas[i].KeyEnd) <= 0
-		if startOK && endOK {
-			return &metas[i]
-		}
-	}
-	for i := idx + 1; i < len(metas); i++ {
-		startOK := len(metas[i].KeyStart) == 0 || bytes.Compare(key, metas[i].KeyStart) >= 0
-		endOK := len(metas[i].KeyEnd) == 0 || bytes.Compare(key, metas[i].KeyEnd) <= 0
-		if startOK && endOK {
-			return &metas[i]
-		}
-		if len(metas[i].KeyStart) > 0 && bytes.Compare(key, metas[i].KeyStart) < 0 {
-			break
-		}
-	}
-	return &metas[len(metas)-1]
+	return &metas[idx-1]
 }
 
 func (db *PrefixDB) readSegmentChunkFile(folderID uint32, fileName string) ([]kvPair, *bufferLease, error) {
@@ -4730,24 +4815,42 @@ func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath 
 		return false, err
 	}
 	if layout.mode == indexLayoutMultiLevel {
+		topData, err := db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
+		if err != nil {
+			return false, err
+		}
+		topNeedsUpgrade := false
+		if version, ok := multiLevelSegmentIndexVersion(topData); ok {
+			topNeedsUpgrade = version < segmentIndexFormatVersion
+		}
+
 		total := 0
 		for _, entry := range layout.entries {
 			total += int(entry.ChunkCount)
 		}
 		metas := make([]segmentChunkMeta, 0, total)
 		var arena []byte
-		migrated := false
+		migrated := topNeedsUpgrade
 		for idx, entry := range layout.entries {
 			data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
 			if err != nil {
 				return false, err
 			}
-			changed, err := db.decodeSegmentIndexBufferForMigration(data, &metas, &arena, idx != 0, folderPath)
-			if err != nil {
-				return false, err
-			}
-			if changed {
-				migrated = true
+			if version, ok := compactSegmentIndexVersion(data); ok {
+				if err := decodeSegmentIndexBuffer(data, &metas, &arena, idx != 0, folderPath); err != nil {
+					return false, err
+				}
+				if version < segmentIndexFlatVersion {
+					migrated = true
+				}
+			} else {
+				changed, err := db.decodeSegmentIndexBufferForMigration(data, &metas, &arena, idx != 0, folderPath)
+				if err != nil {
+					return false, err
+				}
+				if changed {
+					migrated = true
+				}
 			}
 		}
 		if !migrated {
@@ -4767,7 +4870,22 @@ func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath 
 		}
 	}
 	if isCompactSegmentIndexBuffer(data) {
-		return false, nil
+		version, ok := compactSegmentIndexVersion(data)
+		if !ok {
+			return false, fmt.Errorf("invalid compact segment index header: %s", indexPath)
+		}
+		if version >= segmentIndexFlatVersion {
+			return false, nil
+		}
+		var metas []segmentChunkMeta
+		var arena []byte
+		if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
+			return false, err
+		}
+		if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if isMultiLevelSegmentIndexBuffer(data) {
 		return false, fmt.Errorf("unexpected multi-level index header in flat layout: %s", indexPath)

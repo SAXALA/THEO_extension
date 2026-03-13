@@ -279,6 +279,18 @@ func (wb *WriteBatch) updateValue(key []byte, value []byte) error {
 	return nil
 }
 
+func (wb *WriteBatch) drainOperations() map[string]WriteOperation {
+	wb.lock.Lock()
+	defer wb.lock.Unlock()
+
+	if len(wb.operations) == 0 {
+		return nil
+	}
+	operations := wb.operations
+	wb.operations = make(map[string]WriteOperation)
+	return operations
+}
+
 // Commit writes all operations in the batch to the database
 func (db *PrefixDB) WriteCommit(batch *WriteBatch) (err error) {
 	if db.prefixTree != nil {

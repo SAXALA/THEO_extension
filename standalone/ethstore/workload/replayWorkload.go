@@ -22,6 +22,7 @@ import (
 
 	// Please replace "ethstore_module" with the actual module path defined in your ethstore/go.mod file
 
+	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
@@ -381,6 +382,8 @@ type replayConfig struct {
 	EthStoreDir                  string `json:"ethstoreDir"`
 	PebbleDBDir                  string `json:"pebbleDir"`
 	ChainKVDir                   string `json:"chainKVDir"`
+	AccountHashKeyPebbleDir      string `json:"accountHashKeyPebbleDir"`
+	loadedEthstoreDir            string `json:"loadedEthStoreDir"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -543,11 +546,15 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 		if err := loadPrefixdbAndPebble(cfg.EthStoreDir, cfg.LoadDataDir, contractChunkFileSizeMiB, totalCacheSizeMiB, 32, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold); err != nil {
 			return fmt.Errorf("ethstore account load failed: %w", err)
 		}
-
+	case strings.EqualFold(backend, "prefixdb"):
+		if err := loadPrefixDB(cfg.loadedEthstoreDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, contractChunkFileSizeMiB, totalCacheSizeMiB); err != nil {
+			return fmt.Errorf("prefixdb load failed: %w", err)
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown backend: %s", backend)
 	}
+	return nil
 }
 
 func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, chunkFileSize int, totalCacheSizeMiB int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) error {
@@ -565,7 +572,7 @@ func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, ch
 	defer store.Close()
 
 	start := time.Now()
-	if err := store.GCPrefixTreeStorage(); err != nil {
+	if err := store.GCPrefixTree(); err != nil {
 		return fmt.Errorf("gc: failed to run state db GC: %w", err)
 	}
 	fmt.Printf("ethstore state db GC finished in %s\n", time.Since(start))
@@ -1625,6 +1632,10 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 
 		valueBytes := []byte(valuePart)
 
+		if !ethstore.PrefixDBHandledDataTypes[ethstore.GetDataTypeFromKey(keyBytes)] {
+			continue
+		}
+
 		keyBytes, err = hex.DecodeString(string(keyBytes))
 		if err != nil {
 			log.Fatalf("Failed to decode key: %v", err)
@@ -1650,6 +1661,7 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 		}
 	}
+	store.GCPrefixTree()
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }
@@ -1668,15 +1680,18 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 	}
 	defer pdb.Close()
 
+	if len(pebbleDir) == 0 {
+		pebbleDir = "/mnt/ramdisk/accountHash_key_pebble"
+	}
 	dbPath := strings.TrimSpace(pebbleDir)
 	if dbPath == "" {
 		return fmt.Errorf("pebble aux dir is required for loadAccount")
 	}
-	ps, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
+	acccuntHashKeyPebble, err := pebblestore.NewPebbleStore(dbPath, 0, 0, "", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore instance: %w", err)
 	}
-	defer ps.Close()
+	defer acccuntHashKeyPebble.Close()
 
 	testFilePath := strings.TrimSpace(dataFile)
 	if testFilePath == "" {
@@ -1741,15 +1756,13 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 
 		// Perform the Put operation
 		if keyBytes[0] == 'O' {
-			accountKey = pdb.GetParentAccountKey(keyBytes)
-			if accountKey == nil {
-				Key, _, err := findKeyValuePair(keyPart[2:66], ps)
-				if Key == "" || err != nil {
-					fmt.Printf("Failed to get parent account key for key %s\n", keyPart)
-					continue
+			accountHash := keyBytes[1:33]
+			accountKey, err = acccuntHashKeyPebble.Get(accountHash)
+			if err != nil {
+				if err == pebble.ErrNotFound {
+					return nil // account not found
 				}
-				accountKey = []byte(Key)
-				pdb.InsertAccountHashPebble(keyBytes[1:33], accountKey)
+				return nil
 			}
 			// accountKey = nil
 		}
@@ -1784,6 +1797,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 
 	// pdb.SaveTrie()
 	pdb.GCPrefixTree()
+	pdb.GCAllStorageChunkFiles()
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }
