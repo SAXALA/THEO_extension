@@ -240,6 +240,23 @@ func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
 	return entry.metas, true
 }
 
+func (c *segmentIndexCache) GetLevel2(folderID uint32, metaID uint32, generation uint64) ([]segmentChunkMeta, bool) {
+	if c == nil {
+		return nil, false
+	}
+	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation))
+	if !ok {
+		c.refreshUsage()
+		return nil, false
+	}
+	entry, _ := raw.(*segmentIndexCacheEntry)
+	c.refreshUsage()
+	if entry == nil {
+		return nil, false
+	}
+	return entry.metas, true
+}
+
 func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
 	if c == nil {
 		return
@@ -259,6 +276,25 @@ func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
 	c.refreshUsage()
 }
 
+func (c *segmentIndexCache) AddLevel2(folderID uint32, metaID uint32, generation uint64, metas []segmentChunkMeta) {
+	if c == nil {
+		return
+	}
+	sizeBytes := estimateSegmentChunkMetasMemory(metas)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation))
+		c.refreshUsage()
+		return
+	}
+	entry := &segmentIndexCacheEntry{
+		folderID:  folderID,
+		metas:     cloneSegmentChunkMetas(metas),
+		sizeBytes: sizeBytes,
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation), entry, sizeBytes)
+	c.refreshUsage()
+}
+
 func (c *segmentIndexCache) Remove(folderID uint32) {
 	if c == nil {
 		return
@@ -275,7 +311,17 @@ func (c *segmentIndexCache) refreshUsage() {
 }
 
 func segmentIndexCacheKey(folderID uint32) string {
-	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], folderID)
+	var buf [5]byte
+	buf[0] = 0x01
+	binary.BigEndian.PutUint32(buf[1:], folderID)
+	return string(buf[:])
+}
+
+func segmentIndexLevel2CacheKey(folderID uint32, metaID uint32, generation uint64) string {
+	var buf [17]byte
+	buf[0] = 0x02
+	binary.BigEndian.PutUint32(buf[1:5], folderID)
+	binary.BigEndian.PutUint32(buf[5:9], metaID)
+	binary.BigEndian.PutUint64(buf[9:17], generation)
 	return string(buf[:])
 }

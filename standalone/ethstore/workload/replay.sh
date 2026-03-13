@@ -33,9 +33,9 @@ CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
 # segmented storage GC 阈值：当 chunk_file_size >= target_chunk_size * threshold 时触发 GC
-STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-1.5}"
+STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-2}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
-DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
+DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
     DEFAULT_GC_WORKERS=1
 fi
@@ -73,7 +73,7 @@ RUNNING_ROOT="${RUNNING_ROOT:-/mnt/ssd2/running}"
 DISK_MOUNT_POINT="/mnt/ssd2"
 
 # ethstore statedb 目录名，可选: database_statedb16KB | database_statedb64KB | database_statedb256KB
-ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-database_statedb16KB_gced}"
+ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-database_statedb16KB_gced_upgrade_copy}"
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
 GC_STATE_DIR="${GC_STATE_DIR:-/mnt/ssd2/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"

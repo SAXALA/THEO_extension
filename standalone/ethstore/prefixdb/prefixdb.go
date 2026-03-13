@@ -2920,6 +2920,14 @@ func (db *PrefixDB) decodeSegmentIndexBufferForMigration(data []byte, metas *[]s
 }
 
 func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayout, error) {
+	db.segmentIndexMu.Lock()
+	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == folderPath {
+		layout := db.storageIndexLayoutCache
+		db.segmentIndexMu.Unlock()
+		return layout, nil
+	}
+	db.segmentIndexMu.Unlock()
+
 	indexPath := filepath.Join(folderPath, segmentIndexFileName)
 	data, err := db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
 	if err != nil {
@@ -2940,6 +2948,11 @@ func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayou
 			return segmentIndexLayout{}, err
 		}
 	}
+	db.segmentIndexMu.Lock()
+	db.storageIndexLayoutPath = folderPath
+	db.storageIndexLayoutCache = layout
+	db.storageIndexLayoutReady = true
+	db.segmentIndexMu.Unlock()
 	return layout, nil
 }
 
@@ -3330,8 +3343,9 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 }
 
 func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segmentChunkMeta, error) {
-	unlock := db.lockSegmentIndexFolder(folderID)
+	entryLock, unlock := db.lockSegmentIndexFolderEntry(folderID)
 	defer unlock()
+	generation := atomic.LoadUint64(&entryLock.gen)
 	if len(key) == 0 {
 		return db.readSegmentIndexLockedInternal(folderID, true)
 	}
@@ -3355,6 +3369,14 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	if entry == nil {
 		return nil, fmt.Errorf("segment index entry not found for folder %d", folderID)
 	}
+	if db.storageIndexCache != nil {
+		db.segmentIndexMu.Lock()
+		if metas, ok := db.storageIndexCache.GetLevel2(folderID, entry.MetaID, generation); ok {
+			db.segmentIndexMu.Unlock()
+			return metas, nil
+		}
+		db.segmentIndexMu.Unlock()
+	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
 	data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
@@ -3363,6 +3385,11 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	}
 	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
 		return nil, err
+	}
+	if db.storageIndexCache != nil {
+		db.segmentIndexMu.Lock()
+		db.storageIndexCache.AddLevel2(folderID, entry.MetaID, generation, metas)
+		db.segmentIndexMu.Unlock()
 	}
 	return metas, nil
 }

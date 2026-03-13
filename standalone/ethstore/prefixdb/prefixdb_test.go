@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,6 +208,65 @@ func TestFileNodeCacheUsesSharedBudget(t *testing.T) {
 	used, _ = shared.NamespaceStats(sharedCacheNamespaceFileNode)
 	if used != 0 {
 		t.Fatalf("expected file node cache budget to be released, got %d", used)
+	}
+}
+
+func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 16, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(123)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	metas := make([]segmentChunkMeta, 600)
+	for i := range metas {
+		start := []byte(fmt.Sprintf("k%08d", i*2))
+		end := []byte(fmt.Sprintf("k%08d", i*2+1))
+		metas[i] = segmentChunkMeta{
+			FileName:  fmt.Sprintf("chunk_%04d.dat", i),
+			KeyStart:  start,
+			KeyEnd:    end,
+			KVCount:   1,
+			ChunkSize: 1,
+		}
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	targetKey := metas[333].KeyStart
+	before := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	first, err := db.readSegmentIndexForKey(folderID, targetKey)
+	if err != nil {
+		t.Fatalf("first readSegmentIndexForKey failed: %v", err)
+	}
+	if len(first) == 0 {
+		t.Fatal("expected non-empty metas from first read")
+	}
+	afterFirst := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	second, err := db.readSegmentIndexForKey(folderID, targetKey)
+	if err != nil {
+		t.Fatalf("second readSegmentIndexForKey failed: %v", err)
+	}
+	if len(second) != len(first) {
+		t.Fatalf("cached metas size mismatch: got %d want %d", len(second), len(first))
+	}
+	afterSecond := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+
+	firstDelta := afterFirst - before
+	secondDelta := afterSecond - afterFirst
+	if firstDelta < 2 {
+		t.Fatalf("expected first read to include layout+L2 IO, got delta=%d", firstDelta)
+	}
+	if secondDelta >= firstDelta {
+		t.Fatalf("expected second read to use partial L2 cache; firstDelta=%d secondDelta=%d", firstDelta, secondDelta)
 	}
 }
 
