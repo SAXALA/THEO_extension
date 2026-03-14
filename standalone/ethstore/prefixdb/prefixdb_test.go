@@ -422,26 +422,6 @@ func TestEncodeSegmentChunkMetasUsesCompactFormat(t *testing.T) {
 	}
 }
 
-func TestDecodeSegmentIndexBufferSupportsLegacyFormat(t *testing.T) {
-	metas := []segmentChunkMeta{{
-		FileName:  "chunk_0042.dat",
-		KeyStart:  []byte{0x0a},
-		KeyEnd:    []byte{0x0f},
-		KVCount:   3,
-		ChunkSize: 4096,
-	}}
-
-	buf := encodeLegacySegmentChunkMetasForTest(t, metas)
-	var decoded []segmentChunkMeta
-	var arena []byte
-	if err := decodeLegacySegmentIndexBuffer(buf, &decoded, &arena, false, ""); err != nil {
-		t.Fatalf("decode legacy segment index failed: %v", err)
-	}
-	if !segmentChunkMetasEqual(decoded, metas) {
-		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
-	}
-}
-
 func TestDecodeSegmentIndexBufferRejectsLegacyFormat(t *testing.T) {
 	buf := encodeLegacySegmentChunkMetasForTest(t, []segmentChunkMeta{{
 		FileName:  "chunk_0042.dat",
@@ -489,7 +469,7 @@ func TestEncodeSegmentChunkMetasRejectsUnsafeCompactEncoding(t *testing.T) {
 	})
 }
 
-func TestMigrateLegacySegmentIndexFormatsMigratesFlatIndex(t *testing.T) {
+func TestMigrateLegacySegmentIndexFormatsNotSupported(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
 	if err != nil {
@@ -497,109 +477,8 @@ func TestMigrateLegacySegmentIndexFormatsMigratesFlatIndex(t *testing.T) {
 	}
 	defer db.Close()
 
-	folderPath := db.segmentedFolderPath(1)
-	if err := os.MkdirAll(folderPath, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-	metas := []segmentChunkMeta{
-		{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}, KeyEnd: []byte{0x02}, KVCount: 1, ChunkSize: 128},
-		{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}, KeyEnd: []byte{0x04}, KVCount: 2, ChunkSize: 256},
-	}
-	indexPath := filepath.Join(folderPath, segmentIndexFileName)
-	if err := os.WriteFile(indexPath, encodeLegacySegmentChunkMetasForTest(t, metas), 0644); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	if err := db.MigrateLegacySegmentIndexFormats(); err != nil {
-		t.Fatalf("MigrateLegacySegmentIndexFormats failed: %v", err)
-	}
-	buf, err := os.ReadFile(indexPath)
-	if err != nil {
-		t.Fatalf("ReadFile failed: %v", err)
-	}
-	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
-		t.Fatalf("expected migrated flat magic, got 0x%x", got)
-	}
-	decoded, err := db.readSegmentIndexNoCache(1)
-	if err != nil {
-		t.Fatalf("readSegmentIndexNoCache failed after migration: %v", err)
-	}
-	if !segmentChunkMetasEqual(decoded, metas) {
-		t.Fatalf("decoded metas mismatch after migration: got %+v want %+v", decoded, metas)
-	}
-}
-
-func TestMigrateLegacySegmentIndexFormatsMigratesLegacyLevel2Files(t *testing.T) {
-	baseDir := t.TempDir()
-	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
-	if err != nil {
-		t.Fatalf("NewPrefixDB failed: %v", err)
-	}
-	defer db.Close()
-
-	folderPath := db.segmentedFolderPath(2)
-	if err := os.MkdirAll(folderPath, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-	group1 := []segmentChunkMeta{{
-		FileName:  "chunk_0001.dat",
-		KeyStart:  bytes.Repeat([]byte{0x01}, 5000),
-		KeyEnd:    bytes.Repeat([]byte{0x02}, 5000),
-		KVCount:   1,
-		ChunkSize: 128,
-	}}
-	group2 := []segmentChunkMeta{{
-		FileName:  "chunk_0002.dat",
-		KeyStart:  bytes.Repeat([]byte{0x03}, 5000),
-		KeyEnd:    bytes.Repeat([]byte{0x04}, 5000),
-		KVCount:   2,
-		ChunkSize: 256,
-	}}
-	layout := segmentIndexLayout{
-		mode:       indexLayoutMultiLevel,
-		nextMetaID: 3,
-		entries: []segmentIndexL1Entry{
-			{MetaID: 1, KeyStart: cloneBytes(group1[0].KeyStart), KeyEnd: cloneBytes(group1[0].KeyEnd), ChunkCount: 1},
-			{MetaID: 2, KeyStart: cloneBytes(group2[0].KeyStart), KeyEnd: cloneBytes(group2[0].KeyEnd), ChunkCount: 1},
-		},
-	}
-	topBuf, err := encodeTopLevelIndex(layout)
-	if err != nil {
-		t.Fatalf("encodeTopLevelIndex failed: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(folderPath, segmentIndexFileName), topBuf, 0644); err != nil {
-		t.Fatalf("WriteFile top-level failed: %v", err)
-	}
-	if err := os.WriteFile(level2IndexFilePath(folderPath, 1), encodeLegacySegmentChunkMetasForTest(t, group1), 0644); err != nil {
-		t.Fatalf("WriteFile level2 #1 failed: %v", err)
-	}
-	buf2, err := encodeSegmentChunkMetas(group2)
-	if err != nil {
-		t.Fatalf("encodeSegmentChunkMetas for group2 failed: %v", err)
-	}
-	if err := os.WriteFile(level2IndexFilePath(folderPath, 2), buf2, 0644); err != nil {
-		t.Fatalf("WriteFile level2 #2 failed: %v", err)
-	}
-
-	if err := db.MigrateLegacySegmentIndexFormats(); err != nil {
-		t.Fatalf("MigrateLegacySegmentIndexFormats failed: %v", err)
-	}
-	buf, err := os.ReadFile(filepath.Join(folderPath, segmentIndexFileName))
-	if err != nil {
-		t.Fatalf("ReadFile migrated index failed: %v", err)
-	}
-	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
-		t.Fatalf("expected migrated flat magic following current layout rules, got 0x%x", got)
-	}
-	if _, err := os.Stat(level2IndexFilePath(folderPath, 1)); !os.IsNotExist(err) {
-		t.Fatalf("expected legacy level2 file to be removed after migration, got err=%v", err)
-	}
-	decoded, err := db.readSegmentIndexNoCache(2)
-	if err != nil {
-		t.Fatalf("readSegmentIndexNoCache failed after level2 migration: %v", err)
-	}
-	if !segmentChunkMetasEqual(decoded, append(group1, group2...)) {
-		t.Fatalf("decoded metas mismatch after level2 migration: got %+v", decoded)
+	if err := db.MigrateLegacySegmentIndexFormats(); err == nil {
+		t.Fatal("expected legacy migration to be unsupported")
 	}
 }
 
@@ -694,9 +573,9 @@ func TestUpgradeSegmentIndexFilesRebuildsUsingCurrentLayoutConstants(t *testing.
 	}
 }
 
-func TestSegmentIndexCompressionRoundTrip(t *testing.T) {
+func TestSegmentIndexSmallPayloadStaysUncompressed(t *testing.T) {
 	baseDir := t.TempDir()
-	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, false, true)
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, false, true, 0)
 	if err != nil {
 		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
 	}
@@ -718,8 +597,8 @@ func TestSegmentIndexCompressionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	if got := binary.BigEndian.Uint32(raw[:4]); got != compressedMetadataMagic {
-		t.Fatalf("expected compressed metadata wrapper magic, got 0x%x", got)
+	if got := binary.BigEndian.Uint32(raw[:4]); got == compressedMetadataMagic {
+		t.Fatalf("expected small segment index payload to remain uncompressed")
 	}
 	decoded, err := db.readSegmentIndexNoCache(folderID)
 	if err != nil {
@@ -737,6 +616,48 @@ func TestSegmentIndexCompressionRoundTrip(t *testing.T) {
 	}
 	if !segmentChunkMetasEqual(decoded, metas) {
 		t.Fatalf("decoded metas mismatch after upgrade: got %+v want %+v", decoded, metas)
+	}
+}
+
+func TestSegmentIndexLargePayloadUsesCompression(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, false, true, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(10)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := []segmentChunkMeta{{
+		FileName:  "chunk_0001.dat",
+		KeyStart:  bytes.Repeat([]byte{0x01}, segmentIndexCompressionMinSize+32),
+		KeyEnd:    []byte{0x02},
+		KVCount:   1,
+		ChunkSize: 128,
+	}}
+	if got := estimateSegmentIndexSize(metas); got <= segmentIndexCompressionMinSize {
+		t.Fatalf("test fixture must exceed compression threshold: got %d", got)
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(folderPath, segmentIndexFileName))
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(raw[:4]); got != compressedMetadataMagic {
+		t.Fatalf("expected compressed metadata wrapper magic, got 0x%x", got)
+	}
+	decoded, err := db.readSegmentIndexNoCache(folderID)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
 	}
 }
 
@@ -948,7 +869,7 @@ func TestGlobalNodePutAppendsAndUpdatesSkipList(t *testing.T) {
 
 func TestPutIntoCompressedNodeFileAppendsAfterCompressedSortedPayload(t *testing.T) {
 	baseDir := t.TempDir()
-	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, true, false)
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, true, false, 0)
 	if err != nil {
 		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
 	}

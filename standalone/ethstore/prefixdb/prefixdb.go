@@ -37,8 +37,9 @@ const (
 
 const (
 	segmentIndexMultiLevelThreshold = 16 * 1024
-	segmentIndexLevel2TargetSize    = 2 * 1024
-	segmentIndexLevel2MaxSize       = 4 * 1024
+	segmentIndexLevel2TargetSize    = 4 * 1024
+	segmentIndexLevel2MaxSize       = 8 * 1024
+	segmentIndexCompressionMinSize  = 4 * 1024
 	segmentIndexFlatMagic           = 0x464c4958 // 'FLIX'
 	segmentIndexMultiLevelMagic     = 0x4d4c4958 // 'MLIX'
 	segmentIndexFormatVersion       = 2
@@ -301,17 +302,21 @@ type segmentIndexFolderLock struct {
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
 func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, 0)
 }
 
 // NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
 // budget in MiB. All PrefixDB caches share this total budget.
 // Use <=0 values to fallback to the default shared cache size.
 func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, 0)
 }
 
-func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*PrefixDB, error) {
+func NewPrefixDBWithFileHandleCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, fileHandleCacheSize int) (*PrefixDB, error) {
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, fileHandleCacheSize)
+}
+
+func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, fileHandleCacheSize int) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -362,7 +367,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		accountFile:                      accountFile,
 		writeMutex:                       sync.Mutex{},
 		segmentIndexFolderLocks:          make(map[uint32]*segmentIndexFolderLock),
-		fileHandleCache:                  getGlobalFileHandleCache(),
+		fileHandleCache:                  getGlobalFileHandleCache(fileHandleCacheSize),
 		storageDir:                       storageDir,
 		storageGetCacheCount:             storageGetCacheCount,
 		storageChunkSize:                 storageChunkFileSize,
@@ -626,49 +631,9 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
 
-	prepared := &preparedAccountCommit{}
-	storagePlans := make([]storageCommitPlan, 0)
-	var accountErr error
-	var storageErr error
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		prepared, accountErr = db.prepareAccountCommit(accountOps)
-	}()
-
-	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			storagePlans, storageErr = db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
-		}()
-	}
-	wg.Wait()
-	if accountErr != nil {
-		return accountErr
-	}
-	if storageErr != nil {
-		return storageErr
-	}
-
-	for _, plan := range storagePlans {
-		if op, ok := accountOps[plan.accountKey]; ok {
-			if op.value != nil {
-				op.storageFileID = plan.storageInfo.storageFileID
-				op.storageOffset = plan.storageInfo.storageOffset
-				op.storageSize = plan.storageInfo.storageSize
-				accountOps[plan.accountKey] = op
-			}
-			continue
-		}
-		if err := db.prefixTree.Put([]byte(plan.accountKey), plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
-			return err
-		}
-		if db.nodeCache != nil {
-			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
-		}
+	prepared, err := db.prepareAccountCommit(accountOps)
+	if err != nil {
+		return err
 	}
 
 	trieAccountOffset, _ := db.accountFile.Seek(0, io.SeekEnd)
@@ -722,7 +687,41 @@ func (db *PrefixDB) BatchCommit() (err error) {
 		}
 		db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
 	}
-	if len(storagePlans) > 0 {
+
+	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
+		if storageBatch == nil {
+			storageBatch = make(map[string]map[string][]byte)
+		}
+		if err := db.resolveUnresolvedStorageBatch(storageBatch, storageUnresolved); err != nil {
+			return err
+		}
+		if len(storageBatch) > 0 {
+			accountKeys := make([]string, 0, len(storageBatch))
+			for accountKey := range storageBatch {
+				if op, ok := accountOps[accountKey]; ok && op.value == nil {
+					continue
+				}
+				accountKeys = append(accountKeys, accountKey)
+			}
+			sort.Strings(accountKeys)
+			for _, accountKey := range accountKeys {
+				perAccount := storageBatch[accountKey]
+				if len(perAccount) == 0 {
+					continue
+				}
+				kvs := make([]kvPair, 0, len(perAccount))
+				for key, value := range perAccount {
+					kvs = append(kvs, kvPair{key: []byte(key), val: value})
+				}
+				sortKVPairs(kvs)
+				if err := db.commitStorageForAccount(accountKey, kvs); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
 		return db.waitForStorageGCIdle()
 	}
 	return nil
@@ -2563,12 +2562,16 @@ func (db *PrefixDB) bumpSegmentIndexGenerationLocked(entry *segmentIndexFolderLo
 	atomic.AddUint64(&entry.gen, 1)
 }
 
-func (db *PrefixDB) readSegmentIndexNoCacheWithGen(folderID uint32) ([]segmentChunkMeta, uint64, error) {
+func (db *PrefixDB) readSegmentIndexWithGen(folderID uint32, useLRU bool) ([]segmentChunkMeta, uint64, error) {
 	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
 	defer unlock()
 	gen := atomic.LoadUint64(&entry.gen)
-	metas, err := db.readSegmentIndexLockedInternal(folderID, false)
+	metas, err := db.readSegmentIndexLockedInternal(folderID, useLRU)
 	return metas, gen, err
+}
+
+func (db *PrefixDB) readSegmentIndexNoCacheWithGen(folderID uint32) ([]segmentChunkMeta, uint64, error) {
+	return db.readSegmentIndexWithGen(folderID, false)
 }
 
 func segmentFolderIDFromPath(folderPath string) uint32 {
@@ -2660,7 +2663,7 @@ func writeFileIfChanged(db *PrefixDB, path string, data []byte) error {
 }
 
 func (db *PrefixDB) encodeSegmentIndexFileData(data []byte) ([]byte, error) {
-	if db == nil || !db.segmentIndexCompression || len(data) == 0 {
+	if db == nil || !db.segmentIndexCompression || len(data) <= segmentIndexCompressionMinSize {
 		return data, nil
 	}
 	return encodeCompressedMetadataBlock(data)
@@ -2881,13 +2884,13 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 		return fmt.Errorf("invalid segment index payload")
 	}
 	if binary.BigEndian.Uint32(data[:4]) != segmentIndexFlatMagic {
-		return fmt.Errorf("unsupported legacy segment index format")
+		return fmt.Errorf("unsupported segment index format")
 	}
 	if len(data) < 12 {
 		return fmt.Errorf("corrupted compact segment index header")
 	}
 	version := binary.BigEndian.Uint16(data[4:6])
-	if version != 1 && version != segmentIndexFlatVersion {
+	if version != segmentIndexFlatVersion {
 		return fmt.Errorf("unsupported flat index version %d", version)
 	}
 	cursor := 12
@@ -2929,19 +2932,6 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 		}
 		cursor += n
 		meta := segmentChunkMeta{FileName: fileName, KeyStart: start}
-		if version == 1 {
-			end, n, err := readVarBytes(data[cursor:])
-			if err != nil {
-				return err
-			}
-			cursor += n
-			meta.KeyEnd = end
-			if cursor+4 > len(data) {
-				return io.ErrUnexpectedEOF
-			}
-			meta.KVCount = readUint32BE(data[cursor : cursor+4])
-			cursor += 4
-		}
 		if cursor+4 <= len(data) {
 			meta.ChunkSize = uint64(readUint32BE(data[cursor : cursor+4]))
 			cursor += 4
@@ -2958,117 +2948,6 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 		*metas = append(*metas, meta)
 	}
 	return nil
-}
-
-func decodeLegacySegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) error {
-	if len(data) < 4 {
-		return fmt.Errorf("invalid legacy segment index payload")
-	}
-	count := int(binary.BigEndian.Uint32(data[:4]))
-	if count == 0 {
-		if !appendExisting {
-			*metas = (*metas)[:0]
-			*arena = (*arena)[:0]
-		}
-		return nil
-	}
-	if !appendExisting {
-		if cap(*metas) < count {
-			*metas = make([]segmentChunkMeta, 0, count)
-		} else {
-			*metas = (*metas)[:0]
-		}
-		*arena = (*arena)[:0]
-	}
-	needed := len(*metas) + count
-	if cap(*metas) < needed {
-		newCap := needed
-		if newCap < 2*cap(*metas) {
-			newCap = 2 * cap(*metas)
-		}
-		buf := make([]segmentChunkMeta, len(*metas), newCap)
-		copy(buf, *metas)
-		*metas = buf
-	}
-	cursor := 4
-	for i := 0; i < count; i++ {
-		nameBytes, n, err := readVarBytes(data[cursor:])
-		if err != nil {
-			return err
-		}
-		fileName := bytesToString(nameBytes)
-		cursor += n
-		start, n, err := readVarBytes(data[cursor:])
-		if err != nil {
-			return err
-		}
-		cursor += n
-		end, n, err := readVarBytes(data[cursor:])
-		if err != nil {
-			return err
-		}
-		cursor += n
-		if cursor+4 > len(data) {
-			return io.ErrUnexpectedEOF
-		}
-		kvCount := readUint32BE(data[cursor : cursor+4])
-		cursor += 4
-		var chunkSize uint64
-		if cursor+8 <= len(data) {
-			chunkSize = readUint64BE(data[cursor : cursor+8])
-			cursor += 8
-		} else if chunkDir != "" {
-			chunkPath := filepath.Join(chunkDir, fileName)
-			info, err := os.Stat(chunkPath)
-			if err != nil {
-				return err
-			}
-			chunkSize = uint64(info.Size())
-		} else {
-			return io.ErrUnexpectedEOF
-		}
-		meta := segmentChunkMeta{
-			FileName:  fileName,
-			KVCount:   kvCount,
-			ChunkSize: chunkSize,
-		}
-		meta.KeyStart = start
-		meta.KeyEnd = end
-		*metas = append(*metas, meta)
-	}
-	return nil
-}
-
-func isCompactSegmentIndexBuffer(data []byte) bool {
-	return len(data) >= 4 && binary.BigEndian.Uint32(data[:4]) == segmentIndexFlatMagic
-}
-
-func compactSegmentIndexVersion(data []byte) (uint16, bool) {
-	if len(data) < 6 || !isCompactSegmentIndexBuffer(data) {
-		return 0, false
-	}
-	return binary.BigEndian.Uint16(data[4:6]), true
-}
-
-func isMultiLevelSegmentIndexBuffer(data []byte) bool {
-	return len(data) >= 4 && binary.BigEndian.Uint32(data[:4]) == segmentIndexMultiLevelMagic
-}
-
-func multiLevelSegmentIndexVersion(data []byte) (uint16, bool) {
-	if len(data) < 6 || !isMultiLevelSegmentIndexBuffer(data) {
-		return 0, false
-	}
-	return binary.BigEndian.Uint16(data[4:6]), true
-}
-
-func (db *PrefixDB) decodeSegmentIndexBufferForMigration(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) (bool, error) {
-	if isCompactSegmentIndexBuffer(data) {
-		return false, decodeSegmentIndexBuffer(data, metas, arena, appendExisting, chunkDir)
-	}
-	if isMultiLevelSegmentIndexBuffer(data) {
-		return false, fmt.Errorf("unexpected multi-level segment index payload during migration")
-	}
-	return true, decodeLegacySegmentIndexBuffer(data, metas, arena, appendExisting, chunkDir)
 }
 
 func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayout, error) {
@@ -3116,7 +2995,7 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 	cursor := 4
 	version := binary.BigEndian.Uint16(data[cursor : cursor+2])
 	cursor += 2
-	if version != 1 && version != segmentIndexFormatVersion {
+	if version != segmentIndexFormatVersion {
 		return segmentIndexLayout{}, fmt.Errorf("unsupported index meta version %d", version)
 	}
 	cursor += 2 // reserved
@@ -3137,18 +3016,10 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 			return segmentIndexLayout{}, err
 		}
 		cursor += n
-		var end []byte
-		if version == 1 {
-			end, n, err = readVarBytes(data[cursor:])
-			if err != nil {
-				return segmentIndexLayout{}, err
-			}
-			cursor += n
-		}
 		layout.entries = append(layout.entries, segmentIndexL1Entry{
 			MetaID:     metaID,
 			KeyStart:   start,
-			KeyEnd:     end,
+			KeyEnd:     nil,
 			ChunkCount: chunkCount,
 		})
 	}
@@ -3300,19 +3171,15 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 	newEntries := make([]segmentIndexL1Entry, 0, len(groups))
 	for idx, group := range groups {
 		path := level2IndexFilePath(folderPath, idAssignments[idx])
-		skipWrite := false
 		_ = reuseLayoutGrouping
 		_ = groupOffsets
-		if !skipWrite {
-			buf, err := encodeSegmentChunkMetas(group)
-			if err != nil {
-				return err
-			}
-			// We already decided the content changed (or file is missing), so avoid an extra
-			// ReadFile+bytes.Equal pass.
-			if err := db.writeSegmentIndexFileAtomic(path, buf); err != nil {
-				return err
-			}
+		buf, err := encodeSegmentChunkMetas(group)
+		if err != nil {
+			return err
+		}
+		// Incremental write: only update this L2 index file when payload changed.
+		if err := db.writeSegmentIndexFileIfChanged(path, buf); err != nil {
+			return err
 		}
 		entry := segmentIndexL1Entry{
 			MetaID:     idAssignments[idx],
@@ -3347,6 +3214,131 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 		}
 	}
 	return nil
+}
+
+func buildLayoutGroupsFromMetas(layout segmentIndexLayout, metas []segmentChunkMeta) ([][]segmentChunkMeta, bool) {
+	if layout.mode != indexLayoutMultiLevel || len(layout.entries) == 0 {
+		return nil, false
+	}
+	sum := 0
+	for _, entry := range layout.entries {
+		sum += int(entry.ChunkCount)
+	}
+	if sum != len(metas) {
+		return nil, false
+	}
+	groups := make([][]segmentChunkMeta, 0, len(layout.entries))
+	off := 0
+	for _, entry := range layout.entries {
+		cnt := int(entry.ChunkCount)
+		groups = append(groups, metas[off:off+cnt])
+		off += cnt
+	}
+	return groups, true
+}
+
+func applyGroupReplacement(group []segmentChunkMeta, oldFileName string, replacement []segmentChunkMeta) ([]segmentChunkMeta, bool) {
+	idx := -1
+	for i := range group {
+		if group[i].FileName == oldFileName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return nil, false
+	}
+	updated := make([]segmentChunkMeta, 0, len(group)-1+len(replacement))
+	updated = append(updated, group[:idx]...)
+	if len(replacement) > 0 {
+		updated = append(updated, replacement...)
+	}
+	if idx+1 < len(group) {
+		updated = append(updated, group[idx+1:]...)
+	}
+	return updated, true
+}
+
+func (db *PrefixDB) writeSegmentIndexIncrementalGC(folderPath string, latest []segmentChunkMeta, replacements map[string][]segmentChunkMeta) (bool, error) {
+	if len(replacements) == 0 {
+		return true, nil
+	}
+	folderID := segmentFolderIDFromPath(folderPath)
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
+	defer unlock()
+
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		return false, err
+	}
+	groups, ok := buildLayoutGroupsFromMetas(layout, latest)
+	if !ok {
+		return false, nil
+	}
+
+	affected := make(map[int]struct{}, len(replacements))
+	for oldFileName, replacement := range replacements {
+		found := false
+		for groupIdx := range groups {
+			updated, hit := applyGroupReplacement(groups[groupIdx], oldFileName, replacement)
+			if !hit {
+				continue
+			}
+			groups[groupIdx] = updated
+			affected[groupIdx] = struct{}{}
+			found = true
+			break
+		}
+		if !found {
+			return false, nil
+		}
+	}
+
+	oldEntries := layout.entries
+	newEntries := make([]segmentIndexL1Entry, 0, len(layout.entries))
+	keep := make(map[uint32]struct{}, len(layout.entries))
+	for idx := range groups {
+		if len(groups[idx]) == 0 {
+			continue
+		}
+		if _, touch := affected[idx]; touch {
+			buf, err := encodeSegmentChunkMetas(groups[idx])
+			if err != nil {
+				return false, err
+			}
+			if err := db.writeSegmentIndexFileIfChanged(level2IndexFilePath(folderPath, layout.entries[idx].MetaID), buf); err != nil {
+				return false, err
+			}
+		}
+		e := segmentIndexL1Entry{
+			MetaID:     layout.entries[idx].MetaID,
+			ChunkCount: uint32(len(groups[idx])),
+			KeyStart:   cloneBytes(groups[idx][0].KeyStart),
+		}
+		newEntries = append(newEntries, e)
+		keep[e.MetaID] = struct{}{}
+	}
+
+	newLayout := segmentIndexLayout{mode: indexLayoutMultiLevel, entries: newEntries, nextMetaID: layout.nextMetaID}
+	needTopUpdate := !layoutEntriesEqual(layout.entries, newEntries) || layout.nextMetaID != newLayout.nextMetaID
+	if needTopUpdate {
+		buf, err := encodeTopLevelIndex(newLayout)
+		if err != nil {
+			return false, err
+		}
+		indexPath := filepath.Join(folderPath, segmentIndexFileName)
+		if err := db.writeSegmentIndexFileIfChanged(indexPath, buf); err != nil {
+			return false, err
+		}
+	}
+
+	db.bumpSegmentIndexGenerationLocked(entry)
+	if len(oldEntries) > 0 {
+		if err := removeStaleLevel2IndexFiles(folderPath, oldEntries, keep); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
@@ -4392,7 +4384,8 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	}()
 
 	// Phase 1: read index once and rewrite multiple target chunks into new files.
-	metas, gen0, err := db.readSegmentIndexNoCacheWithGen(folderID)
+	// Prefer cached index snapshot on GC reads to reduce repetitive disk IO.
+	metas, gen0, err := db.readSegmentIndexWithGen(folderID, true)
 	if err != nil {
 		return err
 	}
@@ -4485,7 +4478,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	genNow := db.segmentIndexGenerationLocked(folderID)
 	latest := metas
 	if genNow != gen0 {
-		latest, _, err = db.readSegmentIndexNoCacheWithGen(folderID)
+		latest, _, err = db.readSegmentIndexWithGen(folderID, true)
 		if err != nil {
 			return err
 		}
@@ -4507,8 +4500,14 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 		// All targeted chunks disappeared/changed concurrently; new chunks are left as garbage.
 		return nil
 	}
-	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+	applied, err := db.writeSegmentIndexIncrementalGC(folderPath, latest, replacements)
+	if err != nil {
 		return err
+	}
+	if !applied {
+		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+			return err
+		}
 	}
 	db.refreshSegmentIndexCache(folderID, updated)
 	return nil
@@ -4530,7 +4529,8 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	}()
 	// Phase 1: build rewritten chunk(s) into NEW files (do not overwrite old fileName).
 	// This allows concurrent readers to keep using the old index+old chunk file safely.
-	metas, gen0, err := db.readSegmentIndexNoCacheWithGen(job.folderID)
+	// Prefer cached index snapshot on GC reads to reduce repetitive disk IO.
+	metas, gen0, err := db.readSegmentIndexWithGen(job.folderID, true)
 	if err != nil {
 		return err
 	}
@@ -4595,7 +4595,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	latest := metas
 	if genNow != gen0 {
 		var latestGen uint64
-		latest, latestGen, err = db.readSegmentIndexNoCacheWithGen(job.folderID)
+		latest, latestGen, err = db.readSegmentIndexWithGen(job.folderID, true)
 		_ = latestGen
 		if err != nil {
 			return err
@@ -4620,8 +4620,15 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	if idx2+1 < len(latest) {
 		updated = append(updated, latest[idx2+1:]...)
 	}
-	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+	replacements := map[string][]segmentChunkMeta{job.fileName: chunkMetas}
+	applied, err := db.writeSegmentIndexIncrementalGC(folderPath, latest, replacements)
+	if err != nil {
 		return err
+	}
+	if !applied {
+		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+			return err
+		}
 	}
 	db.refreshSegmentIndexCache(job.folderID, updated)
 	// Option B: do NOT delete the original chunk file. It becomes garbage and can be cleaned later.
@@ -4851,134 +4858,8 @@ func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, accountKey []byte, 
 	}
 }
 
-func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath string) (bool, error) {
-	indexPath := filepath.Join(folderPath, segmentIndexFileName)
-	layout, err := db.loadSegmentIndexLayout(folderPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	if layout.mode == indexLayoutMultiLevel {
-		topData, err := db.readSegmentIndexFile(indexPath)
-		if err != nil {
-			return false, err
-		}
-		topNeedsUpgrade := false
-		if version, ok := multiLevelSegmentIndexVersion(topData); ok {
-			topNeedsUpgrade = version < segmentIndexFormatVersion
-		}
-
-		total := 0
-		for _, entry := range layout.entries {
-			total += int(entry.ChunkCount)
-		}
-		metas := make([]segmentChunkMeta, 0, total)
-		var arena []byte
-		migrated := topNeedsUpgrade
-		for idx, entry := range layout.entries {
-			data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
-			if err != nil {
-				return false, err
-			}
-			if version, ok := compactSegmentIndexVersion(data); ok {
-				if err := decodeSegmentIndexBuffer(data, &metas, &arena, idx != 0, folderPath); err != nil {
-					return false, err
-				}
-				if version < segmentIndexFlatVersion {
-					migrated = true
-				}
-			} else {
-				changed, err := db.decodeSegmentIndexBufferForMigration(data, &metas, &arena, idx != 0, folderPath)
-				if err != nil {
-					return false, err
-				}
-				if changed {
-					migrated = true
-				}
-			}
-		}
-		if !migrated {
-			return false, nil
-		}
-		if err := db.writeSegmentIndex(folderPath, metas); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	data := layout.flatData
-	if len(data) == 0 {
-		data, err = db.readSegmentIndexFile(indexPath)
-		if err != nil {
-			return false, err
-		}
-	}
-	if isCompactSegmentIndexBuffer(data) {
-		version, ok := compactSegmentIndexVersion(data)
-		if !ok {
-			return false, fmt.Errorf("invalid compact segment index header: %s", indexPath)
-		}
-		if version >= segmentIndexFlatVersion {
-			return false, nil
-		}
-		var metas []segmentChunkMeta
-		var arena []byte
-		if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-			return false, err
-		}
-		if err := db.writeSegmentIndex(folderPath, metas); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	if isMultiLevelSegmentIndexBuffer(data) {
-		return false, fmt.Errorf("unexpected multi-level index header in flat layout: %s", indexPath)
-	}
-	var metas []segmentChunkMeta
-	var arena []byte
-	if err := decodeLegacySegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return false, err
-	}
-	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (db *PrefixDB) migrateLegacySegmentIndexFormatsLocked() error {
-	entries, err := os.ReadDir(db.storageDir)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		var folderID uint32
-		if _, err := fmt.Sscanf(entry.Name(), segmentedDirNamePrefix+"%08d", &folderID); err != nil {
-			continue
-		}
-		folderPath := filepath.Join(db.storageDir, entry.Name())
-		db.segmentedMu.Lock()
-		migrated, err := db.migrateLegacySegmentIndexFolder(folderID, folderPath)
-		if err != nil {
-			db.segmentedMu.Unlock()
-			return err
-		}
-		if migrated {
-			db.invalidateSegmentIndexCache(folderID)
-		}
-		db.segmentedMu.Unlock()
-	}
-	return nil
-}
-
 func (db *PrefixDB) MigrateLegacySegmentIndexFormats() error {
-	db.writeMutex.Lock()
-	defer db.writeMutex.Unlock()
-	return db.migrateLegacySegmentIndexFormatsLocked()
+	return errors.New("legacy segment index formats are no longer supported")
 }
 
 func (db *PrefixDB) rebuildSegmentIndexFilesLocked() error {
@@ -5027,9 +4908,6 @@ func (db *PrefixDB) RebuildSegmentIndexFiles() error {
 func (db *PrefixDB) UpgradeSegmentIndexFiles() error {
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
-	if err := db.migrateLegacySegmentIndexFormatsLocked(); err != nil {
-		return err
-	}
 	return db.rebuildSegmentIndexFilesLocked()
 }
 

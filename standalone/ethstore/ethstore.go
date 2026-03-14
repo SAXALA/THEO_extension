@@ -172,10 +172,18 @@ func NewWithPrefixCacheSettings(dirPath string, recentN int, namespace string, r
 }
 
 func NewWithPrefixGCSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*Database, error) {
+	return NewWithPrefixGCAndFileHandlesSettings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, 0)
+}
+
+func NewWithPrefixGCAndFileHandlesSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int) (*Database, error) {
+	return NewWithPrefixGCAndStoreSettings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, 0, 0)
+}
+
+func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
 	logger := log.New("database", dirPath)
 
 	dirPathState := dirPath + "_state"
-	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
@@ -206,10 +214,8 @@ func NewWithPrefixGCSettings(dirPath string, recentN int, namespace string, read
 	// Initialize Pebble store for non-AOL data
 	pebblePath := dirPath + "_pebble"
 	logger.Info("Initializing Pebble store", "path", pebblePath)
-	// Pass 0 for cache and handles to use default values defined in NewPebbleStore.
-	// Pass through namespace and readonly from the New function's parameters.
 
-	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, 0, 0, namespace, readonly)
+	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, pebbleCache, pebbleHandles, namespace, readonly)
 	if err != nil {
 		// Close AOL if Pebble initialization fails
 		db.statepdb.Close()
@@ -238,8 +244,12 @@ func NewStateOnlyWithPrefixCacheSettings(stateDir string, chunkFileSize int, tot
 }
 
 func NewStateOnlyWithPrefixGCSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*Database, error) {
+	return NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, 0)
+}
+
+func NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int) (*Database, error) {
 	logger := log.New("database", stateDir)
-	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression)
+	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize prefixdb (state-only): %w", err)
 	}

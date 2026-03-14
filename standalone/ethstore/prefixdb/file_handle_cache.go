@@ -32,6 +32,20 @@ var (
 	globalHandleCacheMisses   uint64
 )
 
+func resolveFileHandleCacheCapacity(capacity int) int {
+	if capacity <= 0 {
+		return defaultFileHandleCacheCapacity()
+	}
+	if capacity < minFileHandleCacheSize {
+		capacity = minFileHandleCacheSize
+	}
+	if capacity > maxFileHandleCacheSize {
+		capacity = maxFileHandleCacheSize
+	}
+	fmt.Println("The file handle cache capacity is set to", capacity)
+	return capacity
+}
+
 func defaultFileHandleCacheCapacity() int {
 	var lim syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil || lim.Cur == 0 {
@@ -48,9 +62,9 @@ func defaultFileHandleCacheCapacity() int {
 	return capacity
 }
 
-func getGlobalFileHandleCache() *fileHandleCache {
+func getGlobalFileHandleCache(capacity int) *fileHandleCache {
 	globalFileHandleCacheOnce.Do(func() {
-		cache, err := newFileHandleCache(defaultFileHandleCacheCapacity())
+		cache, err := newFileHandleCache(resolveFileHandleCacheCapacity(capacity))
 		if err != nil {
 			panic(fmt.Sprintf("failed to init global file handle cache: %v", err))
 		}
@@ -62,6 +76,9 @@ func getGlobalFileHandleCache() *fileHandleCache {
 func newFileHandleCache(capacity int) (*fileHandleCache, error) {
 	if capacity < minFileHandleCacheSize {
 		capacity = minFileHandleCacheSize
+	}
+	if capacity > maxFileHandleCacheSize {
+		capacity = maxFileHandleCacheSize
 	}
 	fhc := &fileHandleCache{}
 	cache, err := lru.NewWithEvict(capacity, func(key interface{}, value interface{}) {

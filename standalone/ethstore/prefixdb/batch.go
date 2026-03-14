@@ -41,10 +41,11 @@ func NewWriteBatch(db *PrefixDB) *WriteBatch {
 	return &WriteBatch{
 		operations:  make(map[string]WriteOperation),
 		db:          db,
-		autoCommit:  true,
+		autoCommit:  false,
 		commitQueue: make(chan *WriteBatch, 100), // buffered channel for commit batches
 		quitCh:      make(chan struct{}),
 		bgCommit:    false,
+		threshold:   4096,
 	}
 }
 

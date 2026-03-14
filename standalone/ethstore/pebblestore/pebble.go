@@ -30,7 +30,7 @@ const (
 	minCache                = 16
 	minHandles              = 16
 	defaultCacheValue        = 16
-	defaultHandlesValue      = 1048576
+	defaultHandlesValue      = 32768
 	defaultNamespaceValue    = "pebble"
 )
 
@@ -128,10 +128,10 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		MaxConcurrentCompactions: func() int {
 			return runtime.NumCPU() / 2
 		},
-		L0CompactionThreshold:       2,
-		L0StopWritesThreshold:       1000,
-		LBaseMaxBytes:               64 * 1024 * 1024,
-		// BytesPerSync:                4 * 1024 * 1024,
+		L0CompactionThreshold:       4,
+		L0StopWritesThreshold:       12,
+		LBaseMaxBytes:               64 << 20, // 64 MB
+		BytesPerSync:                512 << 10, // 512 KB
 		DisableWAL:                  false,
 		Levels: []pebble.LevelOptions{
 			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
