@@ -201,6 +201,8 @@ type PrefixDB struct {
 
 	nodeFileGCUnsortedRatioThreshold float64
 	gcWorkers                        int
+	nodeFileSortedCompression        bool
+	segmentIndexCompression          bool
 
 	storageCache            *storageValueCache
 	stroageCacheSizeLimit   uint64
@@ -299,17 +301,17 @@ type segmentIndexFolderLock struct {
     the storageChunkFileSize is in bytes, and cacheSize is in bytes.
 */
 func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false)
 }
 
 // NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
 // budget in MiB. All PrefixDB caches share this total budget.
 // Use <=0 values to fallback to the default shared cache size.
 func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0)
+	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false)
 }
 
-func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64) (*PrefixDB, error) {
+func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -340,6 +342,9 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		return nil, fmt.Errorf("failed to create base dir: %v", err)
 	}
 
+	resolvedNodeFileSortedCompression := cfg.NodeFileSortedCompression || nodeFileSortedCompression
+	resolvedSegmentIndexCompression := cfg.SegmentIndexCompression || segmentIndexCompression
+
 	// Resolve paths
 	accountFilePath := resolvePath(cfg.BaseDir, cfg.AccountDir)
 	storageDir := resolvePath(cfg.BaseDir, cfg.StorageDir)
@@ -364,6 +369,8 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		segmentedChunkHardLimit:          computeSegmentedChunkHardLimit(storageChunkFileSize, resolvedStorageGCThreshold),
 		nodeFileGCUnsortedRatioThreshold: cfg.NodeFileGCUnsortedRatioThreshold,
 		gcWorkers:                        cfg.GCWorkers,
+		nodeFileSortedCompression:        resolvedNodeFileSortedCompression,
+		segmentIndexCompression:          resolvedSegmentIndexCompression,
 	}
 	if nodeFileGCRatioThreshold > 0 {
 		db.nodeFileGCUnsortedRatioThreshold = nodeFileGCRatioThreshold
@@ -2652,6 +2659,45 @@ func writeFileIfChanged(db *PrefixDB, path string, data []byte) error {
 	return writeFileAtomic(db, path, data)
 }
 
+func (db *PrefixDB) encodeSegmentIndexFileData(data []byte) ([]byte, error) {
+	if db == nil || !db.segmentIndexCompression || len(data) == 0 {
+		return data, nil
+	}
+	return encodeCompressedMetadataBlock(data)
+}
+
+func (db *PrefixDB) decodeSegmentIndexFileData(path string, data []byte) ([]byte, error) {
+	raw, _, err := maybeDecodeCompressedMetadataBlock(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode compressed segment index %s failed: %w", path, err)
+	}
+	return raw, nil
+}
+
+func (db *PrefixDB) readSegmentIndexFile(path string) ([]byte, error) {
+	data, err := db.readFileWithStats(path, diskIOUsageStorageSegmentIndex)
+	if err != nil {
+		return nil, err
+	}
+	return db.decodeSegmentIndexFileData(path, data)
+}
+
+func (db *PrefixDB) writeSegmentIndexFileIfChanged(path string, data []byte) error {
+	encoded, err := db.encodeSegmentIndexFileData(data)
+	if err != nil {
+		return err
+	}
+	return writeFileIfChanged(db, path, encoded)
+}
+
+func (db *PrefixDB) writeSegmentIndexFileAtomic(path string, data []byte) error {
+	encoded, err := db.encodeSegmentIndexFileData(data)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(db, path, encoded)
+}
+
 func fileContentEqualsBytes(db *PrefixDB, path string, data []byte) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -3035,7 +3081,7 @@ func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayou
 	db.segmentIndexMu.Unlock()
 
 	indexPath := filepath.Join(folderPath, segmentIndexFileName)
-	data, err := db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
+	data, err := db.readSegmentIndexFile(indexPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return segmentIndexLayout{mode: indexLayoutFlat, nextMetaID: 1}, nil
@@ -3185,7 +3231,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			return err
 		}
 		indexPath := filepath.Join(folderPath, segmentIndexFileName)
-		if err := writeFileIfChanged(db, indexPath, buf); err != nil {
+		if err := db.writeSegmentIndexFileIfChanged(indexPath, buf); err != nil {
 			return err
 		}
 		db.bumpSegmentIndexGenerationLocked(entry)
@@ -3264,7 +3310,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			}
 			// We already decided the content changed (or file is missing), so avoid an extra
 			// ReadFile+bytes.Equal pass.
-			if err := writeFileAtomic(db, path, buf); err != nil {
+			if err := db.writeSegmentIndexFileAtomic(path, buf); err != nil {
 				return err
 			}
 		}
@@ -3287,7 +3333,7 @@ func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMet
 			return err
 		}
 		indexPath := filepath.Join(folderPath, segmentIndexFileName)
-		if err := writeFileIfChanged(db, indexPath, buf); err != nil {
+		if err := db.writeSegmentIndexFileIfChanged(indexPath, buf); err != nil {
 			return err
 		}
 	}
@@ -3414,7 +3460,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 		metas = make([]segmentChunkMeta, 0, total)
 		var arena []byte
 		for idx, entry := range layout.entries {
-			data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
+			data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 			if err != nil {
 				return nil, err
 			}
@@ -3427,7 +3473,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 		data := layout.flatData
 		if len(data) == 0 {
 			indexPath := filepath.Join(folderPath, segmentIndexFileName)
-			data, err = db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
+			data, err = db.readSegmentIndexFile(indexPath)
 			if err != nil {
 				return nil, err
 			}
@@ -3484,7 +3530,7 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
-	data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
+	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 	if err != nil {
 		return nil, err
 	}
@@ -4815,7 +4861,7 @@ func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath 
 		return false, err
 	}
 	if layout.mode == indexLayoutMultiLevel {
-		topData, err := db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
+		topData, err := db.readSegmentIndexFile(indexPath)
 		if err != nil {
 			return false, err
 		}
@@ -4832,7 +4878,7 @@ func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath 
 		var arena []byte
 		migrated := topNeedsUpgrade
 		for idx, entry := range layout.entries {
-			data, err := db.readFileWithStats(level2IndexFilePath(folderPath, entry.MetaID), diskIOUsageStorageSegmentIndex)
+			data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 			if err != nil {
 				return false, err
 			}
@@ -4864,7 +4910,7 @@ func (db *PrefixDB) migrateLegacySegmentIndexFolder(folderID uint32, folderPath 
 
 	data := layout.flatData
 	if len(data) == 0 {
-		data, err = db.readFileWithStats(indexPath, diskIOUsageStorageSegmentIndex)
+		data, err = db.readSegmentIndexFile(indexPath)
 		if err != nil {
 			return false, err
 		}

@@ -694,6 +694,52 @@ func TestUpgradeSegmentIndexFilesRebuildsUsingCurrentLayoutConstants(t *testing.
 	}
 }
 
+func TestSegmentIndexCompressionRoundTrip(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, false, true)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(9)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := []segmentChunkMeta{
+		{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}, KeyEnd: []byte{0x02}, KVCount: 1, ChunkSize: 128},
+		{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}, KeyEnd: []byte{0x04}, KVCount: 2, ChunkSize: 256},
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(folderPath, segmentIndexFileName))
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(raw[:4]); got != compressedMetadataMagic {
+		t.Fatalf("expected compressed metadata wrapper magic, got 0x%x", got)
+	}
+	decoded, err := db.readSegmentIndexNoCache(folderID)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
+	}
+	if err := db.UpgradeSegmentIndexFiles(); err != nil {
+		t.Fatalf("UpgradeSegmentIndexFiles failed: %v", err)
+	}
+	decoded, err = db.readSegmentIndexNoCache(folderID)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache after upgrade failed: %v", err)
+	}
+	if !segmentChunkMetasEqual(decoded, metas) {
+		t.Fatalf("decoded metas mismatch after upgrade: got %+v want %+v", decoded, metas)
+	}
+}
+
 func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 	shared := newSharedByteCache(4096)
 	db := &PrefixDB{
@@ -804,6 +850,55 @@ func TestNewPrefixTreeLoadsGlobalNodeIntoSkipList(t *testing.T) {
 	}
 }
 
+func TestNewPrefixTreeLoadsCompressedGlobalNodeIntoSkipList(t *testing.T) {
+	baseDir := t.TempDir()
+	fileNodeDir := filepath.Join(baseDir, "prefixdb", "filenodes")
+	if err := os.MkdirAll(fileNodeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	filePath := filepath.Join(fileNodeDir, globalFileName)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: 1, UnsortedEntryCount: 1}
+	sortedData := encodeNodeEntries([]NodeInfo{{key: []byte{0x01, 0x02, 0x03}, accountOffset: 10, storageFileID: 1, storageOffset: 11, storageSize: 12}})
+	unsortedData := encodeNodeEntries([]NodeInfo{{key: []byte{0x01, 0x02, 0x03}, accountOffset: 20, storageFileID: 2, storageOffset: 21, storageSize: 22}})
+	payload, err := encodeNodeFilePayload(&header, sortedData, unsortedData, true)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("encodeNodeFilePayload failed: %v", err)
+	}
+	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+		_ = file.Close()
+		t.Fatalf("write header failed: %v", err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		t.Fatalf("write payload failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file failed: %v", err)
+	}
+
+	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	node, found, err := pt.Get([]byte{0x01, 0x02, 0x03})
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected compressed global node entry to be loaded")
+	}
+	if node.accountOffset != 20 || node.storageFileID != 2 || node.storageOffset != 21 || node.storageSize != 22 {
+		t.Fatalf("unexpected loaded node info: %+v", node)
+	}
+}
+
 func TestGlobalNodePutAppendsAndUpdatesSkipList(t *testing.T) {
 	baseDir := t.TempDir()
 	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
@@ -848,6 +943,58 @@ func TestGlobalNodePutAppendsAndUpdatesSkipList(t *testing.T) {
 	}
 	if _, ok := pt.getFileNodeCache(globalFileName); ok {
 		t.Fatal("global.node should bypass the shared file node cache")
+	}
+}
+
+func TestPutIntoCompressedNodeFileAppendsAfterCompressedSortedPayload(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, true, false)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	fileID := pt.getBucketID([]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee})
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: 1}
+	sortedEntry := NodeInfo{key: []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee}, accountOffset: 10, storageFileID: 1, storageOffset: 11, storageSize: 12}
+	payload, err := encodeNodeFilePayload(&header, encodeNodeEntries([]NodeInfo{sortedEntry}), nil, true)
+	if err != nil {
+		t.Fatalf("encodeNodeFilePayload failed: %v", err)
+	}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+		_ = file.Close()
+		t.Fatalf("write header failed: %v", err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		t.Fatalf("write payload failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file failed: %v", err)
+	}
+
+	updated := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee}
+	if err := pt.putIntoFileNode(fileID, updated, 20, 2, 21, 22); err != nil {
+		t.Fatalf("putIntoFileNode failed: %v", err)
+	}
+	node, found, err := pt.getFromFileNode(fileID, updated)
+	if err != nil {
+		t.Fatalf("getFromFileNode failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected appended node to be found")
+	}
+	if node.accountOffset != 20 || node.storageFileID != 2 || node.storageOffset != 21 || node.storageSize != 22 {
+		t.Fatalf("unexpected appended node info: %+v", node)
 	}
 }
 

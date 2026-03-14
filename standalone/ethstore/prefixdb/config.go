@@ -29,6 +29,12 @@ type Config struct {
 	// chunk_file_size >= target_chunk_size * threshold.
 	// Values <= 0 fall back to the default 2.0.
 	StorageGCThreshold float64 `json:"storage_gc_threshold"`
+	// NodeFileSortedCompression enables zstd compression for the sorted portion
+	// of node files. Disabled by default.
+	NodeFileSortedCompression bool `json:"node_file_sorted_compression"`
+	// SegmentIndexCompression enables zstd compression for segment index files.
+	// Disabled by default.
+	SegmentIndexCompression bool `json:"segment_index_compression"`
 }
 
 // DefaultConfig returns a configuration with default values.
