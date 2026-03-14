@@ -11,8 +11,8 @@ set -Eeuo pipefail
 
 # 可执行动作: load(加载数据) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
 ACTIONS="load restore replay gc upgrade-index"
-# 后端类型: ethstore | chainkv | pebble | all(依次执行前三者)
-BACKENDS="ethstore chainkv pebble all"
+# 后端类型: ethstore | chainkv | pebble | prefixdb | all(依次执行前三者)
+BACKENDS="ethstore chainkv pebble prefixdb all"
 
 # 位置参数1: ACTION，可选值见 ACTIONS，默认 replay
 ACTION="${1:-replay}"
@@ -33,7 +33,7 @@ CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
 # segmented storage GC 阈值：当 chunk_file_size >= target_chunk_size * threshold 时触发 GC
-STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-2}"
+STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-3}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
 DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
@@ -41,8 +41,8 @@ if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
 fi
 GC_WORKERS="${GC_WORKERS:-${NODE_FILE_GC_WORKERS:-$DEFAULT_GC_WORKERS}}"
 
-# ethstore load 参数: chunk 文件大小（字节），如 4096/16384/65536/262144
-CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
+# ethstore load 参数: chunk 文件大小（字节），如 4096/8192/16384/65536/262144
+CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-8192}"
 # ethstore 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
 TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-512}"
 
@@ -73,7 +73,16 @@ RUNNING_ROOT="${RUNNING_ROOT:-/mnt/ssd2/running}"
 DISK_MOUNT_POINT="/mnt/ssd2"
 
 # ethstore statedb 目录名，可选: database_statedb16KB | database_statedb64KB | database_statedb256KB
-ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-database_statedb16KB_gced_upgrade_copy}"
+calculate_default_ethstore_statedb_dirname() {
+    case "$CHUNK_FILE_SIZE" in
+        4096) echo "database_statedb4KB" ;;
+        8192) echo "database_statedb8KB" ;;
+        16384) echo "database_statedb16KB" ;;
+        262144) echo "database_statedb256KB" ;;
+        *) echo "Invalid CHUNK_FILE_SIZE=${CHUNK_FILE_SIZE}. Supported values: 4096, 8192, 16384, 262144" >&2; exit 1 ;;
+    esac
+}
+ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethstore_statedb_dirname)}"
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
 GC_STATE_DIR="${GC_STATE_DIR:-/mnt/ssd2/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
@@ -181,7 +190,7 @@ export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
 usage() {
     cat <<EOF
-Usage: $0 [load|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|all]
+Usage: $0 [load|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
 
 Current values:
   action=${ACTION}
@@ -206,6 +215,7 @@ Common env vars:
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
     load/replay ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
+    load prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir/accountHashKeyPebbleDir
     gc: backend must be ethstore, and GC_STATE_DIR must be provided
     upgrade-index: backend must be ethstore, and UPGRADE_STATE_DIR must be provided
 EOF
@@ -250,6 +260,11 @@ validate_runtime_requirements() {
             echo "RUNNING_ROOT 不存在，自动创建: ${RUNNING_ROOT}"
             sudo_run mkdir -p "$RUNNING_ROOT"
         fi
+    fi
+
+    if [ "$BACKEND" = "prefixdb" ] && [ "$ACTION" != "load" ]; then
+        echo "prefixdb backend 当前仅支持 load（当前 ACTION=${ACTION}）"
+        exit 1
     fi
 
     if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "ethstore" ]; then
@@ -453,6 +468,8 @@ build_run_tag() {
         printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}"
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
+    elif [ "$backend" = "prefixdb" ]; then
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
         printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}${round_tag}"
     else
@@ -486,6 +503,9 @@ print_param_snapshot() {
         printf 'GC_WORKERS=%s\n' "$GC_WORKERS"
         printf 'STORAGE_GC_THRESHOLD=%s\n' "$STORAGE_GC_THRESHOLD"
         printf 'CHUNK_FILE_SIZE=%s\n' "$CHUNK_FILE_SIZE"
+        printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
+    elif [ "$snapshot_backend" = "prefixdb" ]; then
+        printf 'CHUNK_FILE_SIZE=%s (bytes)\n' "$CHUNK_FILE_SIZE"
         printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
     elif [ "$snapshot_backend" = "chainkv" ]; then
         printf 'CHAINKV_CACHE_MB=%s\n' "$CHAINKV_CACHE_MB"
@@ -552,6 +572,10 @@ run_load() {
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode ld -backend ethstore -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD"
+            ;;
+        prefixdb)
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode ld -backend prefixdb -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \

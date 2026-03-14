@@ -21,13 +21,13 @@ BACKEND_SELECTOR="${2:-}"
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(32) #64
-BACKEND_CANDIDATES=(ethstore) # pebble ethstore
+BACKEND_CANDIDATES=(pebble) # pebble ethstore
 TRACE_FILE_CANDIDATES=(cache) # nocache_snap
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-16384}"
+CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-8192}"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"

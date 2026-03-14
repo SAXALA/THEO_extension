@@ -375,7 +375,9 @@ func TestPebbleBatch_DeleteRange_Basic(t *testing.T) {
 		require.NoError(t, ps.Put([]byte(k), []byte(k)))
 	}
 	batch := ps.NewBatch()
-	require.NoError(t, batch.DeleteRange([]byte("2"), []byte("4")))
+	rb, ok := batch.(interface{ DeleteRange(start, end []byte) error })
+	require.True(t, ok)
+	require.NoError(t, rb.DeleteRange([]byte("2"), []byte("4")))
 	require.NoError(t, batch.Write())
 	for k, want := range map[string]bool{
 		"1": true, "2": false, "3": false, "4": true, "5": true,
@@ -393,7 +395,9 @@ func TestPebbleBatch_DeleteRange_NilEnd(t *testing.T) {
 		require.NoError(t, ps.Put([]byte(k), []byte(k)))
 	}
 	batch := ps.NewBatch()
-	require.NoError(t, batch.DeleteRange([]byte("b"), nil))
+	rb, ok := batch.(interface{ DeleteRange(start, end []byte) error })
+	require.True(t, ok)
+	require.NoError(t, rb.DeleteRange([]byte("b"), nil))
 	require.NoError(t, batch.Write())
 	_, ok, err := ps.Has([]byte("a"))
 	require.NoError(t, err)
@@ -463,7 +467,9 @@ func TestPebbleBatch_Replay_WithDeleteRange(t *testing.T) {
 	}
 	b1 := ps.NewBatch()
 	require.NoError(t, b1.Put([]byte("new"), []byte("new-val")))
-	require.NoError(t, b1.DeleteRange([]byte("3"), []byte("7")))
+	rb, ok := b1.(interface{ DeleteRange(start, end []byte) error })
+	require.True(t, ok)
+	require.NoError(t, rb.DeleteRange([]byte("3"), []byte("7")))
 	require.NoError(t, b1.Delete([]byte("8")))
 	b2 := ps.NewBatch()
 	require.NoError(t, b1.Replay(b2))

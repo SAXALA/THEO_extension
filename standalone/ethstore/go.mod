@@ -3,8 +3,8 @@ module github.com/tinoryj/EthStore/standalone/ethstore
 go 1.24.2
 
 require (
-	github.com/cockroachdb/pebble v1.1.5
-	github.com/ethereum/go-ethereum v1.16.8
+	github.com/cockroachdb/pebble v1.1.2
+	github.com/ethereum/go-ethereum v1.14.11
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/huandu/skiplist v1.2.1
 	github.com/stretchr/testify v1.10.0
@@ -44,7 +44,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
+	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect

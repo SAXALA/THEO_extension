@@ -225,7 +225,7 @@ func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	metas := make([]segmentChunkMeta, 600)
+	metas := make([]segmentChunkMeta, 1000)
 	for i := range metas {
 		start := []byte(fmt.Sprintf("k%08d", i*2))
 		end := []byte(fmt.Sprintf("k%08d", i*2+1))
@@ -240,6 +240,7 @@ func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
 	}
+	db.invalidateSegmentIndexCache(folderID)
 
 	targetKey := metas[333].KeyStart
 	before := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
@@ -277,6 +278,9 @@ func writeAccountRecordForTest(t *testing.T, file *os.File, key []byte, value []
 		t.Fatalf("Stat failed: %v", err)
 	}
 	offset := info.Size()
+	if offset == 0 {
+		offset = 1
+	}
 	buf := make([]byte, 4+len(key)+len(value))
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(key)))
 	binary.BigEndian.PutUint16(buf[2:4], uint16(len(value)))
@@ -580,12 +584,15 @@ func TestMigrateLegacySegmentIndexFormatsMigratesLegacyLevel2Files(t *testing.T)
 	if err := db.MigrateLegacySegmentIndexFormats(); err != nil {
 		t.Fatalf("MigrateLegacySegmentIndexFormats failed: %v", err)
 	}
-	buf, err := os.ReadFile(level2IndexFilePath(folderPath, 1))
+	buf, err := os.ReadFile(filepath.Join(folderPath, segmentIndexFileName))
 	if err != nil {
-		t.Fatalf("ReadFile migrated level2 failed: %v", err)
+		t.Fatalf("ReadFile migrated index failed: %v", err)
 	}
 	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
-		t.Fatalf("expected migrated level2 flat magic, got 0x%x", got)
+		t.Fatalf("expected migrated flat magic following current layout rules, got 0x%x", got)
+	}
+	if _, err := os.Stat(level2IndexFilePath(folderPath, 1)); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy level2 file to be removed after migration, got err=%v", err)
 	}
 	decoded, err := db.readSegmentIndexNoCache(2)
 	if err != nil {

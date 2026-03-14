@@ -14,6 +14,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -383,7 +384,7 @@ type replayConfig struct {
 	PebbleDBDir                  string `json:"pebbleDir"`
 	ChainKVDir                   string `json:"chainKVDir"`
 	AccountHashKeyPebbleDir      string `json:"accountHashKeyPebbleDir"`
-	loadedEthstoreDir            string `json:"loadedEthStoreDir"`
+	LoadedEthstoreDir            string `json:"loadedEthStoreDir"`
 }
 
 func loadReplayConfig(path string) (replayConfig, error) {
@@ -547,7 +548,13 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 			return fmt.Errorf("ethstore account load failed: %w", err)
 		}
 	case strings.EqualFold(backend, "prefixdb"):
-		if err := loadPrefixDB(cfg.loadedEthstoreDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, contractChunkFileSizeMiB, totalCacheSizeMiB); err != nil {
+		if strings.TrimSpace(cfg.LoadedEthstoreDir) == "" {
+			return fmt.Errorf("ld with prefixdb backend requires loadedEthStoreDir in config")
+		}
+		if strings.TrimSpace(cfg.LoadDataDir) == "" {
+			return fmt.Errorf("ld with prefixdb backend requires loadDataDir in config")
+		}
+		if err := loadPrefixDB(cfg.LoadedEthstoreDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, contractChunkFileSizeMiB, totalCacheSizeMiB); err != nil {
 			return fmt.Errorf("prefixdb load failed: %w", err)
 		}
 		return nil
@@ -1667,10 +1674,12 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 }
 
 func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int) error {
-	var dir string
+	baseDir := strings.TrimSpace(databaseDir)
+	if baseDir == "" {
+		return fmt.Errorf("loadPrefixDB requires non-empty databaseDir (loadedEthStoreDir)")
+	}
 	chunkFileSizeStr := strconv.Itoa(chunkFileSize/1024) + "KB"
-
-	dir = databaseDir + "/database_statedb" + chunkFileSizeStr
+	dir := filepath.Join(baseDir, "database_statedb"+chunkFileSizeStr)
 
 	// dir = databaseDir + "/database_state"
 

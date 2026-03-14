@@ -3,7 +3,7 @@ module github.com/tinoryj/EthStore/ChainKV
 go 1.24.0
 
 require (
-	github.com/ethereum/go-ethereum v1.16.8
+	github.com/ethereum/go-ethereum v1.14.11
 	github.com/golang/snappy v1.0.0
 	github.com/onsi/ginkgo v1.16.5
 	github.com/onsi/gomega v1.39.1

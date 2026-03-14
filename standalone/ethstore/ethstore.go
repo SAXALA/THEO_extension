@@ -146,7 +146,7 @@ type Database struct {
 
 	accountHashKeyCache *accountHashToKeyCache // in-memory cache: accountHash(32) -> accountKey(max64)
 
-	diskSizeGauge *metrics.Gauge // Gauge for tracking the size of all the data in the database
+	diskSizeGauge metrics.Gauge // Gauge for tracking the size of all the data in the database
 
 	quitLock sync.RWMutex    // Mutex protecting the quit channel and the closed flag
 	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database

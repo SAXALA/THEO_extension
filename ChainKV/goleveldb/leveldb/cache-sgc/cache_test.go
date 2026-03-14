@@ -417,38 +417,38 @@ func TestLRUCache_Capacity(t *testing.T) {
 	if c.Capacity() != 10 {
 		t.Errorf("invalid capacity: want=%d got=%d", 10, c.Capacity())
 	}
-	// charge表示大小，占用capacity
+	// cache-sgc 使用 ARC 风格的 resident + ghost 队列，Capacity 限制的是驻留数据，
+	// 而不是底层 map 中保留的全部元数据节点。
 	set(c, 0, 1, 1, 1, nil).Release()
-	fmt.Println(c.Nodes())
 	set(c, 0, 2, 2, 2, nil).Release()
-	fmt.Println(c.Nodes())
 	set(c, 1, 1, 3, 3, nil).Release()
-	fmt.Println(c.Nodes(),c.Size())
 	set(c, 2, 1, 4, 1, nil).Release()
-	fmt.Println(c.Nodes())
 	set(c, 2, 2, 5, 1, nil).Release()
-	fmt.Println(c.Nodes())
 	set(c, 2, 3, 6, 1, nil).Release()
-	fmt.Println(c.Nodes(),c.Size())
 	set(c, 2, 4, 7, 1, nil).Release()
-	fmt.Println(c.Nodes())
 	set(c, 2, 5, 8, 1, nil).Release()
-	fmt.Println(c.Nodes())
-	if c.Nodes() != 7 {
-		t.Errorf("invalid nodes counter: want=%d got=%d", 7, c.Nodes())
+	arc := c.cacher.(*lru)
+	if c.Nodes() != 8 {
+		t.Errorf("invalid nodes counter: want=%d got=%d", 8, c.Nodes())
 	}
-	if c.Size() != 10 {
-		t.Errorf("invalid size counter: want=%d got=%d", 10, c.Size())
+	if c.Size() != 11 {
+		t.Errorf("invalid size counter: want=%d got=%d", 11, c.Size())
+	}
+	if resident := arc.rused + arc.fused; resident > c.Capacity() {
+		t.Fatalf("resident usage exceeds capacity: used=%d cap=%d", resident, c.Capacity())
 	}
 	c.SetCapacity(9)
 	if c.Capacity() != 9 {
 		t.Errorf("invalid capacity: want=%d got=%d", 9, c.Capacity())
 	}
-	if c.Nodes() != 6 {
-		t.Errorf("invalid nodes counter: want=%d got=%d", 6, c.Nodes())
+	if c.Nodes() != 8 {
+		t.Errorf("invalid nodes counter: want=%d got=%d", 8, c.Nodes())
 	}
-	if c.Size() != 8 {
-		t.Errorf("invalid size counter: want=%d got=%d", 8, c.Size())
+	if c.Size() != 11 {
+		t.Errorf("invalid size counter: want=%d got=%d", 11, c.Size())
+	}
+	if resident := arc.rused + arc.fused; resident > c.Capacity() {
+		t.Fatalf("resident usage exceeds capacity after resize: used=%d cap=%d", resident, c.Capacity())
 	}
 }
 
@@ -503,7 +503,19 @@ func TestLRUCache_Eviction(t *testing.T) {
 			h.Release()
 		}
 	}
-	for _, key := range []uint64{3, 4, 9} {
+	// cache-sgc 会把 3/4 留在 ARC 的 ghost 轨迹中，而大对象 9 会被驱逐。
+	for _, key := range []uint64{3, 4} {
+		h := c.Get(0, key, nil)
+		if h == nil {
+			t.Errorf("miss for key '%d'", key)
+		} else {
+			if x := h.Value().(int); x != int(key) {
+				t.Errorf("invalid value for key '%d' want '%d', got '%d'", key, key, x)
+			}
+			h.Release()
+		}
+	}
+	for _, key := range []uint64{9} {
 		h := c.Get(0, key, nil)
 		if h != nil {
 			t.Errorf("hit for key '%d'", key)

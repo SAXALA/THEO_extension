@@ -130,7 +130,7 @@ func (r *lru) Capacity() int {
 func (r *lru) SetCapacity(capacity int) {
 	var evicted []*lruNode
 	r.mu.Lock()
-	r.capacity = capacity+1
+	r.capacity = capacity
 	// 如果容量超出使用，先回收recent和frequent，然后回收r1和f1
 	for r.rused + r.fused >= r.capacity{
 		r.replace(false)
@@ -411,6 +411,17 @@ func (r *lru) Evict(n *Node) {
 		r.mu.Unlock()
 		return
 	}
+	rn.remove()
+	switch rn.ty {
+	case 0:
+		r.rused -= rn.n.Size()
+	case 1:
+		r.fused -= rn.n.Size()
+	case 2:
+		r.r1used -= rn.n.Size()
+	case 3:
+		r.f1used -= rn.n.Size()
+	}
 	n.CacheData = nil
 	r.mu.Unlock()
 
@@ -469,39 +480,31 @@ func (r *lru) EvictNS(ns uint64) {
 }
 
 func (r *lru) EvictAll() {
+	var evicted []*lruNode
 	r.mu.Lock()
 	back := r.recent.prev
 	for rn := back; rn != &r.recent; rn = rn.prev {
 		rn.n.CacheData = nil
+		evicted = append(evicted, rn)
 	}
 	back = r.frequent.prev
 	for rn := back; rn != &r.frequent; rn = rn.prev {
 		rn.n.CacheData = nil
+		evicted = append(evicted, rn)
 	}
 	back = r.r1.prev
 	for rn := back; rn != &r.r1; rn = rn.prev {
 		rn.n.CacheData = nil
+		evicted = append(evicted, rn)
 	}
 	back = r.f1.prev
 	for rn := back; rn != &r.f1; rn = rn.prev {
 		rn.n.CacheData = nil
+		evicted = append(evicted, rn)
 	}
 	r.reset()
 	r.mu.Unlock()
-	back = r.recent.prev
-	for rn := back; rn != &r.recent; rn = rn.prev {
-		rn.h.Release()
-	}
-	back = r.frequent.prev
-	for rn := back; rn != &r.frequent; rn = rn.prev {
-		rn.h.Release()
-	}
-	back = r.r1.prev
-	for rn := back; rn != &r.r1; rn = rn.prev {
-		rn.h.Release()
-	}
-	back = r.f1.prev
-	for rn := back; rn != &r.f1; rn = rn.prev {
+	for _, rn := range evicted {
 		rn.h.Release()
 	}
 }
