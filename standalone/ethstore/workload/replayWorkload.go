@@ -554,7 +554,7 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeMiB int,
 		if strings.TrimSpace(cfg.LoadDataDir) == "" {
 			return fmt.Errorf("ld with prefixdb backend requires loadDataDir in config")
 		}
-		if err := loadPrefixDB(cfg.LoadedEthstoreDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, contractChunkFileSizeMiB, totalCacheSizeMiB, prefixdbHandles); err != nil {
+		if err := loadPrefixDB(cfg.LoadedEthstoreDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, contractChunkFileSizeMiB, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("prefixdb load failed: %w", err)
 		}
 		return nil
@@ -1367,6 +1367,11 @@ func printRuntimeArgsSnapshot(
 		fmt.Printf("contract_chunk_file_mib=%d\n", contractChunkFileSizeMiB)
 		fmt.Printf("total_cache_size_mib=%d\n", totalCacheSizeMiB)
 		fmt.Printf("prefixdb_handles=%d\n", prefixdbHandles)
+		fmt.Printf("node_file_gc_unsorted_ratio_threshold=%g\n", nodeFileGCRatioThreshold)
+		fmt.Printf("gc_workers=%d\n", gcWorkers)
+		fmt.Printf("storage_gc_threshold=%g\n", storageGCThreshold)
+		fmt.Printf("node_file_sorted_compression=%t\n", nodeFileSortedCompression)
+		fmt.Printf("segment_index_compression=%t\n", segmentIndexCompression)
 	} else if strings.EqualFold(backend, "chainkv") {
 		fmt.Printf("ckv_cache=%d\n", ckvCache)
 		fmt.Printf("ckv_handles=%d\n", ckvHandles)
@@ -1687,12 +1692,14 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 
 		}
 	}
-	store.GCPrefixTree()
+	if err := store.RunPostLoadGC(); err != nil {
+		log.Fatalf("Failed to run post-load GC: %v", err)
+	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }
 
-func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int, prefixdbHandles int) error {
+func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFileSize int, cacheSize int, prefixdbHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
 	baseDir := strings.TrimSpace(databaseDir)
 	if baseDir == "" {
 		return fmt.Errorf("loadPrefixDB requires non-empty databaseDir (loadedEthStoreDir)")
@@ -1702,7 +1709,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 
 	// dir = databaseDir + "/database_state"
 
-	pdb, err := prefixdb.NewPrefixDBWithFileHandleCacheSettings(dir, chunkFileSize, cacheSize, 16, prefixdbHandles)
+	pdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dir, chunkFileSize, cacheSize, 16, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
 		return fmt.Errorf("failed to create PrefixDB: %w", err)
 	}
@@ -1825,8 +1832,9 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 	}
 
 	// pdb.SaveTrie()
-	pdb.GCPrefixTree()
-	pdb.GCAllStorageChunkFiles()
+	if err := pdb.RunPostLoadGC(); err != nil {
+		return fmt.Errorf("failed to run post-load GC: %w", err)
+	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }

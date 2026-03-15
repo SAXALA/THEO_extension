@@ -1110,6 +1110,176 @@ func TestPrefixTreeShouldScheduleGCUsesRatioThreshold(t *testing.T) {
 	}
 }
 
+func TestRunPostLoadGCCompactsAllNodeFilesIgnoringRatio(t *testing.T) {
+	db, err := NewPrefixDBWithRuntimeOptions(t.TempDir(), 16*1024, 8, 16, 1e9, 0, 1e9, true, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	globalKey := []byte{0x01, 0x02, 0x03}
+	bucketKey := bytes.Repeat([]byte{0xaa}, 32)
+	if err := db.prefixTree.Put(globalKey, 11, 1, 101, 1001); err != nil {
+		t.Fatalf("put global key failed: %v", err)
+	}
+	if err := db.prefixTree.Put(bucketKey, 22, 2, 202, 2002); err != nil {
+		t.Fatalf("put bucket key failed: %v", err)
+	}
+
+	globalPath := filepath.Join(db.prefixTree.fileNodeDir, globalFileName)
+	bucketID := db.prefixTree.fileIDForKey(bucketKey)
+	bucketPath := filepath.Join(db.prefixTree.fileNodeDir, bucketID)
+
+	for _, path := range []string{globalPath, bucketPath} {
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open node file before GC failed: %v", err)
+		}
+		var header FileNodeHeader
+		if err := binary.Read(file, binary.BigEndian, &header); err != nil {
+			_ = file.Close()
+			t.Fatalf("read header before GC failed: %v", err)
+		}
+		_ = file.Close()
+		if header.UnsortedEntryCount == 0 {
+			t.Fatalf("expected unsorted entries before post-load GC for %s", path)
+		}
+	}
+
+	if err := db.RunPostLoadGC(); err != nil {
+		t.Fatalf("RunPostLoadGC failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		key  []byte
+	}{
+		{name: "global", path: globalPath, key: globalKey},
+		{name: "bucket", path: bucketPath, key: bucketKey},
+	} {
+		file, err := os.Open(tc.path)
+		if err != nil {
+			t.Fatalf("open %s node file after GC failed: %v", tc.name, err)
+		}
+		var header FileNodeHeader
+		if err := binary.Read(file, binary.BigEndian, &header); err != nil {
+			_ = file.Close()
+			t.Fatalf("read %s header after GC failed: %v", tc.name, err)
+		}
+		_ = file.Close()
+		if header.UnsortedEntryCount != 0 {
+			t.Fatalf("expected %s node file to be fully compacted, unsorted=%d", tc.name, header.UnsortedEntryCount)
+		}
+		if header.SortedEntryCount == 0 {
+			t.Fatalf("expected %s node file to retain sorted entries", tc.name)
+		}
+		if !header.sortedCompressed() {
+			t.Fatalf("expected %s node file sorted part to be compressed", tc.name)
+		}
+		node, found, err := db.prefixTree.Get(tc.key)
+		if err != nil {
+			t.Fatalf("Get %s key after GC failed: %v", tc.name, err)
+		}
+		if !found {
+			t.Fatalf("expected %s key to remain after GC", tc.name)
+		}
+		if node.accountOffset == 0 {
+			t.Fatalf("expected %s node info to remain populated after GC", tc.name)
+		}
+	}
+}
+
+func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T) {
+	db, err := NewPrefixDBWithRuntimeOptions(t.TempDir(), 64, 8, 16, 1e9, 0, 1e9, true, true, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(7)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	const totalChunks = 96
+	metas := make([]segmentChunkMeta, 0, totalChunks)
+	for i := 0; i < totalChunks; i++ {
+		key := []byte(fmt.Sprintf("storage-key-%03d-%s", i, strings.Repeat("k", 64)))
+		value := []byte(fmt.Sprintf("value-%03d", i))
+		if i == totalChunks-1 {
+			key = []byte(fmt.Sprintf("storage-key-%03d-%s", 0, strings.Repeat("k", 64)))
+			value = []byte("value-latest")
+		}
+		entries := []kvPair{{key: key, val: value}}
+		fileName := chunkFileNameForOrdinal(uint32(i))
+		chunkSize, err := db.writeChunkFile(folderPath, fileName, entries)
+		if err != nil {
+			t.Fatalf("writeChunkFile %s failed: %v", fileName, err)
+		}
+		metas = append(metas, segmentChunkMeta{
+			FileName:  fileName,
+			KeyStart:  append([]byte(nil), key...),
+			KeyEnd:    append([]byte(nil), key...),
+			KVCount:   1,
+			ChunkSize: uint64(chunkSize),
+		})
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	if err := db.RunPostLoadGC(); err != nil {
+		t.Fatalf("RunPostLoadGC failed: %v", err)
+	}
+
+	rawIndex, err := os.ReadFile(filepath.Join(folderPath, segmentIndexFileName))
+	if err != nil {
+		t.Fatalf("ReadFile index.meta failed: %v", err)
+	}
+	if len(rawIndex) < 4 || binary.BigEndian.Uint32(rawIndex[:4]) != compressedMetadataMagic {
+		t.Fatalf("expected compressed segment index after post-load GC")
+	}
+
+	updatedMetas, err := db.readSegmentIndexNoCache(folderID)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCache failed: %v", err)
+	}
+	if len(updatedMetas) == 0 {
+		t.Fatal("expected rewritten storage chunk metadata after post-load GC")
+	}
+
+	allEntries := make([]kvPair, 0)
+	for _, meta := range updatedMetas {
+		entries, backing, err := db.readSegmentChunkFile(folderID, meta.FileName)
+		if err != nil {
+			t.Fatalf("readSegmentChunkFile %s failed: %v", meta.FileName, err)
+		}
+		for _, entry := range entries {
+			keyCopy := append([]byte(nil), entry.key...)
+			var valCopy []byte
+			if entry.val != nil {
+				valCopy = append([]byte(nil), entry.val...)
+			}
+			allEntries = append(allEntries, kvPair{key: keyCopy, val: valCopy})
+		}
+		if backing != nil {
+			backing.Release()
+		}
+	}
+	if len(allEntries) != totalChunks-1 {
+		t.Fatalf("expected deduplicated storage entries after full GC, got %d want %d", len(allEntries), totalChunks-1)
+	}
+	entriesByKey := make(map[string][]byte, len(allEntries))
+	for _, entry := range allEntries {
+		entriesByKey[string(entry.key)] = entry.val
+	}
+	if len(entriesByKey) != len(allEntries) {
+		t.Fatalf("expected post-load GC to leave only unique storage keys, got %d unique out of %d", len(entriesByKey), len(allEntries))
+	}
+}
+
 func TestPrefixTreeGCWorkerConcurrency(t *testing.T) {
 	pt := &PrefixTree{gcWorkerCount: 3}
 	if got := pt.gcWorkerConcurrency(); got != 3 {

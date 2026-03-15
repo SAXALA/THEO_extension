@@ -1670,8 +1670,9 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 	return file, nil
 }
 
-// gc All filenodes
-func (pt *PrefixTree) GC() int {
+// CompactAllNodeFiles performs a full sweep over all node files and compacts
+// every file that still contains an unsorted portion.
+func (pt *PrefixTree) CompactAllNodeFiles() int {
 	pt.lock.Lock()
 	defer pt.lock.Unlock()
 
@@ -1718,4 +1719,9 @@ func (pt *PrefixTree) GC() int {
 		jobs = append(jobs, gcJob{fileID: fileID, state: state})
 	}
 	return count + pt.runGCJobsInParallel(jobs)
+}
+
+// GC keeps the historical API name and delegates to the full-sweep compaction.
+func (pt *PrefixTree) GC() int {
+	return pt.CompactAllNodeFiles()
 }

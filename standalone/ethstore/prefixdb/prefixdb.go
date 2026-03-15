@@ -5093,3 +5093,18 @@ func (db *PrefixDB) GCPrefixTree() error {
 	}
 	return fmt.Errorf("prefix tree GC failed")
 }
+
+// RunPostLoadGC performs the full compaction steps expected after bulk load.
+// It always sweeps all node files with unsorted data and all segmented storage folders.
+func (db *PrefixDB) RunPostLoadGC() error {
+	db.writeMutex.Lock()
+	if count := db.prefixTree.CompactAllNodeFiles(); count < 0 {
+		db.writeMutex.Unlock()
+		return fmt.Errorf("prefix tree GC failed")
+	}
+	db.writeMutex.Unlock()
+	if err := db.GCAllStorageChunkFiles(); err != nil {
+		return err
+	}
+	return nil
+}

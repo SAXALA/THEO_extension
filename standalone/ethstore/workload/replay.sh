@@ -476,7 +476,7 @@ build_run_tag() {
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
     elif [ "$backend" = "prefixdb" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}"
     elif [ "$backend" = "ethstore" ]; then
         printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}"
     else
@@ -520,6 +520,11 @@ print_param_snapshot() {
         printf 'CHUNK_FILE_SIZE=%s (bytes)\n' "$CHUNK_FILE_SIZE"
         printf 'TOTAL_CACHE_SIZE_MIB=%s MiB (%s bytes)\n' "$TOTAL_CACHE_SIZE_MIB" "$TOTAL_CACHE_SIZE_BYTES"
         printf 'PREFIXDB_HANDLES=%s\n' "$PREFIXDB_HANDLES"
+        printf 'NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD=%s\n' "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD"
+        printf 'GC_WORKERS=%s\n' "$GC_WORKERS"
+        printf 'STORAGE_GC_THRESHOLD=%s\n' "$STORAGE_GC_THRESHOLD"
+        printf 'NODE_FILE_SORTED_COMPRESSION=%s\n' "$NODE_FILE_SORTED_COMPRESSION"
+        printf 'SEGMENT_INDEX_COMPRESSION=%s\n' "$SEGMENT_INDEX_COMPRESSION"
     elif [ "$snapshot_backend" = "chainkv" ]; then
         printf 'CHAINKV_CACHE_MB=%s\n' "$CHAINKV_CACHE_MB"
         printf 'CHAINKV_HANDLES=%s\n' "$CHAINKV_HANDLES"
@@ -589,7 +594,9 @@ run_load() {
             ;;
         prefixdb)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend prefixdb -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES"
+                -mode ld -backend prefixdb -contract-chunk-file-size-mib "$CHUNK_FILE_SIZE" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
+                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \

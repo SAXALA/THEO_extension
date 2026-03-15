@@ -1073,6 +1073,17 @@ func (d *Database) GCPrefixTree() error {
 	return nil
 }
 
+func (d *Database) RunPostLoadGC() error {
+	if d.statepdb == nil {
+		return fmt.Errorf("PrefixDB is not initialized, cannot perform post-load GC")
+	}
+	if err := d.statepdb.RunPostLoadGC(); err != nil {
+		return fmt.Errorf("failed to perform post-load GC on prefix tree storage: %w", err)
+	}
+	d.log.Trace("Performed post-load GC on prefix tree storage")
+	return nil
+}
+
 func (d *Database) UpgradeSegmentIndexFiles() error {
 	if d.statepdb == nil {
 		return fmt.Errorf("PrefixDB is not initialized, cannot upgrade segment index files")
