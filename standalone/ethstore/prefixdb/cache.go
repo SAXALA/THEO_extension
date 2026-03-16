@@ -26,13 +26,13 @@ type nodeCacheRecord struct {
 	storageInfo   StorageInfo
 }
 
-// NodeCache is a typed view over the shared byte-budgeted LRU implementation.
+// NodeCache is a typed view over the shared byte-budgeted hybrid LRU+LFU implementation.
 type NodeCache struct {
 	lock   sync.RWMutex
 	shared *sharedByteCache
 }
 
-// NewNodeCache instantiates an LRU cache with the provided capacity.
+// NewNodeCache instantiates a hybrid LRU+LFU cache with the provided capacity.
 func NewNodeCache(capacityBytes uint64) (*NodeCache, error) {
 	return newSharedNodeCache(newSharedByteCache(capacityBytes)), nil
 }

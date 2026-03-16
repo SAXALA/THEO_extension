@@ -5,131 +5,69 @@ import (
 	"sync"
 	"unsafe"
 
+	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
 	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
-// DataType defines the type of data identified by a key prefix.
-type DataType int
+type DataType = datatypepkg.DataType
 
-func (DT *DataType) String() {
-
-}
-
-// Define all known data types.
-// Note: The order here defines the integer value. UnknownTypeDataType must be 0.
 const (
-	UnknownTypeDataType DataType = iota // Should be 0
-	ChtRootDataType
-	ChtIndexTableDataType
-	ChtTableDataType
-	BloomTrieRootDataType
-	BloomTrieIndexDataType
-	BloomTrieTableDataType
-	PreimageDataType
-	ConfigDataType
-	GenesisStateDataType
-	CliqueSnapshotDataType
-	BloomBitsIndexDataType
-	HeaderDataType                    // Used in AOL
-	HeaderNumberDataType              // Used in AOL
-	BlockBodyDataType                 // Used in AOL
-	BlockReceiptsDataType             // Used in AOL
-	TransactionLookupMetadataDataType // Used in AOL
-	BloomBitsDataType
-	HeaderTotalDifficultyDataType
-	HeaderNumberHashMappingDataType
-	SnapshotAccountDataType
-	SnapshotStorageDataType
-	CodeDataType
-	SkeletonHeaderDataType
-	TrieNodeAccountDataType
-	TrieNodeStorageDataType
-	StateIDLookupDataType
-	VerkleTrieDataType
-	DatabaseVersionDataType
-	HeadHeaderDataType
-	HeadBlockDataType
-	HeadFastBlockDataType
-	HeadFinalizedBlockDataType
-	PersistentStateIDDataType
-	LastPivotDataType
-	FastTrieProgressDataType
-	SnapshotDisabledDataType
-	SnapshotRootDataType
-	SnapshotJournalDataType
-	SnapshotGeneratorDataType
-	SnapshotRecoveryDataType
-	SnapshotSyncStatusDataType
-	SkeletonSyncStatusDataType
-	TrieJournalDataType
-	TransactionIndexTailDataType
-	FastTransactionLookupLimitDataType // Deprecated
-	BadBlockDataType
-	UncleanShutdownDataType
-	TransitionStatusDataType
-	SnapSyncStatusFlagDataType
-	LightClientUpdateDataType
-	FixedCommitteeRootDataType
-	SyncCommitteeDataType
+	UnknownTypeDataType                = datatypepkg.UnknownTypeDataType
+	ChtRootDataType                    = datatypepkg.ChtRootDataType
+	ChtIndexTableDataType              = datatypepkg.ChtIndexTableDataType
+	ChtTableDataType                   = datatypepkg.ChtTableDataType
+	BloomTrieRootDataType              = datatypepkg.BloomTrieRootDataType
+	BloomTrieIndexDataType             = datatypepkg.BloomTrieIndexDataType
+	BloomTrieTableDataType             = datatypepkg.BloomTrieTableDataType
+	PreimageDataType                   = datatypepkg.PreimageDataType
+	ConfigDataType                     = datatypepkg.ConfigDataType
+	GenesisStateDataType               = datatypepkg.GenesisStateDataType
+	CliqueSnapshotDataType             = datatypepkg.CliqueSnapshotDataType
+	BloomBitsIndexDataType             = datatypepkg.BloomBitsIndexDataType
+	HeaderDataType                     = datatypepkg.HeaderDataType
+	HeaderNumberDataType               = datatypepkg.HeaderNumberDataType
+	BlockBodyDataType                  = datatypepkg.BlockBodyDataType
+	BlockReceiptsDataType              = datatypepkg.BlockReceiptsDataType
+	TransactionLookupMetadataDataType  = datatypepkg.TransactionLookupMetadataDataType
+	BloomBitsDataType                  = datatypepkg.BloomBitsDataType
+	HeaderTotalDifficultyDataType      = datatypepkg.HeaderTotalDifficultyDataType
+	HeaderNumberHashMappingDataType    = datatypepkg.HeaderNumberHashMappingDataType
+	SnapshotAccountDataType            = datatypepkg.SnapshotAccountDataType
+	SnapshotStorageDataType            = datatypepkg.SnapshotStorageDataType
+	CodeDataType                       = datatypepkg.CodeDataType
+	SkeletonHeaderDataType             = datatypepkg.SkeletonHeaderDataType
+	TrieNodeAccountDataType            = datatypepkg.TrieNodeAccountDataType
+	TrieNodeStorageDataType            = datatypepkg.TrieNodeStorageDataType
+	StateIDLookupDataType              = datatypepkg.StateIDLookupDataType
+	VerkleTrieDataType                 = datatypepkg.VerkleTrieDataType
+	DatabaseVersionDataType            = datatypepkg.DatabaseVersionDataType
+	HeadHeaderDataType                 = datatypepkg.HeadHeaderDataType
+	HeadBlockDataType                  = datatypepkg.HeadBlockDataType
+	HeadFastBlockDataType              = datatypepkg.HeadFastBlockDataType
+	HeadFinalizedBlockDataType         = datatypepkg.HeadFinalizedBlockDataType
+	PersistentStateIDDataType          = datatypepkg.PersistentStateIDDataType
+	LastPivotDataType                  = datatypepkg.LastPivotDataType
+	FastTrieProgressDataType           = datatypepkg.FastTrieProgressDataType
+	SnapshotDisabledDataType           = datatypepkg.SnapshotDisabledDataType
+	SnapshotRootDataType               = datatypepkg.SnapshotRootDataType
+	SnapshotJournalDataType            = datatypepkg.SnapshotJournalDataType
+	SnapshotGeneratorDataType          = datatypepkg.SnapshotGeneratorDataType
+	SnapshotRecoveryDataType           = datatypepkg.SnapshotRecoveryDataType
+	SnapshotSyncStatusDataType         = datatypepkg.SnapshotSyncStatusDataType
+	SkeletonSyncStatusDataType         = datatypepkg.SkeletonSyncStatusDataType
+	TrieJournalDataType                = datatypepkg.TrieJournalDataType
+	TransactionIndexTailDataType       = datatypepkg.TransactionIndexTailDataType
+	FastTransactionLookupLimitDataType = datatypepkg.FastTransactionLookupLimitDataType
+	BadBlockDataType                   = datatypepkg.BadBlockDataType
+	UncleanShutdownDataType            = datatypepkg.UncleanShutdownDataType
+	TransitionStatusDataType           = datatypepkg.TransitionStatusDataType
+	SnapSyncStatusFlagDataType         = datatypepkg.SnapSyncStatusFlagDataType
+	LightClientUpdateDataType          = datatypepkg.LightClientUpdateDataType
+	FixedCommitteeRootDataType         = datatypepkg.FixedCommitteeRootDataType
+	SyncCommitteeDataType              = datatypepkg.SyncCommitteeDataType
 )
 
-// DataTypeStrings maps DataType (int) to their string representations.
-// This is useful for logging and debugging.
-var DataTypeStrings = map[DataType]string{
-	UnknownTypeDataType:                "UnknownType",
-	ChtRootDataType:                    "ChtRoot",
-	ChtIndexTableDataType:              "ChtIndexTable",
-	ChtTableDataType:                   "ChtTable",
-	BloomTrieRootDataType:              "BloomTrieRoot",
-	BloomTrieIndexDataType:             "BloomTrieIndex",
-	BloomTrieTableDataType:             "BloomTrieTable",
-	PreimageDataType:                   "Preimage",
-	ConfigDataType:                     "Config",
-	GenesisStateDataType:               "GenesisState",
-	CliqueSnapshotDataType:             "CliqueSnapshot",
-	BloomBitsIndexDataType:             "BloomBitsIndex",
-	HeaderDataType:                     "Header",
-	HeaderNumberDataType:               "HeaderNumber",
-	BlockBodyDataType:                  "BlockBody",
-	BlockReceiptsDataType:              "BlockReceipts",
-	TransactionLookupMetadataDataType:  "TransactionLookupMetadata",
-	BloomBitsDataType:                  "BloomBits",
-	HeaderTotalDifficultyDataType:      "HeaderTotalDifficulty",
-	HeaderNumberHashMappingDataType:    "HeaderNumberHashMapping",
-	SnapshotAccountDataType:            "SnapshotAccountData",
-	SnapshotStorageDataType:            "SnapshotStorageData",
-	CodeDataType:                       "CodeData",
-	SkeletonHeaderDataType:             "SkeletonHeaderData",
-	TrieNodeAccountDataType:            "TrieNodeAccountData",
-	TrieNodeStorageDataType:            "TrieNodeStorageData",
-	StateIDLookupDataType:              "StateIDLookup",
-	VerkleTrieDataType:                 "VerkleTrieData",
-	DatabaseVersionDataType:            "DatabaseVersion",
-	HeadHeaderDataType:                 "HeadHeader",
-	HeadBlockDataType:                  "HeadBlock",
-	HeadFastBlockDataType:              "HeadFastBlock",
-	HeadFinalizedBlockDataType:         "HeadFinalizedBlock",
-	PersistentStateIDDataType:          "PersistentStateID",
-	LastPivotDataType:                  "LastPivot",
-	FastTrieProgressDataType:           "FastTrieProgress",
-	SnapshotDisabledDataType:           "SnapshotDisabled",
-	SnapshotRootDataType:               "SnapshotRoot",
-	SnapshotJournalDataType:            "SnapshotJournal",
-	SnapshotGeneratorDataType:          "SnapshotGenerator",
-	SnapshotRecoveryDataType:           "SnapshotRecovery",
-	SnapshotSyncStatusDataType:         "SnapshotSyncStatus",
-	SkeletonSyncStatusDataType:         "SkeletonSyncStatus",
-	TrieJournalDataType:                "TrieJournal",
-	TransactionIndexTailDataType:       "TransactionIndexTail",
-	FastTransactionLookupLimitDataType: "FastTransactionLookupLimit",
-	BadBlockDataType:                   "BadBlock",
-	UncleanShutdownDataType:            "UncleanShutdown",
-	TransitionStatusDataType:           "TransitionStatus",
-	SnapSyncStatusFlagDataType:         "SnapSyncStatusFlag",
-	LightClientUpdateDataType:          "LightClientUpdate",
-	FixedCommitteeRootDataType:         "FixedCommitteeRoot",
-	SyncCommitteeDataType:              "SyncCommittee",
-}
+var DataTypeStrings = datatypepkg.DataTypeStrings
 
 // The fields below define the low level database schema prefixing.
 var (

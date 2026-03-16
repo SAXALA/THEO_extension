@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
 )
 
 func TestSortStrategyThreshold(t *testing.T) {
@@ -185,6 +187,43 @@ func TestSharedCacheEvictsAcrossCacheTypes(t *testing.T) {
 	}
 }
 
+func TestSharedCacheHybridPolicyKeepsFrequentOldEntry(t *testing.T) {
+	shared := newSharedByteCache(3)
+	shared.Add(sharedCacheNamespaceStorage, "a", []byte{0x01}, 1)
+	shared.Add(sharedCacheNamespaceStorage, "b", []byte{0x02}, 1)
+	shared.Add(sharedCacheNamespaceStorage, "c", []byte{0x03}, 1)
+
+	for i := 0; i < 5; i++ {
+		if _, ok := shared.Get(sharedCacheNamespaceStorage, "a"); !ok {
+			t.Fatal("expected hot entry a to remain present during warmup")
+		}
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "c"); !ok {
+		t.Fatal("expected c to be present")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "b"); !ok {
+		t.Fatal("expected b to be present")
+	}
+
+	shared.Add(sharedCacheNamespaceStorage, "d", []byte{0x04}, 1)
+
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "a"); !ok {
+		t.Fatal("expected frequent entry a to survive hybrid eviction")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "d"); !ok {
+		t.Fatal("expected newest entry d to be cached")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "c"); ok {
+		t.Fatal("expected lower-frequency older entry c to be evicted")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "b"); !ok {
+		t.Fatal("expected b to remain cached")
+	}
+	if shared.usedBytes > shared.capacityBytes {
+		t.Fatalf("shared cache exceeds total budget: used=%d capacity=%d", shared.usedBytes, shared.capacityBytes)
+	}
+}
+
 func TestFileNodeCacheUsesSharedBudget(t *testing.T) {
 	shared := newSharedByteCache(1024)
 	pt := &PrefixTree{sharedCache: shared}
@@ -306,7 +345,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	if err := db.storeNode(shortKey, &TrieNode{offset: shortOffset}); err != nil {
 		t.Fatalf("storeNode shortKey failed: %v", err)
 	}
-	value, found, err := db.Get(shortKey, nil)
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, shortKey, nil)
 	if err != nil {
 		t.Fatalf("Get shortKey failed: %v", err)
 	}
@@ -323,7 +362,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	if err := db.storeNode(longKey, &TrieNode{offset: longOffset}); err != nil {
 		t.Fatalf("storeNode longKey failed: %v", err)
 	}
-	value, found, err = db.Get(longKey, nil)
+	value, found, err = db.Get(datatypepkg.TrieNodeAccountDataType, longKey, nil)
 	if err != nil {
 		t.Fatalf("Get longKey failed: %v", err)
 	}

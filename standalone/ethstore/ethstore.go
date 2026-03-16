@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -16,6 +17,27 @@ import (
 	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 	"github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
+
+type trieStorageGetBreakdownStepStats struct {
+	cacheCount   uint64
+	cacheNanos   uint64
+	noCacheCount uint64
+	noCacheNanos uint64
+}
+
+func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, fromCache bool, duration time.Duration) {
+	if stats == nil {
+		return
+	}
+	nanos := uint64(duration)
+	if fromCache {
+		atomic.AddUint64(&stats.cacheCount, 1)
+		atomic.AddUint64(&stats.cacheNanos, nanos)
+		return
+	}
+	atomic.AddUint64(&stats.noCacheCount, 1)
+	atomic.AddUint64(&stats.noCacheNanos, nanos)
+}
 
 func isNotFoundError(err error) bool {
 	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound)
@@ -88,6 +110,20 @@ var PrefixDBHandledDataTypes = map[DataType]bool{
 	TrieNodeStorageDataType: true,
 }
 
+func (d *Database) resolvePrefixDBAccountKey(key []byte, dataType DataType, requirePresent bool) ([]byte, error) {
+	if dataType != TrieNodeStorageDataType {
+		return nil, nil
+	}
+	if len(key) < 33 {
+		return nil, fmt.Errorf("invalid storage key %x", key)
+	}
+	accountKey := d.GetParentAccountKey(key[1:33])
+	if requirePresent && accountKey == nil {
+		return nil, fmt.Errorf("failed to derive account key for key %x", key)
+	}
+	return accountKey, nil
+}
+
 const aolDeleteTombstone = "__AOL_DELETED__"
 
 // ParseBlockNumberFromKey tries to parse the block number from the key structure
@@ -157,6 +193,8 @@ type Database struct {
 	baolkvs         map[string]string // Temporary storage for BlockAppendOnlyLog key-values during operations
 	baolLatestBlock uint64            // Temporary storage for latest block number during operations
 	accountKey      []byte            // Temporary storage for account key during operations
+
+	trieStorageAccountPathStats trieStorageGetBreakdownStepStats
 }
 
 // The namespace is the prefix that the metrics reporting should use.
@@ -287,6 +325,7 @@ func (d *Database) Close() error {
 		close(d.quitChan) // Close the channel itself
 		d.quitChan = nil
 	}
+	d.printTrieNodeStorageGetBreakdown()
 
 	if d.statepdb != nil {
 		if err := d.statepdb.Close(); err != nil {
@@ -319,12 +358,15 @@ func (d *Database) Close() error {
 
 // Has retrieves if a key is present in the key-value store.
 func (d *Database) Has(key []byte) (bool, error) {
+	return d.HasWithDataType(key, GetDataTypeFromKey(key))
+}
+
+func (d *Database) HasWithDataType(key []byte, dataType DataType) (bool, error) {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
 	if d.closed {
 		return false, ErrClosed
 	}
-	dataType := GetDataTypeFromKey(key)
 
 	if AolHandledDataTypes[dataType] {
 		var valStr string
@@ -351,11 +393,11 @@ func (d *Database) Has(key []byte) (bool, error) {
 		if d.statepdb == nil {
 			return false, fmt.Errorf("PrefixDB is not initialized, cannot check key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		// Check if the key exists in PrefixDB
-		if dataType == TrieNodeStorageDataType {
-			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
+		accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, false)
+		if err != nil {
+			return false, fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
-		exists, err := d.statepdb.Has(key, d.accountKey)
+		exists, err := d.statepdb.Has(dataType, key, accountKey)
 		if err != nil {
 			return false, fmt.Errorf("failed to check key %x in PrefixDB: %w", key, err)
 		}
@@ -419,10 +461,11 @@ func (d *Database) GetFromPrefixDB(key []byte, dataType DataType) ([]byte, error
 	if d.statepdb == nil {
 		return nil, fmt.Errorf("PrefixDB is not initialized, cannot get key %x (type %s)", key, DataTypeStrings[dataType])
 	}
-	if dataType == TrieNodeStorageDataType {
-		d.accountKey = d.GetParentAccountKey(key[1:33])
+	accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
-	value, exists, err := d.statepdb.Get(key, d.accountKey)
+	value, exists, err := d.statepdb.Get(dataType, key, accountKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key %x from PrefixDB: %w", key, err)
 	}
@@ -454,14 +497,16 @@ func (d *Database) GetFromPebble(key []byte) ([]byte, error) {
 // If the key belongs to specific types (Header, HeaderNumber, etc.), it's stored in the Append-Only Log (AOL).
 // Otherwise, it's stored in the underlying key-value database.
 func (d *Database) Put(key []byte, value []byte) error {
+	return d.PutWithDataType(key, value, GetDataTypeFromKey(key))
+}
+
+func (d *Database) PutWithDataType(key []byte, value []byte, dataType DataType) error {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
 
 	if d.closed {
 		return ErrClosed
 	}
-
-	dataType := GetDataTypeFromKey(key)
 	if AolHandledDataTypes[dataType] {
 		var blockID uint64
 		var foundBlockID bool
@@ -506,14 +551,11 @@ func (d *Database) Put(key []byte, value []byte) error {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot store key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		// Store in PrefixDB
-		if dataType == TrieNodeStorageDataType {
-			d.accountKey = d.GetParentAccountKey(key[1:33]) // Assuming the account key is derived from the first 32 bytes after the prefix
-			if d.accountKey == nil {
-				return fmt.Errorf("failed to derive account key for key %x (type %s)", key, DataTypeStrings[dataType])
-			}
+		accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, true)
+		if err != nil {
+			return fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
-		err := d.statepdb.Put(key, value, d.accountKey)
+		err = d.statepdb.Put(dataType, key, value, accountKey)
 
 		if err != nil {
 			return fmt.Errorf("failed to put key %x in PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
@@ -552,7 +594,11 @@ func (d *Database) BatchPutToPrefixDB(key []byte, value []byte, dataType DataTyp
 	if d.statepdb == nil {
 		return fmt.Errorf("PrefixDB is not initialized, cannot batch put key %x (type %s)", key, DataTypeStrings[dataType])
 	}
-	err := d.statepdb.BatchPut(key, value, nil)
+	accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, false)
+	if err != nil {
+		return fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+	}
+	err = d.statepdb.BatchPut(dataType, key, value, accountKey)
 	if err != nil {
 		return fmt.Errorf("failed to batch put account key %x in PrefixDB: %w", key, err)
 	}
@@ -631,14 +677,16 @@ func (d *Database) PrefixdbBatchCommit() error {
 // Deletion for types like HeaderNumber and TransactionLookupMetadata via AOL is not supported
 // with this method as blockID cannot be derived from the key alone.
 func (d *Database) Delete(key []byte) error {
+	return d.DeleteWithDataType(key, GetDataTypeFromKey(key))
+}
+
+func (d *Database) DeleteWithDataType(key []byte, dataType DataType) error {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
 
 	if d.closed {
 		return ErrClosed
 	}
-
-	dataType := GetDataTypeFromKey(key)
 	if AolHandledDataTypes[dataType] {
 		var err error
 		err = d.blockAol.Delete(string(key))
@@ -652,8 +700,11 @@ func (d *Database) Delete(key []byte) error {
 		if d.statepdb == nil {
 			return fmt.Errorf("PrefixDB is not initialized, cannot delete key %x (type %s)", key, DataTypeStrings[dataType])
 		}
-		// Delete from PrefixDB
-		err := d.statepdb.Delete(key, d.accountKey)
+		accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, false)
+		if err != nil {
+			return fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+		}
+		err = d.statepdb.Delete(dataType, key, accountKey)
 		if err != nil {
 			return fmt.Errorf("failed to delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 		}
@@ -690,7 +741,11 @@ func (d *Database) BatchDeleteFromPrefixDB(key []byte, dataType DataType) error 
 	if d.statepdb == nil {
 		return fmt.Errorf("PrefixDB is not initialized, cannot batch delete key %x (type %s)", key, DataTypeStrings[dataType])
 	}
-	err := d.statepdb.BatchPut(key, nil, nil)
+	accountKey, err := d.resolvePrefixDBAccountKey(key, dataType, false)
+	if err != nil {
+		return fmt.Errorf("failed to resolve PrefixDB key context for key %x (type %s): %w", key, DataTypeStrings[dataType], err)
+	}
+	err = d.statepdb.BatchPut(dataType, key, nil, accountKey)
 	if err != nil {
 		return fmt.Errorf("failed to batch delete key %x from PrefixDB (type %s): %w", key, DataTypeStrings[dataType], err)
 	}
@@ -756,12 +811,13 @@ func (d *Database) Path() string {
 
 // iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database (primarily for AOL data)
 type iterator struct {
-	db     *Database
-	prefix []byte
-	start  []byte
-	keys   [][]byte
-	pos    int
-	err    error // Added err field
+	db       *Database
+	dataType DataType
+	prefix   []byte
+	start    []byte
+	keys     [][]byte
+	pos      int
+	err      error // Added err field
 }
 
 // NewIterator creates a binary-alphabetical iterator over a subset of database content.
@@ -828,7 +884,7 @@ func (it *iterator) init() {
 	// If init becomes asynchronous or complex, it needs its own locking.
 
 	// If this iterator is for AOL:
-	if AolHandledDataTypes[GetDataTypeFromKey(it.prefix)] {
+	if AolHandledDataTypes[it.dataType] {
 		// --- BEGIN AOL Key Loading Logic (Placeholder) ---
 		// This section requires significant implementation:
 		// 1. Identify relevant AOL segment files based on potential block ranges or timestamps if applicable.
@@ -910,7 +966,7 @@ func (it *iterator) Value() []byte { // Receiver changed to *iterator
 		return nil
 	}
 	// Fetches from the main Database.Get, which handles AOL/Pebble dispatch
-	value, err := it.db.Get(key, GetDataTypeFromKey(key))
+	value, err := it.db.Get(key, it.dataType)
 	if err != nil {
 		it.err = err
 		return nil
@@ -1028,8 +1084,10 @@ func (d *Database) SetAccountKey(accountKey []byte) error {
 }
 
 func (d *Database) GetParentAccountKey(key []byte) []byte {
+	start := time.Now()
 	// key is expected to be accountHash (fixed 32 bytes)
 	if len(key) != 32 {
+		recordTrieStorageGetBreakdownStep(&d.trieStorageAccountPathStats, false, time.Since(start))
 		return nil
 	}
 
@@ -1038,13 +1096,19 @@ func (d *Database) GetParentAccountKey(key []byte) []byte {
 		var tmp [64]byte
 		if n, ok := d.accountHashKeyCache.Get(key, &tmp); ok {
 			d.accountKey = append(d.accountKey[:0], tmp[:n]...)
+			recordTrieStorageGetBreakdownStep(&d.trieStorageAccountPathStats, true, time.Since(start))
 			return d.accountKey
 		}
 	}
 
 	// Fallback: resolve via Pebble + PrefixDB index
+	if d.pebble == nil {
+		recordTrieStorageGetBreakdownStep(&d.trieStorageAccountPathStats, false, time.Since(start))
+		return nil
+	}
 	val, err := d.pebble.Get(key)
 	if err != nil {
+		recordTrieStorageGetBreakdownStep(&d.trieStorageAccountPathStats, false, time.Since(start))
 		d.log.Error("Failed to get parent account key", "key", key, "err", err)
 		return nil
 	}
@@ -1052,7 +1116,32 @@ func (d *Database) GetParentAccountKey(key []byte) []byte {
 	if d.accountHashKeyCache != nil {
 		d.accountHashKeyCache.Put(key, val)
 	}
+	recordTrieStorageGetBreakdownStep(&d.trieStorageAccountPathStats, false, time.Since(start))
 	return val
+}
+
+func (d *Database) printTrieNodeStorageGetBreakdown() {
+	step := &d.trieStorageAccountPathStats
+	cacheCountNum := atomic.LoadUint64(&step.cacheCount)
+	cacheNanos := atomic.LoadUint64(&step.cacheNanos)
+	noCacheCount := atomic.LoadUint64(&step.noCacheCount)
+	noCacheNanos := atomic.LoadUint64(&step.noCacheNanos)
+	cacheAvgMicros := 0.0
+	if cacheCountNum > 0 {
+		cacheAvgMicros = float64(cacheNanos) / float64(cacheCountNum) / 1000.0
+	}
+	noCacheAvgMicros := 0.0
+	if noCacheCount > 0 {
+		noCacheAvgMicros = float64(noCacheNanos) / float64(noCacheCount) / 1000.0
+	}
+	fmt.Printf("EthStore TrieNodeStorage get breakdown [account-hash->account-path]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+		cacheCountNum,
+		time.Duration(cacheNanos),
+		cacheAvgMicros,
+		noCacheCount,
+		time.Duration(noCacheNanos),
+		noCacheAvgMicros,
+	)
 }
 
 func (d *Database) GCPrefixTree() error {

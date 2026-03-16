@@ -30,7 +30,11 @@ type sharedCacheEntry struct {
 	key       string
 	value     interface{}
 	sizeBytes uint64
+	freq      uint32
+	lastTouch uint64
 }
+
+const sharedCacheEvictionSample = 16 // lower means more close to pure LRU, higher means more LFU influence
 
 type sharedByteCache struct {
 	mu             sync.Mutex
@@ -39,6 +43,7 @@ type sharedByteCache struct {
 	namespaceUsage map[sharedCacheNamespace]uint64
 	ll             *list.List
 	items          map[sharedCacheCompositeKey]*list.Element
+	clock          uint64
 }
 
 func newSharedByteCache(capacityBytes uint64) *sharedByteCache {
@@ -64,8 +69,9 @@ func (c *sharedByteCache) Get(namespace sharedCacheNamespace, key string) (inter
 	if !ok {
 		return nil, false
 	}
-	c.ll.MoveToFront(elem)
-	return elem.Value.(*sharedCacheEntry).value, true
+	entry := elem.Value.(*sharedCacheEntry)
+	c.touchEntryLocked(elem, entry)
+	return entry.value, true
 }
 
 func (c *sharedByteCache) Add(namespace sharedCacheNamespace, key string, value interface{}, sizeBytes uint64) {
@@ -79,7 +85,9 @@ func (c *sharedByteCache) Add(namespace sharedCacheNamespace, key string, value 
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	freq := uint32(1)
 	if existing, ok := c.items[lookup]; ok {
+		freq = existing.Value.(*sharedCacheEntry).freq
 		c.removeElementLocked(existing)
 	}
 	if sizeBytes > c.capacityBytes {
@@ -90,17 +98,19 @@ func (c *sharedByteCache) Add(namespace sharedCacheNamespace, key string, value 
 		key:       key,
 		value:     value,
 		sizeBytes: sizeBytes,
+		freq:      freq,
 	}
 	elem := c.ll.PushFront(entry)
+	c.touchEntryLocked(elem, entry)
 	c.items[lookup] = elem
 	c.usedBytes += sizeBytes
 	c.namespaceUsage[namespace] += sizeBytes
 	for c.usedBytes > c.capacityBytes {
-		back := c.ll.Back()
-		if back == nil {
+		victim := c.selectVictimLocked()
+		if victim == nil {
 			break
 		}
-		c.removeElementLocked(back)
+		c.removeElementLocked(victim)
 	}
 }
 
@@ -146,6 +156,46 @@ func (c *sharedByteCache) removeElementLocked(elem *list.Element) {
 	} else {
 		c.namespaceUsage[entry.namespace] = 0
 	}
+}
+
+func (c *sharedByteCache) touchEntryLocked(elem *list.Element, entry *sharedCacheEntry) {
+	if c == nil || elem == nil || entry == nil {
+		return
+	}
+	if entry.freq < ^uint32(0) {
+		entry.freq++
+	}
+	c.clock++
+	entry.lastTouch = c.clock
+	c.ll.MoveToFront(elem)
+}
+
+func (c *sharedByteCache) selectVictimLocked() *list.Element {
+	if c == nil {
+		return nil
+	}
+	front := c.ll.Front()
+	var victim *list.Element
+	var victimEntry *sharedCacheEntry
+	sampled := 0
+	for elem := c.ll.Back(); elem != nil && sampled < sharedCacheEvictionSample; elem = elem.Prev() {
+		if elem == front && elem != c.ll.Back() {
+			continue
+		}
+		entry, _ := elem.Value.(*sharedCacheEntry)
+		if entry == nil {
+			continue
+		}
+		sampled++
+		if victimEntry == nil || entry.freq < victimEntry.freq || (entry.freq == victimEntry.freq && entry.lastTouch < victimEntry.lastTouch) {
+			victim = elem
+			victimEntry = entry
+		}
+	}
+	if victim != nil {
+		return victim
+	}
+	return c.ll.Back()
 }
 
 type storageValueCache struct {

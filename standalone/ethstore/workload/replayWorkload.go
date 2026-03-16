@@ -1682,7 +1682,7 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 		}
 
 		start := time.Now()
-		store.Put(keyBytes, valueBytes)
+		err = store.PutWithDataType(keyBytes, valueBytes, dataType)
 		end := time.Now()
 
 		totalTime += end.Sub(start)
@@ -1783,6 +1783,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 		if err != nil {
 			return fmt.Errorf("failed to decode value: %w", err)
 		}
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		var accountKey []byte
 
 		if keyBytes[0] != 'O' && keyBytes[0] != 'A' {
@@ -1802,29 +1803,15 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 			// accountKey = nil
 		}
 		startTime := time.Now()
-		err = pdb.Put(keyBytes, valueBytes, accountKey)
+		err = pdb.Put(dataType, keyBytes, valueBytes, accountKey)
 
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
 
-		// value, ok, err := pdb.Get(keyBytes, accountKey)
-
 		if err != nil {
-			// err = pdb.Put(keyBytes, valueBytes)
 			fmt.Printf("Get operation failed for key %s: %v ", keyPart, err)
 			continue
 		}
-		// if !ok {
-		// 	fmt.Printf("Key %s not found in PrefixDB ", keyPart)
-		// 	continue
-		// }
-		// if !bytes.Equal(value, valueBytes) {
-		// 	fmt.Println("counter:", counter)
-		// 	// log.Printf("Value mismatch for key %s: expected %x, got %x", keyPart, valueBytes, value)
-		// }
-		// if err != nil {
-		// 	log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
-		// }
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
 			pdb.BatchCommit()
