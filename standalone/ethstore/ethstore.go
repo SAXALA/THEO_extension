@@ -43,13 +43,6 @@ func isNotFoundError(err error) bool {
 	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound)
 }
 
-func mibToBytes(sizeMiB int) uint64 {
-	if sizeMiB <= 0 {
-		return 0
-	}
-	return uint64(sizeMiB) * 1024 * 1024
-}
-
 // errorIterator is an ethdb.Iterator that always returns an error or represents an invalid state.
 type errorIterator struct {
 	err error
@@ -139,31 +132,9 @@ func ParseBlockNumberFromKey(key []byte, dataType DataType) (uint64, bool) {
 	return 0, false
 }
 
-// ParseBlockNumberFromKey tries to parse the block number from the key structure
-// for data types where it's expected (e.g., Header, BlockBody, BlockReceipts).
-// Key format is assumed to be: prefix (1 byte) + num (8 bytes) + ...
-func parseBlockNumberFromKey(key []byte, dataType DataType) (uint64, bool) {
-	switch dataType {
-	case HeaderDataType, BlockBodyDataType, BlockReceiptsDataType:
-		if len(key) >= 9 { // 1 byte prefix + 8 bytes for uint64
-			return binary.BigEndian.Uint64(key[1:9]), true
-		}
-	}
-	return 0, false
-}
-
-// parseBlockNumberFromValue tries to parse the block number from the value structure
+// ParseBlockNumberFromValue tries to parse the block number from the value structure
 // for data types like HeaderNumber (value is block number) or TransactionLookupMetadata (value is RLP encoded).
-func ParseBlockNumberFromValue(value []byte, dataType DataType) (uint64, bool) {
-	if dataType == HeaderNumberDataType && len(value) == 8 { // Must be exactly 8 bytes for uint64
-		return binary.BigEndian.Uint64(value), true
-	}
-	return 0, false
-}
-
-// parseBlockNumberFromValue tries to parse the block number from the value structure
-// for data types like HeaderNumber (value is block number) or TransactionLookupMetadata (value is RLP encoded).
-func parseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logger) (uint64, bool) {
+func ParseBlockNumberFromValue(value []byte, dataType DataType, logger log.Logger) (uint64, bool) {
 	if dataType == HeaderNumberDataType && len(value) == 8 { // Must be exactly 8 bytes for uint64
 		return binary.BigEndian.Uint64(value), true
 	}
@@ -344,11 +315,6 @@ func (d *Database) Close() error {
 	if d.pebble != nil {
 		if err := d.pebble.Close(); err != nil {
 			d.log.Error("Failed to close Pebble store", "err", err)
-			// Continue trying to close AOL, but remember Pebble's error
-
-			if baolErr := d.blockAol.Close(); baolErr != nil {
-				return fmt.Errorf("failed to close BlockAppendOnlyLog: %v", baolErr)
-			}
 			return fmt.Errorf("failed to close Pebble store: %v", err)
 		}
 	}
@@ -512,11 +478,11 @@ func (d *Database) PutWithDataType(key []byte, value []byte, dataType DataType) 
 		var foundBlockID bool
 
 		// Try to get blockID from key
-		blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+		blockID, foundBlockID = ParseBlockNumberFromKey(key, dataType)
 
 		// If not found in key, try from value (for HeaderNumber)
 		if !foundBlockID {
-			blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
+			blockID, foundBlockID = ParseBlockNumberFromValue(value, dataType, d.log)
 		}
 		if foundBlockID {
 			if blockID > d.baolLatestBlock {
@@ -611,9 +577,9 @@ func (d *Database) BatchPutToAOL(key []byte, value []byte, dataType DataType) er
 	var blockID uint64
 	var foundBlockID bool
 
-	blockID, foundBlockID = parseBlockNumberFromKey(key, dataType)
+	blockID, foundBlockID = ParseBlockNumberFromKey(key, dataType)
 	if !foundBlockID {
-		blockID, foundBlockID = parseBlockNumberFromValue(value, dataType, d.log)
+		blockID, foundBlockID = ParseBlockNumberFromValue(value, dataType, d.log)
 	}
 	if !foundBlockID {
 		return fmt.Errorf("could not determine blockID for AOL-handled type %s for key %x; storage via AOL failed", DataTypeStrings[dataType], key)
@@ -809,17 +775,6 @@ func (d *Database) Path() string {
 	return d.fn
 }
 
-// iterator is a wrapper implementing the ethdb.Iterator interface for iterating over keys in the Database (primarily for AOL data)
-type iterator struct {
-	db       *Database
-	dataType DataType
-	prefix   []byte
-	start    []byte
-	keys     [][]byte
-	pos      int
-	err      error // Added err field
-}
-
 // NewIterator creates a binary-alphabetical iterator over a subset of database content.
 // If the prefix indicates an AOL-handled data type, an AOL-specific iterator is returned.
 // Otherwise, the call is delegated to the underlying PebbleStore.
@@ -868,117 +823,6 @@ func (d *Database) NewPebbleIterator(prefix []byte, start []byte) ethdb.Iterator
 		return &errorIterator{err: errors.New("internal pebble store not initialized for pebble iterator")}
 	}
 	return d.pebble.NewIterator(prefix, start)
-}
-
-// init initializes the iterator, loading keys that match the prefix and start.
-// For the AOL-specific iterator, this method needs to scan relevant AOL files,
-// filter keys by prefix and start, consider tombstones, and sort them if necessary.
-// WARNING: The current implementation is a placeholder and does not load data from AOL.
-func (it *iterator) init() {
-	if it.db == nil {
-		it.err = errors.New("iterator: database not initialized")
-		return
-	}
-	// The RLock/RUnlock for db.closed and aol access should be managed here if init performs direct aol operations.
-	// For now, we assume NewIterator holds the lock during this call.
-	// If init becomes asynchronous or complex, it needs its own locking.
-
-	// If this iterator is for AOL:
-	if AolHandledDataTypes[it.dataType] {
-		// --- BEGIN AOL Key Loading Logic (Placeholder) ---
-		// This section requires significant implementation:
-		// 1. Identify relevant AOL segment files based on potential block ranges or timestamps if applicable.
-		// 2. Read records from these segment files.
-		// 3. For each record:
-		//    a. Deserialize the key-value pairs.
-		//    b. Check if a key matches `it.prefix`.
-		//    c. If `it.start` is provided, ensure the key is >= `it.start`.
-		//    d. Handle `aolDeleteTombstone`: if a key is marked deleted, it should not be included.
-		//    e. Store valid keys. Keys might need to be unique (latest version wins).
-		// 4. Sort the collected keys if order is not guaranteed by the reading process.
-		//
-		// Example (very simplified, conceptual):
-		// allAOLKeysAndValues := it.db.txIndexAol.GetAllMatchingPrefix(it.prefix) // This function doesn't exist, needs to be built
-		// for key, value := range allAOLKeysAndValues {
-		//    if bytes.HasPrefix(key, it.prefix) && (it.start == nil || bytes.Compare(key, it.start) >= 0) {
-		//        if !bytes.Equal(value, []byte(aolDeleteTombstone)) { // Check value if tombstones are stored as values
-		//            it.keys = append(it.keys, key)
-		//        }
-		//    }
-		// }
-		// sort.Slice(it.keys, func(i, j int) bool { return bytes.Compare(it.keys[i], it.keys[j]) < 0 })
-		// --- END AOL Key Loading Logic (Placeholder) ---
-		it.db.log.Debug("AOL iterator init called (data loading logic is a placeholder)", "prefix", common.Bytes2Hex(it.prefix), "start", common.Bytes2Hex(it.start))
-		it.keys = make([][]byte, 0) // Initialize as empty until fully implemented
-		it.pos = -1
-		// To signal that this part is not done, you might set an error:
-		// it.err = errors.New("AOL iterator data loading not implemented in init()")
-	} else {
-		// This 'iterator' struct should ideally not be initialized for non-AOL types if delegation occurs.
-		// However, if NewIterator somehow created this 'iterator' instance before deciding to delegate,
-		// this path might be hit. Setting an error or ensuring it's a no-op is safest.
-		it.err = errors.New("iterator.init() called for a non-AOL type; this should have been delegated to PebbleStore")
-		it.keys = make([][]byte, 0)
-		it.pos = -1
-	}
-}
-
-// Next moves to the next key
-func (it *iterator) Next() bool { // Receiver changed to *iterator
-	if it.err != nil {
-		return false
-	}
-	// This iterates over the 'keys' slice, which 'init' is supposed to populate.
-	// Since 'init' currently leaves 'keys' empty, this will effectively be an empty iterator.
-	if it.pos+1 < len(it.keys) {
-		it.pos++
-		return true
-	}
-	return false
-}
-
-// Error returns any accumulated error
-func (it *iterator) Error() error { // Receiver changed to *iterator
-	return it.err
-}
-
-// Key returns the key of the current entry
-func (it *iterator) Key() []byte { // Receiver changed to *iterator
-	if it.pos < 0 || it.pos >= len(it.keys) {
-		return nil
-	}
-	return it.keys[it.pos]
-}
-
-// Value returns the value of the current entry
-func (it *iterator) Value() []byte { // Receiver changed to *iterator
-	if it.pos < 0 || it.pos >= len(it.keys) {
-		if it.err == nil && len(it.keys) > 0 { // Avoid error if keys was empty from start
-			it.err = errors.New("iterator: invalid position for Value()")
-		}
-		return nil
-	}
-	key := it.keys[it.pos]
-	if key == nil {
-		if it.err == nil {
-			it.err = errors.New("iterator: current key is nil")
-		}
-		return nil
-	}
-	// Fetches from the main Database.Get, which handles AOL/Pebble dispatch
-	value, err := it.db.Get(key, it.dataType)
-	if err != nil {
-		it.err = err
-		return nil
-	}
-	return value
-}
-
-// Release releases associated resources
-func (it *iterator) Release() { // Receiver changed to *iterator
-	it.keys = nil
-	it.pos = -1
-	// it.err = nil // Optional: clear error on release
 }
 
 // NewBatch creates a write-only database batch object that operates on the underlying Pebble store.

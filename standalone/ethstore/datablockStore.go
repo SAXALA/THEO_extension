@@ -879,7 +879,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 
 	// Key not in skiplist - check if we can determine blockID from key
 	dataType := GetDataTypeFromKey([]byte(key))
-	if blockID, ok := parseBlockNumberFromKey([]byte(key), dataType); ok {
+	if blockID, ok := ParseBlockNumberFromKey([]byte(key), dataType); ok {
 		// For keys with embedded block numbers (Header, BlockBody, BlockReceipts)
 		if blockID > baol.latestBlockID {
 			return "", false, fmt.Errorf("Get: requested blockID %d > latestBlockID %d", blockID, baol.latestBlockID)

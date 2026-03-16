@@ -238,11 +238,11 @@ func TestPraseBlockID(t *testing.T) {
 
 	dataType := GetDataTypeFromKey(key1)
 
-	blockID, foundBlockID := parseBlockNumberFromKey(key1, dataType)
+	blockID, foundBlockID := ParseBlockNumberFromKey(key1, dataType)
 
 	// If not found in key, try from value (for HeaderNumber)
 	if !foundBlockID {
-		blockID, foundBlockID = ParseBlockNumberFromValue(value1, dataType)
+		blockID, foundBlockID = ParseBlockNumberFromValue(value1, dataType, nil)
 	}
 
 	fmt.Print("blockID: ", blockID, " foundBlockID: ", foundBlockID, " dataType: ", DataTypeStrings[dataType], "\n")
