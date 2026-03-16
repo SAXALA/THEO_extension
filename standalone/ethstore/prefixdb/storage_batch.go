@@ -390,7 +390,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		kvs = append(kvs, kvPair{key: []byte(key), val: value})
 	}
 	sortKVPairs(kvs)
-	fileID, offset, size, err := db.persistStorageEntries(kvs, existingFileID, existingOffset, existingSize)
+	fileID, offset, size, err := db.persistStorageEntries(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
 	if err != nil {
 		return plan, err
 	}
@@ -432,7 +432,7 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		return nil
 	}
 
-	fileID, off, sz, err := db.persistStorageEntries(kvs, existingFileID, existingOffset, existingSize)
+	fileID, off, sz, err := db.persistStorageEntries(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
 	if err != nil {
 		return err
 	}
@@ -441,12 +441,15 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		storageOffset: off,
 		storageSize:   sz,
 	}
-	if err := db.prefixTree.Put(accountKeyBytes, accOff, fileID, off, sz); err != nil {
-		return err
-	}
-	db.nodeCache.StoreMetadata(accountKey, accOff, info)
-	if db.accountBatch != nil {
-		_ = db.accountBatch.updateStoragePointer(accountKey, info)
+	skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
+	if !skipAccountPointerUpdate {
+		if err := db.prefixTree.Put(accountKeyBytes, accOff, fileID, off, sz); err != nil {
+			return err
+		}
+		db.nodeCache.StoreMetadata(accountKey, accOff, info)
+		if db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(accountKey, info)
+		}
 	}
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))

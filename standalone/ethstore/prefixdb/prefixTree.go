@@ -251,13 +251,6 @@ type PrefixTree struct {
 	nodeFileDiskLoads           uint64 // times we had to read from a node file due to fileNodeCache miss
 	nodeFileReadOps             uint64 // number of os.File.ReadAt calls
 	nodeFileReadBytes           uint64
-	globalFileNodeCacheHits     uint64
-	globalFileNodeCacheMisses   uint64
-	globalFileHandleCacheHits   uint64
-	globalFileHandleCacheMisses uint64
-	globalNodeFileDiskLoads     uint64
-	globalNodeFileReadOps       uint64
-	globalNodeFileReadBytes     uint64
 
 	bufPool sync.Pool
 
@@ -1328,15 +1321,6 @@ func (pt *PrefixTree) Close() error {
 		atomic.LoadUint64(&pt.nodeFileReadOps),
 		atomic.LoadUint64(&pt.nodeFileReadBytes),
 	)
-	fmt.Printf("PrefixTree global.node stats: fileNodeCache hits=%d misses=%d handleCache hits=%d misses=%d diskLoads=%d readOps=%d readBytes=%d\n",
-		atomic.LoadUint64(&pt.globalFileNodeCacheHits),
-		atomic.LoadUint64(&pt.globalFileNodeCacheMisses),
-		atomic.LoadUint64(&pt.globalFileHandleCacheHits),
-		atomic.LoadUint64(&pt.globalFileHandleCacheMisses),
-		atomic.LoadUint64(&pt.globalNodeFileDiskLoads),
-		atomic.LoadUint64(&pt.globalNodeFileReadOps),
-		atomic.LoadUint64(&pt.globalNodeFileReadBytes),
-	)
 
 	if pt.fileHandleCache != nil {
 		pt.fileHandleCache.Purge()
@@ -1412,9 +1396,6 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			hdrBuf = entry.hdrBuf
 			bigBuf = entry.buf
 			atomic.AddUint64(&pt.fileNodeCacheHits, 1)
-			if fileID == globalFileName {
-				atomic.AddUint64(&pt.globalFileNodeCacheHits, 1)
-			}
 			if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
 				return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
 			}
@@ -1423,13 +1404,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			}
 		} else {
 			atomic.AddUint64(&pt.fileNodeCacheMisses, 1)
-			if fileID == globalFileName {
-				atomic.AddUint64(&pt.globalFileNodeCacheMisses, 1)
-			}
 			atomic.AddUint64(&pt.nodeFileDiskLoads, 1)
-			if fileID == globalFileName {
-				atomic.AddUint64(&pt.globalNodeFileDiskLoads, 1)
-			}
 			file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -1444,12 +1419,6 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			atomic.AddUint64(&pt.nodeFileReadOps, 1)
 			if n > 0 {
 				atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n))
-				if fileID == globalFileName {
-					atomic.AddUint64(&pt.globalNodeFileReadBytes, uint64(n))
-				}
-			}
-			if fileID == globalFileName {
-				atomic.AddUint64(&pt.globalNodeFileReadOps, 1)
 			}
 			if err != nil {
 				return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
@@ -1475,12 +1444,6 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 					atomic.AddUint64(&pt.nodeFileReadOps, 1)
 					if n2 > 0 {
 						atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n2))
-						if fileID == globalFileName {
-							atomic.AddUint64(&pt.globalNodeFileReadBytes, uint64(n2))
-						}
-					}
-					if fileID == globalFileName {
-						atomic.AddUint64(&pt.globalNodeFileReadOps, 1)
 					}
 					if err != nil && err != io.EOF {
 						pt.releaseBuf(tempBuf)
@@ -1649,15 +1612,9 @@ func (pt *PrefixTree) getOrCreateFileHandle(fileID string, flag int) (*os.File, 
 	// get from cache
 	if handle, ok := pt.fileHandleCache.Get(cacheKey); ok {
 		atomic.AddUint64(&pt.fileHandleCacheHits, 1)
-		if fileID == globalFileName {
-			atomic.AddUint64(&pt.globalFileHandleCacheHits, 1)
-		}
 		return handle.(*os.File), nil
 	}
 	atomic.AddUint64(&pt.fileHandleCacheMisses, 1)
-	if fileID == globalFileName {
-		atomic.AddUint64(&pt.globalFileHandleCacheMisses, 1)
-	}
 
 	filePath := filepath.Join(pt.fileNodeDir, fileID)
 	file, err := os.OpenFile(filePath, flag, 0644)
