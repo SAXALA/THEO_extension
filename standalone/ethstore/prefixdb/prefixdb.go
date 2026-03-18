@@ -72,11 +72,8 @@ type kvPair struct {
 }
 
 type segmentChunkMeta struct {
-	FileName  string
-	KeyStart  []byte
-	KeyEnd    []byte
-	KVCount   uint32
-	ChunkSize uint64
+	FileName string
+	KeyStart []byte
 }
 
 const segmentedChunkEntryHeaderSize = 4
@@ -2313,7 +2310,7 @@ func (db *PrefixDB) updateAccountNamedSegmentedStorage(accountKey []byte, kvs []
 		return db.rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey, kvs)
 	}
 	allocator := newChunkFileAllocator(metas)
-	buckets := partitionEntriesByChunks(metas, kvs)
+	buckets, unmatched := partitionEntriesByChunks(metas, kvs)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
 	indexDirty := false
 	for idx, meta := range metas {
@@ -2335,6 +2332,19 @@ func (db *PrefixDB) updateAccountNamedSegmentedStorage(accountKey []byte, kvs []
 		}
 		updated = append(updated, chunkMetas...)
 	}
+	// Handle unmatched KV pairs by creating new chunks
+	if len(unmatched) > 0 {
+		// Sort unmatched pairs to ensure proper ordering
+		sortKVPairs(unmatched)
+		// Create new chunks for unmatched pairs using the allocator to avoid filename conflicts
+		newChunkMetas, err := db.writeSegmentedChunksToFolderWithAllocator(folderPath, unmatched, allocator)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		// Append new chunks to the updated list
+		updated = append(updated, newChunkMetas...)
+		indexDirty = true
+	}
 	if indexDirty {
 		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
 			return 0, 0, 0, err
@@ -2346,6 +2356,10 @@ func (db *PrefixDB) updateAccountNamedSegmentedStorage(accountKey []byte, kvs []
 }
 
 func (db *PrefixDB) writeSegmentedChunksToFolder(folderPath string, kvs []kvPair) ([]segmentChunkMeta, error) {
+	return db.writeSegmentedChunksToFolderWithAllocator(folderPath, kvs, nil)
+}
+
+func (db *PrefixDB) writeSegmentedChunksToFolderWithAllocator(folderPath string, kvs []kvPair, allocator *chunkFileAllocator) ([]segmentChunkMeta, error) {
 	chunkMetas := make([]segmentChunkMeta, 0)
 	chunk := make([]kvPair, 0)
 	chunkSize := 0
@@ -2359,17 +2373,20 @@ func (db *PrefixDB) writeSegmentedChunksToFolder(folderPath string, kvs []kvPair
 			return err
 		}
 		defer release()
-		name := fmt.Sprintf("chunk_%04d.dat", chunkIdx)
+		// Use allocator if provided to generate unique chunk filenames
+		var name string
+		if allocator != nil {
+			name = allocator.nextName()
+		} else {
+			name = fmt.Sprintf("chunk_%04d.dat", chunkIdx)
+		}
 		fullPath := filepath.Join(folderPath, name)
 		if err := db.writeFileWithStats(fullPath, seg, 0o644, diskIOUsageStorageSeparatedLogs); err != nil {
 			return err
 		}
 		chunkMetas = append(chunkMetas, segmentChunkMeta{
-			FileName:  name,
-			KeyStart:  cloneBytes(chunk[0].key),
-			KeyEnd:    cloneBytes(chunk[len(chunk)-1].key),
-			KVCount:   uint32(len(chunk)),
-			ChunkSize: uint64(len(seg)),
+			FileName: name,
+			KeyStart: cloneBytes(chunk[0].key),
 		})
 		chunk = make([]kvPair, 0)
 		chunkSize = 0
@@ -2421,7 +2438,7 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 		return 0, 0, 0, fmt.Errorf("segment index missing for folder %d", folderID)
 	}
 	allocator := newChunkFileAllocator(metas)
-	buckets := partitionEntriesByChunks(metas, kvs)
+	buckets, unmatched := partitionEntriesByChunks(metas, kvs)
 	folderPath := db.segmentedFolderPath(folderID)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
 	indexDirty := false
@@ -2444,6 +2461,19 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 		}
 		updated = append(updated, chunkMetas...)
 	}
+	// Handle unmatched KV pairs by creating new chunks
+	if len(unmatched) > 0 {
+		// Sort unmatched pairs to ensure proper ordering
+		sortKVPairs(unmatched)
+		// Create new chunks for unmatched pairs using the allocator to avoid filename conflicts
+		newChunkMetas, err := db.writeSegmentedChunksToFolderWithAllocator(folderPath, unmatched, allocator)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		// Append new chunks to the updated list
+		updated = append(updated, newChunkMetas...)
+		indexDirty = true
+	}
 	if indexDirty {
 		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
 			return 0, 0, 0, err
@@ -2455,20 +2485,22 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 
 // partitionEntriesByChunks takes advantage of kvs being sorted lexicographically to
 // walk the chunk metadata once, yielding O(len(metas)+len(kvs)) complexity.
-func partitionEntriesByChunks(metas []segmentChunkMeta, kvs []kvPair) [][]kvPair {
+func partitionEntriesByChunks(metas []segmentChunkMeta, kvs []kvPair) ([][]kvPair, []kvPair) {
 	buckets := make([][]kvPair, len(metas))
+	var unmatched []kvPair
 	if len(metas) == 0 || len(kvs) == 0 {
-		return buckets
+		return buckets, unmatched
 	}
 	idx := 0
 	for _, kv := range kvs {
 		idx = findChunkIndexForKey(metas, kv.key, idx)
 		if idx < 0 {
+			unmatched = append(unmatched, kv)
 			continue
 		}
 		buckets[idx] = append(buckets[idx], kv)
 	}
-	return buckets
+	return buckets, unmatched
 }
 
 func findChunkIndexForKey(metas []segmentChunkMeta, key []byte, start int) int {
@@ -2483,6 +2515,7 @@ func findChunkIndexForKey(metas []segmentChunkMeta, key []byte, start int) int {
 	} else if start >= len(metas) {
 		start = len(metas) - 1
 	}
+	// First, find the candidate chunk using linear search
 	for start+1 < len(metas) {
 		next := metas[start+1].KeyStart
 		if len(next) > 0 && bytes.Compare(key, next) < 0 {
@@ -2490,12 +2523,27 @@ func findChunkIndexForKey(metas []segmentChunkMeta, key []byte, start int) int {
 		}
 		start++
 	}
+	// Adjust backwards if needed
 	for start > 0 {
 		cur := metas[start].KeyStart
 		if len(cur) == 0 || bytes.Compare(key, cur) >= 0 {
 			break
 		}
 		start--
+	}
+	// Validate that the key falls within the selected chunk's range [KeyStart, next.KeyStart)
+	cur := metas[start]
+	if len(cur.KeyStart) == 0 || bytes.Compare(key, cur.KeyStart) < 0 {
+		// Key is before this chunk's KeyStart
+		return -1
+	}
+	// Check upper bound: if there's a next chunk, key must be < next.KeyStart
+	if start+1 < len(metas) {
+		next := metas[start+1].KeyStart
+		if len(next) > 0 && bytes.Compare(key, next) >= 0 {
+			// Key is at or beyond next chunk's KeyStart
+			return -1
+		}
 	}
 	return start
 }
@@ -2577,8 +2625,6 @@ func (db *PrefixDB) mutateSegmentChunk(folderPath string, meta segmentChunkMeta,
 	if err := db.appendChunkFile(chunkPath, additions, currentSize); err != nil {
 		return nil, err
 	}
-	metaCopy.KVCount += uint32(len(additions))
-	metaCopy.ChunkSize += uint64(appendBytes)
 	adjustMetaRange(&metaCopy, additions)
 	return []segmentChunkMeta{metaCopy}, nil
 }
@@ -2612,10 +2658,7 @@ func adjustMetaRange(meta *segmentChunkMeta, additions []kvPair) {
 	if len(meta.KeyStart) == 0 || bytes.Compare(first, meta.KeyStart) < 0 {
 		meta.KeyStart = cloneBytes(first)
 	}
-	last := additions[len(additions)-1].key
-	if len(meta.KeyEnd) == 0 || bytes.Compare(last, meta.KeyEnd) > 0 {
-		meta.KeyEnd = cloneBytes(last)
-	}
+	// Note: KeyEnd is no longer tracked - ranges are KeyStart-only
 }
 
 func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
@@ -2625,7 +2668,8 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMe
 		if err != nil {
 			return nil, false, err
 		}
-		db.addCommitOldKVReadStats(len(existing), meta.ChunkSize)
+		// ChunkSize is no longer tracked in meta - get from filesystem if needed
+		db.addCommitOldKVReadStats(len(existing), 0)
 	}
 	if backing != nil {
 		defer backing.Release()
@@ -2642,21 +2686,17 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMe
 	}
 	chunks := splitEntriesBySize(merged, db.segmentedChunkTargetSize())
 	result := make([]segmentChunkMeta, 0, len(chunks))
-	var chunkSize int
 	for idx, chunk := range chunks {
 		name := meta.FileName
 		if idx > 0 {
 			name = allocator.nextName()
 		}
-		if chunkSize, err = db.writeChunkFile(folderPath, name, chunk); err != nil {
+		if _, err = db.writeChunkFile(folderPath, name, chunk); err != nil {
 			return nil, false, err
 		}
 		result = append(result, segmentChunkMeta{
-			FileName:  name,
-			KeyStart:  cloneBytes(chunk[0].key),
-			KeyEnd:    cloneBytes(chunk[len(chunk)-1].key),
-			KVCount:   uint32(len(chunk)),
-			ChunkSize: uint64(chunkSize),
+			FileName: name,
+			KeyStart: cloneBytes(chunk[0].key),
 		})
 	}
 	return result, false, nil
@@ -3253,9 +3293,28 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 		return bytes.Compare(start, key) > 0
 	})
 	if idx == 0 {
+		if len(entries[0].KeyStart) == 0 {
+			return &entries[0]
+		}
+		if bytes.Compare(key, entries[0].KeyStart) < 0 {
+			return nil
+		}
 		return &entries[0]
 	}
-	return &entries[idx-1]
+	selected := &entries[idx-1]
+	if len(selected.KeyStart) == 0 {
+		return selected
+	}
+	if bytes.Compare(key, selected.KeyStart) < 0 {
+		return nil
+	}
+	if idx < len(entries) {
+		nextStart := entries[idx].KeyStart
+		if len(nextStart) > 0 && bytes.Compare(key, nextStart) >= 0 {
+			return nil
+		}
+	}
+	return selected
 }
 
 func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) error {
@@ -3872,6 +3931,14 @@ func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) 
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
+		// Log detailed information for debugging
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to locate L1 index entry for key - folder=%s key=%x entries_count=%d\n",
+			folderPath, key, len(layout.entries))
+		// Print key ranges for all L1 entries
+		for i, e := range layout.entries {
+			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: L1[%d] MetaID=%d ChunkCount=%d KeyStart=%x\n",
+				i, e.MetaID, e.ChunkCount, e.KeyStart)
+		}
 		return nil, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
@@ -3920,6 +3987,14 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
+		// Log detailed information for debugging
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to locate L1 index entry for key - folder=%s key=%x entries_count=%d\n",
+			folderPath, key, len(layout.entries))
+		// Print key ranges for all L1 entries
+		for i, e := range layout.entries {
+			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: L1[%d] MetaID=%d ChunkCount=%d KeyStart=%x\n",
+				i, e.MetaID, e.ChunkCount, e.KeyStart)
+		}
 		return nil, false, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	if db.storageIndexCache != nil {
@@ -3954,12 +4029,9 @@ func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
 	dst := make([]segmentChunkMeta, len(src))
 	for i := range src {
 		dst[i] = segmentChunkMeta{
-			FileName:  strings.Clone(src[i].FileName),
-			KVCount:   src[i].KVCount,
-			ChunkSize: src[i].ChunkSize,
+			FileName: strings.Clone(src[i].FileName),
 		}
 		dst[i].KeyStart = cloneBytes(src[i].KeyStart)
-		dst[i].KeyEnd = cloneBytes(src[i].KeyEnd)
 	}
 	return dst
 }
@@ -3972,7 +4044,6 @@ func estimateSegmentChunkMetasMemory(metas []segmentChunkMeta) uint64 {
 	for i := range metas {
 		total += uint64(len(metas[i].FileName))
 		total += uint64(len(metas[i].KeyStart))
-		total += uint64(len(metas[i].KeyEnd))
 	}
 	return total
 }
@@ -4003,9 +4074,28 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 		return bytes.Compare(start, key) > 0
 	})
 	if idx == 0 {
+		if len(metas[0].KeyStart) == 0 {
+			return &metas[0]
+		}
+		if bytes.Compare(key, metas[0].KeyStart) < 0 {
+			return nil
+		}
 		return &metas[0]
 	}
-	return &metas[idx-1]
+	selected := &metas[idx-1]
+	if len(selected.KeyStart) == 0 {
+		return selected
+	}
+	if bytes.Compare(key, selected.KeyStart) < 0 {
+		return nil
+	}
+	if idx < len(metas) {
+		nextStart := metas[idx].KeyStart
+		if len(nextStart) > 0 && bytes.Compare(key, nextStart) >= 0 {
+			return nil
+		}
+	}
+	return selected
 }
 
 func (db *PrefixDB) readSegmentChunkFile(folderID uint32, fileName string) ([]kvPair, *bufferLease, error) {
@@ -4788,15 +4878,13 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderPath string, meta *segmentChunk
 		release()
 		return
 	}
-	chunkSize := meta.ChunkSize
-	if chunkSize == 0 {
-		info, err := os.Stat(filepath.Join(folderPath, meta.FileName))
-		if err != nil {
-			release()
-			return
-		}
-		chunkSize = uint64(info.Size())
+	// ChunkSize is no longer tracked in meta - get from filesystem
+	info, err := os.Stat(filepath.Join(folderPath, meta.FileName))
+	if err != nil {
+		release()
+		return
 	}
+	chunkSize := uint64(info.Size())
 	if chunkSize <= uint64(db.segmentedChunkTriggerSize()) {
 		release()
 		return
@@ -4942,14 +5030,14 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 			}
 		}
 
-		chunkMetas, next, rErr := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
+		chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
 		if preloaded != nil {
 			releaseStorageEntries(preloaded)
 		}
-		if rErr != nil {
-			return rErr
+		if err != nil {
+			return err
 		}
-		nextOrd = next
+		nextOrd = nextOrd2
 		replacements[job.fileName] = chunkMetas
 	}
 
@@ -4958,17 +5046,21 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	}
 
 	// Phase 2: commit by updating the index once.
+	// Re-read metas so we don't clobber concurrent index updates (e.g., another GC job).
 	genNow := db.segmentIndexGenerationLocked(folderPath)
 	latest := metas
 	if genNow != gen0 {
-		latest, _, err = db.readSegmentIndexWithGenByPath(folderPath, true)
+		var latestGen uint64
+		latest, latestGen, err = db.readSegmentIndexWithGenByPath(folderPath, true)
+		_ = latestGen
 		if err != nil {
 			return err
 		}
 	}
 
+	// Build updated index by applying all replacements
 	changed := false
-	updated := make([]segmentChunkMeta, 0, len(latest)+len(replacements))
+	updated := make([]segmentChunkMeta, 0, len(latest))
 	for i := range latest {
 		if repl, ok := replacements[latest[i].FileName]; ok {
 			changed = true
@@ -5192,11 +5284,8 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 		}
 		bytesWritten += uint64(chunkSize)
 		result = append(result, segmentChunkMeta{
-			FileName:  name,
-			KeyStart:  cloneBytes(chunk[0].key),
-			KeyEnd:    cloneBytes(chunk[len(chunk)-1].key),
-			KVCount:   uint32(len(chunk)),
-			ChunkSize: uint64(chunkSize),
+			FileName: name,
+			KeyStart: cloneBytes(chunk[0].key),
 		})
 	}
 	atomic.AddUint64(&db.GCCount, 1)
@@ -5251,6 +5340,14 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	meta := selectSegmentChunkMeta(metas, storageKey)
 	if meta == nil {
 		failure.reason = "segment-chunk-meta-not-found"
+		// Log detailed information for debugging
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to locate chunk for storage key - account=%x storage=%x folder=%s metas_count=%d\n",
+			accountKey, storageKey, folderPath, len(metas))
+		// Print key ranges for all metas
+		for i, m := range metas {
+			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: chunk[%d] file=%s KeyStart=%x\n",
+				i, m.FileName, m.KeyStart)
+		}
 		return nil, failure, nil
 	}
 	failure.chunkFile = meta.FileName
@@ -5532,17 +5629,14 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
 			for i, chunk := range chunks {
 				fileName := fmt.Sprintf("chunk_%04d.dat", i)
-				chunkSize, err := db.writeChunkFileWithUsage(folderPath, fileName, chunk, diskIOUsageStorageGC)
+				_, err := db.writeChunkFileWithUsage(folderPath, fileName, chunk, diskIOUsageStorageGC)
 				if err != nil {
 					db.segmentedMu.Unlock()
 					return err
 				}
 				updated = append(updated, segmentChunkMeta{
-					FileName:  fileName,
-					KeyStart:  cloneBytes(chunk[0].key),
-					KeyEnd:    cloneBytes(chunk[len(chunk)-1].key),
-					KVCount:   uint32(len(chunk)),
-					ChunkSize: uint64(chunkSize),
+					FileName: fileName,
+					KeyStart: cloneBytes(chunk[0].key),
 				})
 				keep[fileName] = struct{}{}
 			}
