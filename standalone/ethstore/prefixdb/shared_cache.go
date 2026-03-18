@@ -246,7 +246,7 @@ func estimateStorageCacheValueSize(key string, value interface{}) uint64 {
 }
 
 type segmentIndexCacheEntry struct {
-	folderID  uint32
+	folderKey string
 	metas     []segmentChunkMeta
 	sizeBytes uint64
 }
@@ -273,11 +273,32 @@ func newSharedSegmentIndexCache(shared *sharedByteCache) *segmentIndexCache {
 	return cache
 }
 
-func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
+func (c *segmentIndexCache) GetByPath(folderPath string) ([]segmentChunkMeta, bool) {
 	if c == nil {
 		return nil, false
 	}
-	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderID))
+	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
+	if !ok {
+		c.refreshUsage()
+		return nil, false
+	}
+	entry, _ := raw.(*segmentIndexCacheEntry)
+	c.refreshUsage()
+	if entry == nil {
+		return nil, false
+	}
+	return entry.metas, true
+}
+
+func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
+	return c.GetByPath(segmentIndexFolderIDCacheKey(folderID))
+}
+
+func (c *segmentIndexCache) GetLevel2ByPath(folderPath string, metaID uint32, generation uint64) ([]segmentChunkMeta, bool) {
+	if c == nil {
+		return nil, false
+	}
+	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation))
 	if !ok {
 		c.refreshUsage()
 		return nil, false
@@ -291,66 +312,65 @@ func (c *segmentIndexCache) Get(folderID uint32) ([]segmentChunkMeta, bool) {
 }
 
 func (c *segmentIndexCache) GetLevel2(folderID uint32, metaID uint32, generation uint64) ([]segmentChunkMeta, bool) {
-	if c == nil {
-		return nil, false
-	}
-	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation))
-	if !ok {
-		c.refreshUsage()
-		return nil, false
-	}
-	entry, _ := raw.(*segmentIndexCacheEntry)
-	c.refreshUsage()
-	if entry == nil {
-		return nil, false
-	}
-	return entry.metas, true
+	return c.GetLevel2ByPath(segmentIndexFolderIDCacheKey(folderID), metaID, generation)
 }
 
-func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
+func (c *segmentIndexCache) AddByPath(folderPath string, metas []segmentChunkMeta) {
 	if c == nil {
 		return
 	}
 	sizeBytes := estimateSegmentChunkMetasMemory(metas)
 	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderID))
+		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
 		c.refreshUsage()
 		return
 	}
 	entry := &segmentIndexCacheEntry{
-		folderID:  folderID,
+		folderKey: folderPath,
 		metas:     cloneSegmentChunkMetas(metas),
 		sizeBytes: sizeBytes,
 	}
-	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderID), entry, sizeBytes)
+	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath), entry, sizeBytes)
+	c.refreshUsage()
+}
+
+func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
+	c.AddByPath(segmentIndexFolderIDCacheKey(folderID), metas)
+}
+
+func (c *segmentIndexCache) AddLevel2ByPath(folderPath string, metaID uint32, generation uint64, metas []segmentChunkMeta) {
+	if c == nil {
+		return
+	}
+	sizeBytes := estimateSegmentChunkMetasMemory(metas)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation))
+		c.refreshUsage()
+		return
+	}
+	entry := &segmentIndexCacheEntry{
+		folderKey: folderPath,
+		metas:     cloneSegmentChunkMetas(metas),
+		sizeBytes: sizeBytes,
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation), entry, sizeBytes)
 	c.refreshUsage()
 }
 
 func (c *segmentIndexCache) AddLevel2(folderID uint32, metaID uint32, generation uint64, metas []segmentChunkMeta) {
+	c.AddLevel2ByPath(segmentIndexFolderIDCacheKey(folderID), metaID, generation, metas)
+}
+
+func (c *segmentIndexCache) RemoveByPath(folderPath string) {
 	if c == nil {
 		return
 	}
-	sizeBytes := estimateSegmentChunkMetasMemory(metas)
-	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation))
-		c.refreshUsage()
-		return
-	}
-	entry := &segmentIndexCacheEntry{
-		folderID:  folderID,
-		metas:     cloneSegmentChunkMetas(metas),
-		sizeBytes: sizeBytes,
-	}
-	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderID, metaID, generation), entry, sizeBytes)
+	c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
 	c.refreshUsage()
 }
 
 func (c *segmentIndexCache) Remove(folderID uint32) {
-	if c == nil {
-		return
-	}
-	c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderID))
-	c.refreshUsage()
+	c.RemoveByPath(segmentIndexFolderIDCacheKey(folderID))
 }
 
 func (c *segmentIndexCache) refreshUsage() {
@@ -360,18 +380,19 @@ func (c *segmentIndexCache) refreshUsage() {
 	c.usedBytes, c.capacityBytes = c.shared.NamespaceStats(sharedCacheNamespaceSegmentIndex)
 }
 
-func segmentIndexCacheKey(folderID uint32) string {
-	var buf [5]byte
-	buf[0] = 0x01
-	binary.BigEndian.PutUint32(buf[1:], folderID)
-	return string(buf[:])
+func segmentIndexFolderIDCacheKey(folderID uint32) string {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], folderID)
+	return "id:" + string(buf[:])
 }
 
-func segmentIndexLevel2CacheKey(folderID uint32, metaID uint32, generation uint64) string {
-	var buf [17]byte
-	buf[0] = 0x02
-	binary.BigEndian.PutUint32(buf[1:5], folderID)
-	binary.BigEndian.PutUint32(buf[5:9], metaID)
-	binary.BigEndian.PutUint64(buf[9:17], generation)
-	return string(buf[:])
+func segmentIndexCacheKey(folderKey string) string {
+	return "l1:" + folderKey
+}
+
+func segmentIndexLevel2CacheKey(folderKey string, metaID uint32, generation uint64) string {
+	var buf [12]byte
+	binary.BigEndian.PutUint32(buf[:4], metaID)
+	binary.BigEndian.PutUint64(buf[4:12], generation)
+	return "l2:" + folderKey + ":" + string(buf[:])
 }

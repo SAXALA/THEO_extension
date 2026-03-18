@@ -1444,11 +1444,12 @@ func TestSegmentIndexLargePayloadUsesCompression(t *testing.T) {
 
 func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 	shared := newSharedByteCache(4096)
+	storageDir := t.TempDir()
 	db := &PrefixDB{
-		storageDir:           t.TempDir(),
-		storageIndexCache:    newSharedSegmentIndexCache(shared),
-		storageIndexFolderId: 7,
-		storageIndexMetas:    []segmentChunkMeta{{FileName: "old.dat"}},
+		storageDir:             storageDir,
+		storageIndexCache:      newSharedSegmentIndexCache(shared),
+		storageIndexFolderPath: filepath.Join(storageDir, segmentedDirNamePrefix+"00000007"),
+		storageIndexMetas:      []segmentChunkMeta{{FileName: "old.dat"}},
 	}
 	metas := []segmentChunkMeta{{
 		FileName:  "chunk_0001.dat",
@@ -1457,10 +1458,11 @@ func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 		KVCount:   1,
 		ChunkSize: 128,
 	}}
+	folderPath := filepath.Join(storageDir, segmentedDirNamePrefix+"00000007")
 
 	db.refreshSegmentIndexCache(7, metas)
 
-	if got, ok := db.storageIndexCache.Get(7); !ok || len(got) != 1 || got[0].FileName != "chunk_0001.dat" {
+	if got, ok := db.storageIndexCache.GetByPath(folderPath); !ok || len(got) != 1 || got[0].FileName != "chunk_0001.dat" {
 		t.Fatalf("segment index cache not refreshed correctly: ok=%t metas=%v", ok, got)
 	}
 	if len(db.storageIndexMetas) != 1 || db.storageIndexMetas[0].FileName != "chunk_0001.dat" {

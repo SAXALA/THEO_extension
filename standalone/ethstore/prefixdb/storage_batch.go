@@ -476,6 +476,6 @@ func (db *PrefixDB) waitForStorageGCIdle() error {
 		if db.isStorageGCIdle() {
 			return nil
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(100 * time.Microsecond)
 	}
 }

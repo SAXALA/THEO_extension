@@ -190,13 +190,13 @@ func (f *accountFolderFilter) maybeContains(accountKey []byte) bool {
 }
 
 type storageGCJob struct {
-	folderID uint32
+	folderPath string
 	fileName string
 	backing  *bufferLease
 }
 
 func (job storageGCJob) key() string {
-	return fmt.Sprintf("%d:%s", job.folderID, job.fileName)
+	return job.folderPath + ":" + job.fileName
 }
 
 type AccountType int
@@ -245,9 +245,9 @@ type PrefixDB struct {
 
 	// segmentIndexMu protects in-memory segment index caches/layouts (they are mutated on reads).
 	segmentIndexMu sync.Mutex
-	// segmentIndexFolderLocks serializes segment index operations per folderID.
+	// segmentIndexFolderLocks serializes segment index operations per folder path.
 	segmentIndexFolderLocksMu sync.Mutex
-	segmentIndexFolderLocks   map[uint32]*segmentIndexFolderLock
+	segmentIndexFolderLocks   map[string]*segmentIndexFolderLock
 
 	storageDir       string
 	storageFileMu    sync.Mutex
@@ -259,14 +259,14 @@ type PrefixDB struct {
 	segmentDirSeq    uint32
 
 	// a index file maybe accessed frequently
-	storageIndexFolderId uint32
+	storageIndexFolderPath string
 	storageIndexMetas    []segmentChunkMeta
 	storageIndexCache    *segmentIndexCache
 	storageIndexReusable bool
 	storageIndexArena    []byte
 	storageGetCacheCount int
 
-	storageIndexPartialFolder   uint32
+	storageIndexPartialFolderPath string
 	storageIndexPartialMetaID   uint32
 	storageIndexPartialMetas    []segmentChunkMeta
 	storageIndexPartialReusable bool
@@ -451,7 +451,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 	db := &PrefixDB{
 		accountFile:                      accountFile,
 		writeMutex:                       sync.Mutex{},
-		segmentIndexFolderLocks:          make(map[uint32]*segmentIndexFolderLock),
+		segmentIndexFolderLocks:          make(map[string]*segmentIndexFolderLock),
 		fileHandleCache:                  getGlobalFileHandleCache(fileHandleCacheSize),
 		accountFolderSet:                 newAccountFolderFilter(accountFolderBloomBitCount),
 		storageDir:                       storageDir,
@@ -2190,7 +2190,6 @@ func (db *PrefixDB) persistStorageEntries(accountKey []byte, kvs []kvPair, exist
 	if len(kvs) == 0 {
 		return 0, 0, 0, nil
 	}
-
 	if isSegmentedStorage(existingFileID) {
 		kvs = dedupSortedKVPairs(kvs)
 		if isAccountNamedSegmentedStorage(existingFileID) {
@@ -2296,14 +2295,13 @@ func (db *PrefixDB) updateAccountNamedSegmentedStorage(accountKey []byte, kvs []
 	buckets := partitionEntriesByChunks(metas, kvs)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
 	indexDirty := false
-	folderID := segmentFolderIDFromPath(folderPath)
 	for idx, meta := range metas {
 		additions := buckets[idx]
 		if len(additions) == 0 {
 			updated = append(updated, meta)
 			continue
 		}
-		chunkMetas, mutateErr := db.mutateSegmentChunk(folderID, folderPath, meta, additions, allocator)
+		chunkMetas, mutateErr := db.mutateSegmentChunk(folderPath, meta, additions, allocator)
 		if mutateErr != nil {
 			return 0, 0, 0, mutateErr
 		}
@@ -2412,7 +2410,7 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 			updated = append(updated, meta)
 			continue
 		}
-		chunkMetas, err := db.mutateSegmentChunk(folderID, folderPath, meta, additions, allocator)
+		chunkMetas, err := db.mutateSegmentChunk(folderPath, meta, additions, allocator)
 		if err != nil {
 			return 0, 0, 0, err
 		}
@@ -2532,7 +2530,7 @@ func parseChunkOrdinal(name string) int {
 	return idx
 }
 
-func (db *PrefixDB) mutateSegmentChunk(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator) ([]segmentChunkMeta, error) {
+func (db *PrefixDB) mutateSegmentChunk(folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator) ([]segmentChunkMeta, error) {
 	if len(additions) == 0 {
 		return []segmentChunkMeta{meta}, nil
 	}
@@ -2540,11 +2538,11 @@ func (db *PrefixDB) mutateSegmentChunk(folderID uint32, folderPath string, meta 
 	info, err := os.Stat(chunkPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			chunkMetas, _, rewriteErr := db.rewriteChunkWithDedup(folderID, folderPath, meta, additions, allocator, []kvPair{}, nil)
+			chunkMetas, _, rewriteErr := db.rewriteChunkWithDedup(folderPath, meta, additions, allocator, []kvPair{}, nil)
 			if rewriteErr != nil {
 				return nil, rewriteErr
 			}
-			fmt.Printf("prefixdb: recreated missing chunk %s in folder %d during write\n", meta.FileName, folderID)
+			fmt.Printf("prefixdb: recreated missing chunk %s in folder %s during write\n", meta.FileName, folderPath)
 			return chunkMetas, nil
 		}
 		return nil, err
@@ -2599,10 +2597,10 @@ func adjustMetaRange(meta *segmentChunkMeta, additions []kvPair) {
 	}
 }
 
-func (db *PrefixDB) rewriteChunkWithDedup(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
+func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
 	var err error
 	if existing == nil {
-		existing, backing, err = db.readSegmentChunkFile(folderID, meta.FileName)
+		existing, backing, err = db.readSegmentChunkFileWithUsageByPath(folderPath, meta.FileName, diskIOUsageStorageSeparatedLogs)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2812,29 +2810,6 @@ func (db *PrefixDB) writeChunkFileWithUsage(folderPath, fileName string, entries
 	return chunkSize, nil
 }
 
-func (db *PrefixDB) nextSegmentedDirID() uint32 {
-	if db.segmentDirSeq == 0 {
-		// ensure we never collide with existing ids by scanning once if needed
-		entries, err := os.ReadDir(db.storageDir)
-		if err == nil {
-			var maxID uint32
-			for _, entry := range entries {
-				if entry.IsDir() {
-					var id uint32
-					if n, _ := fmt.Sscanf(entry.Name(), segmentedDirNamePrefix+"%08d", &id); n == 1 {
-						if id > maxID {
-							maxID = id
-						}
-					}
-				}
-			}
-			db.segmentDirSeq = maxID
-		}
-	}
-	db.segmentDirSeq++
-	return db.segmentDirSeq
-}
-
 func (db *PrefixDB) segmentedFolderPath(id uint32) string {
 	return filepath.Join(db.storageDir, fmt.Sprintf("%s%08d", segmentedDirNamePrefix, id))
 }
@@ -2908,20 +2883,20 @@ func shouldSkipAccountEntryPointerUpdate(existingFileID uint32, fileID uint32, o
 	return isAccountNamedSegmentedStorage(existingFileID) && isAccountNamedSegmentedStorage(fileID) && off == 0 && size == 0
 }
 
-func (db *PrefixDB) lockSegmentIndexFolder(folderID uint32) func() {
-	_, unlock := db.lockSegmentIndexFolderEntry(folderID)
+func (db *PrefixDB) lockSegmentIndexFolder(folderPath string) func() {
+	_, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	return unlock
 }
 
-func (db *PrefixDB) lockSegmentIndexFolderEntry(folderID uint32) (*segmentIndexFolderLock, func()) {
+func (db *PrefixDB) lockSegmentIndexFolderEntry(folderPath string) (*segmentIndexFolderLock, func()) {
 	db.segmentIndexFolderLocksMu.Lock()
 	if db.segmentIndexFolderLocks == nil {
-		db.segmentIndexFolderLocks = make(map[uint32]*segmentIndexFolderLock)
+		db.segmentIndexFolderLocks = make(map[string]*segmentIndexFolderLock)
 	}
-	entry := db.segmentIndexFolderLocks[folderID]
+	entry := db.segmentIndexFolderLocks[folderPath]
 	if entry == nil {
 		entry = &segmentIndexFolderLock{}
-		db.segmentIndexFolderLocks[folderID] = entry
+		db.segmentIndexFolderLocks[folderPath] = entry
 	}
 	entry.refs++
 	db.segmentIndexFolderLocksMu.Unlock()
@@ -2932,14 +2907,14 @@ func (db *PrefixDB) lockSegmentIndexFolderEntry(folderID uint32) (*segmentIndexF
 		db.segmentIndexFolderLocksMu.Lock()
 		entry.refs--
 		if entry.refs == 0 {
-			delete(db.segmentIndexFolderLocks, folderID)
+			delete(db.segmentIndexFolderLocks, folderPath)
 		}
 		db.segmentIndexFolderLocksMu.Unlock()
 	}
 }
 
-func (db *PrefixDB) segmentIndexGenerationLocked(folderID uint32) uint64 {
-	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
+func (db *PrefixDB) segmentIndexGenerationLocked(folderPath string) uint64 {
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	gen := atomic.LoadUint64(&entry.gen)
 	unlock()
 	return gen
@@ -2952,25 +2927,20 @@ func (db *PrefixDB) bumpSegmentIndexGenerationLocked(entry *segmentIndexFolderLo
 	atomic.AddUint64(&entry.gen, 1)
 }
 
-func (db *PrefixDB) readSegmentIndexWithGen(folderID uint32, useLRU bool) ([]segmentChunkMeta, uint64, error) {
-	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
+func (db *PrefixDB) readSegmentIndexWithGenByPath(folderPath string, useLRU bool) ([]segmentChunkMeta, uint64, error) {
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	defer unlock()
 	gen := atomic.LoadUint64(&entry.gen)
-	metas, _, err := db.readSegmentIndexLockedInternal(folderID, useLRU)
+	metas, _, err := db.readSegmentIndexLockedInternalByPath(folderPath, useLRU)
 	return metas, gen, err
+}
+
+func (db *PrefixDB) readSegmentIndexWithGen(folderID uint32, useLRU bool) ([]segmentChunkMeta, uint64, error) {
+	return db.readSegmentIndexWithGenByPath(db.segmentedFolderPath(folderID), useLRU)
 }
 
 func (db *PrefixDB) readSegmentIndexNoCacheWithGen(folderID uint32) ([]segmentChunkMeta, uint64, error) {
 	return db.readSegmentIndexWithGen(folderID, false)
-}
-
-func segmentFolderIDFromPath(folderPath string) uint32 {
-	base := filepath.Base(folderPath)
-	var folderID uint32
-	if _, err := fmt.Sscanf(base, segmentedDirNamePrefix+"%08d", &folderID); err != nil {
-		return 0
-	}
-	return folderID
 }
 
 func level2IndexFilePath(folderPath string, metaID uint32) string {
@@ -3450,8 +3420,7 @@ func layoutEntriesEqual(a, b []segmentIndexL1Entry) bool {
 }
 
 func (db *PrefixDB) writeSegmentIndex(folderPath string, metas []segmentChunkMeta) error {
-	folderID := segmentFolderIDFromPath(folderPath)
-	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	defer unlock()
 	// Capture the previous layout so we can remove stale L2 files without scanning
 	// the whole folder (which may contain many chunk_*.dat files).
@@ -3639,8 +3608,7 @@ func (db *PrefixDB) writeSegmentIndexIncrementalGC(folderPath string, latest []s
 	if len(replacements) == 0 {
 		return true, nil
 	}
-	folderID := segmentFolderIDFromPath(folderPath)
-	entry, unlock := db.lockSegmentIndexFolderEntry(folderID)
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	defer unlock()
 
 	layout, err := db.loadSegmentIndexLayout(folderPath)
@@ -3717,32 +3685,32 @@ func (db *PrefixDB) writeSegmentIndexIncrementalGC(folderPath string, latest []s
 	return true, nil
 }
 
-func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
-	unlock := db.lockSegmentIndexFolder(folderID)
+func (db *PrefixDB) invalidateSegmentIndexCacheByPath(folderPath string) {
+	unlock := db.lockSegmentIndexFolder(folderPath)
 	defer unlock()
-	if folderID == 0 {
+	if folderPath == "" {
 		return
 	}
 	db.segmentIndexMu.Lock()
 	defer db.segmentIndexMu.Unlock()
-	if db.storageIndexFolderId == folderID {
-		db.storageIndexFolderId = 0
+	if db.storageIndexFolderPath == folderPath {
+		db.storageIndexFolderPath = ""
 		db.storageIndexMetas = nil
 		db.storageIndexReusable = true
 		db.storageIndexArena = nil
 	}
-	if db.storageIndexPartialFolder == folderID {
-		db.storageIndexPartialFolder = 0
+	if db.storageIndexPartialFolderPath == folderPath {
+		db.storageIndexPartialFolderPath = ""
 		db.storageIndexPartialMetaID = 0
 		db.storageIndexPartialMetas = nil
 		db.storageIndexPartialReusable = true
 		db.storageIndexPartialArena = nil
 	}
 	if db.storageIndexCache != nil {
-		db.storageIndexCache.Remove(folderID)
+		db.storageIndexCache.RemoveByPath(folderPath)
 	}
 	if db.storageIndexLayoutReady {
-		if db.storageIndexLayoutPath == db.segmentedFolderPath(folderID) {
+		if db.storageIndexLayoutPath == folderPath {
 			db.storageIndexLayoutReady = false
 			db.storageIndexLayoutPath = ""
 			db.storageIndexLayoutCache = segmentIndexLayout{}
@@ -3750,36 +3718,44 @@ func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
 	}
 }
 
-func (db *PrefixDB) refreshSegmentIndexCache(folderID uint32, metas []segmentChunkMeta) {
-	unlock := db.lockSegmentIndexFolder(folderID)
+func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
+	db.invalidateSegmentIndexCacheByPath(db.segmentedFolderPath(folderID))
+}
+
+func (db *PrefixDB) refreshSegmentIndexCacheByPath(folderPath string, metas []segmentChunkMeta) {
+	unlock := db.lockSegmentIndexFolder(folderPath)
 	defer unlock()
-	if folderID == 0 {
+	if folderPath == "" {
 		return
 	}
 	cloned := cloneSegmentChunkMetas(metas)
 	db.segmentIndexMu.Lock()
 	defer db.segmentIndexMu.Unlock()
-	if db.storageIndexFolderId == folderID {
-		db.storageIndexFolderId = folderID
+	if db.storageIndexFolderPath == folderPath {
+		db.storageIndexFolderPath = folderPath
 		db.storageIndexMetas = cloneSegmentChunkMetas(cloned)
 		db.storageIndexReusable = true
 		db.storageIndexArena = nil
 	}
-	if db.storageIndexPartialFolder == folderID {
-		db.storageIndexPartialFolder = 0
+	if db.storageIndexPartialFolderPath == folderPath {
+		db.storageIndexPartialFolderPath = ""
 		db.storageIndexPartialMetaID = 0
 		db.storageIndexPartialMetas = nil
 		db.storageIndexPartialReusable = true
 		db.storageIndexPartialArena = nil
 	}
 	if db.storageIndexCache != nil {
-		db.storageIndexCache.Add(folderID, cloned)
+		db.storageIndexCache.AddByPath(folderPath, cloned)
 	}
-	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == db.segmentedFolderPath(folderID) {
+	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == folderPath {
 		db.storageIndexLayoutReady = false
 		db.storageIndexLayoutPath = ""
 		db.storageIndexLayoutCache = segmentIndexLayout{}
 	}
+}
+
+func (db *PrefixDB) refreshSegmentIndexCache(folderID uint32, metas []segmentChunkMeta) {
+	db.refreshSegmentIndexCacheByPath(db.segmentedFolderPath(folderID), metas)
 }
 
 func appendVarBytes(buf []byte, data []byte) ([]byte, error) {
@@ -3793,89 +3769,15 @@ func appendVarBytes(buf []byte, data []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (db *PrefixDB) readSegmentIndexNoCache(folderID uint32) ([]segmentChunkMeta, error) {
-	unlock := db.lockSegmentIndexFolder(folderID)
-	defer unlock()
-	metas, _, err := db.readSegmentIndexLockedInternal(folderID, false)
-	return metas, err
-}
-
-func (db *PrefixDB) readSegmentIndexNoCacheByPath(folderPath string) ([]segmentChunkMeta, error) {
-	layout, err := db.loadSegmentIndexLayout(folderPath)
-	if err != nil {
-		return nil, err
-	}
-	var metas []segmentChunkMeta
-	if layout.mode == indexLayoutMultiLevel {
-		total := 0
-		for _, entry := range layout.entries {
-			total += int(entry.ChunkCount)
-		}
-		metas = make([]segmentChunkMeta, 0, total)
-		var arena []byte
-		for idx, entry := range layout.entries {
-			data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
-			if err != nil {
-				return nil, err
-			}
-			if err := decodeSegmentIndexBuffer(data, &metas, &arena, idx != 0, folderPath); err != nil {
-				return nil, err
-			}
-		}
-		return metas, nil
-	}
-	data := layout.flatData
-	if len(data) == 0 {
-		indexPath := filepath.Join(folderPath, segmentIndexFileName)
-		data, err = db.readSegmentIndexFile(indexPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-	var arena []byte
-	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return nil, err
-	}
-	return metas, nil
-}
-
-func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) ([]segmentChunkMeta, error) {
-	if len(key) == 0 {
-		return db.readSegmentIndexNoCacheByPath(folderPath)
-	}
-	layout, err := db.loadSegmentIndexLayout(folderPath)
-	if err != nil {
-		return nil, err
-	}
-	if layout.mode != indexLayoutMultiLevel {
-		return db.readSegmentIndexNoCacheByPath(folderPath)
-	}
-	entry := selectSegmentL1Entry(layout.entries, key)
-	if entry == nil {
-		return nil, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
-	}
-	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
-	var arena []byte
-	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
-	if err != nil {
-		return nil, err
-	}
-	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return nil, err
-	}
-	return metas, nil
-}
-
-func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool) ([]segmentChunkMeta, bool, error) {
+func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useLRU bool) ([]segmentChunkMeta, bool, error) {
 	if useLRU && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		if metas, ok := db.storageIndexCache.Get(folderID); ok {
+		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
 			db.segmentIndexMu.Unlock()
 			return metas, true, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
-	folderPath := db.segmentedFolderPath(folderID)
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
 		return nil, false, err
@@ -3916,10 +3818,55 @@ func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool)
 	estimatedSize := estimateSegmentIndexSize(metas)
 	if useLRU && estimatedSize >= segmentIndexCacheThresholdBytes && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		db.storageIndexCache.Add(folderID, metas)
+		db.storageIndexCache.AddByPath(folderPath, metas)
 		db.segmentIndexMu.Unlock()
 	}
 	return metas, false, nil
+}
+
+func (db *PrefixDB) readSegmentIndexNoCache(folderID uint32) ([]segmentChunkMeta, error) {
+	unlock := db.lockSegmentIndexFolder(db.segmentedFolderPath(folderID))
+	defer unlock()
+	metas, _, err := db.readSegmentIndexLockedInternalByPath(db.segmentedFolderPath(folderID), false)
+	return metas, err
+}
+
+func (db *PrefixDB) readSegmentIndexNoCacheByPath(folderPath string) ([]segmentChunkMeta, error) {
+	unlock := db.lockSegmentIndexFolder(folderPath)
+	defer unlock()
+	metas, _, err := db.readSegmentIndexLockedInternalByPath(folderPath, false)
+	return metas, err
+}
+
+func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) ([]segmentChunkMeta, error) {
+	if len(key) == 0 {
+		return db.readSegmentIndexNoCacheByPath(folderPath)
+	}
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		return nil, err
+	}
+	if layout.mode != indexLayoutMultiLevel {
+		return db.readSegmentIndexNoCacheByPath(folderPath)
+	}
+	entry := selectSegmentL1Entry(layout.entries, key)
+	if entry == nil {
+		return nil, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
+	}
+	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
+	var arena []byte
+	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
+	if err != nil {
+		return nil, err
+	}
+	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
+		return nil, err
+	}
+	return metas, nil
+}
+
+func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool) ([]segmentChunkMeta, bool, error) {
+	return db.readSegmentIndexLockedInternalByPath(db.segmentedFolderPath(folderID), useLRU)
 }
 
 func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segmentChunkMeta, error) {
@@ -3928,35 +3875,35 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 }
 
 func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte) ([]segmentChunkMeta, bool, error) {
-	entryLock, unlock := db.lockSegmentIndexFolderEntry(folderID)
+	folderPath := db.segmentedFolderPath(folderID)
+	entryLock, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	defer unlock()
 	generation := atomic.LoadUint64(&entryLock.gen)
 	if len(key) == 0 {
-		return db.readSegmentIndexLockedInternal(folderID, true)
+		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		if metas, ok := db.storageIndexCache.Get(folderID); ok {
+		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
 			db.segmentIndexMu.Unlock()
 			return metas, true, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
-	folderPath := db.segmentedFolderPath(folderID)
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
 		return nil, false, err
 	}
 	if layout.mode != indexLayoutMultiLevel {
-		return db.readSegmentIndexLockedInternal(folderID, true)
+		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
-		return nil, false, fmt.Errorf("%w for folder %d", errSegmentIndexEntryNotFound, folderID)
+		return nil, false, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		if metas, ok := db.storageIndexCache.GetLevel2(folderID, entry.MetaID, generation); ok {
+		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
 			db.segmentIndexMu.Unlock()
 			return metas, true, nil
 		}
@@ -3973,7 +3920,7 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
-		db.storageIndexCache.AddLevel2(folderID, entry.MetaID, generation, metas)
+		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
 		db.segmentIndexMu.Unlock()
 	}
 	return metas, false, nil
@@ -4081,19 +4028,6 @@ func (db *PrefixDB) readSegmentChunkFileWithUsageByPath(folderPath string, fileN
 		db.addDiskRead(usage, 0)
 	}
 	return entries, lease, nil
-}
-
-func (db *PrefixDB) readSegmentChunkPayloadWithUsage(folderID uint32, fileName string, usage diskIOUsage) ([]byte, int, *bufferLease, error) {
-	lease, err := db.readSegmentFileBufferWithUsage(folderID, fileName, usage)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	payload, kvCount, _, err := parseChunkPayload(lease.Bytes())
-	if err != nil {
-		lease.Release()
-		return nil, 0, nil, err
-	}
-	return payload, kvCount, lease, nil
 }
 
 func (db *PrefixDB) readSegmentChunkPayloadByPath(folderPath string, fileName string) ([]byte, int, *bufferLease, error) {
@@ -4227,7 +4161,6 @@ func (db *PrefixDB) readAccountStorageValue(accountKey, storageKey []byte) ([]by
 		return val, true, nil, nil
 	}
 }
-
 
 func (db *PrefixDB) logLargeLogReadFailure(accountKey, storageKey []byte, filePath string, fileID uint32, offset int64, size uint64, reason string, err error) {
 	dir, file := splitLogPath(filePath)
@@ -4729,36 +4662,36 @@ func (db *PrefixDB) startStorageGCWorker() {
 	go func() {
 		defer db.storageGCWait.Done()
 		var batchWait sync.WaitGroup
-		pending := make(map[uint32][]storageGCJob)
-		active := make(map[uint32]struct{})
-		batchDone := make(chan uint32, storageGCQueueCapacity(db.gcWorkers))
-		launchBatch := func(folderID uint32) {
-			jobs := pending[folderID]
+		pending := make(map[string][]storageGCJob)
+		active := make(map[string]struct{})
+		batchDone := make(chan string, storageGCQueueCapacity(db.gcWorkers))
+		launchBatch := func(folderPath string) {
+			jobs := pending[folderPath]
 			if len(jobs) == 0 {
 				return
 			}
-			if _, exists := active[folderID]; exists {
+			if _, exists := active[folderPath]; exists {
 				return
 			}
-			delete(pending, folderID)
-			active[folderID] = struct{}{}
+			delete(pending, folderPath)
+			active[folderPath] = struct{}{}
 			batchWait.Add(1)
-			go func(id uint32, jobs []storageGCJob) {
+			go func(path string, jobs []storageGCJob) {
 				defer batchWait.Done()
 				db.processStorageGCBatch(jobs)
-				batchDone <- id
-			}(folderID, jobs)
+				batchDone <- path
+			}(folderPath, jobs)
 		}
 		launchAllReady := func() {
-			for folderID := range pending {
-				launchBatch(folderID)
+			for folderPath := range pending {
+				launchBatch(folderPath)
 			}
 		}
 		drainQueue := func() {
 			for {
 				select {
 				case job := <-db.storageGCQueue:
-					pending[job.folderID] = append(pending[job.folderID], job)
+					pending[job.folderPath] = append(pending[job.folderPath], job)
 				default:
 					return
 				}
@@ -4774,12 +4707,12 @@ func (db *PrefixDB) startStorageGCWorker() {
 			}
 			select {
 			case job := <-db.storageGCQueue:
-				pending[job.folderID] = append(pending[job.folderID], job)
+				pending[job.folderPath] = append(pending[job.folderPath], job)
 				drainQueue()
 				launchAllReady()
-			case folderID := <-batchDone:
-				delete(active, folderID)
-				launchBatch(folderID)
+			case folderPath := <-batchDone:
+				delete(active, folderPath)
+				launchBatch(folderPath)
 			case <-db.storageGCStop:
 				stopRequested = true
 				drainQueue()
@@ -4819,7 +4752,7 @@ func (db *PrefixDB) isStorageGCIdle() bool {
 	return queued == 0 && inFlight == 0
 }
 
-func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMeta, backing *bufferLease) {
+func (db *PrefixDB) maybeScheduleStorageGC(folderPath string, meta *segmentChunkMeta, backing *bufferLease) {
 	release := func() {
 		if backing != nil {
 			backing.Release()
@@ -4836,7 +4769,7 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 	}
 	chunkSize := meta.ChunkSize
 	if chunkSize == 0 {
-		info, err := os.Stat(filepath.Join(db.segmentedFolderPath(folderID), meta.FileName))
+		info, err := os.Stat(filepath.Join(folderPath, meta.FileName))
 		if err != nil {
 			release()
 			return
@@ -4847,7 +4780,7 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 		release()
 		return
 	}
-	job := storageGCJob{folderID: folderID, fileName: meta.FileName, backing: backing}
+	job := storageGCJob{folderPath: folderPath, fileName: meta.FileName, backing: backing}
 	key := job.key()
 	db.storageGCMu.Lock()
 	if db.storageGCInFlight == nil {
@@ -4875,7 +4808,7 @@ func (db *PrefixDB) processStorageGCJob(job storageGCJob) {
 	defer release()
 	defer db.finishStorageGCJob(job)
 	if err := db.runStorageGCJob(job); err != nil {
-		fmt.Printf("storage GC failed for folder %d file %s: %v\n", job.folderID, job.fileName, err)
+		fmt.Printf("storage GC failed for folder %s file %s: %v\n", job.folderPath, job.fileName, err)
 	}
 }
 
@@ -4891,7 +4824,7 @@ func (db *PrefixDB) processStorageGCBatch(jobs []storageGCJob) {
 	}
 	if err := db.runStorageGCBatch(jobs); err != nil {
 		// Print one summary line to avoid log spam.
-		fmt.Printf("storage GC batch failed for folder %d jobs %d: %v\n", jobs[0].folderID, len(jobs), err)
+		fmt.Printf("storage GC batch failed for folder %s jobs %d: %v\n", jobs[0].folderPath, len(jobs), err)
 	}
 }
 
@@ -4899,7 +4832,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	if len(jobs) == 0 {
 		return nil
 	}
-	folderID := jobs[0].folderID
+	folderPath := jobs[0].folderPath
 	// Ensure we always release any backings not consumed by chunk rewrite.
 	backings := make([]*bufferLease, len(jobs))
 	for i := range jobs {
@@ -4915,7 +4848,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 
 	// Phase 1: read index once and rewrite multiple target chunks into new files.
 	// Prefer cached index snapshot on GC reads to reduce repetitive disk IO.
-	metas, gen0, err := db.readSegmentIndexWithGen(folderID, true)
+	metas, gen0, err := db.readSegmentIndexWithGenByPath(folderPath, true)
 	if err != nil {
 		return err
 	}
@@ -4929,7 +4862,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	uniqueIdx := make([]int, 0, len(jobs))
 	for i := range jobs {
 		j := jobs[i]
-		if j.folderID != folderID || j.fileName == "" {
+		if j.folderPath != folderPath || j.fileName == "" {
 			continue
 		}
 		if _, ok := seen[j.fileName]; ok {
@@ -4943,7 +4876,6 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 		return nil
 	}
 
-	folderPath := db.segmentedFolderPath(folderID)
 	maxOrd := -1
 	for i := range metas {
 		if ord := parseChunkOrdinal(metas[i].FileName); ord > maxOrd {
@@ -4989,7 +4921,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 			}
 		}
 
-		chunkMetas, next, rErr := db.rewriteChunkWithDedupToNewFiles(folderID, folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
+		chunkMetas, next, rErr := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
 		if preloaded != nil {
 			releaseStorageEntries(preloaded)
 		}
@@ -5005,10 +4937,10 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	}
 
 	// Phase 2: commit by updating the index once.
-	genNow := db.segmentIndexGenerationLocked(folderID)
+	genNow := db.segmentIndexGenerationLocked(folderPath)
 	latest := metas
 	if genNow != gen0 {
-		latest, _, err = db.readSegmentIndexWithGen(folderID, true)
+		latest, _, err = db.readSegmentIndexWithGenByPath(folderPath, true)
 		if err != nil {
 			return err
 		}
@@ -5039,7 +4971,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 			return err
 		}
 	}
-	db.refreshSegmentIndexCache(folderID, updated)
+	db.refreshSegmentIndexCacheByPath(folderPath, updated)
 	return nil
 }
 
@@ -5060,7 +4992,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	// Phase 1: build rewritten chunk(s) into NEW files (do not overwrite old fileName).
 	// This allows concurrent readers to keep using the old index+old chunk file safely.
 	// Prefer cached index snapshot on GC reads to reduce repetitive disk IO.
-	metas, gen0, err := db.readSegmentIndexWithGen(job.folderID, true)
+	metas, gen0, err := db.readSegmentIndexWithGenByPath(job.folderPath, true)
 	if err != nil {
 		return err
 	}
@@ -5077,7 +5009,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	if idx == -1 {
 		return nil
 	}
-	folderPath := db.segmentedFolderPath(job.folderID)
+	folderPath := job.folderPath
 
 	// Start allocating new chunk ordinals after the current max.
 	maxOrd := -1
@@ -5110,7 +5042,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 		}
 	}
 
-	chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(job.folderID, folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
+	chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, preloadBacking)
 	if preloaded != nil {
 		releaseStorageEntries(preloaded)
 	}
@@ -5121,11 +5053,11 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 
 	// Phase 2: commit by updating the index to point to the new files.
 	// Re-read metas so we don't clobber concurrent index updates (e.g., another GC job).
-	genNow := db.segmentIndexGenerationLocked(job.folderID)
+	genNow := db.segmentIndexGenerationLocked(job.folderPath)
 	latest := metas
 	if genNow != gen0 {
 		var latestGen uint64
-		latest, latestGen, err = db.readSegmentIndexWithGen(job.folderID, true)
+		latest, latestGen, err = db.readSegmentIndexWithGenByPath(job.folderPath, true)
 		_ = latestGen
 		if err != nil {
 			return err
@@ -5160,7 +5092,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 			return err
 		}
 	}
-	db.refreshSegmentIndexCache(job.folderID, updated)
+	db.refreshSegmentIndexCacheByPath(job.folderPath, updated)
 	// Option B: do NOT delete the original chunk file. It becomes garbage and can be cleaned later.
 	return nil
 }
@@ -5188,11 +5120,11 @@ func reserveChunkFileName(folderPath string, startOrdinal int) (name string, nex
 // rewriteChunkWithDedupToNewFiles rewrites a chunk with deduplication and splits by target size,
 // writing results into NEW chunk files (never overwriting meta.FileName). It returns the new metas
 // and the next suggested ordinal.
-func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderID uint32, folderPath string, meta segmentChunkMeta, additions []kvPair, startOrdinal int, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, int, error) {
+func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segmentChunkMeta, additions []kvPair, startOrdinal int, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, int, error) {
 	var err error
 	var bytesWritten uint64
 	if existing == nil {
-		existing, backing, err = db.readSegmentChunkFileWithUsage(folderID, meta.FileName, diskIOUsageStorageGC)
+		existing, backing, err = db.readSegmentChunkFileWithUsageByPath(folderPath, meta.FileName, diskIOUsageStorageGC)
 		if err != nil {
 			return nil, startOrdinal, err
 		}
