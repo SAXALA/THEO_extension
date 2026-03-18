@@ -1750,6 +1750,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 	var totalTime time.Duration
 	counter := 0
 	deferredStorageCount := 0
+	deferredStorageSamples := make([]string, 0, 4)
 	reader := bufio.NewReader(file)
 
 	//isSaveTrie := false
@@ -1757,12 +1758,21 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 	for {
 
 		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read load data line: %w", err)
+		}
+		if err == io.EOF && len(line) == 0 {
+			break
 		}
 
 		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
+		line = strings.TrimRight(line, "\r\n")
+		if len(line) == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
 
 		counter++
 
@@ -1806,6 +1816,9 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 			}
 			if accountKey == nil {
 				deferredStorageCount++
+				if len(deferredStorageSamples) < cap(deferredStorageSamples) {
+					deferredStorageSamples = append(deferredStorageSamples, fmt.Sprintf("%x", keyBytes))
+				}
 			}
 		}
 		startTime := time.Now()
@@ -1824,18 +1837,21 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 				return fmt.Errorf("failed to commit PrefixDB batch at row %d: %w", counter, err)
 			}
 		}
+		if err == io.EOF {
+			break
+		}
 	}
 
 	if err := pdb.BatchCommit(); err != nil {
 		return fmt.Errorf("failed to finalize PrefixDB batch commit: %w", err)
 	}
-
-	if err := pdb.RunPostLoadGC(); err != nil {
-		return fmt.Errorf("failed to run post-load GC: %w", err)
-	}
 	if deferredStorageCount > 0 {
-		fmt.Printf("\nDeferred PrefixDB storage account resolution count: %d\n", deferredStorageCount)
+		return fmt.Errorf("loadPrefixDB deferred %d storage entries with unresolved account keys; sample keys: %v", deferredStorageCount, deferredStorageSamples)
 	}
+
+	// if err := pdb.RunPostLoadGC(); err != nil {
+	// 	return fmt.Errorf("failed to run post-load GC: %w", err)
+	// }
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
 }
@@ -1849,7 +1865,7 @@ func resolvePrefixDBLoadAccountKey(index interface{ Get([]byte) ([]byte, error) 
 	}
 	accountKey, err := index.Get(storageKey[1:33])
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
+		if errors.Is(err, pebble.ErrNotFound) || errors.Is(err, ethstore.ErrNotFound) {
 			return nil, nil
 		}
 		return nil, err

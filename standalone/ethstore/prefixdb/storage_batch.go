@@ -2,6 +2,7 @@ package prefixdb
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -45,6 +46,8 @@ func (sb *storageBatcher) reset() {
 func (sb *storageBatcher) put(accountKey string, storageKey, value []byte) {
 	if accountKey == "" {
 		// Should not drop unresolved here; caller should use putUnresolved when accountKey is unknown.
+		fmt.Printf("storageBatcher.put: dropped storage entry with empty accountKey - storageKey=%x valueLen=%d\n",
+			storageKey, len(value))
 		return
 	}
 	sb.mu.Lock()
@@ -67,6 +70,8 @@ func (sb *storageBatcher) put(accountKey string, storageKey, value []byte) {
 
 func (sb *storageBatcher) putUnresolved(originalKey string, value []byte) {
 	if originalKey == "" {
+		fmt.Printf("storageBatcher.putUnresolved: dropped storage entry with empty originalKey - valueLen=%d\n",
+			len(value))
 		return
 	}
 	sb.mu.Lock()
@@ -282,9 +287,9 @@ func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte
 
 	accountKeys := make([]string, 0, len(batch))
 	for accountKey := range batch {
-		if op, ok := accountOps[accountKey]; ok && op.value == nil {
-			continue
-		}
+		// if op, ok := accountOps[accountKey]; ok && op.value == nil {
+		// 	continue
+		// }
 		accountKeys = append(accountKeys, accountKey)
 	}
 	if len(accountKeys) == 0 {
@@ -311,6 +316,8 @@ func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte
 			for idx := range jobs {
 				plan, err := db.buildStorageCommitPlan(accountKeys[idx], batch[accountKeys[idx]])
 				if err != nil {
+					fmt.Printf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%s error=%v\n",
+						accountKeys[idx], err)
 					select {
 					case errCh <- err:
 					default:
@@ -338,6 +345,7 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 	if len(unresolved) == 0 {
 		return nil
 	}
+	unresolvedCount := 0
 	for origKeyStr, v := range unresolved {
 		origKeyBytes := []byte(origKeyStr)
 		var accountKey []byte
@@ -345,6 +353,9 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 			accountKey = db.ParentKeyResolver(origKeyBytes)
 		}
 		if accountKey == nil {
+			unresolvedCount++
+			fmt.Printf("prepareStorageCommitPlans: unresolved storage entry will be dropped - storageKey=%x valueLen=%d reason=ParentKeyResolver returned nil\n",
+				origKeyBytes, len(v))
 			continue
 		}
 		storageKey, err := db.normalizeStorageKey(origKeyBytes)
@@ -361,6 +372,10 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 		if db.storageCache != nil {
 			db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), v)
 		}
+	}
+	if unresolvedCount > 0 {
+		fmt.Printf("prepareStorageCommitPlans: dropped unresolved storage entries - droppedCount=%d totalUnresolved=%d\n",
+			unresolvedCount, len(unresolved))
 	}
 	return nil
 }
@@ -384,6 +399,8 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		existingSize = node.storageSize
 	}
 	if len(perAccount) == 0 {
+		fmt.Printf("buildStorageCommitPlan: no storage entries to write for account - accountKey=%s\n",
+			accountKey)
 		return plan, nil
 	}
 	kvs := make([]kvPair, 0, len(perAccount))
@@ -424,6 +441,8 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		existingSize = node.storageSize
 	}
 	if len(kvs) == 0 {
+		fmt.Printf("commitStorageForAccount: no storage kvs to write for account - accountKey=%s\n",
+			accountKey)
 		if err := db.prefixTree.Put(accountKeyBytes, accOff, 0, 0, 0); err != nil {
 			return err
 		}

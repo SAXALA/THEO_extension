@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -193,6 +194,83 @@ func TestLoadPrefixDBFinalBatchCommitPersistsTailEntries(t *testing.T) {
 	}
 	if !bytes.Equal(gotStorage, storageValue) {
 		t.Fatalf("unexpected storage value: got %q want %q", gotStorage, storageValue)
+	}
+}
+
+func TestLoadPrefixDBProcessesLastLineWithoutTrailingNewline(t *testing.T) {
+	tempDir := t.TempDir()
+	auxDir := filepath.Join(tempDir, "account-hash-pebble")
+	auxStore, err := pebblestore.NewPebbleStore(auxDir, 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("NewPebbleStore failed: %v", err)
+	}
+	accountKey := []byte{'A', 0x09, 0x08, 0x07, 0x06}
+	accountHash := bytes.Repeat([]byte{0x4a}, 32)
+	if err := auxStore.Put(accountHash, accountKey); err != nil {
+		auxStore.Close()
+		t.Fatalf("auxStore.Put failed: %v", err)
+	}
+	if err := auxStore.Close(); err != nil {
+		t.Fatalf("auxStore.Close failed: %v", err)
+	}
+
+	accountValue := []byte("account-value")
+	storageValue := []byte("storage-value-without-newline")
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x0a, 0x0b, 0x0c)
+	dataFile := filepath.Join(tempDir, "load-no-trailing-newline.txt")
+	content := fmt.Sprintf("Key: %x, Value : %x\nKey: %x, Value : %x", accountKey, accountValue, storageKey, storageValue)
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if err := loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("loadPrefixDB failed: %v", err)
+	}
+
+	dbDir := filepath.Join(tempDir, "database_statedb8KB")
+	reopened, err := prefixdb.NewPrefixDBWithRuntimeOptions(dbDir, 8*1024, 16, 16, 0, 0, 0, false, false, 0)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	gotStorage, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected storage entry from final line without trailing newline")
+	}
+	if !bytes.Equal(gotStorage, storageValue) {
+		t.Fatalf("unexpected storage value: got %q want %q", gotStorage, storageValue)
+	}
+}
+
+func TestLoadPrefixDBFailsWhenStorageAccountKeyCannotBeResolved(t *testing.T) {
+	tempDir := t.TempDir()
+	auxDir := filepath.Join(tempDir, "account-hash-pebble")
+	auxStore, err := pebblestore.NewPebbleStore(auxDir, 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("NewPebbleStore failed: %v", err)
+	}
+	if err := auxStore.Close(); err != nil {
+		t.Fatalf("auxStore.Close failed: %v", err)
+	}
+
+	missingHash := bytes.Repeat([]byte{0x5b}, 32)
+	storageKey := append(append([]byte{'O'}, missingHash...), 0x01, 0x02, 0x03)
+	dataFile := filepath.Join(tempDir, "load-missing-account-key.txt")
+	content := fmt.Sprintf("Key: %x, Value : %x\n", storageKey, []byte("storage-value"))
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	err = loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false)
+	if err == nil {
+		t.Fatal("expected loadPrefixDB to fail when storage account key cannot be resolved")
+	}
+	if !strings.Contains(err.Error(), "deferred") || !strings.Contains(err.Error(), "unresolved account keys") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -808,6 +808,17 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	if db.storageBatch != nil {
 		storageBatch, storageUnresolved = db.storageBatch.drain()
 	}
+	
+	// Log batch commit statistics
+	totalStorageKeys := 0
+	for _, perAccount := range storageBatch {
+		totalStorageKeys += len(perAccount)
+	}
+	if len(accountOps) > 0 || totalStorageKeys > 0 || len(storageUnresolved) > 0 {
+		fmt.Printf("BatchCommit: starting commit - accountOps=%d storageAccounts=%d storageKeys=%d unresolved=%d\n",
+			len(accountOps), len(storageBatch), totalStorageKeys, len(storageUnresolved))
+	}
+	
 	if len(accountOps) == 0 && len(storageBatch) == 0 && len(storageUnresolved) == 0 {
 		return nil
 	}
@@ -1061,6 +1072,14 @@ func (db *PrefixDB) bufferStorageMutation(accountKey, storageKey, value []byte) 
 		db.storageBuf.accountKey = accountStr
 		db.storageBuf.storagekvs = make([]kvPair, 0)
 	}
+	// Check for duplicate key in the buffer
+	for _, existing := range db.storageBuf.storagekvs {
+		if string(existing.key) == string(storageKey) {
+			fmt.Printf("bufferStorageMutation: duplicate storage key detected in buffer - accountKey=%s storageKey=%x (will be overwritten)\n",
+				accountStr, storageKey)
+			break
+		}
+	}
 	db.storageBuf.storagekvs = append(db.storageBuf.storagekvs, kvPair{key: storageKey, val: value})
 	return nil
 }
@@ -1087,8 +1106,9 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
 	}
-	sortKVPairs(buf.storagekvs)
 	if len(buf.storagekvs) == 0 {
+		fmt.Printf("flushStorageBuffer: empty buffer for account - accountKey=%s\n",
+			buf.accountKey)
 		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0); err != nil {
 			return err
 		}
@@ -1096,33 +1116,34 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		if db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(buf.accountKey, StorageInfo{})
 		}
-	} else {
-		fileID, off, sz, err := db.persistStorageEntries([]byte(buf.accountKey), buf.storagekvs, existingFileID, existingOffset, existingSize)
-		if err != nil {
+		return nil
+	}
+	sortKVPairs(buf.storagekvs)
+	fileID, off, sz, err := db.persistStorageEntries([]byte(buf.accountKey), buf.storagekvs, existingFileID, existingOffset, existingSize)
+	if err != nil {
+		return err
+	}
+	skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
+	if !skipAccountPointerUpdate {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, fileID, off, sz); err != nil {
 			return err
 		}
-		skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
-		if !skipAccountPointerUpdate {
-			if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, fileID, off, sz); err != nil {
-				return err
-			}
-			db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{
-				storageFileID: fileID,
-				storageOffset: off,
-				storageSize:   sz,
-			})
-		}
+		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{
+			storageFileID: fileID,
+			storageOffset: off,
+			storageSize:   sz,
+		})
+	}
 
-		// cacheKeyHex := hex.EncodeToString([]byte(buf.accountKey))
-		// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", fileID) + ", offset:" + fmt.Sprintf("%d", off) + ", size:" + fmt.Sprintf("%d", sz))
+	// cacheKeyHex := hex.EncodeToString([]byte(buf.accountKey))
+	// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", fileID) + ", offset:" + fmt.Sprintf("%d", off) + ", size:" + fmt.Sprintf("%d", sz))
 
-		if db.accountBatch != nil && !skipAccountPointerUpdate {
-			_ = db.accountBatch.updateStoragePointer(buf.accountKey, StorageInfo{
-				storageFileID: fileID,
-				storageOffset: off,
-				storageSize:   sz,
-			})
-		}
+	if db.accountBatch != nil && !skipAccountPointerUpdate {
+		_ = db.accountBatch.updateStoragePointer(buf.accountKey, StorageInfo{
+			storageFileID: fileID,
+			storageOffset: off,
+			storageSize:   sz,
+		})
 	}
 	buf.reset()
 	return nil
