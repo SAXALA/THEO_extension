@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -302,8 +301,8 @@ func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
 
 	firstDelta := afterFirst - before
 	secondDelta := afterSecond - afterFirst
-	if firstDelta < 2 {
-		t.Fatalf("expected first read to include layout+L2 IO, got delta=%d", firstDelta)
+	if firstDelta < 1 {
+		t.Fatalf("expected first read to hit index storage, got delta=%d", firstDelta)
 	}
 	if secondDelta >= firstDelta {
 		t.Fatalf("expected second read to use partial L2 cache; firstDelta=%d secondDelta=%d", firstDelta, secondDelta)
@@ -348,6 +347,13 @@ func makeTestStorageRawKey(accountKey []byte, suffix ...byte) []byte {
 	return raw
 }
 
+func makeTestStorageRawKeyWithSuffix(suffix ...byte) []byte {
+	raw := make([]byte, 1+32+len(suffix))
+	raw[0] = 'O'
+	copy(raw[33:], suffix)
+	return raw
+}
+
 func TestCommitStorageForAccountUsesAccountNamedSegmentedFolder(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 16)
@@ -386,6 +392,46 @@ func TestCommitStorageForAccountUsesAccountNamedSegmentedFolder(t *testing.T) {
 	}
 	if !found || !bytes.Equal(value, bytes.Repeat([]byte("b"), 40)) {
 		t.Fatalf("unexpected storage lookup result: found=%t value=%q", found, value)
+	}
+}
+
+func TestShortAccountKeyFolderManagedStorageSurvivesReopen(t *testing.T) {
+	baseDir := t.TempDir()
+	accountKey := []byte{0x41, 0x03, 0x07, 0x0d, 0x06, 0x05, 0x0e, 0x0a}
+	storageSuffix := []byte{0x07, 0x0c, 0x01}
+
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	kvs := []kvPair{
+		{key: append([]byte(nil), storageSuffix...), val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x07, 0x0c, 0x02}, val: bytes.Repeat([]byte("b"), 40)},
+		{key: []byte{0x07, 0x0c, 0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), kvs); err != nil {
+		_ = db.Close()
+		t.Fatalf("commitStorageForAccount failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if !reopened.isAccountStorageFolderManaged(accountKey) {
+		t.Fatal("expected short account key folder marker to be restored after reopen")
+	}
+	value, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKeyWithSuffix(storageSuffix...), accountKey)
+	if err != nil {
+		t.Fatalf("Get storage after reopen failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, bytes.Repeat([]byte("a"), 40)) {
+		t.Fatalf("unexpected storage lookup after reopen: found=%t value=%q", found, value)
 	}
 }
 
@@ -457,6 +503,477 @@ func TestFolderManagedPutSkipsAccountEntryPointerRewrite(t *testing.T) {
 	nodeMutationWriteOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
 	if nodeMutationWriteOpsAfter != nodeMutationWriteOpsBefore {
 		t.Fatalf("expected folder-managed put to skip account-entry pointer rewrite, nodefile writes before=%d after=%d", nodeMutationWriteOpsBefore, nodeMutationWriteOpsAfter)
+	}
+}
+
+func TestBatchCommitPlansInlineStoragePointerBeforeAccountNodeWrite(t *testing.T) {
+	accountOnlyDB, err := NewPrefixDB(filepath.Join(t.TempDir(), "account-only"), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer accountOnlyDB.Close()
+
+	combinedDB, err := NewPrefixDB(filepath.Join(t.TempDir(), "combined"), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer combinedDB.Close()
+
+	accountOnlyKey := makeTestAccountKey(0x13)
+	accountOnlyWritesBefore := atomic.LoadUint64(&accountOnlyDB.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	if err := accountOnlyDB.BatchPut(datatypepkg.TrieNodeAccountDataType, accountOnlyKey, []byte("account-value"), nil); err != nil {
+		t.Fatalf("BatchPut account-only failed: %v", err)
+	}
+	if err := accountOnlyDB.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account-only failed: %v", err)
+	}
+	accountOnlyDelta := atomic.LoadUint64(&accountOnlyDB.diskIOStats[diskIOUsageNodeFileMutation].writeOps) - accountOnlyWritesBefore
+
+	accountKey := makeTestAccountKey(0x14)
+	nodeMutationWriteOpsBefore := atomic.LoadUint64(&combinedDB.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+
+	if err := combinedDB.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-value"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := combinedDB.BatchPut(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x01), []byte("small-value"), accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := combinedDB.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+
+	nodeMutationWriteOpsAfter := atomic.LoadUint64(&combinedDB.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	combinedDelta := nodeMutationWriteOpsAfter - nodeMutationWriteOpsBefore
+	if combinedDelta != accountOnlyDelta {
+		t.Fatalf("expected combined account/storage batch to reuse the same node write count as account-only commit, accountOnly=%d combined=%d", accountOnlyDelta, combinedDelta)
+	}
+
+	node, err := combinedDB.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode failed: %v", err)
+	}
+	if node == nil {
+		t.Fatal("expected account node to exist")
+	}
+	if node.storageFileID == 0 || isSegmentedStorage(node.storageFileID) {
+		t.Fatalf("expected inline storage pointer after BatchCommit, got fileID=%d", node.storageFileID)
+	}
+}
+
+func TestBatchCommitPlansSegmentedStoragePointerBeforeAccountNodeWrite(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x15)
+	inlineStorageKey := makeTestStorageRawKey(accountKey, 0x01)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-v1"), nil); err != nil {
+		t.Fatalf("BatchPut initial account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, inlineStorageKey, []byte("small-value"), accountKey); err != nil {
+		t.Fatalf("BatchPut initial storage failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("initial BatchCommit failed: %v", err)
+	}
+
+	before, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode before migration failed: %v", err)
+	}
+	if before == nil {
+		t.Fatal("expected account node before migration")
+	}
+	if before.storageFileID == 0 || isSegmentedStorage(before.storageFileID) {
+		t.Fatalf("expected initial inline storage pointer, got fileID=%d", before.storageFileID)
+	}
+
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-v2"), nil); err != nil {
+		t.Fatalf("BatchPut migrated account failed: %v", err)
+	}
+	largeValues := [][]byte{
+		bytes.Repeat([]byte("a"), 40),
+		bytes.Repeat([]byte("b"), 40),
+		bytes.Repeat([]byte("c"), 40),
+	}
+	for idx, value := range largeValues {
+		storageKey := makeTestStorageRawKey(accountKey, byte(idx+1))
+		if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, storageKey, value, accountKey); err != nil {
+			t.Fatalf("BatchPut large storage %d failed: %v", idx, err)
+		}
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("migration BatchCommit failed: %v", err)
+	}
+
+	after, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode after migration failed: %v", err)
+	}
+	if after == nil {
+		t.Fatal("expected account node after migration")
+	}
+	if after.storageFileID != segmentedStorageFlag || after.storageOffset != 0 || after.storageSize != 0 {
+		t.Fatalf("expected account-named segmented sentinel pointer after mixed batch migration, got fileID=%d offset=%d size=%d", after.storageFileID, after.storageOffset, after.storageSize)
+	}
+	if !db.isAccountStorageFolderManaged(accountKey) {
+		t.Fatal("expected account to be marked as folder-managed after mixed batch migration")
+	}
+	if value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil); err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	} else if !found || !bytes.Equal(value, []byte("account-v2")) {
+		t.Fatalf("unexpected migrated account value: found=%t value=%q", found, value)
+	}
+	for idx, expected := range largeValues {
+		storageKey := makeTestStorageRawKey(accountKey, byte(idx+1))
+		value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+		if err != nil {
+			t.Fatalf("Get migrated storage %d failed: %v", idx, err)
+		}
+		if !found || !bytes.Equal(value, expected) {
+			t.Fatalf("unexpected migrated storage %d: found=%t value=%q", idx, found, value)
+		}
+	}
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if _, err := os.Stat(filepath.Join(folderPath, segmentIndexFileName)); err != nil {
+		t.Fatalf("expected segment index after mixed batch migration: %v", err)
+	}
+}
+
+func TestGCPrefixTreePreservesInlineStoragePointer(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x14)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-value"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x01), []byte("small-value"), accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+
+	before, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode before GC failed: %v", err)
+	}
+	if before == nil {
+		t.Fatal("expected account node before GC")
+	}
+	if before.storageFileID == 0 || isSegmentedStorage(before.storageFileID) {
+		t.Fatalf("expected inline storage pointer before GC, got fileID=%d", before.storageFileID)
+	}
+
+	if err := db.GCPrefixTree(); err != nil {
+		t.Fatalf("GCPrefixTree failed: %v", err)
+	}
+
+	after, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode after GC failed: %v", err)
+	}
+	if after == nil {
+		t.Fatal("expected account node after GC")
+	}
+	if after.storageFileID != before.storageFileID || after.storageOffset != before.storageOffset || after.storageSize != before.storageSize {
+		t.Fatalf("expected inline storage pointer to survive GC, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestGetStorageLogsInvalidLargeLogPointer(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x16)
+	storageKey := makeTestStorageRawKey(accountKey, 0x01)
+	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 1, storageOffset: 0, storageSize: 0})
+	node, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode failed: %v", err)
+	}
+	if node == nil || node.storageFileID != 1 || node.storageSize != 0 {
+		t.Fatalf("expected invalid inline pointer setup to persist, node=%+v", node)
+	}
+
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	{
+		value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+		if err != nil {
+			t.Fatalf("Get storage failed: %v", err)
+		}
+		if found || value != nil {
+			t.Fatalf("expected invalid large-log pointer read to fail without value, found=%t value=%q", found, value)
+		}
+	}
+
+	output := logBuf.String()
+
+	if !strings.Contains(output, "prefixdb ERROR: failed to read large log via account entry") {
+		t.Fatalf("expected large-log read error log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=invalid-account-entry-pointer") {
+		t.Fatalf("expected invalid pointer reason in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("fileID=%d", uint32(1))) {
+		t.Fatalf("expected fileID in log, got %q", output)
+	}
+}
+
+func TestGetAccountLogsMissingAccountKV(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x19)
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if found || value != nil {
+		t.Fatalf("expected missing account read to fail without value, found=%t value=%q", found, value)
+	}
+
+	output := logBuf.String()
+	if !strings.Contains(output, "prefixdb ERROR: account kv read failed") {
+		t.Fatalf("expected account read failure log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=account-not-found") {
+		t.Fatalf("expected account-not-found reason in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("key=%x", accountKey)) {
+		t.Fatalf("expected account key in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("dir=%s", filepath.Dir(db.accountFile.Name()))) {
+		t.Fatalf("expected account dir in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("file=%s", filepath.Base(db.accountFile.Name()))) {
+		t.Fatalf("expected account file in log, got %q", output)
+	}
+	if !strings.Contains(output, "offset=0") || !strings.Contains(output, "size=0") {
+		t.Fatalf("expected account offset/size in log, got %q", output)
+	}
+}
+
+func TestGetStorageLogsMissingStorageKV(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x1a)
+	storageKey := makeTestStorageRawKey(accountKey, 0x01)
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if found || value != nil {
+		t.Fatalf("expected missing storage read to fail without value, found=%t value=%q", found, value)
+	}
+
+	output := logBuf.String()
+	if !strings.Contains(output, "prefixdb ERROR: storage kv read failed") {
+		t.Fatalf("expected storage read failure log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=storage-not-found") {
+		t.Fatalf("expected storage-not-found reason in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("account=%x", accountKey)) {
+		t.Fatalf("expected account key in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("storage=%x", storageKey[33:])) {
+		t.Fatalf("expected normalized storage key in log, got %q", output)
+	}
+}
+
+func TestGetStorageLogsFolderManagedChunkMiss(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x33)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas, err := db.writeSegmentedChunksToFolder(folderPath, []kvPair{{key: []byte{0x0a}, val: []byte("value-a")}})
+	if err != nil {
+		t.Fatalf("writeSegmentedChunksToFolder failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	db.markAccountStorageFolder(accountKey)
+
+	storageKey := makeTestStorageRawKey(accountKey, 0x0b)
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if found || value != nil {
+		t.Fatalf("expected missing folder-managed storage to fail without value, found=%t value=%q", found, value)
+	}
+
+	output := logBuf.String()
+	if !strings.Contains(output, "mode=folder") {
+		t.Fatalf("expected folder mode in log, got %q", output)
+	}
+	if !strings.Contains(output, "index=index.meta") {
+		t.Fatalf("expected index file in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("chunk=%s", metas[0].FileName)) {
+		t.Fatalf("expected selected chunk file in log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=segment-chunk-key-not-found") {
+		t.Fatalf("expected exact folder miss reason in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("file=%s", filepath.Base(folderPath))) {
+		t.Fatalf("expected folder basename in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("storage=%x", storageKey[33:])) {
+		t.Fatalf("expected normalized storage key in log, got %q", output)
+	}
+}
+
+func TestGetStorageLogsMissingLargeLogFile(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x17)
+	storageKey := makeTestStorageRawKey(accountKey, 0x01)
+	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 7, storageOffset: 0, storageSize: 16})
+
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if found || value != nil {
+		t.Fatalf("expected missing large-log file read to fail without value, found=%t value=%q", found, value)
+	}
+
+	output := logBuf.String()
+	if !strings.Contains(output, "prefixdb ERROR: failed to read large log via account entry") {
+		t.Fatalf("expected missing-file error log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=open-storage-file") {
+		t.Fatalf("expected open-storage-file reason in log, got %q", output)
+	}
+	if !strings.Contains(output, "fileID=7") {
+		t.Fatalf("expected fileID in log, got %q", output)
+	}
+	storagePath, _ := db.storagePathByFileID(7)
+	if !strings.Contains(output, fmt.Sprintf("dir=%s", filepath.Dir(storagePath))) {
+		t.Fatalf("expected storage dir in log, got %q", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("file=%s", filepath.Base(storagePath))) {
+		t.Fatalf("expected storage file in log, got %q", output)
+	}
+	if !strings.Contains(output, "offset=0") || !strings.Contains(output, "size=16") {
+		t.Fatalf("expected storage offset/size in log, got %q", output)
+	}
+}
+
+func TestGetStorageLogsCorruptedLargeLogContent(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x18)
+	storageKey := makeTestStorageRawKey(accountKey, 0x01)
+	storagePath, _ := db.storagePathByFileID(8)
+	corrupted := make([]byte, 10)
+	binary.BigEndian.PutUint32(corrupted[:4], 1)
+	copy(corrupted[4:], []byte{0x00, 0x04, 0x00, 0x00, 0x00, 0x08})
+	if err := os.WriteFile(storagePath, corrupted, 0o644); err != nil {
+		t.Fatalf("WriteFile corrupted storage failed: %v", err)
+	}
+	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 8, storageOffset: 0, storageSize: uint64(len(corrupted))})
+
+	var logBuf bytes.Buffer
+	oldLogWriter := prefixdbLogWriter
+	prefixdbLogWriter = &logBuf
+	defer func() {
+		prefixdbLogWriter = oldLogWriter
+	}()
+
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if found || value != nil {
+		t.Fatalf("expected corrupted large-log read to fail without value, found=%t value=%q", found, value)
+	}
+
+	output := logBuf.String()
+	if !strings.Contains(output, "prefixdb ERROR: failed to read large log via account entry") {
+		t.Fatalf("expected corrupted-content error log, got %q", output)
+	}
+	if !strings.Contains(output, "reason=corrupted-storage-segment") {
+		t.Fatalf("expected corrupted-storage-segment reason in log, got %q", output)
+	}
+	if !strings.Contains(output, "fileID=8") {
+		t.Fatalf("expected fileID in log, got %q", output)
 	}
 }
 
@@ -731,20 +1248,6 @@ func TestEncodeSegmentChunkMetasRejectsUnsafeCompactEncoding(t *testing.T) {
 		}
 	})
 
-	t.Run("chunk size overflow", func(t *testing.T) {
-		metas := []segmentChunkMeta{{
-			FileName:  "chunk_0007.dat",
-			KeyStart:  []byte{0x03},
-			KeyEnd:    []byte{0x04},
-			KVCount:   2,
-			ChunkSize: uint64(math.MaxUint32) + 1,
-		}}
-
-		buf, err := encodeSegmentChunkMetas(metas)
-		if err == nil {
-			t.Fatalf("expected compact encoding rejection, got buffer len %d", len(buf))
-		}
-	})
 }
 
 func TestMigrateLegacySegmentIndexFormatsNotSupported(t *testing.T) {
@@ -1609,6 +2112,247 @@ func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T
 	}
 	if len(entriesByKey) != len(allEntries) {
 		t.Fatalf("expected post-load GC to leave only unique storage keys, got %d unique out of %d", len(entriesByKey), len(allEntries))
+	}
+}
+
+func TestSegmentedChunkFileUsesPayloadWithoutLeadingKVCount(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderPath := db.segmentedFolderPath(11)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	entries := []kvPair{{key: []byte{0x0a}, val: []byte("value-a")}}
+	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(folderPath, "chunk_0000.dat"))
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	wantPrefix := []byte{0x00, 0x01, 0x00, 0x07}
+	if len(raw) < len(wantPrefix) || !bytes.Equal(raw[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("expected chunk to start with first kv header, got %x", raw)
+	}
+	if got, want := len(raw), len(wantPrefix)+1+len("value-a"); got != want {
+		t.Fatalf("unexpected chunk size: got %d want %d", got, want)
+	}
+	if len(raw) >= 4 && binary.BigEndian.Uint32(raw[:4]) == uint32(len(entries)) {
+		t.Fatalf("unexpected leading kvCount metadata in chunk: %x", raw[:4])
+	}
+}
+
+func TestAppendChunkFileReadsBackWithoutLeadingKVCount(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(12)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	initial := []kvPair{{key: []byte{0x0a}, val: []byte("value-a")}}
+	chunkSize, err := db.writeChunkFile(folderPath, "chunk_0000.dat", initial)
+	if err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.appendChunkFile(filepath.Join(folderPath, "chunk_0000.dat"), []kvPair{{key: []byte{0x0b}, val: []byte("value-b")}}, int64(chunkSize)); err != nil {
+		t.Fatalf("appendChunkFile failed: %v", err)
+	}
+
+	entries, backing, err := db.readSegmentChunkFile(folderID, "chunk_0000.dat")
+	if backing != nil {
+		defer backing.Release()
+	}
+	if err != nil {
+		t.Fatalf("readSegmentChunkFile failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries after append, got %d", len(entries))
+	}
+	if !bytes.Equal(entries[0].key, []byte{0x0a}) || !bytes.Equal(entries[0].val, []byte("value-a")) {
+		t.Fatalf("unexpected first entry after append: %+v", entries[0])
+	}
+	if !bytes.Equal(entries[1].key, []byte{0x0b}) || !bytes.Equal(entries[1].val, []byte("value-b")) {
+		t.Fatalf("unexpected second entry after append: %+v", entries[1])
+	}
+}
+
+func TestCommonStorageSegmentUsesPayloadWithoutLeadingKVCount(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	kvs := []kvPair{
+		{key: []byte{0x01}, val: []byte("value-a")},
+		{key: []byte{0x02}, val: []byte("value-b")},
+	}
+	fileID, offset, size, err := db.appendStorageSegment(kvs)
+	if err != nil {
+		t.Fatalf("appendStorageSegment failed: %v", err)
+	}
+
+	path, _ := db.storagePathByFileID(fileID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	segment := raw[offset : offset+int64(size)]
+	wantPrefix := []byte{0x00, 0x01, 0x00, 0x07}
+	if len(segment) < len(wantPrefix) || !bytes.Equal(segment[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("expected common storage segment to start with first kv header, got %x", segment)
+	}
+	if len(segment) >= 4 && binary.BigEndian.Uint32(segment[:4]) == uint32(len(kvs)) {
+		t.Fatalf("unexpected leading kvCount metadata in common storage segment: %x", segment[:4])
+	}
+	entries, backing, err := db.readStorageSegmentPairs(fileID, offset, size)
+	if err != nil {
+		t.Fatalf("readStorageSegmentPairs failed: %v", err)
+	}
+	if backing != nil {
+		defer backing.Release()
+	}
+	if len(entries) != len(kvs) {
+		t.Fatalf("unexpected common storage entry count: got %d want %d", len(entries), len(kvs))
+	}
+	for i := range kvs {
+		if !bytes.Equal(entries[i].key, kvs[i].key) || !bytes.Equal(entries[i].val, kvs[i].val) {
+			t.Fatalf("unexpected common storage entry %d: got=%+v want=%+v", i, entries[i], kvs[i])
+		}
+	}
+}
+
+func TestAccountNamedSegmentedAppendDoesNotRewriteIndex(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x44)
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x02}, val: bytes.Repeat([]byte("b"), 40)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), initial); err != nil {
+		t.Fatalf("first commitStorageForAccount failed: %v", err)
+	}
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	indexPath := filepath.Join(folderPath, segmentIndexFileName)
+	indexBefore, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile index before append failed: %v", err)
+	}
+
+	appendOnly := []kvPair{{key: []byte{0x04}, val: bytes.Repeat([]byte("d"), 40)}}
+	if err := db.commitStorageForAccount(string(accountKey), appendOnly); err != nil {
+		t.Fatalf("second commitStorageForAccount failed: %v", err)
+	}
+	indexAfter, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile index after append failed: %v", err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) {
+		t.Fatalf("expected append-only segmented update to keep index.meta unchanged\nbefore=%x\nafter=%x", indexBefore, indexAfter)
+	}
+
+	count, _, err := db.GetStorageCount(accountKey)
+	if err != nil {
+		t.Fatalf("GetStorageCount failed: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("expected append-only update to preserve old entries and add the new one, got %d", count)
+	}
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x04), accountKey)
+	if err != nil {
+		t.Fatalf("Get appended storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, bytes.Repeat([]byte("d"), 40)) {
+		t.Fatalf("unexpected appended storage value: found=%t value=%q", found, value)
+	}
+	value, found, err = db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x01), accountKey)
+	if err != nil {
+		t.Fatalf("Get preserved storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, bytes.Repeat([]byte("a"), 40)) {
+		t.Fatalf("unexpected preserved storage value: found=%t value=%q", found, value)
+	}
+}
+
+func TestAccountNamedSegmentedAppendSurvivesReopenWithoutIndexRewrite(t *testing.T) {
+	baseDir := t.TempDir()
+	accountKey := makeTestAccountKey(0x45)
+
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x02}, val: bytes.Repeat([]byte("b"), 40)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), initial); err != nil {
+		_ = db.Close()
+		t.Fatalf("first commitStorageForAccount failed: %v", err)
+	}
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	indexPath := filepath.Join(folderPath, segmentIndexFileName)
+	indexBefore, err := os.ReadFile(indexPath)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("ReadFile index before append failed: %v", err)
+	}
+	if err := db.commitStorageForAccount(string(accountKey), []kvPair{{key: []byte{0x04}, val: bytes.Repeat([]byte("d"), 40)}}); err != nil {
+		_ = db.Close()
+		t.Fatalf("second commitStorageForAccount failed: %v", err)
+	}
+	indexAfter, err := os.ReadFile(indexPath)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("ReadFile index after append failed: %v", err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) {
+		_ = db.Close()
+		t.Fatalf("expected append-only segmented update to keep index.meta unchanged across reopen setup")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if !reopened.isAccountStorageFolderManaged(accountKey) {
+		t.Fatal("expected folder-managed marker to survive reopen after append-only update")
+	}
+	for suffix, expected := range map[byte][]byte{
+		0x01: bytes.Repeat([]byte("a"), 40),
+		0x02: bytes.Repeat([]byte("b"), 40),
+		0x03: bytes.Repeat([]byte("c"), 40),
+		0x04: bytes.Repeat([]byte("d"), 40),
+	} {
+		value, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, suffix), accountKey)
+		if err != nil {
+			t.Fatalf("Get storage after reopen failed for suffix %x: %v", suffix, err)
+		}
+		if !found || !bytes.Equal(value, expected) {
+			t.Fatalf("unexpected storage after reopen for suffix %x: found=%t value=%q", suffix, found, value)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ type storageCommitPlan struct {
 	accountKey    string
 	accountOffset int64
 	storageInfo   StorageInfo
+	skipNodeWrite bool
 }
 
 type preparedAccountCommit struct {
@@ -399,6 +400,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		storageOffset: offset,
 		storageSize:   size,
 	}
+	plan.skipNodeWrite = shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, offset, size)
 	return plan, nil
 }
 

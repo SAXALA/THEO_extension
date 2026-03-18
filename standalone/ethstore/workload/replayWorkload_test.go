@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/pebble"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
+	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
 	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
+	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
 )
 
 type fakeReplayBackend struct {
@@ -68,6 +73,23 @@ type fakeGetterStore struct {
 	getCall int
 }
 
+type fakeAccountKeyLookup struct {
+	value []byte
+	err   error
+	seen  []byte
+}
+
+func (f *fakeAccountKeyLookup) Get(key []byte) ([]byte, error) {
+	f.seen = append([]byte(nil), key...)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.value == nil {
+		return nil, pebble.ErrNotFound
+	}
+	return append([]byte(nil), f.value...), nil
+}
+
 func (s *fakeGetterStore) Get(key []byte) ([]byte, error) {
 	s.getCall++
 	if s.err != nil {
@@ -94,6 +116,83 @@ func TestGetWithPebbleBatchOverlay_FallbackToStoreWhenBatchMiss(t *testing.T) {
 	}
 	if store.getCall != 1 {
 		t.Fatalf("expected store.Get call once, got %d", store.getCall)
+	}
+}
+
+func TestResolvePrefixDBLoadAccountKeyNotFoundIsDeferred(t *testing.T) {
+	accountHash := bytes.Repeat([]byte{0x42}, 32)
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x01, 0x08, 0x0b)
+	lookup := &fakeAccountKeyLookup{err: pebble.ErrNotFound}
+
+	accountKey, err := resolvePrefixDBLoadAccountKey(lookup, storageKey)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if accountKey != nil {
+		t.Fatalf("expected nil account key on deferred resolution, got %x", accountKey)
+	}
+	if !bytes.Equal(lookup.seen, accountHash) {
+		t.Fatalf("unexpected account hash lookup: got %x want %x", lookup.seen, accountHash)
+	}
+}
+
+func TestLoadPrefixDBFinalBatchCommitPersistsTailEntries(t *testing.T) {
+	tempDir := t.TempDir()
+	auxDir := filepath.Join(tempDir, "account-hash-pebble")
+	auxStore, err := pebblestore.NewPebbleStore(auxDir, 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("NewPebbleStore failed: %v", err)
+	}
+	accountKey := []byte{'A', 0x01, 0x02, 0x03, 0x04}
+	accountHash := bytes.Repeat([]byte{0x7a}, 32)
+	if err := auxStore.Put(accountHash, accountKey); err != nil {
+		auxStore.Close()
+		t.Fatalf("auxStore.Put failed: %v", err)
+	}
+	if err := auxStore.Close(); err != nil {
+		t.Fatalf("auxStore.Close failed: %v", err)
+	}
+
+	accountValue := []byte("account-value")
+	storageValue := []byte("storage-value")
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x04, 0x05, 0x06)
+	dataFile := filepath.Join(tempDir, "load.txt")
+	content := fmt.Sprintf("Key: %x, Value : %x\nKey: %x, Value : %x\n", accountKey, accountValue, storageKey, storageValue)
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if err := loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("loadPrefixDB failed: %v", err)
+	}
+
+	dbDir := filepath.Join(tempDir, "database_statedb8KB")
+	reopened, err := prefixdb.NewPrefixDBWithRuntimeOptions(dbDir, 8*1024, 16, 16, 0, 0, 0, false, false, 0)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	gotAccount, found, err := reopened.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected account entry to exist after final BatchCommit")
+	}
+	if !bytes.Equal(gotAccount, accountValue) {
+		t.Fatalf("unexpected account value: got %q want %q", gotAccount, accountValue)
+	}
+
+	gotStorage, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected storage entry to exist after final BatchCommit")
+	}
+	if !bytes.Equal(gotStorage, storageValue) {
+		t.Fatalf("unexpected storage value: got %q want %q", gotStorage, storageValue)
 	}
 }
 

@@ -53,6 +53,17 @@ const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
 
 const ()
 
+var prefixdbLogWriter io.Writer = os.Stdout
+
+var errSegmentIndexEntryNotFound = errors.New("segment index entry not found")
+
+type segmentedStorageReadFailure struct {
+	folderPath string
+	indexFile  string
+	chunkFile  string
+	reason     string
+}
+
 const storageKeyTrimOffset = 33 // 'O' + 32-byte account hash
 
 type kvPair struct {
@@ -67,6 +78,8 @@ type segmentChunkMeta struct {
 	KVCount   uint32
 	ChunkSize uint64
 }
+
+const segmentedChunkEntryHeaderSize = 4
 
 type segmentIndexLayoutMode uint8
 
@@ -522,15 +535,16 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 
 	node, err := db.getAccountNode(key)
 	if err != nil {
+		db.logAccountKVReadFailure(key, 0, "load-account-node", err)
 		return nil, false, err
 	}
 	if node == nil {
-		keyHex := fmt.Sprintf("%x", key)
-		fmt.Printf("Account key %s not found in index\n", keyHex)
+		db.logAccountKVReadFailure(key, 0, "account-not-found", nil)
 		return nil, false, nil
 	}
 	value, err := db.readFromFile(node.offset)
 	if err != nil {
+		db.logAccountKVReadFailure(key, node.offset, "read-account-file", err)
 		return nil, false, err
 	}
 
@@ -573,16 +587,18 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 
 	storageKey, err := db.normalizeStorageKey(key)
 	if err != nil {
+		db.logStorageKVReadFailure(key, accountKey, "normalize-storage-key", err)
 		return nil, false, err
 	}
 
 	if accountKey == nil {
-		fmt.Printf("Parent account key not found for %x\n", key)
+		db.logStorageKVReadFailure(storageKey, nil, "missing-parent-account", nil)
 		return nil, false, nil
 	}
 
 	if v, present := db.batchGetOverlay(key, accountKey); present {
 		if v == nil {
+			db.logStorageKVReadFailure(storageKey, accountKey, "storage-overlay-tombstone", nil)
 			return nil, false, nil
 		}
 		return v, true, nil
@@ -592,6 +608,7 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 	if value, ok := db.storageCache.Get(db.storageCacheKey(accountKey, storageKey)); ok {
 		recordTrieStorageGetBreakdownStep(&db.trieStorageKVStats, true, time.Since(storageCacheStart))
 		if value == nil {
+			db.logStorageKVReadFailure(storageKey, accountKey, "storage-cache-tombstone", nil)
 			return nil, false, nil
 		}
 		valueBytes := value.([]byte)
@@ -599,16 +616,98 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 		return valueBytes, true, nil
 	}
 
-	value, ok, err := db.readAccountStorageValue(accountKey, storageKey)
+	value, ok, failure, err := db.readAccountStorageValue(accountKey, storageKey)
 	if err != nil {
-		fmt.Println("Error reading account storage:", err)
+		if failure != nil {
+			db.logSegmentedStorageKVReadFailure(storageKey, accountKey, failure, err)
+		} else {
+			db.logStorageKVReadFailure(storageKey, accountKey, "read-account-storage", err)
+		}
 		return nil, false, err
 	}
 	if ok {
 		db.addTrieStorageFetchStats(false, value)
 		return value, true, nil
 	}
+	if failure != nil {
+		db.logSegmentedStorageKVReadFailure(storageKey, accountKey, failure, nil)
+	} else {
+		db.logStorageKVReadFailure(storageKey, accountKey, "storage-not-found", nil)
+	}
 	return nil, false, nil
+}
+
+func splitLogPath(path string) (string, string) {
+	if path == "" {
+		return "", ""
+	}
+	return filepath.Dir(path), filepath.Base(path)
+}
+
+func (db *PrefixDB) accountReadLogFields(offset int64) (string, string, int64, uint64) {
+	if db == nil || db.accountFile == nil {
+		return "", "", offset, 0
+	}
+	dir, file := splitLogPath(db.accountFile.Name())
+	return dir, file, offset, 0
+}
+
+func (db *PrefixDB) storageReadLogFields(accountKey []byte) (string, string, uint32, int64, uint64) {
+	if db == nil || len(accountKey) == 0 {
+		return "", "", 0, 0, 0
+	}
+	if db.isAccountStorageFolderManaged(accountKey) {
+		folderPath := db.segmentedFolderPathForAccount(accountKey)
+		dir, file := splitLogPath(folderPath)
+		return dir, file, segmentedStorageFlag, 0, 0
+	}
+	node, err := db.getNode(accountKey)
+	if err != nil || node == nil {
+		return "", "", 0, 0, 0
+	}
+	if isSegmentedStorage(node.storageFileID) {
+		folderPath := db.segmentedFolderPathForAccount(accountKey)
+		dir, file := splitLogPath(folderPath)
+		return dir, file, node.storageFileID, node.storageOffset, node.storageSize
+	}
+	path, _ := db.storagePathByFileID(node.storageFileID)
+	dir, file := splitLogPath(path)
+	return dir, file, node.storageFileID, node.storageOffset, node.storageSize
+}
+
+func (db *PrefixDB) logAccountKVReadFailure(key []byte, offset int64, reason string, err error) {
+	dir, file, offset, size := db.accountReadLogFields(offset)
+	if err != nil {
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: account kv read failed key=%x dir=%s file=%s offset=%d size=%d reason=%s err=%v\n", key, dir, file, offset, size, reason, err)
+		return
+	}
+	fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: account kv read failed key=%x dir=%s file=%s offset=%d size=%d reason=%s\n", key, dir, file, offset, size, reason)
+}
+
+func (db *PrefixDB) logStorageKVReadFailure(storageKey, accountKey []byte, reason string, err error) {
+	dir, file, fileID, offset, size := db.storageReadLogFields(accountKey)
+	if err != nil {
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: storage kv read failed account=%x storage=%x dir=%s file=%s fileID=%d offset=%d size=%d reason=%s err=%v\n", accountKey, storageKey, dir, file, fileID, offset, size, reason, err)
+		return
+	}
+	fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: storage kv read failed account=%x storage=%x dir=%s file=%s fileID=%d offset=%d size=%d reason=%s\n", accountKey, storageKey, dir, file, fileID, offset, size, reason)
+}
+
+func (db *PrefixDB) logSegmentedStorageKVReadFailure(storageKey, accountKey []byte, failure *segmentedStorageReadFailure, err error) {
+	if failure == nil {
+		db.logStorageKVReadFailure(storageKey, accountKey, "storage-not-found", err)
+		return
+	}
+	dir, file := splitLogPath(failure.folderPath)
+	indexFile := failure.indexFile
+	if indexFile == "" {
+		indexFile = segmentIndexFileName
+	}
+	if err != nil {
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: storage kv read failed account=%x storage=%x dir=%s file=%s fileID=%d offset=0 size=0 mode=folder index=%s chunk=%s reason=%s err=%v\n", accountKey, storageKey, dir, file, segmentedStorageFlag, indexFile, failure.chunkFile, failure.reason, err)
+		return
+	}
+	fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: storage kv read failed account=%x storage=%x dir=%s file=%s fileID=%d offset=0 size=0 mode=folder index=%s chunk=%s reason=%s\n", accountKey, storageKey, dir, file, segmentedStorageFlag, indexFile, failure.chunkFile, failure.reason)
 }
 
 func (db *PrefixDB) putAccount(key, value []byte) error {
@@ -716,6 +815,23 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
 
+	storagePlans, err := db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
+	if err != nil {
+		return err
+	}
+	if len(storagePlans) > 0 && accountOps != nil {
+		for _, plan := range storagePlans {
+			op, ok := accountOps[plan.accountKey]
+			if !ok || op.value == nil {
+				continue
+			}
+			op.storageFileID = plan.storageInfo.storageFileID
+			op.storageOffset = plan.storageInfo.storageOffset
+			op.storageSize = plan.storageInfo.storageSize
+			accountOps[plan.accountKey] = op
+		}
+	}
+
 	prepared, err := db.prepareAccountCommit(accountOps)
 	if err != nil {
 		return err
@@ -773,40 +889,28 @@ func (db *PrefixDB) BatchCommit() (err error) {
 		db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
 	}
 
-	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
-		if storageBatch == nil {
-			storageBatch = make(map[string]map[string][]byte)
-		}
-		if err := db.resolveUnresolvedStorageBatch(storageBatch, storageUnresolved); err != nil {
-			return err
-		}
-		if len(storageBatch) > 0 {
-			accountKeys := make([]string, 0, len(storageBatch))
-			for accountKey := range storageBatch {
-				if op, ok := accountOps[accountKey]; ok && op.value == nil {
+	if len(storagePlans) > 0 {
+		for _, plan := range storagePlans {
+			if op, ok := accountOps[plan.accountKey]; ok {
+				if op.value == nil {
 					continue
 				}
-				accountKeys = append(accountKeys, accountKey)
+				continue
 			}
-			sort.Strings(accountKeys)
-			for _, accountKey := range accountKeys {
-				perAccount := storageBatch[accountKey]
-				if len(perAccount) == 0 {
-					continue
-				}
-				kvs := make([]kvPair, 0, len(perAccount))
-				for key, value := range perAccount {
-					kvs = append(kvs, kvPair{key: []byte(key), val: value})
-				}
-				sortKVPairs(kvs)
-				if err := db.commitStorageForAccount(accountKey, kvs); err != nil {
-					return err
-				}
+			if plan.skipNodeWrite {
+				continue
+			}
+			accountKeyBytes := []byte(plan.accountKey)
+			if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
+				return err
+			}
+			if db.nodeCache != nil {
+				db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
 			}
 		}
 	}
 
-	if len(storageBatch) > 0 || len(storageUnresolved) > 0 {
+	if len(storagePlans) > 0 {
 		return db.waitForStorageGCIdle()
 	}
 	return nil
@@ -885,7 +989,7 @@ func (db *PrefixDB) hasStorage(key []byte, accountKey []byte) (bool, error) {
 	if v, ok := db.storageCache.Get(db.storageCacheKey(accountKey, storageKey)); ok {
 		return v != nil, nil
 	}
-	_, ok, err := db.readAccountStorageValue(accountKey, storageKey)
+	_, ok, _, err := db.readAccountStorageValue(accountKey, storageKey)
 	if err != nil {
 		fmt.Println("Error reading account storage:", err)
 		return false, err
@@ -1374,13 +1478,14 @@ func (db *PrefixDB) addTrieStorageFetchStats(fromCache bool, value []byte) {
 	if len(value) == 0 {
 		return
 	}
+	valueSize := uint64(len(value))
 	if fromCache {
 		atomic.AddUint64(&db.trieStorageCachePairs, 1)
-		atomic.AddUint64(&db.trieStorageCacheBytes, uint64(len(value)))
+		atomic.AddUint64(&db.trieStorageCacheBytes, valueSize)
 		return
 	}
 	atomic.AddUint64(&db.trieStorageLogPairs, 1)
-	atomic.AddUint64(&db.trieStorageLogBytes, uint64(len(value)))
+	atomic.AddUint64(&db.trieStorageLogBytes, valueSize)
 }
 
 func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, fromCache bool, duration time.Duration) {
@@ -1993,14 +2098,17 @@ func (db *PrefixDB) ensureStorageCapacityLocked(need int64) error {
 	return nil
 }
 
-// [kvCount u32] [keyLen u16][valLen u32][key][val]...
+// Common storage segment format: [keyLen u16][valLen u16][key][val]...
 func (db *PrefixDB) serializeStorageSegment(kvs []kvPair) ([]byte, func(), int, error) {
-	total := 4
+	total := 0
 	for _, v := range kvs {
 		if len(v.key) > 0xFFFF {
 			return nil, func() {}, 0, fmt.Errorf("key too large: %d", len(v.key))
 		}
-		total += 6 + len(v.key) + len(v.val)
+		if len(v.val) > 0xFFFF {
+			return nil, func() {}, 0, fmt.Errorf("value too large: %d", len(v.val))
+		}
+		total += segmentedChunkEntryHeaderSize + len(v.key) + len(v.val)
 	}
 
 	buf := getDataBuffer(total)
@@ -2008,15 +2116,45 @@ func (db *PrefixDB) serializeStorageSegment(kvs []kvPair) ([]byte, func(), int, 
 		putDataBuffer(buf)
 	}
 	offset := 0
-	writeUint32BE(buf[offset:offset+4], uint32(len(kvs)))
-	offset += 4
-	var header [6]byte
+	var header [segmentedChunkEntryHeaderSize]byte
 
 	for _, v := range kvs {
 		writeUint16BE(header[:2], uint16(len(v.key)))
-		writeUint32BE(header[2:6], uint32(len(v.val)))
+		writeUint16BE(header[2:4], uint16(len(v.val)))
 		copy(buf[offset:], header[:])
-		offset += 6
+		offset += segmentedChunkEntryHeaderSize
+		copy(buf[offset:], v.key)
+		offset += len(v.key)
+		copy(buf[offset:], v.val)
+		offset += len(v.val)
+	}
+	return buf, release, total, nil
+}
+
+// Segmented chunk format: [keyLen u16][valLen u16][key][val]...
+func serializeChunkPayload(kvs []kvPair) ([]byte, func(), int, error) {
+	total := 0
+	for _, v := range kvs {
+		if len(v.key) > 0xFFFF {
+			return nil, func() {}, 0, fmt.Errorf("key too large: %d", len(v.key))
+		}
+		if len(v.val) > 0xFFFF {
+			return nil, func() {}, 0, fmt.Errorf("value too large for segmented chunk: %d", len(v.val))
+		}
+		total += segmentedChunkEntryHeaderSize + len(v.key) + len(v.val)
+	}
+
+	buf := getDataBuffer(total)
+	release := func() {
+		putDataBuffer(buf)
+	}
+	offset := 0
+	var header [segmentedChunkEntryHeaderSize]byte
+	for _, v := range kvs {
+		writeUint16BE(header[:2], uint16(len(v.key)))
+		writeUint16BE(header[2:4], uint16(len(v.val)))
+		copy(buf[offset:], header[:])
+		offset += segmentedChunkEntryHeaderSize
 		copy(buf[offset:], v.key)
 		offset += len(v.key)
 		copy(buf[offset:], v.val)
@@ -2056,7 +2194,7 @@ func (db *PrefixDB) persistStorageEntries(accountKey []byte, kvs []kvPair, exist
 	if isSegmentedStorage(existingFileID) {
 		kvs = dedupSortedKVPairs(kvs)
 		if isAccountNamedSegmentedStorage(existingFileID) {
-			return db.rewriteAccountNamedSegmentedStorage(accountKey, kvs)
+			return db.updateAccountNamedSegmentedStorage(accountKey, kvs)
 		}
 		return 0, 0, 0, errors.New("legacy segmented storage pointers are no longer supported")
 	}
@@ -2090,9 +2228,9 @@ func (db *PrefixDB) persistStorageEntries(accountKey []byte, kvs []kvPair, exist
 }
 
 func estimateSegmentSize(kvs []kvPair) int {
-	total := 4
+	total := 0
 	for _, kv := range kvs {
-		total += 6 + len(kv.key) + len(kv.val)
+		total += segmentedChunkEntryHeaderSize + len(kv.key) + len(kv.val)
 	}
 	return total
 }
@@ -2110,6 +2248,10 @@ func (db *PrefixDB) rewriteAccountNamedSegmentedStorage(accountKey []byte, kvs [
 	}
 	db.segmentedMu.Lock()
 	defer db.segmentedMu.Unlock()
+	return db.rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey, kvs)
+}
+
+func (db *PrefixDB) rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey []byte, kvs []kvPair) (uint32, int64, uint64, error) {
 	folderPath := db.segmentedFolderPathForAccount(accountKey)
 	if err := os.RemoveAll(folderPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0, 0, 0, err
@@ -2129,16 +2271,71 @@ func (db *PrefixDB) rewriteAccountNamedSegmentedStorage(accountKey []byte, kvs [
 	return segmentedStorageFlag, 0, 0, nil
 }
 
+func (db *PrefixDB) updateAccountNamedSegmentedStorage(accountKey []byte, kvs []kvPair) (uint32, int64, uint64, error) {
+	if len(accountKey) == 0 {
+		return 0, 0, 0, errors.New("account key required for account-named segmented storage")
+	}
+	db.segmentedMu.Lock()
+	defer db.segmentedMu.Unlock()
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	metas, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return db.rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey, kvs)
+		}
+		indexPath := filepath.Join(folderPath, segmentIndexFileName)
+		if errors.Is(err, errSegmentIndexEntryNotFound) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, os.ErrNotExist) || !fileExists(indexPath) {
+			return db.rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey, kvs)
+		}
+		return 0, 0, 0, err
+	}
+	if len(metas) == 0 {
+		return db.rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey, kvs)
+	}
+	allocator := newChunkFileAllocator(metas)
+	buckets := partitionEntriesByChunks(metas, kvs)
+	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
+	indexDirty := false
+	folderID := segmentFolderIDFromPath(folderPath)
+	for idx, meta := range metas {
+		additions := buckets[idx]
+		if len(additions) == 0 {
+			updated = append(updated, meta)
+			continue
+		}
+		chunkMetas, mutateErr := db.mutateSegmentChunk(folderID, folderPath, meta, additions, allocator)
+		if mutateErr != nil {
+			return 0, 0, 0, mutateErr
+		}
+		if len(chunkMetas) == 0 {
+			indexDirty = true
+			continue
+		}
+		if len(chunkMetas) != 1 || chunkMetas[0].FileName != meta.FileName || !bytes.Equal(chunkMetas[0].KeyStart, meta.KeyStart) {
+			indexDirty = true
+		}
+		updated = append(updated, chunkMetas...)
+	}
+	if indexDirty {
+		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+			return 0, 0, 0, err
+		}
+		db.invalidateSegmentIndexLayoutForPath(folderPath)
+	}
+	db.markAccountStorageFolder(accountKey)
+	return segmentedStorageFlag, 0, 0, nil
+}
+
 func (db *PrefixDB) writeSegmentedChunksToFolder(folderPath string, kvs []kvPair) ([]segmentChunkMeta, error) {
 	chunkMetas := make([]segmentChunkMeta, 0)
 	chunk := make([]kvPair, 0)
-	chunkSize := 4
+	chunkSize := 0
 	chunkIdx := 0
 	flushChunk := func() error {
 		if len(chunk) == 0 {
 			return nil
 		}
-		seg, release, _, err := db.serializeStorageSegment(chunk)
+		seg, release, _, err := serializeChunkPayload(chunk)
 		if err != nil {
 			return err
 		}
@@ -2156,12 +2353,12 @@ func (db *PrefixDB) writeSegmentedChunksToFolder(folderPath string, kvs []kvPair
 			ChunkSize: uint64(len(seg)),
 		})
 		chunk = make([]kvPair, 0)
-		chunkSize = 4
+		chunkSize = 0
 		chunkIdx++
 		return nil
 	}
 	for _, kv := range kvs {
-		sz := 6 + len(kv.key) + len(kv.val)
+		sz := segmentedChunkEntryHeaderSize + len(kv.key) + len(kv.val)
 		if chunkSize+sz > db.storageChunkSize && len(chunk) > 0 {
 			if err := flushChunk(); err != nil {
 				return nil, err
@@ -2208,6 +2405,7 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 	buckets := partitionEntriesByChunks(metas, kvs)
 	folderPath := db.segmentedFolderPath(folderID)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
+	indexDirty := false
 	for idx, meta := range metas {
 		additions := buckets[idx]
 		if len(additions) == 0 {
@@ -2219,15 +2417,21 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 			return 0, 0, 0, err
 		}
 		if len(chunkMetas) == 0 {
+			indexDirty = true
 			continue
+		}
+		if len(chunkMetas) != 1 || chunkMetas[0].FileName != meta.FileName || !bytes.Equal(chunkMetas[0].KeyStart, meta.KeyStart) {
+			indexDirty = true
 		}
 		updated = append(updated, chunkMetas...)
 	}
-	if err := db.writeSegmentIndex(folderPath, updated); err != nil {
-		return 0, 0, 0, err
+	if indexDirty {
+		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+			return 0, 0, 0, err
+		}
+		db.invalidateSegmentIndexCache(folderID)
 	}
-	db.invalidateSegmentIndexCache(folderID)
-	return existingFileID, 0, uint64(len(updated)), nil
+	return existingFileID, 0, 0, nil
 }
 
 // partitionEntriesByChunks takes advantage of kvs being sorted lexicographically to
@@ -2333,23 +2537,25 @@ func (db *PrefixDB) mutateSegmentChunk(folderID uint32, folderPath string, meta 
 		return []segmentChunkMeta{meta}, nil
 	}
 	chunkPath := filepath.Join(folderPath, meta.FileName)
-	currentSize := int64(meta.ChunkSize)
+	info, err := os.Stat(chunkPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			chunkMetas, _, rewriteErr := db.rewriteChunkWithDedup(folderID, folderPath, meta, additions, allocator, []kvPair{}, nil)
+			if rewriteErr != nil {
+				return nil, rewriteErr
+			}
+			fmt.Printf("prefixdb: recreated missing chunk %s in folder %d during write\n", meta.FileName, folderID)
+			return chunkMetas, nil
+		}
+		return nil, err
+	}
+	currentSize := info.Size()
 	appendBytes := payloadSize(additions)
 	if appendBytes == 0 {
 		return []segmentChunkMeta{meta}, nil
 	}
 	metaCopy := meta
-	if err := db.appendChunkFile(chunkPath, metaCopy.KVCount, additions, currentSize); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// The index references a chunk file that no longer exists.
-			// We cannot append safely, so recreate the chunk from the current additions.
-			chunkMetas, _, rewriteErr := db.rewriteChunkWithDedup(folderID, folderPath, metaCopy, additions, allocator, []kvPair{}, nil)
-			if rewriteErr != nil {
-				return nil, rewriteErr
-			}
-			fmt.Printf("prefixdb: recreated missing chunk %s in folder %d during write\n", metaCopy.FileName, folderID)
-			return chunkMetas, nil
-		}
+	if err := db.appendChunkFile(chunkPath, additions, currentSize); err != nil {
 		return nil, err
 	}
 	metaCopy.KVCount += uint32(len(additions))
@@ -2358,31 +2564,24 @@ func (db *PrefixDB) mutateSegmentChunk(folderID uint32, folderPath string, meta 
 	return []segmentChunkMeta{metaCopy}, nil
 }
 
-func (db *PrefixDB) appendChunkFile(path string, currentCount uint32, additions []kvPair, currentSize int64) error {
+func (db *PrefixDB) appendChunkFile(path string, additions []kvPair, currentSize int64) error {
 	if len(additions) == 0 {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	var header [4]byte
-	writeUint32BE(header[:], currentCount+uint32(len(additions)))
-	if _, err := f.WriteAt(header[:], 0); err != nil {
-		return err
-	}
-	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(header))
-	seg, release, _, err := db.serializeStorageSegment(additions)
+	seg, release, _, err := serializeChunkPayload(additions)
 	if err != nil {
 		return err
 	}
 	defer release()
-	data := seg[4:]
-	if _, err := f.WriteAt(data, currentSize); err != nil {
+	if _, err := f.WriteAt(seg, currentSize); err != nil {
 		return err
 	}
-	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(data))
+	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(seg))
 	return nil
 }
 
@@ -2507,14 +2706,14 @@ func splitEntriesBySize(entries []kvPair, limit int) [][]kvPair {
 	}
 	chunks := make([][]kvPair, 0, len(entries)/64+1)
 	start := 0
-	var size int = 4
+	var size int
 	for i := 0; i < len(entries); i++ {
-		entrySize := 6 + len(entries[i].key) + len(entries[i].val)
+		entrySize := segmentedChunkEntryHeaderSize + len(entries[i].key) + len(entries[i].val)
 		if size+entrySize > limit && i > start {
 			chunk := entries[start:i:i]
 			chunks = append(chunks, chunk)
 			start = i
-			size = 4
+			size = 0
 		}
 		size += entrySize
 	}
@@ -2528,7 +2727,7 @@ func splitEntriesBySize(entries []kvPair, limit int) [][]kvPair {
 func payloadSize(entries []kvPair) int64 {
 	var total int64
 	for _, kv := range entries {
-		total += int64(6 + len(kv.key) + len(kv.val))
+		total += int64(segmentedChunkEntryHeaderSize + len(kv.key) + len(kv.val))
 	}
 	return total
 }
@@ -2583,7 +2782,7 @@ func (db *PrefixDB) writeChunkFile(folderPath, fileName string, entries []kvPair
 }
 
 func (db *PrefixDB) writeChunkFileWithUsage(folderPath, fileName string, entries []kvPair, usage diskIOUsage) (int, error) {
-	seg, release, chunkSize, err := db.serializeStorageSegment(entries)
+	seg, release, chunkSize, err := serializeChunkPayload(entries)
 	if err != nil {
 		return 0, err
 	}
@@ -2693,7 +2892,7 @@ func (db *PrefixDB) primeAccountFolderSetFromStorageDir() error {
 			continue
 		}
 		hexKey := strings.TrimPrefix(name, segmentedDirNamePrefix)
-		if len(hexKey) != storageKeyTrimOffset*2 {
+		if len(hexKey) == 0 || len(hexKey)%2 != 0 {
 			continue
 		}
 		accountKey, decodeErr := hex.DecodeString(hexKey)
@@ -2779,7 +2978,7 @@ func level2IndexFilePath(folderPath string, metaID uint32) string {
 }
 
 func segmentChunkMetaCanUseCompactEncoding(meta segmentChunkMeta) bool {
-	return parseChunkOrdinal(meta.FileName) >= 0 && meta.ChunkSize <= math.MaxUint32
+	return parseChunkOrdinal(meta.FileName) >= 0
 }
 
 func canUseCompactSegmentEncoding(metas []segmentChunkMeta) bool {
@@ -2793,9 +2992,9 @@ func canUseCompactSegmentEncoding(metas []segmentChunkMeta) bool {
 
 func estimateSegmentEntrySize(meta segmentChunkMeta) int {
 	if segmentChunkMetaCanUseCompactEncoding(meta) {
-		return 4 + 2 + len(meta.KeyStart) + 4
+		return 4 + 2 + len(meta.KeyStart)
 	}
-	return 2 + len(meta.FileName) + 2 + len(meta.KeyStart) + 8
+	return 2 + len(meta.FileName) + 2 + len(meta.KeyStart)
 }
 
 func estimateSegmentIndexSize(metas []segmentChunkMeta) int {
@@ -2831,8 +3030,6 @@ func encodeSegmentChunkMetas(metas []segmentChunkMeta) ([]byte, error) {
 		if buf, err = appendVarBytes(buf, meta.KeyStart); err != nil {
 			return nil, err
 		}
-		writeUint32BE(tmp32[:], uint32(meta.ChunkSize))
-		buf = append(buf, tmp32[:]...)
 	}
 	return buf, nil
 }
@@ -2953,7 +3150,7 @@ func fileExists(path string) bool {
 }
 
 func segmentChunkMetaEqual(a, b segmentChunkMeta) bool {
-	if a.FileName != b.FileName || a.ChunkSize != b.ChunkSize {
+	if a.FileName != b.FileName {
 		return false
 	}
 	return bytes.Equal(a.KeyStart, b.KeyStart)
@@ -3123,19 +3320,7 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 		}
 		cursor += n
 		meta := segmentChunkMeta{FileName: fileName, KeyStart: start}
-		if cursor+4 <= len(data) {
-			meta.ChunkSize = uint64(readUint32BE(data[cursor : cursor+4]))
-			cursor += 4
-		} else if chunkDir != "" {
-			chunkPath := filepath.Join(chunkDir, fileName)
-			info, err := os.Stat(chunkPath)
-			if err != nil {
-				return err
-			}
-			meta.ChunkSize = uint64(info.Size())
-		} else {
-			return io.ErrUnexpectedEOF
-		}
+		_ = chunkDir
 		*metas = append(*metas, meta)
 	}
 	return nil
@@ -3667,7 +3852,7 @@ func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) 
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
-		return nil, fmt.Errorf("segment index entry not found for folder %s", folderPath)
+		return nil, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
@@ -3767,7 +3952,7 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
-		return nil, false, fmt.Errorf("segment index entry not found for folder %d", folderID)
+		return nil, false, fmt.Errorf("%w for folder %d", errSegmentIndexEntryNotFound, folderID)
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
@@ -3864,12 +4049,12 @@ func (db *PrefixDB) readSegmentChunkFileWithUsage(folderID uint32, fileName stri
 	if err != nil {
 		return nil, nil, err
 	}
-	payload, kvCount, err := parseSegmentBuffer(lease.Bytes())
+	payload, kvCount, headerSize, err := parseChunkPayload(lease.Bytes())
 	if err != nil {
 		lease.Release()
 		return nil, nil, err
 	}
-	entries, err := buildPairsFromPayload(payload, kvCount, nil)
+	entries, err := buildPairsFromPayload(payload, kvCount, headerSize, nil)
 	if err != nil {
 		lease.Release()
 		return nil, nil, err
@@ -3882,12 +4067,12 @@ func (db *PrefixDB) readSegmentChunkFileWithUsageByPath(folderPath string, fileN
 	if err != nil {
 		return nil, nil, err
 	}
-	payload, kvCount, err := parseSegmentBuffer(lease.Bytes())
+	payload, kvCount, headerSize, err := parseChunkPayload(lease.Bytes())
 	if err != nil {
 		lease.Release()
 		return nil, nil, err
 	}
-	entries, err := buildPairsFromPayload(payload, kvCount, nil)
+	entries, err := buildPairsFromPayload(payload, kvCount, headerSize, nil)
 	if err != nil {
 		lease.Release()
 		return nil, nil, err
@@ -3903,7 +4088,7 @@ func (db *PrefixDB) readSegmentChunkPayloadWithUsage(folderID uint32, fileName s
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	payload, kvCount, err := parseSegmentBuffer(lease.Bytes())
+	payload, kvCount, _, err := parseChunkPayload(lease.Bytes())
 	if err != nil {
 		lease.Release()
 		return nil, 0, nil, err
@@ -3916,7 +4101,7 @@ func (db *PrefixDB) readSegmentChunkPayloadByPath(folderPath string, fileName st
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	payload, kvCount, err := parseSegmentBuffer(lease.Bytes())
+	payload, kvCount, _, err := parseChunkPayload(lease.Bytes())
 	if err != nil {
 		lease.Release()
 		return nil, 0, nil, err
@@ -3987,58 +4172,70 @@ func (db *PrefixDB) maybeNormalizeChunkEntries(entries []kvPair, meta *segmentCh
 	if len(entries) < 2 || meta == nil {
 		return entries
 	}
-	if meta.ChunkSize <= uint64(db.storageChunkSize) {
-		return entries
-	}
 	return normalizeStorageEntries(entries)
 }
 
-func (db *PrefixDB) readAccountStorageValue(accountKey, storageKey []byte) ([]byte, bool, error) {
+func (db *PrefixDB) readAccountStorageValue(accountKey, storageKey []byte) ([]byte, bool, *segmentedStorageReadFailure, error) {
 	if len(accountKey) == 0 {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	if db.isAccountStorageFolderManaged(accountKey) {
 		folderPath := db.segmentedFolderPathForAccount(accountKey)
-		val, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
+		val, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
 		if err != nil {
 			if shouldFallbackMissingFolderRead(err) {
 				db.clearAccountStorageFolder(accountKey)
 			} else {
-				return nil, false, err
+				return nil, false, failure, err
 			}
 		} else if val != nil {
-			return val, true, nil
+			return val, true, nil, nil
 		} else {
-			return nil, false, nil
+			return nil, false, failure, nil
 		}
 	}
 
 	cacheInfo, err := db.resolveAccountStoragePointer(accountKey)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 
 	if cacheInfo.storageFileID == 0 {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 
 	if isSegmentedStorage(cacheInfo.storageFileID) {
 		if !isAccountNamedSegmentedStorage(cacheInfo.storageFileID) {
-			return nil, false, errors.New("legacy segmented storage pointers are no longer supported")
+			return nil, false, nil, errors.New("legacy segmented storage pointers are no longer supported")
 		}
-		val := db.readSegmentedChunkToCache(cacheInfo.storageFileID, accountKey, storageKey)
+		val, failure := db.readSegmentedChunkToCache(cacheInfo.storageFileID, accountKey, storageKey)
 		if val == nil {
-			return nil, false, nil
+			return nil, false, failure, nil
 		}
-		return val, true, nil
+		return val, true, nil, nil
 
 	} else {
+		if cacheInfo.storageSize == 0 || cacheInfo.storageOffset < 0 {
+			storagePath, _ := db.storagePathByFileID(cacheInfo.storageFileID)
+			db.logLargeLogReadFailure(accountKey, storageKey, storagePath, cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize, "invalid-account-entry-pointer", nil)
+			return nil, false, nil, nil
+		}
 		val := db.readStorageSegmentFile(cacheInfo.storageFileID, cacheInfo.storageOffset, cacheInfo.storageSize, accountKey, storageKey)
 		if val == nil {
-			return nil, false, nil
+			return nil, false, nil, nil
 		}
-		return val, true, nil
+		return val, true, nil, nil
 	}
+}
+
+
+func (db *PrefixDB) logLargeLogReadFailure(accountKey, storageKey []byte, filePath string, fileID uint32, offset int64, size uint64, reason string, err error) {
+	dir, file := splitLogPath(filePath)
+	if err != nil {
+		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to read large log via account entry account=%x storage=%x dir=%s file=%s fileID=%d offset=%d size=%d reason=%s err=%v\n", accountKey, storageKey, dir, file, fileID, offset, size, reason, err)
+		return
+	}
+	fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to read large log via account entry account=%x storage=%x dir=%s file=%s fileID=%d offset=%d size=%d reason=%s\n", accountKey, storageKey, dir, file, fileID, offset, size, reason)
 }
 
 func borrowStorageEntries(count int) []kvPair {
@@ -4147,12 +4344,13 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 
 	f, err := db.openCachedReadOnlyFile(p)
 	if err != nil {
+		db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "open-storage-file", err)
 		return nil
 	}
 
 	if size == 0 {
+		db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "empty-storage-size", nil)
 		return nil
-
 	}
 
 	total := int(size)
@@ -4167,6 +4365,7 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 				db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 				break
 			}
+			db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "read-storage-file", err)
 			putDataBuffer(buf)
 			return nil
 		}
@@ -4174,31 +4373,31 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 		db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 	}
 	if read != total {
+		db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "short-storage-read", io.ErrUnexpectedEOF)
 		putDataBuffer(buf)
 		return nil
 	}
 	buf = buf[:total]
 
 	if db.storageCache != nil && len(accountKey) > 0 && len(storageKey) > 0 {
-		payload := buf
-		if len(payload) >= 4 {
-			kvCount := int(readUint32BE(payload[:4]))
-			payload = payload[4:]
+		payload, kvCount, parseErr := parseSegmentBuffer(buf)
+		if parseErr != nil {
+			db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "corrupted-storage-segment", parseErr)
+		} else {
 			cursor := 0
 			payloadLen := len(payload)
-			var klen, vlen int
 			hit := false
 			malformed := false
 			count := 0
 			for i := 0; i < kvCount; i++ {
-				if cursor+6 > payloadLen {
+				if cursor+segmentedChunkEntryHeaderSize > payloadLen {
 					malformed = true
 					break
 				}
-				header := payload[cursor : cursor+6]
-				klen = int(header[0])<<8 | int(header[1])
-				vlen = int(header[2])<<24 | int(header[3])<<16 | int(header[4])<<8 | int(header[5])
-				cursor += 6
+				header := payload[cursor : cursor+segmentedChunkEntryHeaderSize]
+				klen := int(readUint16BE(header[:2]))
+				vlen := int(readUint16BE(header[2:4]))
+				cursor += segmentedChunkEntryHeaderSize
 				totalLen := klen + vlen
 				if cursor+totalLen > payloadLen {
 					malformed = true
@@ -4233,6 +4432,9 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 					}
 				}
 				cursor += totalLen
+			}
+			if malformed {
+				db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "corrupted-storage-segment", io.ErrUnexpectedEOF)
 			}
 			if !hit && !malformed {
 				db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), nil)
@@ -4281,30 +4483,62 @@ func (db *PrefixDB) readStorageSegmentPayload(fileID uint32, offset int64, size 
 	}
 	buf = buf[:total]
 
-	if len(buf) < 4 {
+	payload, kvCount, err := parseSegmentBuffer(buf)
+	if err != nil {
 		putDataBuffer(buf)
-		return nil, 0, nil, io.ErrUnexpectedEOF
+		return nil, 0, nil, err
 	}
-	kvCount := int(readUint32BE(buf[:4]))
-	payload := buf[4:]
 	return payload, kvCount, newBufferLease(buf), nil
 
 }
 
 func parseSegmentBuffer(buf []byte) ([]byte, int, error) {
-	if len(buf) < 4 {
-		return nil, 0, fmt.Errorf("segment too small")
+	kvCount, err := countPayloadEntriesWithHeaderSize(buf, segmentedChunkEntryHeaderSize)
+	if err != nil {
+		return nil, 0, err
 	}
-	kvCount := int(readUint32BE(buf[:4]))
-	if kvCount < 0 {
-		return nil, 0, fmt.Errorf("invalid kv count: %d", kvCount)
-	}
-	return buf[4:], kvCount, nil
+	return buf, kvCount, nil
 }
 
-func buildPairsFromPayload(payload []byte, kvCount int, dst []kvPair) ([]kvPair, error) {
+func countPayloadEntriesWithHeaderSize(payload []byte, headerSize int) (int, error) {
+	if headerSize != segmentedChunkEntryHeaderSize {
+		return 0, fmt.Errorf("unsupported segmented chunk header size: %d", headerSize)
+	}
+	cursor := 0
+	payloadLen := len(payload)
+	count := 0
+	for cursor < payloadLen {
+		if cursor+headerSize > payloadLen {
+			return 0, io.ErrUnexpectedEOF
+		}
+		header := payload[cursor : cursor+headerSize]
+		klen := int(readUint16BE(header[:2]))
+		vlen := int(readUint16BE(header[2:4]))
+		cursor += headerSize
+		totalLen := klen + vlen
+		if cursor+totalLen > payloadLen {
+			return 0, io.ErrUnexpectedEOF
+		}
+		cursor += totalLen
+		count++
+	}
+	return count, nil
+}
+
+func parseChunkPayload(buf []byte) ([]byte, int, int, error) {
+	kvCount, err := countPayloadEntriesWithHeaderSize(buf, segmentedChunkEntryHeaderSize)
+	if err == nil {
+		return buf, kvCount, segmentedChunkEntryHeaderSize, nil
+	}
+	return nil, 0, 0, err
+}
+
+func buildPairsFromPayload(payload []byte, kvCount int, headerSize int, dst []kvPair) ([]kvPair, error) {
 	if kvCount <= 0 {
 		return dst[:0], nil
+	}
+	if headerSize != segmentedChunkEntryHeaderSize {
+		return nil, fmt.Errorf("unsupported segmented chunk header size: %d", headerSize)
 	}
 
 	if cap(dst) < kvCount {
@@ -4316,13 +4550,13 @@ func buildPairsFromPayload(payload []byte, kvCount int, dst []kvPair) ([]kvPair,
 
 	var klen, vlen int
 	for i := 0; i < kvCount; i++ {
-		if cursor+6 > payloadLen {
+		if cursor+headerSize > payloadLen {
 			return nil, io.ErrUnexpectedEOF
 		}
-		header := payload[cursor : cursor+6]
-		klen = int(header[0])<<8 | int(header[1])
-		vlen = int(header[2])<<24 | int(header[3])<<16 | int(header[4])<<8 | int(header[5])
-		cursor += 6
+		header := payload[cursor : cursor+headerSize]
+		klen = int(readUint16BE(header[:2]))
+		vlen = int(readUint16BE(header[2:4]))
+		cursor += headerSize
 		totalLen := klen + vlen
 		if cursor+totalLen > payloadLen {
 			return nil, io.ErrUnexpectedEOF
@@ -4360,7 +4594,7 @@ func (db *PrefixDB) readStorageSegmentPairs(fileID uint32, offset int64, size ui
 		}
 		return nil, nil, nil
 	}
-	entries, err := buildPairsFromPayload(payload, kvCount, nil)
+	entries, err := buildPairsFromPayload(payload, kvCount, segmentedChunkEntryHeaderSize, nil)
 	if err != nil {
 		if backing != nil {
 			backing.Release()
@@ -4380,9 +4614,11 @@ func (db *PrefixDB) GetStorageCount(accountKey []byte) (int, uint64, error) {
 		count := 0
 		var total uint64
 		for i := range metas {
-			total += metas[i].ChunkSize
 			payload, kvCount, backing, err := db.readSegmentChunkPayloadByPath(folderPath, metas[i].FileName)
 			_ = payload
+			if backing != nil {
+				total += uint64(len(backing.Bytes()))
+			}
 			if backing != nil {
 				backing.Release()
 			}
@@ -4418,27 +4654,17 @@ func (db *PrefixDB) GetStorageCount(accountKey []byte) (int, uint64, error) {
 		return 0, 0, nil
 	}
 
-	// just read kv count
-	buf := make([]byte, 10)
-
+	buf := make([]byte, int(node.storageSize))
 	n, err := f.ReadAt(buf, node.storageOffset)
 	if err != nil && err != io.EOF {
 		return 0, 0, err
 	}
 	db.addDiskRead(diskIOUsageStorageCommonLogs, n)
 	buf = buf[:n]
-
-	var kvCount int
-
-	if len(buf) < 4 {
-		return 0, 0, fmt.Errorf("segment too small")
+	_, kvCount, parseErr := parseSegmentBuffer(buf)
+	if parseErr != nil {
+		return 0, 0, parseErr
 	}
-	kvCount = int(readUint32BE(buf[:4]))
-
-	if kvCount < 0 {
-		return 0, 0, fmt.Errorf("invalid kv count: %d", kvCount)
-	}
-
 	return kvCount, node.storageSize, nil
 
 }
@@ -4604,7 +4830,20 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderID uint32, meta *segmentChunkMe
 		release()
 		return
 	}
-	if db.storageGCQueue == nil || meta.ChunkSize <= uint64(db.segmentedChunkTriggerSize()) {
+	if db.storageGCQueue == nil {
+		release()
+		return
+	}
+	chunkSize := meta.ChunkSize
+	if chunkSize == 0 {
+		info, err := os.Stat(filepath.Join(db.segmentedFolderPath(folderID), meta.FileName))
+		if err != nil {
+			release()
+			return
+		}
+		chunkSize = uint64(info.Size())
+	}
+	if chunkSize <= uint64(db.segmentedChunkTriggerSize()) {
 		release()
 		return
 	}
@@ -4740,7 +4979,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 			payload, kvCount, pErr := parseSegmentBuffer(backings[backingIdx].Bytes())
 			if pErr == nil {
 				entries := borrowStorageEntries(kvCount)
-				if decoded, decErr := buildPairsFromPayload(payload, kvCount, entries); decErr == nil {
+				if decoded, decErr := buildPairsFromPayload(payload, kvCount, segmentedChunkEntryHeaderSize, entries); decErr == nil {
 					preloaded = decoded
 					preloadBacking = backings[backingIdx]
 					backings[backingIdx] = nil
@@ -4857,7 +5096,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 		payload, kvCount, err := parseSegmentBuffer(job.backing.Bytes())
 		if err == nil {
 			entries := borrowStorageEntries(kvCount)
-			if decoded, decErr := buildPairsFromPayload(payload, kvCount, entries); decErr == nil {
+			if decoded, decErr := buildPairsFromPayload(payload, kvCount, segmentedChunkEntryHeaderSize, entries); decErr == nil {
 				preloaded = decoded
 				preloadBacking = job.backing
 				job.backing = nil
@@ -5016,54 +5255,72 @@ func (db *PrefixDB) InsertAccountHashPebble(accountHash []byte, pebbleKey []byte
 	return db.accountHashKeyPebble.Put(accountHash, pebbleKey)
 }
 
-func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, accountKey []byte, storageKey []byte) []byte {
+func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, accountKey []byte, storageKey []byte) ([]byte, *segmentedStorageReadFailure) {
 	if !isAccountNamedSegmentedStorage(fileID) {
-		return nil
+		return nil, nil
 	}
-	if !db.isAccountStorageFolderManaged(accountKey) {
-		return nil
+	if len(accountKey) == 0 {
+		return nil, nil
 	}
-	val, err := db.readSegmentedChunkToCacheByPath(db.segmentedFolderPathForAccount(accountKey), accountKey, storageKey)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	val, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
 	if err != nil {
 		if shouldFallbackMissingFolderRead(err) {
 			db.clearAccountStorageFolder(accountKey)
 		}
-		return nil
+		return nil, failure
 	}
-	return val
+	if val != nil {
+		db.markAccountStorageFolder(accountKey)
+	}
+	return val, failure
 }
 
-func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKey []byte, storageKey []byte) ([]byte, error) {
+func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKey []byte, storageKey []byte) ([]byte, *segmentedStorageReadFailure, error) {
+	failure := &segmentedStorageReadFailure{folderPath: folderPath, indexFile: segmentIndexFileName}
 	indexStart := time.Now()
 	metas, err := db.readSegmentIndexForKeyByPath(folderPath, storageKey)
 	if len(metas) > 0 {
 		recordTrieStorageGetBreakdownStep(&db.trieStorageSegmentIndexStats, false, time.Since(indexStart))
 	}
-	if err != nil || len(metas) == 0 {
-		return nil, err
+	if err != nil {
+		if errors.Is(err, errSegmentIndexEntryNotFound) {
+			failure.reason = "segment-index-entry-not-found"
+			return nil, failure, nil
+		}
+		failure.reason = "segment-index-read-failed"
+		return nil, failure, err
+	}
+	if len(metas) == 0 {
+		failure.reason = "segment-index-empty"
+		return nil, failure, nil
 	}
 	meta := selectSegmentChunkMeta(metas, storageKey)
 	if meta == nil {
-		return nil, nil
+		failure.reason = "segment-chunk-meta-not-found"
+		return nil, failure, nil
 	}
+	failure.chunkFile = meta.FileName
 	chunkStart := time.Now()
 	defer func() {
 		recordTrieStorageGetBreakdownStep(&db.trieStorageKVStats, false, time.Since(chunkStart))
 	}()
 	lease, err := db.readSegmentFileBufferByPath(folderPath, meta.FileName)
 	if err != nil {
-		return nil, err
+		failure.reason = "segment-chunk-read-failed"
+		return nil, failure, err
 	}
 	defer lease.Release()
 	buf := lease.Bytes()
-	if len(buf) < 4 {
-		return nil, nil
+	if len(buf) == 0 {
+		failure.reason = "segment-chunk-empty"
+		return nil, failure, nil
 	}
-	kvCount := int(binary.BigEndian.Uint32(buf[:4]))
-	if kvCount <= 0 {
-		return nil, nil
+	_, _, headerSize, parseErr := parseChunkPayload(buf)
+	if parseErr != nil {
+		failure.reason = "segment-chunk-corrupted"
+		return nil, failure, nil
 	}
-	buf = buf[4:]
 	cursor := 0
 	bufLen := len(buf)
 	prefetchLimit := db.storageGetCacheCount
@@ -5073,17 +5330,19 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	exactTombstone := false
 	var exactValue []byte
 	count := 0
-	for i := 0; i < kvCount; i++ {
-		if cursor+6 > bufLen {
-			return nil, nil
+	for cursor < bufLen {
+		if cursor+headerSize > bufLen {
+			failure.reason = "segment-chunk-corrupted"
+			return nil, failure, nil
 		}
-		header := buf[cursor : cursor+6]
-		klen := int(header[0])<<8 | int(header[1])
-		vlen := int(header[2])<<24 | int(header[3])<<16 | int(header[4])<<8 | int(header[5])
-		cursor += 6
+		header := buf[cursor : cursor+headerSize]
+		klen := int(readUint16BE(header[:2]))
+		vlen := int(readUint16BE(header[2:4]))
+		cursor += headerSize
 		totalLen := klen + vlen
 		if cursor+totalLen > bufLen {
-			return nil, nil
+			failure.reason = "segment-chunk-corrupted"
+			return nil, failure, nil
 		}
 		keyRaw := buf[cursor : cursor+klen]
 		key := normalizeStoredStorageKey(keyRaw)
@@ -5118,19 +5377,21 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		if cache != nil {
 			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
 		}
-		return nil, nil
+		failure.reason = "segment-chunk-key-not-found"
+		return nil, failure, nil
 	}
 	if exactTombstone {
 		if cache != nil {
 			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
 		}
-		return nil, nil
+		failure.reason = "segment-chunk-tombstone"
+		return nil, failure, nil
 	}
 	result := append([]byte(nil), exactValue...)
 	if cache != nil {
 		cache.Add(db.storageCacheKey(accountKey, storageKey), append([]byte(nil), exactValue...))
 	}
-	return result, nil
+	return result, nil, nil
 }
 
 func (db *PrefixDB) MigrateLegacySegmentIndexFormats() error {

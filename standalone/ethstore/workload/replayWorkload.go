@@ -1727,6 +1727,13 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 		return fmt.Errorf("failed to create PebbleStore instance: %w", err)
 	}
 	defer acccuntHashKeyPebble.Close()
+	pdb.ParentKeyResolver = func(storageKey []byte) []byte {
+		accountKey, resolveErr := resolvePrefixDBLoadAccountKey(acccuntHashKeyPebble, storageKey)
+		if resolveErr != nil {
+			return nil
+		}
+		return accountKey
+	}
 
 	testFilePath := strings.TrimSpace(dataFile)
 	if testFilePath == "" {
@@ -1742,6 +1749,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 
 	var totalTime time.Duration
 	counter := 0
+	deferredStorageCount := 0
 	reader := bufio.NewReader(file)
 
 	//isSaveTrie := false
@@ -1792,18 +1800,16 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 
 		// Perform the Put operation
 		if keyBytes[0] == 'O' {
-			accountHash := keyBytes[1:33]
-			accountKey, err = acccuntHashKeyPebble.Get(accountHash)
+			accountKey, err = resolvePrefixDBLoadAccountKey(acccuntHashKeyPebble, keyBytes)
 			if err != nil {
-				if err == pebble.ErrNotFound {
-					return nil // account not found
-				}
-				return nil
+				return fmt.Errorf("failed to resolve account key for storage key %x: %w", keyBytes, err)
 			}
-			// accountKey = nil
+			if accountKey == nil {
+				deferredStorageCount++
+			}
 		}
 		startTime := time.Now()
-		err = pdb.Put(dataType, keyBytes, valueBytes, accountKey)
+		err = pdb.BatchPut(dataType, keyBytes, valueBytes, accountKey)
 
 		endTime := time.Now()
 		totalTime += endTime.Sub(startTime)
@@ -1814,16 +1820,41 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 		}
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-			pdb.BatchCommit()
+			if err := pdb.BatchCommit(); err != nil {
+				return fmt.Errorf("failed to commit PrefixDB batch at row %d: %w", counter, err)
+			}
 		}
 	}
 
-	// pdb.SaveTrie()
+	if err := pdb.BatchCommit(); err != nil {
+		return fmt.Errorf("failed to finalize PrefixDB batch commit: %w", err)
+	}
+
 	if err := pdb.RunPostLoadGC(); err != nil {
 		return fmt.Errorf("failed to run post-load GC: %w", err)
 	}
+	if deferredStorageCount > 0 {
+		fmt.Printf("\nDeferred PrefixDB storage account resolution count: %d\n", deferredStorageCount)
+	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
 	return nil
+}
+
+func resolvePrefixDBLoadAccountKey(index interface{ Get([]byte) ([]byte, error) }, storageKey []byte) ([]byte, error) {
+	if len(storageKey) == 0 || storageKey[0] != 'O' {
+		return nil, nil
+	}
+	if len(storageKey) < 33 {
+		return nil, fmt.Errorf("invalid storage key %x", storageKey)
+	}
+	accountKey, err := index.Get(storageKey[1:33])
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return accountKey, nil
 }
 
 func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, totalCacheSizeMiB int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
