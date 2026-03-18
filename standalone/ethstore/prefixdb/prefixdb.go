@@ -413,9 +413,6 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 	}
 
 	resolvedStorageGCThreshold := sanitizeStorageGCThreshold(cfg.StorageGCThreshold)
-	if storageGCThreshold > 0 {
-		resolvedStorageGCThreshold = sanitizeStorageGCThreshold(storageGCThreshold)
-	}
 
 	// Ensure base directory exists
 	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
