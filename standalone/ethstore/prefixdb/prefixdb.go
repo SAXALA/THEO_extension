@@ -54,6 +54,18 @@ const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
 const ()
 
 var prefixdbLogWriter io.Writer = os.Stdout
+var prefixdbDebugLogging atomic.Bool
+
+func SetPrefixDBDebugLogging(enabled bool) {
+	prefixdbDebugLogging.Store(enabled)
+}
+
+func prefixdbDebugf(format string, args ...interface{}) {
+	if !prefixdbDebugLogging.Load() {
+		return
+	}
+	fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: "+format+"\n", args...)
+}
 
 var errSegmentIndexEntryNotFound = errors.New("segment index entry not found")
 
@@ -329,7 +341,8 @@ type PrefixDB struct {
 	nodeCacheHitFallbackToNodeFile uint64
 	diskIOStats                    [diskIOUsageCount]diskIOCounters
 
-	testSegmentedReadHook func(folderPath string, meta segmentChunkMeta)
+	testSegmentedReadHook    func(folderPath string, meta segmentChunkMeta)
+	testBuildStoragePlanHook func(accountKey string)
 }
 
 type diskIOUsage uint8
@@ -810,115 +823,145 @@ func (db *PrefixDB) BatchCommit() (err error) {
 		totalStorageKeys += len(perAccount)
 	}
 	if len(accountOps) > 0 || totalStorageKeys > 0 || len(storageUnresolved) > 0 {
-		fmt.Printf("BatchCommit: starting commit - accountOps=%d storageAccounts=%d storageKeys=%d unresolved=%d\n",
+		prefixdbDebugf("BatchCommit: starting commit - accountOps=%d storageAccounts=%d storageKeys=%d unresolved=%d",
 			len(accountOps), len(storageBatch), totalStorageKeys, len(storageUnresolved))
 	}
 
 	if len(accountOps) == 0 && len(storageBatch) == 0 && len(storageUnresolved) == 0 {
 		return nil
 	}
+	shouldWaitForStorageGC := false
+	commitStart := time.Now()
 
 	db.writeMutex.Lock()
-	defer db.writeMutex.Unlock()
-
-	storagePlans, err := db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
-	if err != nil {
-		return err
-	}
-	if len(storagePlans) > 0 && accountOps != nil {
-		for _, plan := range storagePlans {
-			op, ok := accountOps[plan.accountKey]
-			if !ok || op.value == nil {
-				continue
-			}
-			op.storageFileID = plan.storageInfo.storageFileID
-			op.storageOffset = plan.storageInfo.storageOffset
-			op.storageSize = plan.storageInfo.storageSize
-			accountOps[plan.accountKey] = op
-		}
-	}
-
-	prepared, err := db.prepareAccountCommit(accountOps)
-	if err != nil {
-		return err
-	}
-
-	trieAccountOffset, _ := db.accountFile.Seek(0, io.SeekEnd)
-	if trieAccountOffset == 0 {
-		trieAccountOffset = 1
-	}
-
-	naEntry := make([]byte, 0, prepared.totalSize)
-	for _, key := range prepared.order {
-		op := accountOps[key]
-		keyBytes := []byte(key)
-		if op.modifiedType == None {
-			continue
-		}
-		if op.value == nil {
-			if db.nodeCache != nil {
-				db.nodeCache.Delete(key)
-			}
-			if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
-				return err
-			}
-			continue
-		}
-
-		entry := prepared.entries[key]
-		offset := trieAccountOffset + int64(len(naEntry))
-		naEntry = append(naEntry, entry...)
-
-		node := &TrieNode{
-			storageFileID: op.storageFileID,
-			storageOffset: op.storageOffset,
-			storageSize:   op.storageSize,
-			offset:        offset,
-		}
-		if err := db.storeNode(keyBytes, node); err != nil {
-			return err
-		}
-		if db.nodeCache != nil {
-			db.nodeCache.StoreMetadata(key, offset, StorageInfo{
-				storageFileID: op.storageFileID,
-				storageOffset: op.storageOffset,
-				storageSize:   op.storageSize,
-			})
-		}
-	}
-
-	if len(naEntry) > 0 {
-		_, err := db.accountFile.WriteAt(naEntry, trieAccountOffset)
+	err = func() error {
+		stageStart := time.Now()
+		storagePlans, err := db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
 		if err != nil {
 			return err
 		}
-		db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
-	}
-
-	if len(storagePlans) > 0 {
-		for _, plan := range storagePlans {
-			if op, ok := accountOps[plan.accountKey]; ok {
-				if op.value == nil {
+		prefixdbDebugf("BatchCommit: storage plans ready count=%d elapsed=%s", len(storagePlans), time.Since(stageStart))
+		if len(storagePlans) > 0 && accountOps != nil {
+			stageStart = time.Now()
+			for _, plan := range storagePlans {
+				op, ok := accountOps[plan.accountKey]
+				if !ok || op.value == nil {
 					continue
+				}
+				op.storageFileID = plan.storageInfo.storageFileID
+				op.storageOffset = plan.storageInfo.storageOffset
+				op.storageSize = plan.storageInfo.storageSize
+				accountOps[plan.accountKey] = op
+			}
+			prefixdbDebugf("BatchCommit: storage pointers merged elapsed=%s", time.Since(stageStart))
+		}
+
+		stageStart = time.Now()
+		prepared, err := db.prepareAccountCommit(accountOps)
+		if err != nil {
+			return err
+		}
+		prefixdbDebugf("BatchCommit: account entries prepared count=%d bytes=%d elapsed=%s",
+			len(prepared.order), prepared.totalSize, time.Since(stageStart))
+
+		trieAccountOffset, _ := db.accountFile.Seek(0, io.SeekEnd)
+		if trieAccountOffset == 0 {
+			trieAccountOffset = 1
+		}
+
+		naEntry := make([]byte, 0, prepared.totalSize)
+		stageStart = time.Now()
+		processedAccounts := 0
+		for _, key := range prepared.order {
+			op := accountOps[key]
+			keyBytes := []byte(key)
+			if op.modifiedType == None {
+				continue
+			}
+			if op.value == nil {
+				if db.nodeCache != nil {
+					db.nodeCache.Delete(key)
+				}
+				if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
+					return err
 				}
 				continue
 			}
-			if plan.skipNodeWrite {
-				continue
+
+			entry := prepared.entries[key]
+			offset := trieAccountOffset + int64(len(naEntry))
+			naEntry = append(naEntry, entry...)
+
+			node := &TrieNode{
+				storageFileID: op.storageFileID,
+				storageOffset: op.storageOffset,
+				storageSize:   op.storageSize,
+				offset:        offset,
 			}
-			accountKeyBytes := []byte(plan.accountKey)
-			if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
+			if err := db.storeNode(keyBytes, node); err != nil {
 				return err
 			}
 			if db.nodeCache != nil {
-				db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
+				db.nodeCache.StoreMetadata(key, offset, StorageInfo{
+					storageFileID: op.storageFileID,
+					storageOffset: op.storageOffset,
+					storageSize:   op.storageSize,
+				})
+			}
+			processedAccounts++
+			if processedAccounts%10000 == 0 {
+				prefixdbDebugf("BatchCommit: account node writes progress=%d/%d elapsed=%s",
+					processedAccounts, len(prepared.order), time.Since(stageStart))
 			}
 		}
-	}
+		prefixdbDebugf("BatchCommit: account node writes done count=%d elapsed=%s", processedAccounts, time.Since(stageStart))
 
-	if len(storagePlans) > 0 {
-		return db.waitForStorageGCIdle()
+		if len(naEntry) > 0 {
+			stageStart = time.Now()
+			_, err := db.accountFile.WriteAt(naEntry, trieAccountOffset)
+			if err != nil {
+				return err
+			}
+			db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
+			prefixdbDebugf("BatchCommit: account file append bytes=%d elapsed=%s", len(naEntry), time.Since(stageStart))
+		}
+
+		if len(storagePlans) > 0 {
+			shouldWaitForStorageGC = true
+			stageStart = time.Now()
+			appliedStoragePlans := 0
+			for _, plan := range storagePlans {
+				if _, ok := accountOps[plan.accountKey]; ok || plan.skipNodeWrite {
+					continue
+				}
+				appliedStoragePlans++
+				if appliedStoragePlans%25 == 0 {
+					prefixdbDebugf("BatchCommit: storage pointer writes progress=%d/%d elapsed=%s",
+						appliedStoragePlans, len(storagePlans), time.Since(stageStart))
+				}
+			}
+			if err := db.applyStorageCommitPlans(storagePlans, accountOps, false); err != nil {
+				return err
+			}
+			prefixdbDebugf("BatchCommit: storage pointer writes done applied=%d total=%d elapsed=%s",
+				appliedStoragePlans, len(storagePlans), time.Since(stageStart))
+		}
+		prefixdbDebugf("BatchCommit: write phase finished totalElapsed=%s", time.Since(commitStart))
+		return nil
+	}()
+	db.writeMutex.Unlock()
+	if err != nil {
+		return err
 	}
+	if shouldWaitForStorageGC {
+		waitStart := time.Now()
+		prefixdbDebugf("BatchCommit: waiting storage GC idle")
+		if waitErr := db.waitForStorageGCIdle(); err == nil {
+			err = waitErr
+		}
+		prefixdbDebugf("BatchCommit: storage GC idle wait done elapsed=%s", time.Since(waitStart))
+	}
+	prefixdbDebugf("BatchCommit: finished totalElapsed=%s", time.Since(commitStart))
 	return nil
 }
 
@@ -2437,7 +2480,10 @@ func dedupSortedKVPairs(kvs []kvPair) []kvPair {
 
 func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kvs []kvPair) (uint32, int64, uint64, error) {
 	folderID := existingFileID & ^segmentedStorageFlag
-	metas, err := db.readSegmentIndexNoCache(folderID)
+	folderPath := db.segmentedFolderPath(folderID)
+	entry, unlock := db.lockSegmentIndexFolderEntry(folderPath)
+	defer unlock()
+	metas, err := db.readSegmentIndexNoCacheByPathLocked(folderPath)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -2448,7 +2494,6 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 	metas = normalizeSegmentChunkMetasOrder(metas, &orderChanged)
 	allocator := newChunkFileAllocator(metas)
 	buckets, unmatched := partitionEntriesByChunks(metas, kvs)
-	folderPath := db.segmentedFolderPath(folderID)
 	updated := make([]segmentChunkMeta, 0, len(metas)+len(kvs)/64+1)
 	indexDirty := orderChanged
 	for idx, meta := range metas {
@@ -2484,10 +2529,11 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 		indexDirty = true
 	}
 	if indexDirty {
-		if err := db.writeSegmentIndex(folderPath, updated); err != nil {
+		if err := db.writeSegmentIndexLocked(folderPath, updated, entry); err != nil {
 			return 0, 0, 0, err
 		}
-		db.invalidateSegmentIndexCache(folderID)
+		db.invalidateSegmentIndexLayoutForPath(folderPath)
+		db.refreshSegmentIndexCacheByPathLocked(folderPath, updated)
 	}
 	return existingFileID, 0, 0, nil
 }
@@ -2736,7 +2782,8 @@ func (db *PrefixDB) repairMissingChunkFile(folderID uint32, fileName string) err
 	if err := db.writeSegmentIndexLocked(folderPath, filtered, entry); err != nil {
 		return err
 	}
-	db.invalidateSegmentIndexCache(folderID)
+	db.invalidateSegmentIndexLayoutForPath(folderPath)
+	db.refreshSegmentIndexCacheByPathLocked(folderPath, filtered)
 	fmt.Printf("prefixdb: repaired missing chunk %s in folder %d\n", fileName, folderID)
 	return nil
 }

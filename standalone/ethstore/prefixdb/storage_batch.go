@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+type storageCommitTask struct {
+	index      int
+	accountKey string
+}
+
+type storageCommitResult struct {
+	index int
+	plan  storageCommitPlan
+	err   error
+}
+
 type storageCommitPlan struct {
 	accountKey    string
 	accountOffset int64
@@ -178,67 +189,29 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	}
 
 	// Hold the write lock across the commit to serialize with regular Put/Delete.
+	shouldWaitForStorageGC := false
 	db.writeMutex.Lock()
-	defer db.writeMutex.Unlock()
-
-	if len(unresolved) > 0 {
-		for origKeyStr, v := range unresolved {
-			origKeyBytes := []byte(origKeyStr)
-			var accountKey []byte
-			if db.ParentKeyResolver != nil {
-				accountKey = db.ParentKeyResolver(origKeyBytes)
-			}
-			if accountKey == nil {
-				// fmt.Printf("Warning: failed to resolve parent account key for storage key %s\n", origKeyStr)
-				continue
-			}
-			storageKey, err := db.normalizeStorageKey(origKeyBytes)
-			if err != nil {
-				return err
-			}
-			accStr := string(accountKey)
-			perAcc := batch[accStr]
-			if perAcc == nil {
-				perAcc = make(map[string][]byte)
-				batch[accStr] = perAcc
-			}
-			storageKeyStr := string(storageKey)
-			// v is already owned by this commit (copied in putUnresolved),
-			// so assign directly to avoid an extra allocation+copy here.
-			perAcc[storageKeyStr] = v
-			if db.storageCache != nil {
-				db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), v)
-			}
-		}
-	}
-
-	accountKeys := make([]string, 0, len(batch))
-	for accountKey := range batch {
-		accountKeys = append(accountKeys, accountKey)
-	}
-	sort.Strings(accountKeys)
-
-	for _, accountKey := range accountKeys {
-		perAccount := batch[accountKey]
-		if len(perAccount) == 0 {
-			if err := db.commitStorageForAccount(accountKey, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		kvs := make([]kvPair, 0, len(perAccount))
-		for k, v := range perAccount {
-			keyBytes := []byte(k)
-			// v is already a stable copy owned by this commit (sb.put makes a copy).
-			kvs = append(kvs, kvPair{key: keyBytes, val: v})
-		}
-		sortKVPairs(kvs)
-		if err := db.commitStorageForAccount(accountKey, kvs); err != nil {
+	err = func() error {
+		plans, err := db.prepareStorageCommitPlans(batch, unresolved, nil)
+		if err != nil {
 			return err
 		}
+		if len(plans) > 0 {
+			shouldWaitForStorageGC = true
+		}
+		if err := db.applyStorageCommitPlans(plans, nil, true); err != nil {
+			return err
+		}
+		return nil
+	}()
+	db.writeMutex.Unlock()
+	if err != nil {
+		return err
 	}
-
-	return db.waitForStorageGCIdle()
+	if shouldWaitForStorageGC {
+		return db.waitForStorageGCIdle()
+	}
+	return nil
 }
 
 func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (*preparedAccountCommit, error) {
@@ -298,47 +271,84 @@ func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte
 	sort.Strings(accountKeys)
 
 	plans := make([]storageCommitPlan, len(accountKeys))
-	workerCount := sanitizePrefixTreeGCWorkerCount(db.gcWorkers)
-	if workerCount > len(accountKeys) {
-		workerCount = len(accountKeys)
-	}
-	if workerCount < 1 {
-		workerCount = 1
+	workerCount := db.storageCommitWorkerCount(len(accountKeys))
+	if workerCount <= 1 {
+		for idx, accountKey := range accountKeys {
+			perAccount := batch[accountKey]
+			prefixdbDebugf("BatchCommit: storage plan %d/%d account=%x keys=%d",
+				idx+1, len(accountKeys), []byte(accountKey), len(perAccount))
+			start := time.Now()
+			plan, err := db.buildStorageCommitPlan(accountKey, perAccount)
+			if err != nil {
+				prefixdbDebugf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%x error=%v",
+					[]byte(accountKey), err)
+				return nil, err
+			}
+			prefixdbDebugf("BatchCommit: storage plan %d/%d done account=%x elapsed=%s",
+				idx+1, len(accountKeys), []byte(accountKey), time.Since(start))
+			plans[idx] = plan
+		}
+		return plans, nil
 	}
 
-	jobs := make(chan int, len(accountKeys))
-	errCh := make(chan error, 1)
+	tasks := make(chan storageCommitTask, len(accountKeys))
+	results := make(chan storageCommitResult, len(accountKeys))
 	var wg sync.WaitGroup
 	for worker := 0; worker < workerCount; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				plan, err := db.buildStorageCommitPlan(accountKeys[idx], batch[accountKeys[idx]])
+			for task := range tasks {
+				perAccount := batch[task.accountKey]
+				prefixdbDebugf("BatchCommit: storage plan %d/%d account=%x keys=%d",
+					task.index+1, len(accountKeys), []byte(task.accountKey), len(perAccount))
+				start := time.Now()
+				plan, err := db.buildStorageCommitPlan(task.accountKey, perAccount)
 				if err != nil {
-					fmt.Printf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%s error=%v\n",
-						accountKeys[idx], err)
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
+					prefixdbDebugf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%x error=%v",
+						[]byte(task.accountKey), err)
+					results <- storageCommitResult{index: task.index, err: err}
+					continue
 				}
-				plans[idx] = plan
+				prefixdbDebugf("BatchCommit: storage plan %d/%d done account=%x elapsed=%s",
+					task.index+1, len(accountKeys), []byte(task.accountKey), time.Since(start))
+				results <- storageCommitResult{index: task.index, plan: plan}
 			}
 		}()
 	}
-	for idx := range accountKeys {
-		jobs <- idx
+	for idx, accountKey := range accountKeys {
+		tasks <- storageCommitTask{index: idx, accountKey: accountKey}
 	}
-	close(jobs)
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return nil, err
-	default:
+	close(tasks)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	var firstErr error
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		plans[result.index] = result.plan
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return plans, nil
+}
+
+func (db *PrefixDB) storageCommitWorkerCount(taskCount int) int {
+	workers := sanitizePrefixTreeGCWorkerCount(db.gcWorkers)
+	if taskCount > 0 && workers > taskCount {
+		workers = taskCount
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
 }
 
 func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]byte, unresolved map[string][]byte) error {
@@ -382,6 +392,9 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 
 func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[string][]byte) (storageCommitPlan, error) {
 	plan := storageCommitPlan{accountKey: accountKey}
+	if db.testBuildStoragePlanHook != nil {
+		db.testBuildStoragePlanHook(accountKey)
+	}
 	accountKeyBytes := []byte(accountKey)
 	node, err := db.getNode(accountKeyBytes)
 	if err != nil {
@@ -419,6 +432,33 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 	}
 	plan.skipNodeWrite = shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, offset, size)
 	return plan, nil
+}
+
+func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOps map[string]WriteOperation, updateAccountBatch bool) error {
+	for _, plan := range plans {
+		if accountOps != nil {
+			if op, ok := accountOps[plan.accountKey]; ok {
+				if op.value == nil {
+					continue
+				}
+				continue
+			}
+		}
+		if plan.skipNodeWrite {
+			continue
+		}
+		accountKeyBytes := []byte(plan.accountKey)
+		if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
+			return err
+		}
+		if db.nodeCache != nil {
+			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
+		}
+		if updateAccountBatch && db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(plan.accountKey, plan.storageInfo)
+		}
+	}
+	return nil
 }
 
 func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) error {

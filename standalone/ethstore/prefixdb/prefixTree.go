@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/huandu/skiplist"
@@ -244,13 +245,13 @@ type PrefixTree struct {
 	globalNeedsRewrite bool
 
 	// node file access stats (read path)
-	fileNodeCacheHits           uint64
-	fileNodeCacheMisses         uint64
-	fileHandleCacheHits         uint64
-	fileHandleCacheMisses       uint64
-	nodeFileDiskLoads           uint64 // times we had to read from a node file due to fileNodeCache miss
-	nodeFileReadOps             uint64 // number of os.File.ReadAt calls
-	nodeFileReadBytes           uint64
+	fileNodeCacheHits     uint64
+	fileNodeCacheMisses   uint64
+	fileHandleCacheHits   uint64
+	fileHandleCacheMisses uint64
+	nodeFileDiskLoads     uint64 // times we had to read from a node file due to fileNodeCache miss
+	nodeFileReadOps       uint64 // number of os.File.ReadAt calls
+	nodeFileReadBytes     uint64
 
 	bufPool sync.Pool
 
@@ -310,13 +311,17 @@ func (pt *PrefixTree) getGCState(fileID string) *gcState {
 }
 
 func (pt *PrefixTree) beginFileMutation(fileID string) func() {
+	return pt.beginFileMutationForState(fileID, nil)
+}
+
+func (pt *PrefixTree) beginFileMutationForState(fileID string, allowedState *gcState) func() {
 	if fileID == "" {
 		return func() {}
 	}
 	for {
 		pt.gcMu.Lock()
 		state, running := pt.gcInFlight[fileID]
-		if running {
+		if running && state != allowedState {
 			pt.gcMu.Unlock()
 			<-state.done
 			continue
@@ -459,7 +464,7 @@ func (pt *PrefixTree) finishGC(fileID string) {
 }
 
 func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error {
-	release := pt.beginFileMutation(fileID)
+	release := pt.beginFileMutationForState(fileID, state)
 	defer release()
 
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
@@ -712,13 +717,17 @@ func (pt *PrefixTree) beginGlobalCommit() {
 }
 
 func (pt *PrefixTree) endGlobalCommit() error {
+	commitStart := time.Now()
 	pt.globalNodeMu.Lock()
 	defer pt.globalNodeMu.Unlock()
 	if pt.globalCommitDepth == 0 {
+		prefixdbDebugf("PrefixTree endGlobalCommit: no-op elapsed=%s", time.Since(commitStart))
 		return nil
 	}
 	pt.globalCommitDepth--
 	if pt.globalCommitDepth > 0 || !pt.globalCommitDirty {
+		prefixdbDebugf("PrefixTree endGlobalCommit: skipped dirty=%t depth=%d elapsed=%s",
+			pt.globalCommitDirty, pt.globalCommitDepth, time.Since(commitStart))
 		return nil
 	}
 	defer func() {
@@ -727,9 +736,13 @@ func (pt *PrefixTree) endGlobalCommit() error {
 		clear(pt.globalCommitBatch)
 	}()
 	if pt.globalNeedsRewrite {
-		return pt.rewriteGlobalNodeFileLocked()
+		prefixdbDebugf("PrefixTree endGlobalCommit: rewrite start entries=%d", len(pt.globalCommitBatch))
+		err := pt.rewriteGlobalNodeFileLocked()
+		prefixdbDebugf("PrefixTree endGlobalCommit: rewrite done elapsed=%s err=%v", time.Since(commitStart), err)
+		return err
 	}
 	if len(pt.globalCommitBatch) == 0 {
+		prefixdbDebugf("PrefixTree endGlobalCommit: empty batch elapsed=%s", time.Since(commitStart))
 		return nil
 	}
 	entries := make([]NodeInfo, 0, len(pt.globalCommitBatch))
@@ -737,7 +750,10 @@ func (pt *PrefixTree) endGlobalCommit() error {
 		entries = append(entries, cloneNodeInfo(entry))
 	}
 	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
-	return pt.appendGlobalNodeEntries(entries)
+	prefixdbDebugf("PrefixTree endGlobalCommit: append start entries=%d", len(entries))
+	err := pt.appendGlobalNodeEntries(entries)
+	prefixdbDebugf("PrefixTree endGlobalCommit: append done elapsed=%s err=%v", time.Since(commitStart), err)
+	return err
 }
 
 func (pt *PrefixTree) appendGlobalNodeEntry(nodeInfo NodeInfo) error {

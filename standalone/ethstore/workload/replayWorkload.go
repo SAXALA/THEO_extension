@@ -67,6 +67,14 @@ var opTypeNames = map[opType]string{
 	opIteratorNext: "IteratorNext",
 }
 
+func logPutProgressSeconds(counter int, totalTime time.Duration) {
+	fmt.Printf("Put test: %d, use time: %f s\n", counter, totalTime.Seconds())
+}
+
+func logPutProgressNanos(counter int, totalTime time.Duration) {
+	fmt.Printf("Put test: %d, use time: %d ns\n", counter, totalTime.Nanoseconds())
+}
+
 type latencyHistogram struct {
 	boundsNs   []int64
 	counts     []int64
@@ -1613,7 +1621,7 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 		}
 		// Verify the value was stored correctly
 		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
+			logPutProgressSeconds(counter, totalTime)
 		}
 	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
@@ -1688,8 +1696,7 @@ func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunk
 		totalTime += end.Sub(start)
 		counter++
 		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-
+			logPutProgressSeconds(counter, totalTime)
 		}
 	}
 	if err := store.RunPostLoadGC(); err != nil {
@@ -1832,8 +1839,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 			continue
 		}
 		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
-			fmt.Println()
+			logPutProgressSeconds(counter, totalTime)
 			if err := pdb.BatchCommit(); err != nil {
 				return fmt.Errorf("failed to commit PrefixDB batch at row %d: %w", counter, err)
 			}
@@ -1842,10 +1848,6 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 			break
 		}
 	}
-	if counter > 0 {
-		fmt.Println()
-	}
-
 	if err := pdb.BatchCommit(); err != nil {
 		return fmt.Errorf("failed to finalize PrefixDB batch commit: %w", err)
 	}
@@ -1943,7 +1945,7 @@ func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, tota
 		// Verify the value was stored correctly
 
 		if counter%100000 == 0 {
-			fmt.Printf("\rPut test: %d, use time: %d ns", counter, totalTime.Nanoseconds())
+			logPutProgressNanos(counter, totalTime)
 		}
 	}
 
@@ -2142,7 +2144,7 @@ func loadPebble(dirPath string, testFilePath string) {
 				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
 			}
 			if counter%100000 == 0 {
-				fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
+				logPutProgressSeconds(counter, totalTime)
 			}
 		}
 

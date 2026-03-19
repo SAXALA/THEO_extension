@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1637,6 +1638,56 @@ func TestCompactFileFromStateRefreshesFileNodeCache(t *testing.T) {
 	}
 }
 
+func TestPrefixTreeProcessGCJobDoesNotSelfDeadlock(t *testing.T) {
+	baseDir := t.TempDir()
+	db := &PrefixDB{sharedCache: newSharedByteCache(4096)}
+	pt, err := NewPrefixTree(db, baseDir)
+	if err != nil {
+		t.Fatalf("NewPrefixTree failed: %v", err)
+	}
+	defer pt.Close()
+
+	key := bytes.Repeat([]byte{0x02}, 32)
+	fileID := pt.fileIDForKey(key)
+	if err := pt.putIntoFileNode(fileID, key, 1, 2, 3, 4); err != nil {
+		t.Fatalf("first putIntoFileNode failed: %v", err)
+	}
+	if err := pt.putIntoFileNode(fileID, key, 5, 6, 7, 8); err != nil {
+		t.Fatalf("second putIntoFileNode failed: %v", err)
+	}
+
+	state, err := pt.buildGCStateFromFile(fileID)
+	if err != nil {
+		t.Fatalf("buildGCStateFromFile failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected non-nil GC state")
+	}
+
+	pt.gcMu.Lock()
+	pt.gcInFlight[fileID] = state
+	pt.gcMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		pt.processGCJob(gcJob{fileID: fileID, state: state})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processGCJob timed out; likely self-deadlocked waiting on its own gc state")
+	}
+
+	pt.gcMu.Lock()
+	_, exists := pt.gcInFlight[fileID]
+	pt.gcMu.Unlock()
+	if exists {
+		t.Fatal("expected processGCJob to clear gcInFlight state")
+	}
+}
+
 func TestNewPrefixTreeLoadsGlobalNodeIntoSkipList(t *testing.T) {
 	baseDir := t.TempDir()
 	fileNodeDir := filepath.Join(baseDir, "prefixdb", "filenodes")
@@ -2576,6 +2627,69 @@ func TestStorageGCQueueCapacity(t *testing.T) {
 	autoWorkers := sanitizePrefixTreeGCWorkerCount(0)
 	if got := storageGCQueueCapacity(0); got != autoWorkers*storageGCQueueMultiplier {
 		t.Fatalf("unexpected automatic queue capacity: got %d want %d", got, autoWorkers*storageGCQueueMultiplier)
+	}
+}
+
+func TestPrepareStorageCommitPlansRunsWorkersAcrossFolders(t *testing.T) {
+	db, err := NewPrefixDBWithRuntimeOptions(t.TempDir(), 64, 8, 16, 1e9, 2, 1e9, true, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	batch := map[string]map[string][]byte{
+		string(bytes.Repeat([]byte{0x11}, 32)): {string([]byte("slot-a")): []byte("value-a")},
+		string(bytes.Repeat([]byte{0x22}, 32)): {string([]byte("slot-b")): []byte("value-b")},
+	}
+
+	release := make(chan struct{})
+	started := make(chan string, len(batch))
+	var current int32
+	var maxConcurrent int32
+	var once sync.Once
+	db.testBuildStoragePlanHook = func(accountKey string) {
+		cur := atomic.AddInt32(&current, 1)
+		for {
+			max := atomic.LoadInt32(&maxConcurrent)
+			if cur <= max || atomic.CompareAndSwapInt32(&maxConcurrent, max, cur) {
+				break
+			}
+		}
+		started <- accountKey
+		once.Do(func() {
+			go func() {
+				<-started
+				<-started
+				close(release)
+			}()
+		})
+		<-release
+		atomic.AddInt32(&current, -1)
+	}
+	defer func() { db.testBuildStoragePlanHook = nil }()
+
+	done := make(chan struct{})
+	var plans []storageCommitPlan
+	var planErr error
+	go func() {
+		plans, planErr = db.prepareStorageCommitPlans(batch, nil, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("prepareStorageCommitPlans timed out")
+	}
+	if planErr != nil {
+		t.Fatalf("prepareStorageCommitPlans failed: %v", planErr)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("unexpected plan count: got %d want 2", len(plans))
+	}
+	if atomic.LoadInt32(&maxConcurrent) < 2 {
+		t.Fatalf("expected storage plan workers to overlap across folders, maxConcurrent=%d", maxConcurrent)
 	}
 }
 
