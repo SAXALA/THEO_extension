@@ -459,6 +459,15 @@ func (pt *PrefixTree) finishGC(fileID string) {
 }
 
 func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error {
+	release := pt.beginFileMutation(fileID)
+	defer release()
+
+	fl := pt.fileStripeLocks.pick([]byte(fileID))
+	fl.Lock()
+	defer fl.Unlock()
+
+	pt.invalidateFileNodeCache(fileID)
+
 	entries := buildEntriesFromSlices(state.header, state.sorted, state.unsorted)
 	filePath := filepath.Join(pt.fileNodeDir, fileID)
 	tmp := filePath + ".tmp"
@@ -503,6 +512,7 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename failed: %w", err)
 	}
+	pt.dropFileHandles(fileID)
 	if dirf, err := os.Open(filepath.Dir(filePath)); err == nil {
 		_ = dirf.Sync()
 		_ = dirf.Close()
@@ -534,7 +544,6 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 	} else {
 		pt.invalidateFileNodeCache(fileID)
 	}
-	pt.dropFileHandles(fileID)
 	pt.gcCount++
 	return nil
 }
@@ -1173,8 +1182,12 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 		return false, err
 	}
 	payload := make([]byte, payloadSize)
-	if _, err := file.ReadAt(payload, int64(binary.Size(header))); err != nil && err != io.EOF {
+	n, err := file.ReadAt(payload, int64(binary.Size(header)))
+	if err != nil && err != io.EOF {
 		return false, fmt.Errorf("read payload failed : %w", err)
+	}
+	if n != payloadSize {
+		return false, fmt.Errorf("read payload failed : short read got %d want %d: %w", n, payloadSize, io.ErrUnexpectedEOF)
 	}
 	if pt.db != nil {
 		pt.db.addDiskRead(diskIOUsageNodeFileMutation, len(payload))
@@ -1448,6 +1461,10 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 					if err != nil && err != io.EOF {
 						pt.releaseBuf(tempBuf)
 						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: %w", err)
+					}
+					if n2 != payloadSize {
+						pt.releaseBuf(tempBuf)
+						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: short read got %d want %d: %w", n2, payloadSize, io.ErrUnexpectedEOF)
 					}
 					if pt.db != nil {
 						pt.db.addDiskRead(diskIOUsageNodeFileLookup, n2)

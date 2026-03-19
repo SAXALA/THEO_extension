@@ -1833,6 +1833,7 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 		}
 		if counter%100000 == 0 {
 			fmt.Printf("\rPut test: %d, use time: %f s", counter, totalTime.Seconds())
+			fmt.Println()
 			if err := pdb.BatchCommit(); err != nil {
 				return fmt.Errorf("failed to commit PrefixDB batch at row %d: %w", counter, err)
 			}
@@ -1840,6 +1841,9 @@ func loadPrefixDB(databaseDir string, dataFile string, pebbleDir string, chunkFi
 		if err == io.EOF {
 			break
 		}
+	}
+	if counter > 0 {
+		fmt.Println()
 	}
 
 	if err := pdb.BatchCommit(); err != nil {
