@@ -1642,17 +1642,18 @@ func (pt *PrefixTree) readDecodedFileNode(fileID string, file *os.File) (decoded
 	if tempBuf == nil {
 		return result, fmt.Errorf("borrow payload buffer failed: file=%s payloadSize=%d", fileID, payloadSize)
 	}
-	defer pt.releaseBuf(tempBuf)
 	n2, err := file.ReadAt(tempBuf[:payloadSize], headerSize)
 	atomic.AddUint64(&pt.nodeFileReadOps, 1)
 	if n2 > 0 {
 		atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n2))
 	}
 	if err != nil && err != io.EOF {
+		pt.releaseBuf(tempBuf)
 		return result, fmt.Errorf("read bulk data failed: file=%s version=%d sorted=%d unsorted=%d payload=%d: %w",
 			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, payloadSize, err)
 	}
 	if n2 != payloadSize {
+		pt.releaseBuf(tempBuf)
 		return result, fmt.Errorf("read bulk data failed: file=%s version=%d sorted=%d unsorted=%d short read got %d want %d: %w",
 			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, n2, payloadSize, io.ErrUnexpectedEOF)
 	}
@@ -1661,9 +1662,16 @@ func (pt *PrefixTree) readDecodedFileNode(fileID string, file *os.File) (decoded
 	}
 	decodedPayload, _, _, err := decodeNodeFilePayload(result.header, tempBuf[:payloadSize])
 	if err != nil {
+		pt.releaseBuf(tempBuf)
 		return result, fmt.Errorf("decode bulk data failed: file=%s version=%d sorted=%d unsorted=%d payload=%d: %w",
 			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, payloadSize, err)
 	}
+	if !result.header.sortedCompressed() {
+		// Uncompressed payloads alias tempBuf directly, so transfer ownership to the cache path.
+		result.bigBuf = tempBuf[:payloadSize]
+		return result, nil
+	}
+	pt.releaseBuf(tempBuf)
 	result.bigBuf = decodedPayload
 	return result, nil
 }

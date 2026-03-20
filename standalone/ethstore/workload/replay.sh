@@ -9,8 +9,8 @@ cd "$script_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 可执行动作: load(加载数据) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
-ACTIONS="load restore replay gc upgrade-index"
+# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
+ACTIONS="load load-account load-storage restore replay gc upgrade-index"
 # 后端类型: ethstore | chainkv | pebble | prefixdb | all(依次执行前三者)
 BACKENDS="ethstore chainkv pebble prefixdb all"
 
@@ -18,6 +18,9 @@ BACKENDS="ethstore chainkv pebble prefixdb all"
 ACTION="${1:-replay}"
 # 位置参数2: BACKEND，可选值见 BACKENDS，默认 ethstore
 BACKEND="${2:-${WORKLOAD_BACKEND:-ethstore}}"
+if [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
+    BACKEND="${2:-prefixdb}"
+fi
 
 # 回放最大操作数；0 代表不限制
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
@@ -95,6 +98,8 @@ ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethsto
 GC_STATE_DIR="${GC_STATE_DIR:-/mnt/ssd2/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
 # segment index 升级目录：直接在该 statedb 目录执行，不进行复制
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
+# prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
+PREFIXDB_ACCOUNT_STATE_DIR="${PREFIXDB_ACCOUNT_STATE_DIR:-}"
 
 # ethstore prefixdb 目录（用于权限预检查）
 ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-${RUNNING_ROOT}/ethstore_state/prefixdb}"
@@ -197,7 +202,7 @@ export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
 usage() {
     cat <<EOF
-Usage: $0 [load|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
+Usage: $0 [load|load-account|load-storage|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
 
 Current values:
   action=${ACTION}
@@ -223,7 +228,8 @@ Common env vars:
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
     load/replay ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
-    load prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir/accountHashKeyPebbleDir
+    load-account prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir
+    load-storage prefixdb: uses replay_config.json 中 loadDataDir/accountHashKeyPebbleDir，并要求 PREFIXDB_ACCOUNT_STATE_DIR
     gc: backend must be ethstore, and GC_STATE_DIR must be provided
     upgrade-index: backend must be ethstore, and UPGRADE_STATE_DIR must be provided
 EOF
@@ -270,9 +276,25 @@ validate_runtime_requirements() {
         fi
     fi
 
-    if [ "$BACKEND" = "prefixdb" ] && [ "$ACTION" != "load" ]; then
-        echo "prefixdb backend 当前仅支持 load（当前 ACTION=${ACTION}）"
+    if [ "$BACKEND" = "prefixdb" ] && [ "$ACTION" = "load" ]; then
+        echo "prefixdb backend 已拆分为 load-account / load-storage，请使用新的 action"
         exit 1
+    fi
+
+    if { [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; } && [ "$BACKEND" != "prefixdb" ]; then
+        echo "${ACTION} 仅支持 prefixdb backend（当前 BACKEND=${BACKEND}）"
+        exit 1
+    fi
+
+    if [ "$ACTION" = "load-storage" ]; then
+        if [ -z "$PREFIXDB_ACCOUNT_STATE_DIR" ]; then
+            echo "load-storage 需要 PREFIXDB_ACCOUNT_STATE_DIR（已完成 account load 的 statedb 目录）"
+            exit 1
+        fi
+        if [ ! -d "$PREFIXDB_ACCOUNT_STATE_DIR" ]; then
+            echo "PREFIXDB_ACCOUNT_STATE_DIR 不存在: ${PREFIXDB_ACCOUNT_STATE_DIR}"
+            exit 1
+        fi
     fi
 
     if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "ethstore" ]; then
@@ -504,6 +526,7 @@ print_param_snapshot() {
     printf 'ETHSTORE_STATEDB_DIRNAME=%s\n' "$ETHSTORE_STATEDB_DIRNAME"
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
     printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
+    printf 'PREFIXDB_ACCOUNT_STATE_DIR=%s\n' "$PREFIXDB_ACCOUNT_STATE_DIR"
 
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
@@ -594,10 +617,8 @@ run_load() {
                 -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
             ;;
         prefixdb)
-            run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend prefixdb -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
-                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+            echo "prefixdb backend 已拆分为 load-account / load-storage，请使用新的 action"
+            exit 1
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -606,6 +627,50 @@ run_load() {
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode ld -backend pebble -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES"
+            ;;
+    esac
+}
+
+run_load_account() {
+    local backend="$1"
+    local run_tag
+    run_tag=$(build_run_tag "load-account" "$backend")
+    local log_file="./replayLog/${run_tag}_${log_date}.log"
+    local io_file="./replayLog/${run_tag}_io_${log_date}.log"
+
+    case "$backend" in
+        prefixdb)
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode ld -backend prefixdb -prefixdb-load-stage account \
+                -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
+                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+            ;;
+        *)
+            echo "load-account 仅支持 prefixdb backend"
+            exit 1
+            ;;
+    esac
+}
+
+run_load_storage() {
+    local backend="$1"
+    local run_tag
+    run_tag=$(build_run_tag "load-storage" "$backend")
+    local log_file="./replayLog/${run_tag}_${log_date}.log"
+    local io_file="./replayLog/${run_tag}_io_${log_date}.log"
+
+    case "$backend" in
+        prefixdb)
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode ld -backend prefixdb -prefixdb-load-stage storage -prefixdb-state-dir "$PREFIXDB_ACCOUNT_STATE_DIR" \
+                -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
+                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+            ;;
+        *)
+            echo "load-storage 仅支持 prefixdb backend"
+            exit 1
             ;;
     esac
 }
@@ -719,6 +784,12 @@ run_action() {
         load)
             run_load "$backend"
             ;;
+        load-account)
+            run_load_account "$backend"
+            ;;
+        load-storage)
+            run_load_storage "$backend"
+            ;;
         restore)
             run_restore "$backend"
             ;;
@@ -749,14 +820,14 @@ main() {
     if [ "$BACKEND" = "all" ]; then
         for b in ethstore chainkv pebble; do
             echo "==== ${ACTION} ${b} ===="
-            if [ "$ACTION" = "load" ]; then
+            if [ "$ACTION" = "load" ] || [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
                 drop_caches
             fi
             run_action "$b"
         done
     else
         echo "==== ${ACTION} ${BACKEND} ===="
-        if [ "$ACTION" = "load" ]; then
+        if [ "$ACTION" = "load" ] || [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
             drop_caches
         fi
         run_action "$BACKEND"

@@ -14,6 +14,8 @@ cd "$script_dir" || exit 1
 # Examples:
 #   ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh replay all all
+#   ./multiple_replay.sh load-account prefixdb
+#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB ./multiple_replay.sh load-storage prefixdb
 
 ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
@@ -23,6 +25,7 @@ CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(24) #64
 BACKEND_CANDIDATES=(ethstore) # pebble ethstore
 TRACE_FILE_CANDIDATES=(cache) # cache nocache_snap
+CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
@@ -87,7 +90,7 @@ usage() {
 	cat <<EOF
 Usage: $0 [action] [backend|all] [trace-file|all]
 
-action:     load | restore | replay | gc                 (default: replay)
+action:     load | load-account | load-storage | restore | replay | gc  (default: replay)
 backend:    ethstore | chainkv | pebble | all            (default: all when omitted)
 trace-file: cache | nocache | nocache_snap | all         (default: all for replay when omitted)
 

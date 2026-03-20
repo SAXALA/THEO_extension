@@ -163,11 +163,15 @@ func TestLoadPrefixDBFinalBatchCommitPersistsTailEntries(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	if err := loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
-		t.Fatalf("loadPrefixDB failed: %v", err)
+	stateDir := filepath.Join(tempDir, formatPrefixDBStateDirName(8*1024))
+	if err := loadPrefixDB(tempDir, "", dataFile, auxDir, prefixdbLoadStageAccount, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("account loadPrefixDB failed: %v", err)
+	}
+	if err := loadPrefixDB(tempDir, stateDir, dataFile, auxDir, prefixdbLoadStageStorage, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("storage loadPrefixDB failed: %v", err)
 	}
 
-	dbDir := filepath.Join(tempDir, "database_statedb8KB")
+	dbDir := stateDir
 	reopened, err := prefixdb.NewPrefixDBWithRuntimeOptions(dbDir, 8*1024, 16, 16, 0, 0, 0, false, false, 0)
 	if err != nil {
 		t.Fatalf("reopen PrefixDB failed: %v", err)
@@ -223,11 +227,15 @@ func TestLoadPrefixDBProcessesLastLineWithoutTrailingNewline(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	if err := loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
-		t.Fatalf("loadPrefixDB failed: %v", err)
+	stateDir := filepath.Join(tempDir, formatPrefixDBStateDirName(8*1024))
+	if err := loadPrefixDB(tempDir, "", dataFile, auxDir, prefixdbLoadStageAccount, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("account loadPrefixDB failed: %v", err)
+	}
+	if err := loadPrefixDB(tempDir, stateDir, dataFile, auxDir, prefixdbLoadStageStorage, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("storage loadPrefixDB failed: %v", err)
 	}
 
-	dbDir := filepath.Join(tempDir, "database_statedb8KB")
+	dbDir := stateDir
 	reopened, err := prefixdb.NewPrefixDBWithRuntimeOptions(dbDir, 8*1024, 16, 16, 0, 0, 0, false, false, 0)
 	if err != nil {
 		t.Fatalf("reopen PrefixDB failed: %v", err)
@@ -265,12 +273,75 @@ func TestLoadPrefixDBFailsWhenStorageAccountKeyCannotBeResolved(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	err = loadPrefixDB(tempDir, dataFile, auxDir, 8*1024, 16, 0, 0, 0, 0, false, false)
+	stateDir := filepath.Join(tempDir, formatPrefixDBStateDirName(8*1024))
+	err = loadPrefixDB(tempDir, stateDir, dataFile, auxDir, prefixdbLoadStageStorage, 8*1024, 16, 0, 0, 0, 0, false, false)
 	if err == nil {
 		t.Fatal("expected loadPrefixDB to fail when storage account key cannot be resolved")
 	}
 	if !strings.Contains(err.Error(), "deferred") || !strings.Contains(err.Error(), "unresolved account keys") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadPrefixDBStorageRequiresExplicitStateDir(t *testing.T) {
+	tempDir := t.TempDir()
+	dataFile := filepath.Join(tempDir, "load-storage-only.txt")
+	storageKey := append(append([]byte{'O'}, bytes.Repeat([]byte{0x11}, 32)...), 0x01)
+	content := fmt.Sprintf("Key: %x, Value : %x\n", storageKey, []byte("storage-value"))
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	err := loadPrefixDB(tempDir, "", dataFile, filepath.Join(tempDir, "aux"), prefixdbLoadStageStorage, 8*1024, 16, 0, 0, 0, 0, false, false)
+	if err == nil {
+		t.Fatal("expected storage stage to require explicit state dir")
+	}
+	if !strings.Contains(err.Error(), "requires -prefixdb-state-dir") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadPrefixDBAccountStopsAfterLeavingAccountPrefixRange(t *testing.T) {
+	tempDir := t.TempDir()
+	dataFile := filepath.Join(tempDir, "load-account-stop-early.txt")
+	accountKey := []byte{'A', 0x01, 0x02, 0x03}
+	storageKey := append(append([]byte{'O'}, bytes.Repeat([]byte{0x22}, 32)...), 0x01)
+	lateAccountKey := []byte{'A', 0x09, 0x08, 0x07}
+	content := fmt.Sprintf(
+		"Key: %x, Value : %x\nKey: %x, Value : %x\nKey: %x, Value : %x\n",
+		accountKey, []byte("account-value"),
+		storageKey, []byte("storage-value"),
+		lateAccountKey, []byte("late-account-value"),
+	)
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if err := loadPrefixDB(tempDir, "", dataFile, filepath.Join(tempDir, "aux"), prefixdbLoadStageAccount, 8*1024, 16, 0, 0, 0, 0, false, false); err != nil {
+		t.Fatalf("account loadPrefixDB failed: %v", err)
+	}
+
+	stateDir := filepath.Join(tempDir, formatPrefixDBStateDirName(8*1024))
+	reopened, err := prefixdb.NewPrefixDBWithRuntimeOptions(stateDir, 8*1024, 16, 16, 0, 0, 0, false, false, 0)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	gotAccount, found, err := reopened.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if !found || !bytes.Equal(gotAccount, []byte("account-value")) {
+		t.Fatalf("unexpected first account value: found=%v value=%q", found, gotAccount)
+	}
+
+	_, found, err = reopened.Get(datatypepkg.TrieNodeAccountDataType, lateAccountKey, nil)
+	if err != nil {
+		t.Fatalf("Get late account failed: %v", err)
+	}
+	if found {
+		t.Fatal("expected loader to stop after leaving account prefix range")
 	}
 }
 
