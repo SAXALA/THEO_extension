@@ -237,6 +237,25 @@ type trieStorageGetBreakdownStepStats struct {
 	noCacheNanos uint64
 }
 
+type segmentIndexLookupSource uint8
+
+const (
+	segmentIndexLookupSourceNoCache segmentIndexLookupSource = iota
+	segmentIndexLookupSourceL1Cache
+	segmentIndexLookupSourceL2Cache
+)
+
+func (s segmentIndexLookupSource) fromCache() bool {
+	return s == segmentIndexLookupSourceL1Cache || s == segmentIndexLookupSourceL2Cache
+}
+
+type trieStorageSegmentIndexLayerStats struct {
+	l1CacheCount uint64
+	l1CacheNanos uint64
+	l2CacheCount uint64
+	l2CacheNanos uint64
+}
+
 type PrefixDB struct {
 	prefixTree  *PrefixTree
 	accountFile *os.File
@@ -327,9 +346,10 @@ type PrefixDB struct {
 	trieStorageLogPairs   uint64
 	trieStorageLogBytes   uint64
 
-	trieStorageAccountEntryStats trieStorageGetBreakdownStepStats
-	trieStorageSegmentIndexStats trieStorageGetBreakdownStepStats
-	trieStorageKVStats           trieStorageGetBreakdownStepStats
+	trieStorageAccountEntryStats      trieStorageGetBreakdownStepStats
+	trieStorageSegmentIndexStats      trieStorageGetBreakdownStepStats
+	trieStorageSegmentIndexLayerStats trieStorageSegmentIndexLayerStats
+	trieStorageKVStats                trieStorageGetBreakdownStepStats
 
 	// nodeCache access stats (read path)
 	nodeCacheLookups uint64
@@ -416,7 +436,7 @@ func NewPrefixDBWithFileHandleCacheSettings(dirpath string, storageChunkFileSize
 
 func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, fileHandleCacheSize int) (*PrefixDB, error) {
 	fmt.Println(dirpath + " prefixDB Initializing...")
-	SetPrefixDBDebugLogging(true)
+	SetPrefixDBDebugLogging(false)
 	defaultCfg := DefaultConfig(dirpath)
 	// Try to load config from config.json in dirpath
 	configPath := filepath.Join(dirpath, "config.json")
@@ -1604,6 +1624,47 @@ func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdo
 	)
 }
 
+func recordTrieStorageSegmentIndexLayer(source segmentIndexLookupSource, duration time.Duration, stats *trieStorageSegmentIndexLayerStats) {
+	if stats == nil {
+		return
+	}
+	nanos := uint64(duration)
+	switch source {
+	case segmentIndexLookupSourceL1Cache:
+		atomic.AddUint64(&stats.l1CacheCount, 1)
+		atomic.AddUint64(&stats.l1CacheNanos, nanos)
+	case segmentIndexLookupSourceL2Cache:
+		atomic.AddUint64(&stats.l2CacheCount, 1)
+		atomic.AddUint64(&stats.l2CacheNanos, nanos)
+	}
+}
+
+func printTrieStorageSegmentIndexLayerStats(stats *trieStorageSegmentIndexLayerStats) {
+	if stats == nil {
+		return
+	}
+	l1Count := atomic.LoadUint64(&stats.l1CacheCount)
+	l1Nanos := atomic.LoadUint64(&stats.l1CacheNanos)
+	l2Count := atomic.LoadUint64(&stats.l2CacheCount)
+	l2Nanos := atomic.LoadUint64(&stats.l2CacheNanos)
+	l1AvgMicros := 0.0
+	if l1Count > 0 {
+		l1AvgMicros = float64(l1Nanos) / float64(l1Count) / 1000.0
+	}
+	l2AvgMicros := 0.0
+	if l2Count > 0 {
+		l2AvgMicros = float64(l2Nanos) / float64(l2Count) / 1000.0
+	}
+	fmt.Printf("PrefixDB TrieNodeStorage segment-index cache layer stats: l1Count=%d l1Total=%s l1Avg=%0.2fus l2Count=%d l2Total=%s l2Avg=%0.2fus\n",
+		l1Count,
+		time.Duration(l1Nanos),
+		l1AvgMicros,
+		l2Count,
+		time.Duration(l2Nanos),
+		l2AvgMicros,
+	)
+}
+
 func (db *PrefixDB) Close() error {
 	errs := []error{}
 	// Flush any pending storage batch writes before tearing down files.
@@ -1644,6 +1705,7 @@ func (db *PrefixDB) Close() error {
 	)
 	printTrieStorageGetBreakdownStep("account-entry", &db.trieStorageAccountEntryStats)
 	printTrieStorageGetBreakdownStep("segment-index", &db.trieStorageSegmentIndexStats)
+	printTrieStorageSegmentIndexLayerStats(&db.trieStorageSegmentIndexLayerStats)
 	printTrieStorageGetBreakdownStep("storage-kv-pairs", &db.trieStorageKVStats)
 	lookups := atomic.LoadUint64(&db.nodeCacheLookups)
 	hits := atomic.LoadUint64(&db.nodeCacheHits)
@@ -4108,18 +4170,18 @@ func appendVarBytes(buf []byte, data []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useLRU bool) ([]segmentChunkMeta, bool, error) {
+func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useLRU bool) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
 	if useLRU && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
 			db.segmentIndexMu.Unlock()
-			return metas, true, nil
+			return metas, segmentIndexLookupSourceL1Cache, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
-		return nil, false, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	var metas []segmentChunkMeta
 	if layout.mode == indexLayoutMultiLevel {
@@ -4132,11 +4194,11 @@ func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useL
 		for idx, entry := range layout.entries {
 			data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 			if err != nil {
-				return nil, false, err
+				return nil, segmentIndexLookupSourceNoCache, err
 			}
 			appendExisting := idx != 0
 			if err := decodeSegmentIndexBuffer(data, &metas, &arena, appendExisting, folderPath); err != nil {
-				return nil, false, err
+				return nil, segmentIndexLookupSourceNoCache, err
 			}
 		}
 	} else {
@@ -4145,13 +4207,13 @@ func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useL
 			indexPath := filepath.Join(folderPath, segmentIndexFileName)
 			data, err = db.readSegmentIndexFile(indexPath)
 			if err != nil {
-				return nil, false, err
+				return nil, segmentIndexLookupSourceNoCache, err
 			}
 		}
 		metas = nil
 		var arena []byte
 		if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-			return nil, false, err
+			return nil, segmentIndexLookupSourceNoCache, err
 		}
 	}
 	estimatedSize := estimateSegmentIndexSize(metas)
@@ -4160,7 +4222,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useL
 		db.storageIndexCache.AddByPath(folderPath, metas)
 		db.segmentIndexMu.Unlock()
 	}
-	return metas, false, nil
+	return metas, segmentIndexLookupSourceNoCache, nil
 }
 
 func (db *PrefixDB) readSegmentIndexNoCache(folderID uint32) ([]segmentChunkMeta, error) {
@@ -4178,15 +4240,31 @@ func (db *PrefixDB) readSegmentIndexNoCacheByPath(folderPath string) ([]segmentC
 }
 
 func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) ([]segmentChunkMeta, error) {
+	metas, _, err := db.readSegmentIndexForKeyByPathWithSource(folderPath, key)
+	return metas, err
+}
+
+func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, key []byte) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
+	entryLock, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
+	defer unlock()
+	generation := atomic.LoadUint64(&entryLock.gen)
 	if len(key) == 0 {
-		return db.readSegmentIndexNoCacheByPath(folderPath)
+		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
+	}
+	if db.storageIndexCache != nil {
+		db.segmentIndexMu.Lock()
+		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
+			db.segmentIndexMu.Unlock()
+			return metas, segmentIndexLookupSourceL1Cache, nil
+		}
+		db.segmentIndexMu.Unlock()
 	}
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
-		return nil, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if layout.mode != indexLayoutMultiLevel {
-		return db.readSegmentIndexNoCacheByPath(folderPath)
+		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
 	if entry == nil {
@@ -4198,21 +4276,34 @@ func (db *PrefixDB) readSegmentIndexForKeyByPath(folderPath string, key []byte) 
 			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: L1[%d] MetaID=%d ChunkCount=%d KeyStart=%x\n",
 				i, e.MetaID, e.ChunkCount, e.KeyStart)
 		}
-		return nil, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
+		return nil, segmentIndexLookupSourceNoCache, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
+	}
+	if db.storageIndexCache != nil {
+		db.segmentIndexMu.Lock()
+		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
+			db.segmentIndexMu.Unlock()
+			return metas, segmentIndexLookupSourceL2Cache, nil
+		}
+		db.segmentIndexMu.Unlock()
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
 	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 	if err != nil {
-		return nil, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return nil, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
-	return metas, nil
+	if db.storageIndexCache != nil {
+		db.segmentIndexMu.Lock()
+		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
+		db.segmentIndexMu.Unlock()
+	}
+	return metas, segmentIndexLookupSourceNoCache, nil
 }
 
-func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool) ([]segmentChunkMeta, bool, error) {
+func (db *PrefixDB) readSegmentIndexLockedInternal(folderID uint32, useLRU bool) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
 	return db.readSegmentIndexLockedInternalByPath(db.segmentedFolderPath(folderID), useLRU)
 }
 
@@ -4221,7 +4312,7 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 	return metas, err
 }
 
-func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte) ([]segmentChunkMeta, bool, error) {
+func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
 	folderPath := db.segmentedFolderPath(folderID)
 	entryLock, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
 	defer unlock()
@@ -4233,13 +4324,13 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
 			db.segmentIndexMu.Unlock()
-			return metas, true, nil
+			return metas, segmentIndexLookupSourceL1Cache, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
-		return nil, false, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if layout.mode != indexLayoutMultiLevel {
 		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
@@ -4254,13 +4345,13 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: L1[%d] MetaID=%d ChunkCount=%d KeyStart=%x\n",
 				i, e.MetaID, e.ChunkCount, e.KeyStart)
 		}
-		return nil, false, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
+		return nil, segmentIndexLookupSourceNoCache, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
 			db.segmentIndexMu.Unlock()
-			return metas, true, nil
+			return metas, segmentIndexLookupSourceL2Cache, nil
 		}
 		db.segmentIndexMu.Unlock()
 	}
@@ -4268,17 +4359,17 @@ func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte
 	var arena []byte
 	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
 	if err != nil {
-		return nil, false, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return nil, false, err
+		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
 		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
 		db.segmentIndexMu.Unlock()
 	}
-	return metas, false, nil
+	return metas, segmentIndexLookupSourceNoCache, nil
 }
 
 func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
@@ -5772,9 +5863,11 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	defer unlock()
 	failure := &segmentedStorageReadFailure{folderPath: folderPath, indexFile: segmentIndexFileName}
 	indexStart := time.Now()
-	metas, err := db.readSegmentIndexForKeyByPath(folderPath, storageKey)
+	metas, segmentIndexSource, err := db.readSegmentIndexForKeyByPathWithSource(folderPath, storageKey)
 	if len(metas) > 0 {
-		recordTrieStorageGetBreakdownStep(&db.trieStorageSegmentIndexStats, false, time.Since(indexStart))
+		duration := time.Since(indexStart)
+		recordTrieStorageGetBreakdownStep(&db.trieStorageSegmentIndexStats, segmentIndexSource.fromCache(), duration)
+		recordTrieStorageSegmentIndexLayer(segmentIndexSource, duration, &db.trieStorageSegmentIndexLayerStats)
 	}
 	if err != nil {
 		if errors.Is(err, errSegmentIndexEntryNotFound) {

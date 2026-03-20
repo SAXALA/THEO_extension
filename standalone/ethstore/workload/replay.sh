@@ -26,7 +26,7 @@ fi
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20500100}"
+END_BLOCK_ID="${END_BLOCK_ID:-20500200}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -38,9 +38,9 @@ NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-
 # segmented storage GC 阈值：当 CHUNK_FILE_SIZE_BYTES >= target_chunk_size * threshold 时触发 GC
 STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-3}"
 # node file sorted part 是否启用 zstd 压缩；默认开启
-NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-false}"
+NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-true}"
 # segment index 是否启用 zstd 压缩；默认开启
-SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
+SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-true}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
 DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
@@ -405,13 +405,6 @@ sync_ethstore_loaded_to_running() {
     sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
     sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
     sudo_run chmod -R 777 "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
-
-    # Print destination sizes for quick sync validation.
-    # echo "Synced destination usage:"
-    # sudo_run du -sh "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state" 2>/dev/null || true
-    # if [ -d "${dst_prefix}_state/prefixdb" ]; then
-    #     sudo_run du -sh "${dst_prefix}_state/prefixdb" 2>/dev/null || true
-    # fi
 }
 
 sync_chainkv_loaded_to_running() {

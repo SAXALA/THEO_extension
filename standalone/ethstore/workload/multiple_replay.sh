@@ -21,16 +21,15 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 # Fill these arrays with candidate values (MiB / count).
-CACHE_SIZE_CANDIDATES=(16) # 64 256
+CACHE_SIZE_CANDIDATES=(16 64 512) # 64 256
 CACHE_COUNT_CANDIDATES=(24) #64
 BACKEND_CANDIDATES=(ethstore) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache) # cache nocache_snap
+TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-CHUNK_FILE_SIZE="${CHUNK_FILE_SIZE:-8}"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -241,7 +240,7 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 					TRACE_FILE="$trace_file" \
 					DB_TYPE="$DB_TYPE" \
 					WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-					CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+					CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
 					./replay.sh "$ACTION" "$backend" &
 				else
 					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB"
@@ -250,14 +249,14 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 						TRACE_FILE="$trace_file" \
 						DB_TYPE="$DB_TYPE" \
 						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-						CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+						CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
 						./replay.sh "$ACTION" "$backend" &
 					else
 						PEBBLE_CACHE_MB="$backend_cache_mib" \
 						TRACE_FILE="$trace_file" \
 						DB_TYPE="$DB_TYPE" \
 						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-						CHUNK_FILE_SIZE="$CHUNK_FILE_SIZE" \
+						CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
 						./replay.sh "$ACTION" "$backend" &
 					fi
 				fi

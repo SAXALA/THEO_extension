@@ -1620,6 +1620,159 @@ func TestGCAllStorageChunkFilesRefreshesSegmentIndexCache(t *testing.T) {
 	}
 }
 
+func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(78)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := []segmentChunkMeta{
+		{FileName: "chunk_0000.dat", KeyStart: []byte{0x10}},
+		{FileName: "chunk_0001.dat", KeyStart: []byte{0x20}},
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
+	if err != nil {
+		t.Fatalf("first readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceNoCache {
+		t.Fatalf("expected first lookup to miss cache, got source=%d", source)
+	}
+
+	_, source, err = db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
+	if err != nil {
+		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceL1Cache {
+		t.Fatalf("expected second lookup to hit L1 cache, got source=%d", source)
+	}
+}
+
+func TestReadSegmentIndexForKeyWithSourceReportsL2CacheHit(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(79)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := make([]segmentChunkMeta, 3000)
+	for i := range metas {
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: []byte{byte(i >> 8), byte(i), 0x7f},
+		}
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		t.Fatalf("loadSegmentIndexLayout failed: %v", err)
+	}
+	if layout.mode != indexLayoutMultiLevel {
+		t.Fatalf("expected multi-level layout, got mode=%d", layout.mode)
+	}
+
+	targetKey := cloneBytes(metas[len(metas)/2].KeyStart)
+	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, targetKey)
+	if err != nil {
+		t.Fatalf("first readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceNoCache {
+		t.Fatalf("expected first lookup to miss cache, got source=%d", source)
+	}
+
+	_, source, err = db.readSegmentIndexForKeyWithSource(folderID, targetKey)
+	if err != nil {
+		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceL2Cache {
+		t.Fatalf("expected second lookup to hit L2 cache, got source=%d", source)
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(88)
+	folderPath := db.segmentedFolderPath(folderID)
+	accountKey := makeTestAccountKey(0x58)
+	storageKey := []byte("aa")
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", []kvPair{{key: storageKey, val: []byte("value-aa")}}); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: "chunk_0000.dat", KeyStart: cloneBytes(storageKey)}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	db.invalidateSegmentIndexCacheByPath(folderPath)
+
+	beforeReadOps := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("first readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected first read failure: %+v", *failure)
+	}
+	if !bytes.Equal(value, []byte("value-aa")) {
+		t.Fatalf("unexpected first read value: %q", value)
+	}
+	afterFirstReadOps := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	if afterFirstReadOps <= beforeReadOps {
+		t.Fatalf("expected first read to load segment index from disk, before=%d after=%d", beforeReadOps, afterFirstReadOps)
+	}
+
+	cacheCountBefore := atomic.LoadUint64(&db.trieStorageSegmentIndexStats.cacheCount)
+	l1CountBefore := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
+	value, failure, err = db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("second readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected second read failure: %+v", *failure)
+	}
+	if !bytes.Equal(value, []byte("value-aa")) {
+		t.Fatalf("unexpected second read value: %q", value)
+	}
+	afterSecondReadOps := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	if afterSecondReadOps != afterFirstReadOps {
+		t.Fatalf("expected second read to hit segment index cache, readOps first=%d second=%d", afterFirstReadOps, afterSecondReadOps)
+	}
+	cacheCountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexStats.cacheCount)
+	if cacheCountAfter <= cacheCountBefore {
+		t.Fatalf("expected segment-index cache hit to be recorded, before=%d after=%d", cacheCountBefore, cacheCountAfter)
+	}
+	l1CountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
+	if l1CountAfter <= l1CountBefore {
+		t.Fatalf("expected segment-index L1 cache hit to be recorded, before=%d after=%d", l1CountBefore, l1CountAfter)
+	}
+}
+
 func TestCompactFileFromStateRefreshesFileNodeCache(t *testing.T) {
 	baseDir := t.TempDir()
 	db := &PrefixDB{sharedCache: newSharedByteCache(4096)}
