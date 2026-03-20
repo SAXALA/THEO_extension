@@ -352,6 +352,37 @@ func makeTestStorageRawKeyWithSuffix(suffix ...byte) []byte {
 	return raw
 }
 
+func writeLargeChunkFileForTest(t *testing.T, path string, entryCount int, targetKey []byte, targetValue []byte) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	defer file.Close()
+
+	valueTemplate := bytes.Repeat([]byte{'x'}, 65535)
+	var header [4]byte
+	for i := 0; i < entryCount; i++ {
+		key := []byte{byte(i % 250), byte((i / 250) % 250)}
+		value := valueTemplate
+		if i == entryCount-1 {
+			key = append([]byte(nil), targetKey...)
+			value = targetValue
+		}
+		binary.BigEndian.PutUint16(header[0:2], uint16(len(key)))
+		binary.BigEndian.PutUint16(header[2:4], uint16(len(value)))
+		if _, err := file.Write(header[:]); err != nil {
+			t.Fatalf("Write header failed: %v", err)
+		}
+		if _, err := file.Write(key); err != nil {
+			t.Fatalf("Write key failed: %v", err)
+		}
+		if _, err := file.Write(value); err != nil {
+			t.Fatalf("Write value failed: %v", err)
+		}
+	}
+}
+
 func TestCommitStorageForAccountUsesAccountNamedSegmentedFolder(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 16)
@@ -2002,6 +2033,96 @@ func TestGetFromFileNodeCompressedPayloadShortReadReturnsExplicitError(t *testin
 	}
 }
 
+func TestGetFromFileNodeRetriesWithFreshHandleAfterDecodeFailure(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, true, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	key := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x21}
+	fileID := pt.getBucketID(key)
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	badHeader := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: 1}
+	badPayload, err := encodeNodeFilePayload(&badHeader, encodeNodeEntries([]NodeInfo{{
+		key:           key,
+		accountOffset: 10,
+		storageFileID: 1,
+		storageOffset: 11,
+		storageSize:   12,
+	}}), nil, true)
+	if err != nil {
+		t.Fatalf("encodeNodeFilePayload bad payload failed: %v", err)
+	}
+	badFile, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile bad file failed: %v", err)
+	}
+	if err := binary.Write(badFile, binary.BigEndian, &badHeader); err != nil {
+		_ = badFile.Close()
+		t.Fatalf("write bad header failed: %v", err)
+	}
+	if _, err := badFile.Write(badPayload[:len(badPayload)-1]); err != nil {
+		_ = badFile.Close()
+		t.Fatalf("write bad payload failed: %v", err)
+	}
+	if err := badFile.Close(); err != nil {
+		t.Fatalf("close bad file failed: %v", err)
+	}
+
+	if _, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR); err != nil {
+		t.Fatalf("getOrCreateFileHandle failed: %v", err)
+	}
+
+	goodHeader := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: 1}
+	goodPayload, err := encodeNodeFilePayload(&goodHeader, encodeNodeEntries([]NodeInfo{{
+		key:           key,
+		accountOffset: 20,
+		storageFileID: 2,
+		storageOffset: 21,
+		storageSize:   22,
+	}}), nil, true)
+	if err != nil {
+		t.Fatalf("encodeNodeFilePayload good payload failed: %v", err)
+	}
+	tmpPath := filePath + ".tmp"
+	goodFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile good file failed: %v", err)
+	}
+	if err := binary.Write(goodFile, binary.BigEndian, &goodHeader); err != nil {
+		_ = goodFile.Close()
+		t.Fatalf("write good header failed: %v", err)
+	}
+	if _, err := goodFile.Write(goodPayload); err != nil {
+		_ = goodFile.Close()
+		t.Fatalf("write good payload failed: %v", err)
+	}
+	if err := goodFile.Close(); err != nil {
+		t.Fatalf("close good file failed: %v", err)
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	node, found, err := pt.getFromFileNode(fileID, key)
+	if err != nil {
+		t.Fatalf("getFromFileNode failed after fresh reopen retry: %v", err)
+	}
+	if !found {
+		t.Fatal("expected node to be found after fresh reopen retry")
+	}
+	if node.accountOffset != 20 || node.storageFileID != 2 || node.storageOffset != 21 || node.storageSize != 22 {
+		t.Fatalf("unexpected node info after fresh reopen retry: %+v", node)
+	}
+}
+
 func TestGlobalNodeDeleteRewritesDedicatedFile(t *testing.T) {
 	baseDir := t.TempDir()
 	pt, err := NewPrefixTree(&PrefixDB{}, baseDir)
@@ -2477,7 +2598,7 @@ func TestCommonStorageSegmentUsesPayloadWithoutLeadingKVCount(t *testing.T) {
 	}
 }
 
-func TestAccountNamedSegmentedAppendDoesNotRewriteIndex(t *testing.T) {
+func TestAccountNamedSegmentedAppendKeepsIndexWhenWithinTrigger(t *testing.T) {
 	db, err := NewPrefixDB(t.TempDir(), 64, 8, 16)
 	if err != nil {
 		t.Fatalf("NewPrefixDB failed: %v", err)
@@ -2509,7 +2630,7 @@ func TestAccountNamedSegmentedAppendDoesNotRewriteIndex(t *testing.T) {
 		t.Fatalf("ReadFile index after append failed: %v", err)
 	}
 	if !bytes.Equal(indexBefore, indexAfter) {
-		t.Fatalf("expected append-only segmented update to keep index.meta unchanged\nbefore=%x\nafter=%x", indexBefore, indexAfter)
+		t.Fatalf("expected append within trigger to keep index.meta unchanged\nbefore=%x\nafter=%x", indexBefore, indexAfter)
 	}
 
 	count, _, err := db.GetStorageCount(accountKey)
@@ -2532,6 +2653,13 @@ func TestAccountNamedSegmentedAppendDoesNotRewriteIndex(t *testing.T) {
 	}
 	if !found || !bytes.Equal(value, bytes.Repeat([]byte("a"), 40)) {
 		t.Fatalf("unexpected preserved storage value: found=%t value=%q", found, value)
+	}
+	metas, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	if len(metas) != 3 {
+		t.Fatalf("expected append within trigger to keep existing chunk layout, got %d metas", len(metas))
 	}
 }
 
@@ -2570,7 +2698,7 @@ func TestAccountNamedSegmentedAppendSurvivesReopenWithoutIndexRewrite(t *testing
 	}
 	if !bytes.Equal(indexBefore, indexAfter) {
 		_ = db.Close()
-		t.Fatalf("expected append-only segmented update to keep index.meta unchanged across reopen setup")
+		t.Fatalf("expected append within trigger to keep index.meta unchanged across reopen setup")
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
@@ -2598,6 +2726,135 @@ func TestAccountNamedSegmentedAppendSurvivesReopenWithoutIndexRewrite(t *testing
 		if !found || !bytes.Equal(value, expected) {
 			t.Fatalf("unexpected storage after reopen for suffix %x: found=%t value=%q", suffix, found, value)
 		}
+	}
+}
+
+func TestAccountNamedSegmentedAppendRewritesChunkWhenTriggerExceeded(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+	db.segmentedChunkHardLimit = 64
+
+	accountKey := makeTestAccountKey(0x46)
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), initial); err != nil {
+		t.Fatalf("initial commitStorageForAccount failed: %v", err)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	before, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath before append failed: %v", err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("expected 2 initial chunks, got %d", len(before))
+	}
+
+	if err := db.commitStorageForAccount(string(accountKey), []kvPair{{key: []byte{0x02}, val: bytes.Repeat([]byte("b"), 40)}}); err != nil {
+		t.Fatalf("append commitStorageForAccount failed: %v", err)
+	}
+
+	after, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath after append failed: %v", err)
+	}
+	if segmentChunkMetasEqual(before, after) {
+		t.Fatal("expected oversized append to rewrite chunk layout, but segment index did not change")
+	}
+	hasMiddleChunk := false
+	for _, meta := range after {
+		if bytes.Equal(meta.KeyStart, []byte{0x02}) {
+			hasMiddleChunk = true
+		}
+	}
+	if !hasMiddleChunk {
+		t.Fatalf("expected rewritten index to contain a chunk starting at key 0x02, metas=%+v", after)
+	}
+	for _, meta := range after {
+		info, err := os.Stat(filepath.Join(folderPath, meta.FileName))
+		if err != nil {
+			t.Fatalf("Stat chunk %s failed: %v", meta.FileName, err)
+		}
+		if info.Size() > int64(db.segmentedChunkTriggerSize()) {
+			t.Fatalf("chunk %s still exceeds trigger after rewrite: size=%d trigger=%d", meta.FileName, info.Size(), db.segmentedChunkTriggerSize())
+		}
+	}
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x02), accountKey)
+	if err != nil {
+		t.Fatalf("Get appended storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, bytes.Repeat([]byte("b"), 40)) {
+		t.Fatalf("unexpected appended storage value after rewrite: found=%t value=%q", found, value)
+	}
+}
+
+func TestLargeSegmentedChunkUsesStreamingReadAndGCSplit(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x47)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	targetKey := []byte{0xfe, 0xed}
+	targetValue := []byte("streaming-target-value")
+	chunkPath := filepath.Join(folderPath, "chunk_0000.dat")
+	writeLargeChunkFileForTest(t, chunkPath, 1050, targetKey, targetValue)
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: "chunk_0000.dat", KeyStart: []byte{0x00, 0x00}}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	db.markAccountStorageFolder(accountKey)
+
+	info, err := os.Stat(chunkPath)
+	if err != nil {
+		t.Fatalf("Stat oversized chunk failed: %v", err)
+	}
+	if info.Size() <= int64(segmentChunkStreamReadThreshold) {
+		t.Fatalf("expected test chunk to exceed streaming threshold, size=%d threshold=%d", info.Size(), segmentChunkStreamReadThreshold)
+	}
+
+	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, targetKey...), accountKey)
+	if err != nil {
+		t.Fatalf("Get oversized chunk storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, targetValue) {
+		t.Fatalf("unexpected streaming read result: found=%t value=%q", found, value)
+	}
+
+	if err := db.GCAllStorageChunkFiles(); err != nil {
+		t.Fatalf("GCAllStorageChunkFiles failed on oversized chunk: %v", err)
+	}
+	updated, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath after GC failed: %v", err)
+	}
+	if len(updated) <= 1 {
+		t.Fatalf("expected oversized chunk GC to split into multiple chunks, got %d", len(updated))
+	}
+	for _, meta := range updated {
+		chunkInfo, err := os.Stat(filepath.Join(folderPath, meta.FileName))
+		if err != nil {
+			t.Fatalf("Stat GC chunk %s failed: %v", meta.FileName, err)
+		}
+		if chunkInfo.Size() > int64(db.segmentedChunkTargetSize()) {
+			t.Fatalf("GC chunk %s exceeds target size: size=%d target=%d", meta.FileName, chunkInfo.Size(), db.segmentedChunkTargetSize())
+		}
+	}
+	value, found, err = db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, targetKey...), accountKey)
+	if err != nil {
+		t.Fatalf("Get storage after oversized chunk GC failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, targetValue) {
+		t.Fatalf("unexpected value after oversized chunk GC: found=%t value=%q", found, value)
 	}
 }
 
@@ -2699,6 +2956,42 @@ func TestComputeSegmentedChunkHardLimit(t *testing.T) {
 	}
 	if got := computeSegmentedChunkHardLimit(1024, 0); got != 2048 {
 		t.Fatalf("default hard limit mismatch: got %d want %d", got, 2048)
+	}
+}
+
+func TestNewPrefixDBWithRuntimeOptionsOverridesStorageGCThreshold(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"storage_gc_threshold":3.0}`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 100, 8, 16, 0, 0, 1.25, false, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	if got := db.segmentedChunkHardLimit; got != 125 {
+		t.Fatalf("runtime storage GC threshold should override config: got %d want %d", got, 125)
+	}
+}
+
+func TestNewPrefixDBWithRuntimeOptionsFallsBackToConfigStorageGCThreshold(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"storage_gc_threshold":1.75}`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 100, 8, 16, 0, 0, 0, false, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer db.Close()
+
+	if got := db.segmentedChunkHardLimit; got != 175 {
+		t.Fatalf("config storage GC threshold should be used when runtime override is unset: got %d want %d", got, 175)
 	}
 }
 

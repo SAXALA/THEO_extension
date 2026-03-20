@@ -35,9 +35,9 @@ NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-
 # segmented storage GC 阈值：当 CHUNK_FILE_SIZE_BYTES >= target_chunk_size * threshold 时触发 GC
 STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-3}"
 # node file sorted part 是否启用 zstd 压缩；默认开启
-NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-true}"
+NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-false}"
 # segment index 是否启用 zstd 压缩；默认开启
-SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-true}"
+SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
 DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then

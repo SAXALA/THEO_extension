@@ -1441,58 +1441,19 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 				}
 				return NodeInfo{}, false, fmt.Errorf("open file failed: %w", err)
 			}
-
-			headerSize := int64(binary.Size(header))
-			hdrBuf = make([]byte, headerSize)
-			n, err := file.ReadAt(hdrBuf, 0)
-			atomic.AddUint64(&pt.nodeFileReadOps, 1)
-			if n > 0 {
-				atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n))
-			}
-			if err != nil {
-				return NodeInfo{}, false, fmt.Errorf("read header failed: %w", err)
-			}
-			if pt.db != nil {
-				pt.db.addDiskRead(diskIOUsageNodeFileLookup, n)
-			}
-			if err := binary.Read(bytes.NewReader(hdrBuf), binary.BigEndian, &header); err != nil {
-				return NodeInfo{}, false, fmt.Errorf("decode header failed: %w", err)
-			}
-			if header.Magic != FileNodeMagic {
-				return NodeInfo{}, false, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", header.Magic, fileID)
-			}
-
-			payloadSize, err := nodeFileStoredPayloadSize(header)
-			if err != nil {
-				return NodeInfo{}, false, err
-			}
-			if payloadSize > 0 {
-				tempBuf := pt.borrowBuf(payloadSize)
-				if tempBuf != nil {
-					n2, err := file.ReadAt(tempBuf[:payloadSize], headerSize)
-					atomic.AddUint64(&pt.nodeFileReadOps, 1)
-					if n2 > 0 {
-						atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n2))
-					}
-					if err != nil && err != io.EOF {
-						pt.releaseBuf(tempBuf)
-						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: %w", err)
-					}
-					if n2 != payloadSize {
-						pt.releaseBuf(tempBuf)
-						return NodeInfo{}, false, fmt.Errorf("read bulk data failed: short read got %d want %d: %w", n2, payloadSize, io.ErrUnexpectedEOF)
-					}
-					if pt.db != nil {
-						pt.db.addDiskRead(diskIOUsageNodeFileLookup, n2)
-					}
-					decodedPayload, _, _, err := decodeNodeFilePayload(header, tempBuf[:payloadSize])
-					pt.releaseBuf(tempBuf)
-					if err != nil {
-						return NodeInfo{}, false, fmt.Errorf("decode bulk data failed: %w", err)
-					}
-					bigBuf = decodedPayload
+			decoded, readErr := pt.readDecodedFileNode(fileID, file)
+			if readErr != nil {
+				var retryErr error
+				pt.dropFileHandles(fileID)
+				pt.invalidateFileNodeCache(fileID)
+				decoded, retryErr = pt.readDecodedFileNodeFresh(fileID)
+				if retryErr != nil {
+					return NodeInfo{}, false, fmt.Errorf("%v; fresh reopen retry failed: %w", readErr, retryErr)
 				}
 			}
+			hdrBuf = decoded.hdrBuf
+			header = decoded.header
+			bigBuf = decoded.bigBuf
 
 			pt.setFileNodeCache(fileID, hdrBuf, bigBuf)
 		}
@@ -1636,6 +1597,85 @@ func (pt *PrefixTree) releaseBuf(buf []byte) {
 		return
 	}
 	pt.bufPool.Put(buf[:cap(buf)])
+}
+
+type decodedFileNode struct {
+	hdrBuf []byte
+	header FileNodeHeader
+	bigBuf []byte
+}
+
+func (pt *PrefixTree) readDecodedFileNode(fileID string, file *os.File) (decodedFileNode, error) {
+	var result decodedFileNode
+	if file == nil {
+		return result, fmt.Errorf("nil file handle")
+	}
+	headerSize := int64(binary.Size(result.header))
+	result.hdrBuf = make([]byte, headerSize)
+	n, err := file.ReadAt(result.hdrBuf, 0)
+	atomic.AddUint64(&pt.nodeFileReadOps, 1)
+	if n > 0 {
+		atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n))
+	}
+	if err != nil {
+		return result, fmt.Errorf("read header failed: file=%s: %w", fileID, err)
+	}
+	if pt.db != nil {
+		pt.db.addDiskRead(diskIOUsageNodeFileLookup, n)
+	}
+	if err := binary.Read(bytes.NewReader(result.hdrBuf), binary.BigEndian, &result.header); err != nil {
+		return result, fmt.Errorf("decode header failed: file=%s: %w", fileID, err)
+	}
+	if result.header.Magic != FileNodeMagic {
+		return result, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", result.header.Magic, fileID)
+	}
+
+	payloadSize, err := nodeFileStoredPayloadSize(result.header)
+	if err != nil {
+		return result, fmt.Errorf("compute payload size failed: file=%s version=%d sorted=%d unsorted=%d: %w",
+			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, err)
+	}
+	if payloadSize == 0 {
+		return result, nil
+	}
+	tempBuf := pt.borrowBuf(payloadSize)
+	if tempBuf == nil {
+		return result, fmt.Errorf("borrow payload buffer failed: file=%s payloadSize=%d", fileID, payloadSize)
+	}
+	defer pt.releaseBuf(tempBuf)
+	n2, err := file.ReadAt(tempBuf[:payloadSize], headerSize)
+	atomic.AddUint64(&pt.nodeFileReadOps, 1)
+	if n2 > 0 {
+		atomic.AddUint64(&pt.nodeFileReadBytes, uint64(n2))
+	}
+	if err != nil && err != io.EOF {
+		return result, fmt.Errorf("read bulk data failed: file=%s version=%d sorted=%d unsorted=%d payload=%d: %w",
+			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, payloadSize, err)
+	}
+	if n2 != payloadSize {
+		return result, fmt.Errorf("read bulk data failed: file=%s version=%d sorted=%d unsorted=%d short read got %d want %d: %w",
+			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, n2, payloadSize, io.ErrUnexpectedEOF)
+	}
+	if pt.db != nil {
+		pt.db.addDiskRead(diskIOUsageNodeFileLookup, n2)
+	}
+	decodedPayload, _, _, err := decodeNodeFilePayload(result.header, tempBuf[:payloadSize])
+	if err != nil {
+		return result, fmt.Errorf("decode bulk data failed: file=%s version=%d sorted=%d unsorted=%d payload=%d: %w",
+			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, payloadSize, err)
+	}
+	result.bigBuf = decodedPayload
+	return result, nil
+}
+
+func (pt *PrefixTree) readDecodedFileNodeFresh(fileID string) (decodedFileNode, error) {
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	file, err := os.Open(filePath)
+	if err != nil {
+		return decodedFileNode{}, err
+	}
+	defer file.Close()
+	return pt.readDecodedFileNode(fileID, file)
 }
 
 // getOrCreateFileHandle gets or creates a cached file handle for a given fileID and flag
