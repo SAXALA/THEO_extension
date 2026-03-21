@@ -26,7 +26,7 @@ fi
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20500200}"
+END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -36,7 +36,7 @@ CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
 # segmented storage GC 阈值：当 CHUNK_FILE_SIZE_BYTES >= target_chunk_size * threshold 时触发 GC
-STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-3}"
+STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-2}"
 # node file sorted part 是否启用 zstd 压缩；默认开启
 NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-true}"
 # segment index 是否启用 zstd 压缩；默认开启

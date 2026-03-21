@@ -21,10 +21,10 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 # Fill these arrays with candidate values (MiB / count).
-CACHE_SIZE_CANDIDATES=(16 64 512) # 64 256
-CACHE_COUNT_CANDIDATES=(24) #64
+CACHE_SIZE_CANDIDATES=(16 512) # 64 256
+CACHE_COUNT_CANDIDATES=(16 24 32) #64
 BACKEND_CANDIDATES=(ethstore) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap
+TRACE_FILE_CANDIDATES=(cache) # cache nocache_snap
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"

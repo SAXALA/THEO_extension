@@ -1242,6 +1242,218 @@ func TestDecodeSegmentIndexBufferRejectsLegacyFormat(t *testing.T) {
 	}
 }
 
+func TestGetStorageReadsUncommittedStorageBatchValue(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x24)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x01, 0x02)
+	want := []byte("pending-value")
+
+	if err := db.StorageBatchPut(rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected uncommitted storage batch value to be readable")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage value: got=%q want=%q", got, want)
+	}
+}
+
+func TestHasStorageSeesUncommittedStorageBatchValue(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x25)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x0a)
+
+	if err := db.StorageBatchPut(rawStorageKey, []byte("pending-value"), accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+
+	found, err := db.Has(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Has storage failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected Has to see uncommitted storage batch value")
+	}
+}
+
+func TestStorageBatchCommitRefreshesStorageCacheTombstone(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x26)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x01)
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+	db.storageCache.Add(cacheKey, nil)
+
+	want := []byte("committed-value")
+	if err := db.StorageBatchPut(rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit failed: %v", err)
+	}
+
+	cached, ok := db.storageCache.Get(cacheKey)
+	if !ok {
+		t.Fatal("expected storage cache entry after commit")
+	}
+	valueBytes, ok := cached.([]byte)
+	if !ok {
+		t.Fatalf("expected []byte cache entry, got %T", cached)
+	}
+	if !bytes.Equal(valueBytes, want) {
+		t.Fatalf("unexpected cached value: got=%q want=%q", valueBytes, want)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage result: found=%t value=%q", found, got)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected committed storage read to hit cache, common log reads before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
+func TestGCAllStorageChunkFilesRefreshesStorageCacheTombstone(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x27)
+	want := bytes.Repeat([]byte("b"), 40)
+	kvs := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x02}, val: want},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), kvs); err != nil {
+		t.Fatalf("commitStorageForAccount failed: %v", err)
+	}
+
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+	db.storageCache.Add(cacheKey, nil)
+
+	if err := db.GCAllStorageChunkFiles(); err != nil {
+		t.Fatalf("GCAllStorageChunkFiles failed: %v", err)
+	}
+
+	cached, ok := db.storageCache.Get(cacheKey)
+	if !ok {
+		t.Fatal("expected storage cache entry after GC")
+	}
+	valueBytes, ok := cached.([]byte)
+	if !ok {
+		t.Fatalf("expected []byte cache entry after GC, got %T", cached)
+	}
+	if !bytes.Equal(valueBytes, want) {
+		t.Fatalf("unexpected cached value after GC: got=%q want=%q", valueBytes, want)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed after GC: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage after GC: found=%t value=%q", found, got)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected GC-refreshed storage read to hit cache, separated log reads before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
+func TestStorageBatchCommitDeleteKeepsStorageCacheTombstone(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x28)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x01)
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+
+	if err := db.StorageBatchPut(rawStorageKey, []byte("value-before-delete"), accountKey); err != nil {
+		t.Fatalf("StorageBatchPut initial failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit initial failed: %v", err)
+	}
+
+	if err := db.StorageBatchPut(rawStorageKey, nil, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut delete failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit delete failed: %v", err)
+	}
+
+	cached, ok := db.storageCache.Get(cacheKey)
+	if !ok {
+		t.Fatal("expected tombstone to remain cached after delete commit")
+	}
+	if cached != nil {
+		t.Fatalf("expected cached tombstone nil after delete commit, got %T %v", cached, cached)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get after delete commit failed: %v", err)
+	}
+	if found || got != nil {
+		t.Fatalf("expected deleted storage to stay absent, found=%t value=%q", found, got)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected deleted storage lookup to use tombstone cache, common log reads before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
 func TestEncodeSegmentChunkMetasRejectsUnsafeCompactEncoding(t *testing.T) {
 	t.Run("non ordinal file name", func(t *testing.T) {
 		metas := []segmentChunkMeta{{
@@ -1617,6 +1829,106 @@ func TestGCAllStorageChunkFilesRefreshesSegmentIndexCache(t *testing.T) {
 	after := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
 	if after != before {
 		t.Fatalf("expected post-GC segment index lookup to use refreshed cache, readOps before=%d after=%d", before, after)
+	}
+}
+
+func TestCommitStorageForAccountRefreshesSegmentIndexCacheAfterRewrite(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+	db.segmentedChunkHardLimit = 64
+
+	accountKey := makeTestAccountKey(0x29)
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 40)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 40)},
+	}
+	if err := db.commitStorageForAccount(string(accountKey), initial); err != nil {
+		t.Fatalf("initial commitStorageForAccount failed: %v", err)
+	}
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	primed, _, err := db.readSegmentIndexWithGenByPath(folderPath, true)
+	if err != nil {
+		t.Fatalf("readSegmentIndexWithGenByPath failed: %v", err)
+	}
+	if len(primed) == 0 {
+		t.Fatal("expected initial segment index metas")
+	}
+
+	if err := db.commitStorageForAccount(string(accountKey), []kvPair{{key: []byte{0x02}, val: bytes.Repeat([]byte("b"), 40)}}); err != nil {
+		t.Fatalf("rewrite commitStorageForAccount failed: %v", err)
+	}
+
+	fresh, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	cached, ok := db.storageIndexCache.GetByPath(folderPath)
+	if !ok {
+		t.Fatal("expected refreshed segment-index cache after rewrite")
+	}
+	if !segmentChunkMetasEqual(cached, fresh) {
+		t.Fatalf("segment-index cache stale after rewrite: cached=%+v fresh=%+v", cached, fresh)
+	}
+	if segmentChunkMetasEqual(cached, primed) {
+		t.Fatalf("expected segment-index cache to change after rewrite, still old=%+v", cached)
+	}
+}
+
+func TestRunStorageGCJobRefreshesSegmentIndexCache(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x2a)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	initial := []segmentChunkMeta{
+		{FileName: "chunk_0000.dat", KeyStart: []byte{'a'}},
+		{FileName: "chunk_0001.dat", KeyStart: []byte{'m'}},
+	}
+	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", []kvPair{{key: []byte{'a'}, val: []byte("value-a")}}); err != nil {
+		t.Fatalf("writeChunkFile chunk_0000.dat failed: %v", err)
+	}
+	if _, err := db.writeChunkFile(folderPath, "chunk_0001.dat", []kvPair{{key: []byte{'m'}, val: []byte("value-m")}}); err != nil {
+		t.Fatalf("writeChunkFile chunk_0001.dat failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, initial); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	primed, _, err := db.readSegmentIndexWithGenByPath(folderPath, true)
+	if err != nil {
+		t.Fatalf("readSegmentIndexWithGenByPath failed: %v", err)
+	}
+	if len(primed) != 2 {
+		t.Fatalf("expected 2 primed metas, got %d", len(primed))
+	}
+
+	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: "chunk_0000.dat"}); err != nil {
+		t.Fatalf("runStorageGCJob failed: %v", err)
+	}
+
+	fresh, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	cached, ok := db.storageIndexCache.GetByPath(folderPath)
+	if !ok {
+		t.Fatal("expected refreshed segment-index cache after GC job")
+	}
+	if !segmentChunkMetasEqual(cached, fresh) {
+		t.Fatalf("segment-index cache stale after GC job: cached=%+v fresh=%+v", cached, fresh)
+	}
+	if segmentChunkMetasEqual(cached, primed) {
+		t.Fatalf("expected GC job to replace cached metas, still old=%+v", cached)
 	}
 }
 

@@ -24,6 +24,7 @@ type storageCommitPlan struct {
 	accountOffset int64
 	storageInfo   StorageInfo
 	skipNodeWrite bool
+	cacheEntries  []kvPair
 }
 
 type preparedAccountCommit struct {
@@ -190,9 +191,10 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 
 	// Hold the write lock across the commit to serialize with regular Put/Delete.
 	shouldWaitForStorageGC := false
+	var plans []storageCommitPlan
 	db.writeMutex.Lock()
 	err = func() error {
-		plans, err := db.prepareStorageCommitPlans(batch, unresolved, nil)
+		plans, err = db.prepareStorageCommitPlans(batch, unresolved, nil)
 		if err != nil {
 			return err
 		}
@@ -207,6 +209,9 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	db.writeMutex.Unlock()
 	if err != nil {
 		return err
+	}
+	for _, plan := range plans {
+		db.syncStorageCacheEntries([]byte(plan.accountKey), plan.cacheEntries)
 	}
 	if shouldWaitForStorageGC {
 		return db.waitForStorageGCIdle()
@@ -379,9 +384,6 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 			batch[accStr] = perAcc
 		}
 		perAcc[string(storageKey)] = v
-		if db.storageCache != nil {
-			db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), v)
-		}
 	}
 	if unresolvedCount > 0 {
 		fmt.Printf("prepareStorageCommitPlans: dropped unresolved storage entries - droppedCount=%d totalUnresolved=%d\n",
@@ -421,6 +423,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		kvs = append(kvs, kvPair{key: []byte(key), val: value})
 	}
 	sortKVPairs(kvs)
+	plan.cacheEntries = kvs
 	fileID, offset, size, err := db.persistStorageEntries(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
 	if err != nil {
 		return plan, err
@@ -515,16 +518,13 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 
 	// cacheKeyHex := hex.EncodeToString([]byte(accountKey))
 	// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", info.storageFileID) + ", offset:" + fmt.Sprintf("%d", info.storageOffset) + ", size:" + fmt.Sprintf("%d", info.storageSize))
+	db.syncStorageCacheEntries(accountKeyBytes, kvs)
 	return nil
 }
 
 // batchGetOverlay returns staged values for read-your-writes semantics.
-func (db *PrefixDB) batchGetOverlay(key, accountKey []byte) ([]byte, bool) {
+func (db *PrefixDB) batchGetOverlayNormalized(storageKey, accountKey []byte) ([]byte, bool) {
 	if db.storageBatch == nil || len(accountKey) == 0 {
-		return nil, false
-	}
-	storageKey, err := db.normalizeStorageKey(key)
-	if err != nil {
 		return nil, false
 	}
 	return db.storageBatch.get(string(accountKey), storageKey)

@@ -565,15 +565,16 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 	}()
 	cacheKey := string(key)
 	useNodeCache := !db.shouldBypassNodeCache(key)
-	if useNodeCache {
-		if entry, ok := db.nodeCache.Get(cacheKey); ok && entry.Value != nil {
-			return entry.Value, true, nil
-		}
-	}
 
 	if db.accountBatch != nil {
 		if value, _, ok := db.accountBatch.get(key); ok {
 			return value, true, nil
+		}
+	}
+
+	if useNodeCache {
+		if entry, ok := db.nodeCache.Get(cacheKey); ok && entry.Value != nil {
+			return entry.Value, true, nil
 		}
 	}
 
@@ -640,7 +641,7 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 		return nil, false, nil
 	}
 
-	if v, present := db.batchGetOverlay(key, accountKey); present {
+	if v, present := db.batchGetOverlayNormalized(storageKey, accountKey); present {
 		if v == nil {
 			db.logStorageKVReadFailure(storageKey, accountKey, "storage-overlay-tombstone", nil)
 			return nil, false, nil
@@ -848,6 +849,7 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	var (
 		storageBatch      map[string]map[string][]byte
 		storageUnresolved map[string][]byte
+		storagePlans      []storageCommitPlan
 	)
 	if db.storageBatch != nil {
 		storageBatch, storageUnresolved = db.storageBatch.drain()
@@ -872,7 +874,7 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	db.writeMutex.Lock()
 	err = func() error {
 		stageStart := time.Now()
-		storagePlans, err := db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
+		storagePlans, err = db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps)
 		if err != nil {
 			return err
 		}
@@ -989,6 +991,9 @@ func (db *PrefixDB) BatchCommit() (err error) {
 	if err != nil {
 		return err
 	}
+	for _, plan := range storagePlans {
+		db.syncStorageCacheEntries([]byte(plan.accountKey), plan.cacheEntries)
+	}
 	if shouldWaitForStorageGC {
 		waitStart := time.Now()
 		prefixdbDebugf("BatchCommit: waiting storage GC idle")
@@ -1067,7 +1072,7 @@ func (db *PrefixDB) hasStorage(key []byte, accountKey []byte) (bool, error) {
 		return false, nil
 	}
 
-	if v, present := db.batchGetOverlay(key, accountKey); present {
+	if v, present := db.batchGetOverlayNormalized(storageKey, accountKey); present {
 		return v != nil, nil
 	}
 
@@ -1219,6 +1224,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 			storageSize:   sz,
 		})
 	}
+	db.syncStorageCacheEntries([]byte(buf.accountKey), buf.storagekvs)
 	buf.reset()
 	return nil
 }
@@ -3016,6 +3022,28 @@ func (db *PrefixDB) segmentedFolderPathForAccount(accountKey []byte) string {
 	return filepath.Join(db.storageDir, segmentedDirNamePrefix+hex.EncodeToString(accountKey))
 }
 
+func (db *PrefixDB) managedAccountKeyForFolderPath(folderPath string) ([]byte, bool) {
+	if db == nil {
+		return nil, false
+	}
+	name := filepath.Base(folderPath)
+	if !strings.HasPrefix(name, segmentedDirNamePrefix) {
+		return nil, false
+	}
+	suffix := strings.TrimPrefix(name, segmentedDirNamePrefix)
+	if len(suffix) == 0 || len(suffix)%2 != 0 {
+		return nil, false
+	}
+	accountKey, err := hex.DecodeString(suffix)
+	if err != nil {
+		return nil, false
+	}
+	if !db.isAccountStorageFolderManaged(accountKey) {
+		return nil, false
+	}
+	return accountKey, true
+}
+
 func isAccountNamedSegmentedStorage(fileID uint32) bool {
 	return fileID == segmentedStorageFlag
 }
@@ -3781,6 +3809,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 		}
 		db.invalidateSegmentIndexLayoutForPath(folderPath)
 		db.bumpSegmentIndexGenerationLocked(entry)
+		db.refreshSegmentIndexCacheByPathLocked(folderPath, nil)
 		if len(prevEntries) > 0 {
 			return removeStaleLevel2IndexFiles(folderPath, prevEntries, nil)
 		}
@@ -3798,6 +3827,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 		}
 		db.invalidateSegmentIndexLayoutForPath(folderPath)
 		db.bumpSegmentIndexGenerationLocked(entry)
+		db.refreshSegmentIndexCacheByPathLocked(folderPath, metas)
 		if len(prevEntries) > 0 {
 			return removeStaleLevel2IndexFiles(folderPath, prevEntries, nil)
 		}
@@ -3901,6 +3931,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 	}
 	// Even if the top-level layout didn't change, L2 files may have been rewritten.
 	db.bumpSegmentIndexGenerationLocked(entry)
+	db.refreshSegmentIndexCacheByPathLocked(folderPath, metas)
 	// Remove only those L2 files that were previously referenced but are no longer
 	// needed. This avoids scanning the whole folder (which can be huge).
 	if len(oldEntries) > 0 {
@@ -5284,6 +5315,42 @@ func (db *PrefixDB) storageCacheKey(accountKey, storageKey []byte) string {
 	return b.String()
 }
 
+func (db *PrefixDB) syncStorageCacheEntries(accountKey []byte, kvs []kvPair) {
+	if db == nil || db.storageCache == nil || len(accountKey) == 0 || len(kvs) == 0 {
+		return
+	}
+	for _, kv := range kvs {
+		cacheKey := db.storageCacheKey(accountKey, kv.key)
+		if kv.val == nil {
+			db.storageCache.Add(cacheKey, nil)
+			continue
+		}
+		db.storageCache.Add(cacheKey, kv.val)
+	}
+}
+
+func (db *PrefixDB) refreshManagedFolderStorageCache(folderPath string) error {
+	accountKey, ok := db.managedAccountKeyForFolderPath(folderPath)
+	if !ok || db.storageCache == nil {
+		return nil
+	}
+	metas, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		return err
+	}
+	for _, meta := range metas {
+		entries, backing, err := db.readSegmentChunkFileWithUsageByPath(folderPath, meta.FileName, diskIOUsageStorageGC)
+		if err != nil {
+			return err
+		}
+		db.syncStorageCacheEntries(accountKey, entries)
+		if backing != nil {
+			backing.Release()
+		}
+	}
+	return nil
+}
+
 func isSegmentedStorage(fileID uint32) bool {
 	return fileID&segmentedStorageFlag != 0
 }
@@ -5623,6 +5690,9 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 		return err
 	}
 	db.refreshSegmentIndexCacheByPath(folderPath, committed)
+	if err := db.refreshManagedFolderStorageCache(folderPath); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -5746,6 +5816,9 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 		return err
 	}
 	db.refreshSegmentIndexCacheByPath(job.folderPath, committed)
+	if err := db.refreshManagedFolderStorageCache(job.folderPath); err != nil {
+		return err
+	}
 	// Option B: do NOT delete the original chunk file. It becomes garbage and can be cleaned later.
 	return nil
 }
@@ -6212,6 +6285,9 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 		}
 		db.invalidateSegmentIndexLayoutForPath(folderPath)
 		db.refreshSegmentIndexCacheByPathLocked(folderPath, updated)
+		if accountKey, ok := db.managedAccountKeyForFolderPath(folderPath); ok {
+			db.syncStorageCacheEntries(accountKey, allEntries)
+		}
 		unlock()
 	}
 	fmt.Println("Completed GC for all segmented storage chunk files")
