@@ -269,7 +269,7 @@ func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
 	for i := range metas {
 		start := []byte(fmt.Sprintf("k%08d", i*2))
 		metas[i] = segmentChunkMeta{
-			FileName: fmt.Sprintf("chunk_%04d.dat", i),
+			FileName: chunkFileNameForOrdinal(uint32(i)),
 			KeyStart: start,
 		}
 	}
@@ -1202,8 +1202,8 @@ func encodeLegacySegmentChunkMetasForTest(t *testing.T, metas []segmentChunkMeta
 
 func TestEncodeSegmentChunkMetasUsesCompactFormat(t *testing.T) {
 	metas := []segmentChunkMeta{{
-		FileName: "chunk_0012.dat",
-		KeyStart: []byte{0x01, 0x02},
+		FileName: chunkFileNameForOrdinal(12),
+		KeyStart: bytes.Repeat([]byte{0x01}, segmentIndexKeyStartMaxBytes),
 	}}
 
 	buf, err := encodeSegmentChunkMetas(metas)
@@ -1212,6 +1212,9 @@ func TestEncodeSegmentChunkMetasUsesCompactFormat(t *testing.T) {
 	}
 	if got := binary.BigEndian.Uint32(buf[:4]); got != segmentIndexFlatMagic {
 		t.Fatalf("expected compact flat magic, got 0x%x", got)
+	}
+	if got := binary.BigEndian.Uint16(buf[4:6]); got != segmentIndexFlatVersion {
+		t.Fatalf("expected flat version %d, got %d", segmentIndexFlatVersion, got)
 	}
 	if len(buf) != estimateSegmentIndexSize(metas) {
 		t.Fatalf("encoded size mismatch: got %d want %d", len(buf), estimateSegmentIndexSize(metas))
@@ -1225,14 +1228,112 @@ func TestEncodeSegmentChunkMetasUsesCompactFormat(t *testing.T) {
 	if !segmentChunkMetasEqual(decoded, metas) {
 		t.Fatalf("decoded metas mismatch: got %+v want %+v", decoded, metas)
 	}
-	if len(buf) >= len(encodeLegacySegmentChunkMetasForTest(t, metas)) {
-		t.Fatalf("expected compact encoding to be smaller than legacy encoding, got compact=%d legacy=%d", len(buf), len(encodeLegacySegmentChunkMetasForTest(t, metas)))
+	if len(buf) != 12+segmentIndexFlatEntryBytes*len(metas) {
+		t.Fatalf("expected fixed-width flat encoding size %d, got %d", 12+segmentIndexFlatEntryBytes*len(metas), len(buf))
+	}
+}
+
+func TestFixedSegmentIndexEncodingPreservesShortKeyOrdering(t *testing.T) {
+	metas := []segmentChunkMeta{
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0xaa, 0xbb}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0xaa, 0xbb, 0x00}},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0xaa, 0xbb, 0x00, 0x01}},
+	}
+	buf, err := encodeSegmentChunkMetas(metas)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas failed: %v", err)
+	}
+
+	selected, err := selectFixedFlatSegmentIndexMeta(buf, []byte{0xaa, 0xbb})
+	if err != nil {
+		t.Fatalf("selectFixedFlatSegmentIndexMeta short key failed: %v", err)
+	}
+	if selected == nil || selected.FileName != chunkFileNameForOrdinal(0) {
+		t.Fatalf("expected first chunk for short key, got %+v", selected)
+	}
+
+	selected, err = selectFixedFlatSegmentIndexMeta(buf, []byte{0xaa, 0xbb, 0x00})
+	if err != nil {
+		t.Fatalf("selectFixedFlatSegmentIndexMeta zero-extended key failed: %v", err)
+	}
+	if selected == nil || selected.FileName != chunkFileNameForOrdinal(1) {
+		t.Fatalf("expected second chunk for zero-extended key, got %+v", selected)
+	}
+
+	selected, err = selectFixedFlatSegmentIndexMeta(buf, []byte{0xaa, 0xbb, 0x00, 0x00})
+	if err != nil {
+		t.Fatalf("selectFixedFlatSegmentIndexMeta trailing-zero key failed: %v", err)
+	}
+	if selected == nil || selected.FileName != chunkFileNameForOrdinal(1) {
+		t.Fatalf("expected second chunk for trailing-zero key, got %+v", selected)
+	}
+}
+
+func TestParseMultiLevelLayoutSupportsFixedWidthKeyStarts(t *testing.T) {
+	layout := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 3,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 1, ChunkCount: 2, KeyStart: []byte{0xaa, 0xbb}},
+			{MetaID: 2, ChunkCount: 1, KeyStart: []byte{0xaa, 0xbb, 0x00}},
+		},
+	}
+	buf, err := encodeTopLevelIndex(layout)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex failed: %v", err)
+	}
+	parsed, err := parseMultiLevelLayout(buf)
+	if err != nil {
+		t.Fatalf("parseMultiLevelLayout failed: %v", err)
+	}
+	if !layoutEntriesEqual(parsed.entries, layout.entries) {
+		t.Fatalf("parsed layout entries mismatch: got %+v want %+v", parsed.entries, layout.entries)
+	}
+	if parsed.nextMetaID != layout.nextMetaID {
+		t.Fatalf("parsed nextMetaID mismatch: got %d want %d", parsed.nextMetaID, layout.nextMetaID)
+	}
+}
+
+func TestReadSegmentIndexForKeyWithSourceUsesFixedFlatBufferSearch(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(91)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	metas := []segmentChunkMeta{
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0xaa, 0xbb}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0xaa, 0xbb, 0x00}},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0xaa, 0xbb, 0x01}},
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.RemoveByPath(folderPath)
+	}
+
+	selected, source, err := db.readSegmentIndexForKeyWithSource(folderID, []byte{0xaa, 0xbb, 0x00})
+	if err != nil {
+		t.Fatalf("readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceNoCache {
+		t.Fatalf("expected no-cache source for flat direct search, got %d", source)
+	}
+	if len(selected) != 1 || selected[0].FileName != chunkFileNameForOrdinal(1) {
+		t.Fatalf("expected direct flat search to return selected chunk only, got %+v", selected)
 	}
 }
 
 func TestDecodeSegmentIndexBufferRejectsLegacyFormat(t *testing.T) {
 	buf := encodeLegacySegmentChunkMetasForTest(t, []segmentChunkMeta{{
-		FileName: "chunk_0042.dat",
+		FileName: chunkFileNameForOrdinal(42),
 		KeyStart: []byte{0x0a},
 	}})
 	var decoded []segmentChunkMeta
@@ -1494,8 +1595,8 @@ func TestUpgradeSegmentIndexFilesRebuildsUsingCurrentLayoutConstants(t *testing.
 	if err := os.MkdirAll(folderPath, 0755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	group1 := []segmentChunkMeta{{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}}}
-	group2 := []segmentChunkMeta{{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}}}
+	group1 := []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x01}}}
+	group2 := []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0x03}}}
 	layout := segmentIndexLayout{
 		mode:       indexLayoutMultiLevel,
 		nextMetaID: 3,
@@ -1654,8 +1755,8 @@ func TestSegmentIndexSmallPayloadStaysUncompressed(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 	metas := []segmentChunkMeta{
-		{FileName: "chunk_0001.dat", KeyStart: []byte{0x01}},
-		{FileName: "chunk_0002.dat", KeyStart: []byte{0x03}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x01}},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0x03}},
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -1702,9 +1803,9 @@ func TestWriteSegmentIndexCanonicalizesMetaOrder(t *testing.T) {
 
 	// Intentionally unordered by KeyStart.
 	metas := []segmentChunkMeta{
-		{FileName: "chunk_0002.dat", KeyStart: []byte{0x30}},
-		{FileName: "chunk_0000.dat", KeyStart: []byte{0x10}},
-		{FileName: "chunk_0001.dat", KeyStart: []byte{0x20}},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0x30}},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0x10}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x20}},
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -1737,10 +1838,16 @@ func TestSegmentIndexLargePayloadUsesCompression(t *testing.T) {
 	if err := os.MkdirAll(folderPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	metas := []segmentChunkMeta{{
-		FileName: "chunk_0001.dat",
-		KeyStart: bytes.Repeat([]byte{0x01}, segmentIndexCompressionMinSize+32),
-	}}
+	count := segmentIndexCompressionMinSize/segmentIndexFlatEntryBytes + 8
+	metas := make([]segmentChunkMeta, count)
+	for i := range metas {
+		key := make([]byte, segmentIndexKeyStartMaxBytes)
+		binary.BigEndian.PutUint32(key[len(key)-4:], uint32(i))
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i + 1)),
+			KeyStart: key,
+		}
+	}
 	if got := estimateSegmentIndexSize(metas); got <= segmentIndexCompressionMinSize {
 		t.Fatalf("test fixture must exceed compression threshold: got %d", got)
 	}
@@ -1769,21 +1876,21 @@ func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 	db := &PrefixDB{
 		storageDir:             storageDir,
 		storageIndexCache:      newSharedSegmentIndexCache(shared),
-		storageIndexFolderPath: filepath.Join(storageDir, segmentedDirNamePrefix+"00000007"),
+		storageIndexFolderPath: filepath.Join(storageDir, "00000007"),
 		storageIndexMetas:      []segmentChunkMeta{{FileName: "old.dat"}},
 	}
 	metas := []segmentChunkMeta{{
-		FileName: "chunk_0001.dat",
+		FileName: chunkFileNameForOrdinal(1),
 		KeyStart: []byte{0x01},
 	}}
-	folderPath := filepath.Join(storageDir, segmentedDirNamePrefix+"00000007")
+	folderPath := filepath.Join(storageDir, "00000007")
 
 	db.refreshSegmentIndexCache(7, metas)
 
-	if got, ok := db.storageIndexCache.GetByPath(folderPath); !ok || len(got) != 1 || got[0].FileName != "chunk_0001.dat" {
+	if got, ok := db.storageIndexCache.GetByPath(folderPath); !ok || len(got) != 1 || got[0].FileName != chunkFileNameForOrdinal(1) {
 		t.Fatalf("segment index cache not refreshed correctly: ok=%t metas=%v", ok, got)
 	}
-	if len(db.storageIndexMetas) != 1 || db.storageIndexMetas[0].FileName != "chunk_0001.dat" {
+	if len(db.storageIndexMetas) != 1 || db.storageIndexMetas[0].FileName != chunkFileNameForOrdinal(1) {
 		t.Fatalf("in-memory segment index snapshot not refreshed: %+v", db.storageIndexMetas)
 	}
 }
@@ -1801,8 +1908,8 @@ func TestGCAllStorageChunkFilesRefreshesSegmentIndexCache(t *testing.T) {
 	if err := os.MkdirAll(folderPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	metas := []segmentChunkMeta{{FileName: "chunk_0000.dat", KeyStart: []byte("aa")}}
-	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", []kvPair{{key: []byte("aa"), val: []byte("value-aa")}}); err != nil {
+	metas := []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("aa")}}
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), []kvPair{{key: []byte("aa"), val: []byte("value-aa")}}); err != nil {
 		t.Fatalf("writeChunkFile failed: %v", err)
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
@@ -1876,6 +1983,9 @@ func TestCommitStorageForAccountRefreshesSegmentIndexCacheAfterRewrite(t *testin
 	if segmentChunkMetasEqual(cached, primed) {
 		t.Fatalf("expected segment-index cache to change after rewrite, still old=%+v", cached)
 	}
+	if !isSegmentChunkMetasOrdered(fresh) {
+		t.Fatalf("expected rewritten segment index metas to remain ordered after commit, got %+v", fresh)
+	}
 }
 
 func TestRunStorageGCJobRefreshesSegmentIndexCache(t *testing.T) {
@@ -1892,14 +2002,14 @@ func TestRunStorageGCJobRefreshesSegmentIndexCache(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 	initial := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte{'a'}},
-		{FileName: "chunk_0001.dat", KeyStart: []byte{'m'}},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{'a'}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{'m'}},
 	}
-	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", []kvPair{{key: []byte{'a'}, val: []byte("value-a")}}); err != nil {
-		t.Fatalf("writeChunkFile chunk_0000.dat failed: %v", err)
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), []kvPair{{key: []byte{'a'}, val: []byte("value-a")}}); err != nil {
+		t.Fatalf("writeChunkFile %s failed: %v", chunkFileNameForOrdinal(0), err)
 	}
-	if _, err := db.writeChunkFile(folderPath, "chunk_0001.dat", []kvPair{{key: []byte{'m'}, val: []byte("value-m")}}); err != nil {
-		t.Fatalf("writeChunkFile chunk_0001.dat failed: %v", err)
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(1), []kvPair{{key: []byte{'m'}, val: []byte("value-m")}}); err != nil {
+		t.Fatalf("writeChunkFile %s failed: %v", chunkFileNameForOrdinal(1), err)
 	}
 	if err := db.writeSegmentIndex(folderPath, initial); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -1912,7 +2022,7 @@ func TestRunStorageGCJobRefreshesSegmentIndexCache(t *testing.T) {
 		t.Fatalf("expected 2 primed metas, got %d", len(primed))
 	}
 
-	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: "chunk_0000.dat"}); err != nil {
+	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: chunkFileNameForOrdinal(0)}); err != nil {
 		t.Fatalf("runStorageGCJob failed: %v", err)
 	}
 
@@ -1930,6 +2040,9 @@ func TestRunStorageGCJobRefreshesSegmentIndexCache(t *testing.T) {
 	if segmentChunkMetasEqual(cached, primed) {
 		t.Fatalf("expected GC job to replace cached metas, still old=%+v", cached)
 	}
+	if !isSegmentChunkMetasOrdered(fresh) {
+		t.Fatalf("expected GC-updated segment index metas to remain ordered, got %+v", fresh)
+	}
 }
 
 func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
@@ -1946,11 +2059,14 @@ func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 	metas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte{0x10}},
-		{FileName: "chunk_0001.dat", KeyStart: []byte{0x20}},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0x10}},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x20}},
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.RemoveByPath(folderPath)
 	}
 
 	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
@@ -1965,8 +2081,8 @@ func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
 	}
-	if source != segmentIndexLookupSourceL1Cache {
-		t.Fatalf("expected second lookup to hit L1 cache, got source=%d", source)
+	if source != segmentIndexLookupSourceNoCache {
+		t.Fatalf("expected flat fixed-width lookup to continue using direct buffer search, got source=%d", source)
 	}
 }
 
@@ -1992,6 +2108,9 @@ func TestReadSegmentIndexForKeyWithSourceReportsL2CacheHit(t *testing.T) {
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.RemoveByPath(folderPath)
 	}
 
 	layout, err := db.loadSegmentIndexLayout(folderPath)
@@ -2035,10 +2154,10 @@ func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
 	if err := os.MkdirAll(folderPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", []kvPair{{key: storageKey, val: []byte("value-aa")}}); err != nil {
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), []kvPair{{key: storageKey, val: []byte("value-aa")}}); err != nil {
 		t.Fatalf("writeChunkFile failed: %v", err)
 	}
-	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: "chunk_0000.dat", KeyStart: cloneBytes(storageKey)}}); err != nil {
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: cloneBytes(storageKey)}}); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
 	}
 	db.invalidateSegmentIndexCacheByPath(folderPath)
@@ -2073,15 +2192,15 @@ func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
 	}
 	afterSecondReadOps := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
 	if afterSecondReadOps != afterFirstReadOps {
-		t.Fatalf("expected second read to hit segment index cache, readOps first=%d second=%d", afterFirstReadOps, afterSecondReadOps)
+		t.Fatalf("expected second read to reuse flat segment index data without extra disk IO, readOps first=%d second=%d", afterFirstReadOps, afterSecondReadOps)
 	}
 	cacheCountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexStats.cacheCount)
-	if cacheCountAfter <= cacheCountBefore {
-		t.Fatalf("expected segment-index cache hit to be recorded, before=%d after=%d", cacheCountBefore, cacheCountAfter)
+	if cacheCountAfter != cacheCountBefore {
+		t.Fatalf("expected flat fixed-width lookup to avoid L1 cache accounting, before=%d after=%d", cacheCountBefore, cacheCountAfter)
 	}
 	l1CountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
-	if l1CountAfter <= l1CountBefore {
-		t.Fatalf("expected segment-index L1 cache hit to be recorded, before=%d after=%d", l1CountBefore, l1CountAfter)
+	if l1CountAfter != l1CountBefore {
+		t.Fatalf("expected flat fixed-width lookup to avoid L1 layer hits, before=%d after=%d", l1CountBefore, l1CountAfter)
 	}
 }
 
@@ -2958,11 +3077,11 @@ func TestSegmentedChunkFileUsesPayloadWithoutLeadingKVCount(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 	entries := []kvPair{{key: []byte{0x0a}, val: []byte("value-a")}}
-	if _, err := db.writeChunkFile(folderPath, "chunk_0000.dat", entries); err != nil {
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), entries); err != nil {
 		t.Fatalf("writeChunkFile failed: %v", err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(folderPath, "chunk_0000.dat"))
+	raw, err := os.ReadFile(filepath.Join(folderPath, chunkFileNameForOrdinal(0)))
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
@@ -2991,15 +3110,15 @@ func TestAppendChunkFileReadsBackWithoutLeadingKVCount(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 	initial := []kvPair{{key: []byte{0x0a}, val: []byte("value-a")}}
-	chunkSize, err := db.writeChunkFile(folderPath, "chunk_0000.dat", initial)
+	chunkSize, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), initial)
 	if err != nil {
 		t.Fatalf("writeChunkFile failed: %v", err)
 	}
-	if err := db.appendChunkFile(filepath.Join(folderPath, "chunk_0000.dat"), []kvPair{{key: []byte{0x0b}, val: []byte("value-b")}}, int64(chunkSize)); err != nil {
+	if err := db.appendChunkFile(filepath.Join(folderPath, chunkFileNameForOrdinal(0)), []kvPair{{key: []byte{0x0b}, val: []byte("value-b")}}, int64(chunkSize)); err != nil {
 		t.Fatalf("appendChunkFile failed: %v", err)
 	}
 
-	entries, backing, err := db.readSegmentChunkFile(folderID, "chunk_0000.dat")
+	entries, backing, err := db.readSegmentChunkFile(folderID, chunkFileNameForOrdinal(0))
 	if backing != nil {
 		defer backing.Release()
 	}
@@ -3272,9 +3391,9 @@ func TestLargeSegmentedChunkUsesStreamingReadAndGCSplit(t *testing.T) {
 	}
 	targetKey := []byte{0xfe, 0xed}
 	targetValue := []byte("streaming-target-value")
-	chunkPath := filepath.Join(folderPath, "chunk_0000.dat")
+	chunkPath := filepath.Join(folderPath, chunkFileNameForOrdinal(0))
 	writeLargeChunkFileForTest(t, chunkPath, 1050, targetKey, targetValue)
-	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: "chunk_0000.dat", KeyStart: []byte{0x00, 0x00}}}); err != nil {
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0x00, 0x00}}}); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
 	}
 	db.markAccountStorageFolder(accountKey)
@@ -3519,9 +3638,9 @@ func TestFindChunkIndexForKeyBoundaryValidation(t *testing.T) {
 	// Note: KeyEnd fields are ignored in KeyStart-only indexing
 	// Chunk ranges are: [a,d), [d,g), [g,i)
 	metas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
-		{FileName: "chunk_0001.dat", KeyStart: []byte("d")},
-		{FileName: "chunk_0002.dat", KeyStart: []byte("g")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte("d")},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte("g")},
 	}
 
 	tests := []struct {
@@ -3564,8 +3683,8 @@ func TestFindChunkIndexForKeyBoundaryValidation(t *testing.T) {
 func TestPartitionEntriesByChunksReturnsUnmatchedPairs(t *testing.T) {
 	// Chunk 0: [a,d), Chunk 1: [d,∞)
 	metas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
-		{FileName: "chunk_0001.dat", KeyStart: []byte("d")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte("d")},
 	}
 
 	kvs := []kvPair{
@@ -3602,6 +3721,38 @@ func TestPartitionEntriesByChunksReturnsUnmatchedPairs(t *testing.T) {
 	}
 }
 
+func TestSegmentIndexKeyStartFastComparePreservesOrderingWithin32Bytes(t *testing.T) {
+	a := append(bytes.Repeat([]byte{0x11}, 31), 0x10)
+	b := append(bytes.Repeat([]byte{0x11}, 31), 0x20)
+	if cmp := compareSegmentIndexKeyStarts(a, b); cmp >= 0 {
+		t.Fatalf("expected a < b, got %d", cmp)
+	}
+
+	short := []byte{0xaa, 0xbb}
+	long := []byte{0xaa, 0xbb, 0x00}
+	if cmp := compareSegmentIndexKeyStarts(short, long); cmp >= 0 {
+		t.Fatalf("expected short < long, got %d", cmp)
+	}
+}
+
+func TestSegmentIndexKeyStartFastCompareFallsBackForLongKeys(t *testing.T) {
+	base := bytes.Repeat([]byte{0x33}, 32)
+	a := append(append([]byte(nil), base...), 0x10)
+	b := append(append([]byte(nil), base...), 0x20)
+	if cmp := compareSegmentIndexKeyStarts(a, b); cmp >= 0 {
+		t.Fatalf("expected long a < b, got %d", cmp)
+	}
+
+	metas := []segmentChunkMeta{
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: a},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: b},
+	}
+	selected := selectSegmentChunkMeta(metas, append(append([]byte(nil), base...), 0x18))
+	if selected == nil || selected.FileName != chunkFileNameForOrdinal(0) {
+		t.Fatalf("expected first chunk for long key fallback, got %+v", selected)
+	}
+}
+
 // TestUpdateAccountNamedSegmentedStorageCreatesNewChunksForUnmatchedKeys
 // tests that unmatched KV pairs trigger creation of new chunks instead of being lost.
 func TestUpdateAccountNamedSegmentedStorageCreatesNewChunksForUnmatchedKeys(t *testing.T) {
@@ -3621,7 +3772,7 @@ func TestUpdateAccountNamedSegmentedStorageCreatesNewChunksForUnmatchedKeys(t *t
 	// Create initial index with one chunk
 	// Chunk 0: [a,∞)
 	initialMetas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
 	}
 	if err := db.writeSegmentIndex(folderPath, initialMetas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -3774,7 +3925,7 @@ func TestIndexSynchronizationAfterChunkCreation(t *testing.T) {
 	// Create initial index
 	// Chunk 0: [a,∞)
 	initialMetas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
 	}
 	if err := db.writeSegmentIndex(folderPath, initialMetas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -3931,7 +4082,7 @@ func TestSegmentedReadBlocksConcurrentFolderWriters(t *testing.T) {
 
 	runScenario(t, "gc", func(t *testing.T, db *PrefixDB, accountKey []byte) error {
 		folderPath := db.segmentedFolderPathForAccount(accountKey)
-		if _, err := db.writeChunkFile(folderPath, "chunk_9999.dat", []kvPair{{
+		if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(9999), []kvPair{{
 			key: []byte{'z'},
 			val: []byte("garbage"),
 		}}); err != nil {
@@ -4197,8 +4348,8 @@ func TestConcurrentStorageGCJobsDoNotReuseChunkOrdinals(t *testing.T) {
 		key   []byte
 		value string
 	}{
-		{name: "chunk_0000.dat", key: []byte{'m'}, value: "value-m"},
-		{name: "chunk_0001.dat", key: []byte{'t'}, value: "value-t"},
+		{name: chunkFileNameForOrdinal(0), key: []byte{'m'}, value: "value-m"},
+		{name: chunkFileNameForOrdinal(1), key: []byte{'t'}, value: "value-t"},
 	}
 	metas := make([]segmentChunkMeta, 0, len(initial))
 	for _, item := range initial {
@@ -4247,7 +4398,7 @@ func TestConcurrentStorageGCJobsDoNotReuseChunkOrdinals(t *testing.T) {
 			t.Fatalf("duplicate chunk file referenced after concurrent GC: %s", meta.FileName)
 		}
 		seenNames[meta.FileName] = struct{}{}
-		if meta.FileName == "chunk_0000.dat" || meta.FileName == "chunk_0001.dat" {
+		if meta.FileName == chunkFileNameForOrdinal(0) || meta.FileName == chunkFileNameForOrdinal(1) {
 			t.Fatalf("old chunk file still referenced after rewrite: %s", meta.FileName)
 		}
 		if _, err := os.Stat(filepath.Join(folderPath, meta.FileName)); err != nil {
@@ -4296,9 +4447,9 @@ func TestWriteSegmentedChunksToFolderWithAllocator(t *testing.T) {
 	// Create existing chunks
 	// Chunk ranges: [a,d), [d,g), [g,∞)
 	existingMetas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
-		{FileName: "chunk_0001.dat", KeyStart: []byte("d")},
-		{FileName: "chunk_0005.dat", KeyStart: []byte("g")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte("d")},
+		{FileName: chunkFileNameForOrdinal(5), KeyStart: []byte("g")},
 	}
 
 	// Create allocator that knows about existing chunks
@@ -4329,7 +4480,7 @@ func TestWriteSegmentedChunksToFolderWithAllocator(t *testing.T) {
 		if existingNames[meta.FileName] {
 			t.Fatalf("new chunk %s conflicts with existing chunk!", meta.FileName)
 		}
-		if !strings.HasPrefix(meta.FileName, "chunk_") || !strings.HasSuffix(meta.FileName, ".dat") {
+		if parseChunkOrdinal(meta.FileName) < 0 || !strings.HasSuffix(meta.FileName, ".dat") {
 			t.Fatalf("invalid chunk filename format: %s", meta.FileName)
 		}
 	}
@@ -4356,7 +4507,7 @@ func TestRunStorageGCBatchMultipleJobs(t *testing.T) {
 	}
 
 	// Create initial chunk files
-	chunkFiles := []string{"chunk_0000.dat", "chunk_0001.dat", "chunk_0002.dat"}
+	chunkFiles := []string{chunkFileNameForOrdinal(0), chunkFileNameForOrdinal(1), chunkFileNameForOrdinal(2)}
 	for _, chunkFile := range chunkFiles {
 		chunkPath := filepath.Join(folderPath, chunkFile)
 		if err := os.WriteFile(chunkPath, []byte("dummy-chunk-data"), 0o644); err != nil {
@@ -4366,9 +4517,9 @@ func TestRunStorageGCBatchMultipleJobs(t *testing.T) {
 
 	// Create initial index with multiple chunks
 	initialMetas := []segmentChunkMeta{
-		{FileName: "chunk_0000.dat", KeyStart: []byte("a")},
-		{FileName: "chunk_0001.dat", KeyStart: []byte("d")},
-		{FileName: "chunk_0002.dat", KeyStart: []byte("g")},
+		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},
+		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte("d")},
+		{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte("g")},
 	}
 	if err := db.writeSegmentIndex(folderPath, initialMetas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)

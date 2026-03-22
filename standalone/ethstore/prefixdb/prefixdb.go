@@ -30,7 +30,6 @@ const storageMaxFileSize int64 = 1 << 30 // 1GB
 
 const (
 	segmentedStorageFlag            uint32 = 1 << 31
-	segmentedDirNamePrefix                 = "storage_seg_"
 	segmentIndexFileName                   = "index.meta"
 	accountFolderBloomBitCount      uint64 = 1 << 20
 	segmentIndexCacheThresholdBytes        = 0   // cache all decoded segment indexes
@@ -44,11 +43,15 @@ const (
 	segmentIndexLevel2TargetSize    = 4 * 1024
 	segmentIndexLevel2MaxSize       = 8 * 1024
 	segmentIndexCompressionMinSize  = 4 * 1024
+	segmentIndexKeyStartMaxBytes    = 32
+	segmentIndexFixedKeyFieldBytes  = 1 + segmentIndexKeyStartMaxBytes
+	segmentIndexFlatEntryBytes      = 4 + segmentIndexFixedKeyFieldBytes
+	segmentIndexL1EntryBytes        = 8 + segmentIndexFixedKeyFieldBytes
 	segmentChunkStreamReadThreshold = 64 * 1024 * 1024
 	segmentIndexFlatMagic           = 0x464c4958 // 'FLIX'
 	segmentIndexMultiLevelMagic     = 0x4d4c4958 // 'MLIX'
-	segmentIndexFormatVersion       = 2
-	segmentIndexFlatVersion         = 2
+	segmentIndexFormatVersion       = 3
+	segmentIndexFlatVersion         = 3
 )
 
 const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
@@ -2168,7 +2171,7 @@ func (db *PrefixDB) openOrCreateStorageFileLocked() error {
 	for _, e := range entries {
 		if e.IsDir() {
 			var segID uint32
-			if n, _ := fmt.Sscanf(e.Name(), segmentedDirNamePrefix+"%08d", &segID); n == 1 && segID > maxSegmentID {
+			if n, _ := fmt.Sscanf(e.Name(), "%08d", &segID); n == 1 && segID > maxSegmentID {
 				maxSegmentID = segID
 			}
 			continue
@@ -2512,7 +2515,7 @@ func (db *PrefixDB) writeSegmentedChunksToFolderWithAllocator(folderPath string,
 		if allocator != nil {
 			name = allocator.nextName()
 		} else {
-			name = fmt.Sprintf("chunk_%04d.dat", chunkIdx)
+			name = chunkFileNameForOrdinal(uint32(chunkIdx))
 		}
 		fullPath := filepath.Join(folderPath, name)
 		if err := db.writeFileWithStats(fullPath, seg, 0o644, diskIOUsageStorageSeparatedLogs); err != nil {
@@ -2622,8 +2625,8 @@ func (db *PrefixDB) updateSegmentedStorageWithLockHeld(existingFileID uint32, kv
 	return existingFileID, 0, 0, nil
 }
 
-// partitionEntriesByChunks takes advantage of kvs being sorted lexicographically to
-// walk the chunk metadata once, yielding O(len(metas)+len(kvs)) complexity.
+// partitionEntriesByChunks assigns sorted kvs to chunk ranges using binary search
+// on KeyStart boundaries.
 func partitionEntriesByChunks(metas []segmentChunkMeta, kvs []kvPair) ([][]kvPair, []kvPair) {
 	buckets := make([][]kvPair, len(metas))
 	var unmatched []kvPair
@@ -2649,42 +2652,37 @@ func findChunkIndexForKey(metas []segmentChunkMeta, key []byte, start int) int {
 	if len(key) == 0 {
 		return 0
 	}
-	if start < 0 {
-		start = 0
-	} else if start >= len(metas) {
-		start = len(metas) - 1
-	}
-	// First, find the candidate chunk using linear search
-	for start+1 < len(metas) {
-		next := metas[start+1].KeyStart
-		if len(next) > 0 && bytes.Compare(key, next) < 0 {
-			break
+	idx := sort.Search(len(metas), func(i int) bool {
+		startKey := metas[i].KeyStart
+		if len(startKey) == 0 {
+			return false
 		}
-		start++
-	}
-	// Adjust backwards if needed
-	for start > 0 {
-		cur := metas[start].KeyStart
-		if len(cur) == 0 || bytes.Compare(key, cur) >= 0 {
-			break
+		return compareSegmentIndexKeyStarts(key, startKey) < 0
+	})
+	if idx == 0 {
+		if len(metas[0].KeyStart) == 0 {
+			return 0
 		}
-		start--
+		if compareSegmentIndexKeyStarts(key, metas[0].KeyStart) < 0 {
+			return -1
+		}
+		return 0
 	}
-	// Validate that the key falls within the selected chunk's range [KeyStart, next.KeyStart)
-	cur := metas[start]
-	if len(cur.KeyStart) == 0 || bytes.Compare(key, cur.KeyStart) < 0 {
-		// Key is before this chunk's KeyStart
+	selected := idx - 1
+	if len(metas[selected].KeyStart) == 0 {
+		return selected
+	}
+	if compareSegmentIndexKeyStarts(key, metas[selected].KeyStart) < 0 {
 		return -1
 	}
-	// Check upper bound: if there's a next chunk, key must be < next.KeyStart
-	if start+1 < len(metas) {
-		next := metas[start+1].KeyStart
-		if len(next) > 0 && bytes.Compare(key, next) >= 0 {
-			// Key is at or beyond next chunk's KeyStart
+	if idx < len(metas) {
+		nextStart := metas[idx].KeyStart
+		if len(nextStart) > 0 && compareSegmentIndexKeyStarts(key, nextStart) >= 0 {
 			return -1
 		}
 	}
-	return start
+	_ = start
+	return selected
 }
 
 type chunkFileAllocator struct {
@@ -2708,22 +2706,18 @@ func (a *chunkFileAllocator) nextName() string {
 }
 
 func chunkFileNameForOrdinal(ordinal uint32) string {
-	return fmt.Sprintf("chunk_%04d.dat", ordinal)
+	return fmt.Sprintf("%04d.dat", ordinal)
 }
 
 func parseChunkOrdinal(name string) int {
-	const prefix = "chunk_"
 	const suffix = ".dat"
-	if len(name) <= len(prefix)+len(suffix) {
-		return -1
-	}
-	if name[:len(prefix)] != prefix {
+	if len(name) <= len(suffix) {
 		return -1
 	}
 	if name[len(name)-len(suffix):] != suffix {
 		return -1
 	}
-	num := name[len(prefix) : len(name)-len(suffix)]
+	num := name[:len(name)-len(suffix)]
 	if len(num) == 0 {
 		return -1
 	}
@@ -3015,11 +3009,11 @@ func (db *PrefixDB) writeChunkFileWithUsage(folderPath, fileName string, entries
 }
 
 func (db *PrefixDB) segmentedFolderPath(id uint32) string {
-	return filepath.Join(db.storageDir, fmt.Sprintf("%s%08d", segmentedDirNamePrefix, id))
+	return filepath.Join(db.storageDir, fmt.Sprintf("%08d", id))
 }
 
 func (db *PrefixDB) segmentedFolderPathForAccount(accountKey []byte) string {
-	return filepath.Join(db.storageDir, segmentedDirNamePrefix+hex.EncodeToString(accountKey))
+	return filepath.Join(db.storageDir, hex.EncodeToString(accountKey))
 }
 
 func (db *PrefixDB) managedAccountKeyForFolderPath(folderPath string) ([]byte, bool) {
@@ -3027,14 +3021,7 @@ func (db *PrefixDB) managedAccountKeyForFolderPath(folderPath string) ([]byte, b
 		return nil, false
 	}
 	name := filepath.Base(folderPath)
-	if !strings.HasPrefix(name, segmentedDirNamePrefix) {
-		return nil, false
-	}
-	suffix := strings.TrimPrefix(name, segmentedDirNamePrefix)
-	if len(suffix) == 0 || len(suffix)%2 != 0 {
-		return nil, false
-	}
-	accountKey, err := hex.DecodeString(suffix)
+	accountKey, err := hex.DecodeString(name)
 	if err != nil {
 		return nil, false
 	}
@@ -3089,14 +3076,7 @@ func (db *PrefixDB) primeAccountFolderSetFromStorageDir() error {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, segmentedDirNamePrefix) {
-			continue
-		}
-		hexKey := strings.TrimPrefix(name, segmentedDirNamePrefix)
-		if len(hexKey) == 0 || len(hexKey)%2 != 0 {
-			continue
-		}
-		accountKey, decodeErr := hex.DecodeString(hexKey)
+		accountKey, decodeErr := hex.DecodeString(name)
 		if decodeErr != nil || len(accountKey) == 0 {
 			continue
 		}
@@ -3204,6 +3184,9 @@ func level2IndexFilePath(folderPath string, metaID uint32) string {
 }
 
 func segmentChunkMetaCanUseCompactEncoding(meta segmentChunkMeta) bool {
+	if len(meta.KeyStart) > segmentIndexKeyStartMaxBytes {
+		return false
+	}
 	return parseChunkOrdinal(meta.FileName) >= 0
 }
 
@@ -3218,7 +3201,7 @@ func canUseCompactSegmentEncoding(metas []segmentChunkMeta) bool {
 
 func estimateSegmentEntrySize(meta segmentChunkMeta) int {
 	if segmentChunkMetaCanUseCompactEncoding(meta) {
-		return 4 + 2 + len(meta.KeyStart)
+		return segmentIndexFlatEntryBytes
 	}
 	return 2 + len(meta.FileName) + 2 + len(meta.KeyStart)
 }
@@ -3253,7 +3236,7 @@ func encodeSegmentChunkMetas(metas []segmentChunkMeta) ([]byte, error) {
 		writeUint32BE(tmp32[:], uint32(ordinal))
 		buf = append(buf, tmp32[:]...)
 		var err error
-		if buf, err = appendVarBytes(buf, meta.KeyStart); err != nil {
+		if buf, err = appendFixedSegmentIndexKeyStart(buf, meta.KeyStart); err != nil {
 			return nil, err
 		}
 	}
@@ -3382,8 +3365,165 @@ func segmentChunkMetaEqual(a, b segmentChunkMeta) bool {
 	return bytes.Equal(a.KeyStart, b.KeyStart)
 }
 
+func compareSegmentIndexKeyStarts(a, b []byte) int {
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+var zeroSegmentIndexKeyPadding [segmentIndexKeyStartMaxBytes]byte
+
+func appendFixedSegmentIndexKeyStart(buf []byte, key []byte) ([]byte, error) {
+	if len(key) > segmentIndexKeyStartMaxBytes {
+		return nil, fmt.Errorf("segment key start too large: %d", len(key))
+	}
+	buf = append(buf, byte(len(key)))
+	if len(key) > 0 {
+		buf = append(buf, key...)
+	}
+	if pad := segmentIndexKeyStartMaxBytes - len(key); pad > 0 {
+		buf = append(buf, zeroSegmentIndexKeyPadding[:pad]...)
+	}
+	return buf, nil
+}
+
+func decodeFixedSegmentIndexKeyStart(data []byte) ([]byte, int, error) {
+	if len(data) < segmentIndexFixedKeyFieldBytes {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	keyLen := int(data[0])
+	if keyLen > segmentIndexKeyStartMaxBytes {
+		return nil, 0, fmt.Errorf("invalid fixed segment key length %d", keyLen)
+	}
+	if keyLen == 0 {
+		return nil, segmentIndexFixedKeyFieldBytes, nil
+	}
+	return data[1 : 1+keyLen], segmentIndexFixedKeyFieldBytes, nil
+}
+
+func compareSearchKeyToEncodedFixedSegmentIndexKey(search []byte, encoded []byte) (int, error) {
+	if len(encoded) < segmentIndexFixedKeyFieldBytes {
+		return 0, io.ErrUnexpectedEOF
+	}
+	keyLen := int(encoded[0])
+	if keyLen > segmentIndexKeyStartMaxBytes {
+		return 0, fmt.Errorf("invalid fixed segment key length %d", keyLen)
+	}
+	keyData := encoded[1 : 1+keyLen]
+	return compareSegmentIndexKeyStarts(search, keyData), nil
+}
+
+func flatSegmentIndexCount(data []byte) (int, uint16, error) {
+	if len(data) < 12 {
+		return 0, 0, fmt.Errorf("corrupted compact segment index header")
+	}
+	if binary.BigEndian.Uint32(data[:4]) != segmentIndexFlatMagic {
+		return 0, 0, fmt.Errorf("unsupported segment index format")
+	}
+	version := binary.BigEndian.Uint16(data[4:6])
+	if version != segmentIndexFlatVersion {
+		return 0, 0, fmt.Errorf("unsupported flat index version %d", version)
+	}
+	count := int(binary.BigEndian.Uint32(data[8:12]))
+	return count, version, nil
+}
+
+func flatSegmentIndexEntryOffset(version uint16, idx int) (int, error) {
+	if idx < 0 {
+		return 0, fmt.Errorf("invalid flat segment index entry index %d", idx)
+	}
+	if version != segmentIndexFlatVersion {
+		return 0, fmt.Errorf("unsupported flat index version %d", version)
+	}
+	return 12 + idx*segmentIndexFlatEntryBytes, nil
+}
+
+func flatSegmentIndexMetaAt(data []byte, version uint16, idx int) (segmentChunkMeta, error) {
+	offset, err := flatSegmentIndexEntryOffset(version, idx)
+	if err != nil {
+		return segmentChunkMeta{}, err
+	}
+	if offset+segmentIndexFlatEntryBytes > len(data) {
+		return segmentChunkMeta{}, io.ErrUnexpectedEOF
+	}
+	ordinal := readUint32BE(data[offset : offset+4])
+	keyStart, _, err := decodeFixedSegmentIndexKeyStart(data[offset+4 : offset+4+segmentIndexFixedKeyFieldBytes])
+	if err != nil {
+		return segmentChunkMeta{}, err
+	}
+	return segmentChunkMeta{FileName: chunkFileNameForOrdinal(ordinal), KeyStart: keyStart}, nil
+}
+
+func selectFixedFlatSegmentIndexMeta(data []byte, key []byte) (*segmentChunkMeta, error) {
+	count, version, err := flatSegmentIndexCount(data)
+	if err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	idx := sort.Search(count, func(i int) bool {
+		offset := 12 + i*segmentIndexFlatEntryBytes + 4
+		cmp, cmpErr := compareSearchKeyToEncodedFixedSegmentIndexKey(key, data[offset:offset+segmentIndexFixedKeyFieldBytes])
+		if cmpErr != nil {
+			return true
+		}
+		return cmp < 0
+	})
+	if idx == 0 {
+		cmp, cmpErr := compareSearchKeyToEncodedFixedSegmentIndexKey(key, data[16:16+segmentIndexFixedKeyFieldBytes])
+		if cmpErr != nil {
+			return nil, cmpErr
+		}
+		if cmp < 0 {
+			return nil, nil
+		}
+		meta, err := flatSegmentIndexMetaAt(data, version, 0)
+		if err != nil {
+			return nil, err
+		}
+		return &meta, nil
+	}
+	selectedIdx := idx - 1
+	selected, err := flatSegmentIndexMetaAt(data, version, selectedIdx)
+	if err != nil {
+		return nil, err
+	}
+	if compareSegmentIndexKeyStarts(key, selected.KeyStart) < 0 {
+		return nil, nil
+	}
+	if idx < count {
+		nextOffset := 12 + idx*segmentIndexFlatEntryBytes + 4
+		cmp, cmpErr := compareSearchKeyToEncodedFixedSegmentIndexKey(key, data[nextOffset:nextOffset+segmentIndexFixedKeyFieldBytes])
+		if cmpErr != nil {
+			return nil, cmpErr
+		}
+		if cmp >= 0 {
+			return nil, nil
+		}
+	}
+	return &selected, nil
+}
+
 func lessSegmentChunkMeta(a, b segmentChunkMeta) bool {
-	cmp := bytes.Compare(a.KeyStart, b.KeyStart)
+	cmp := compareSegmentIndexKeyStarts(a.KeyStart, b.KeyStart)
 	if cmp != 0 {
 		return cmp < 0
 	}
@@ -3525,13 +3665,13 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 		if len(start) == 0 {
 			return false
 		}
-		return bytes.Compare(start, key) > 0
+		return compareSegmentIndexKeyStarts(key, start) < 0
 	})
 	if idx == 0 {
 		if len(entries[0].KeyStart) == 0 {
 			return &entries[0]
 		}
-		if bytes.Compare(key, entries[0].KeyStart) < 0 {
+		if compareSegmentIndexKeyStarts(key, entries[0].KeyStart) < 0 {
 			return nil
 		}
 		return &entries[0]
@@ -3540,12 +3680,12 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 	if len(selected.KeyStart) == 0 {
 		return selected
 	}
-	if bytes.Compare(key, selected.KeyStart) < 0 {
+	if compareSegmentIndexKeyStarts(key, selected.KeyStart) < 0 {
 		return nil
 	}
 	if idx < len(entries) {
 		nextStart := entries[idx].KeyStart
-		if len(nextStart) > 0 && bytes.Compare(key, nextStart) >= 0 {
+		if len(nextStart) > 0 && compareSegmentIndexKeyStarts(key, nextStart) >= 0 {
 			return nil
 		}
 	}
@@ -3553,21 +3693,11 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 }
 
 func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) error {
-	if len(data) < 4 {
-		return fmt.Errorf("invalid segment index payload")
-	}
-	if binary.BigEndian.Uint32(data[:4]) != segmentIndexFlatMagic {
-		return fmt.Errorf("unsupported segment index format")
-	}
-	if len(data) < 12 {
-		return fmt.Errorf("corrupted compact segment index header")
-	}
-	version := binary.BigEndian.Uint16(data[4:6])
-	if version != segmentIndexFlatVersion {
-		return fmt.Errorf("unsupported flat index version %d", version)
+	count, version, err := flatSegmentIndexCount(data)
+	if err != nil {
+		return err
 	}
 	cursor := 12
-	count := int(binary.BigEndian.Uint32(data[cursor-4 : cursor]))
 	if count == 0 {
 		if !appendExisting {
 			*metas = (*metas)[:0]
@@ -3593,13 +3723,16 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 		copy(buf, *metas)
 		*metas = buf
 	}
+	if version != segmentIndexFlatVersion {
+		return fmt.Errorf("unsupported flat index version %d", version)
+	}
 	for i := 0; i < count; i++ {
-		if cursor+4 > len(data) {
+		if cursor+segmentIndexFlatEntryBytes > len(data) {
 			return io.ErrUnexpectedEOF
 		}
 		fileName := chunkFileNameForOrdinal(readUint32BE(data[cursor : cursor+4]))
 		cursor += 4
-		start, n, err := readVarBytes(data[cursor:])
+		start, n, err := decodeFixedSegmentIndexKeyStart(data[cursor : cursor+segmentIndexFixedKeyFieldBytes])
 		if err != nil {
 			return err
 		}
@@ -3672,7 +3805,10 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 		metaID := readUint32BE(data[cursor : cursor+4])
 		chunkCount := readUint32BE(data[cursor+4 : cursor+8])
 		cursor += 8
-		start, n, err := readVarBytes(data[cursor:])
+		if cursor+segmentIndexFixedKeyFieldBytes > len(data) {
+			return segmentIndexLayout{}, io.ErrUnexpectedEOF
+		}
+		start, n, err := decodeFixedSegmentIndexKeyStart(data[cursor : cursor+segmentIndexFixedKeyFieldBytes])
 		if err != nil {
 			return segmentIndexLayout{}, err
 		}
@@ -3712,7 +3848,7 @@ func encodeTopLevelIndex(layout segmentIndexLayout) ([]byte, error) {
 		writeUint32BE(tmp32[:], entry.ChunkCount)
 		buf = append(buf, tmp32[:]...)
 		var err error
-		if buf, err = appendVarBytes(buf, entry.KeyStart); err != nil {
+		if buf, err = appendFixedSegmentIndexKeyStart(buf, entry.KeyStart); err != nil {
 			return nil, err
 		}
 	}
@@ -3735,7 +3871,7 @@ func layoutEntriesEqual(a, b []segmentIndexL1Entry) bool {
 }
 
 func lessSegmentIndexL1Entry(a, b segmentIndexL1Entry) bool {
-	cmp := bytes.Compare(a.KeyStart, b.KeyStart)
+	cmp := compareSegmentIndexKeyStarts(a.KeyStart, b.KeyStart)
 	if cmp != 0 {
 		return cmp < 0
 	}
@@ -3796,7 +3932,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 	db.invalidateSegmentIndexLayoutForPath(folderPath)
 	metas = normalizeSegmentChunkMetasOrder(metas, nil)
 	// Capture the previous layout so we can remove stale L2 files without scanning
-	// the whole folder (which may contain many chunk_*.dat files).
+	// the whole folder (which may contain many *.dat files).
 	prevLayout, _ := db.loadSegmentIndexLayout(folderPath)
 	var prevEntries []segmentIndexL1Entry
 	if prevLayout.mode == indexLayoutMultiLevel {
@@ -4295,6 +4431,19 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if layout.mode != indexLayoutMultiLevel {
+		data := layout.flatData
+		if len(data) == 0 {
+			indexPath := filepath.Join(folderPath, segmentIndexFileName)
+			data, err = db.readSegmentIndexFile(indexPath)
+			if err != nil {
+				return nil, segmentIndexLookupSourceNoCache, err
+			}
+		}
+		if meta, selectErr := selectFixedFlatSegmentIndexMeta(data, key); selectErr != nil {
+			return nil, segmentIndexLookupSourceNoCache, selectErr
+		} else if meta != nil {
+			return []segmentChunkMeta{*meta}, segmentIndexLookupSourceNoCache, nil
+		}
 		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
 	}
 	entry := selectSegmentL1Entry(layout.entries, key)
@@ -4344,63 +4493,7 @@ func (db *PrefixDB) readSegmentIndexForKey(folderID uint32, key []byte) ([]segme
 }
 
 func (db *PrefixDB) readSegmentIndexForKeyWithSource(folderID uint32, key []byte) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
-	folderPath := db.segmentedFolderPath(folderID)
-	entryLock, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
-	defer unlock()
-	generation := atomic.LoadUint64(&entryLock.gen)
-	if len(key) == 0 {
-		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
-	}
-	if db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
-		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
-			db.segmentIndexMu.Unlock()
-			return metas, segmentIndexLookupSourceL1Cache, nil
-		}
-		db.segmentIndexMu.Unlock()
-	}
-	layout, err := db.loadSegmentIndexLayout(folderPath)
-	if err != nil {
-		return nil, segmentIndexLookupSourceNoCache, err
-	}
-	if layout.mode != indexLayoutMultiLevel {
-		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
-	}
-	entry := selectSegmentL1Entry(layout.entries, key)
-	if entry == nil {
-		// Log detailed information for debugging
-		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: failed to locate L1 index entry for key - folder=%s key=%x entries_count=%d\n",
-			folderPath, key, len(layout.entries))
-		// Print key ranges for all L1 entries
-		for i, e := range layout.entries {
-			fmt.Fprintf(prefixdbLogWriter, "prefixdb DEBUG: L1[%d] MetaID=%d ChunkCount=%d KeyStart=%x\n",
-				i, e.MetaID, e.ChunkCount, e.KeyStart)
-		}
-		return nil, segmentIndexLookupSourceNoCache, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
-	}
-	if db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
-		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
-			db.segmentIndexMu.Unlock()
-			return metas, segmentIndexLookupSourceL2Cache, nil
-		}
-		db.segmentIndexMu.Unlock()
-	}
-	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
-	var arena []byte
-	data, err := db.readSegmentIndexFile(level2IndexFilePath(folderPath, entry.MetaID))
-	if err != nil {
-		return nil, segmentIndexLookupSourceNoCache, err
-	}
-	if err := decodeSegmentIndexBuffer(data, &metas, &arena, false, folderPath); err != nil {
-		return nil, segmentIndexLookupSourceNoCache, err
-	}
-	if db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
-		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
-		db.segmentIndexMu.Unlock()
-	}
-	return metas, segmentIndexLookupSourceNoCache, nil
+	return db.readSegmentIndexForKeyByPathWithSource(db.segmentedFolderPath(folderID), key)
 }
 
 func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
@@ -4452,13 +4545,13 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 		if len(start) == 0 {
 			return false
 		}
-		return bytes.Compare(start, key) > 0
+		return compareSegmentIndexKeyStarts(key, start) < 0
 	})
 	if idx == 0 {
 		if len(metas[0].KeyStart) == 0 {
 			return &metas[0]
 		}
-		if bytes.Compare(key, metas[0].KeyStart) < 0 {
+		if compareSegmentIndexKeyStarts(key, metas[0].KeyStart) < 0 {
 			return nil
 		}
 		return &metas[0]
@@ -4467,12 +4560,12 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 	if len(selected.KeyStart) == 0 {
 		return selected
 	}
-	if bytes.Compare(key, selected.KeyStart) < 0 {
+	if compareSegmentIndexKeyStarts(key, selected.KeyStart) < 0 {
 		return nil
 	}
 	if idx < len(metas) {
 		nextStart := metas[idx].KeyStart
-		if len(nextStart) > 0 && bytes.Compare(key, nextStart) >= 0 {
+		if len(nextStart) > 0 && compareSegmentIndexKeyStarts(key, nextStart) >= 0 {
 			return nil
 		}
 	}
@@ -5823,12 +5916,12 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	return nil
 }
 
-// reserveChunkFileName tries to reserve a unique chunk_%04d.dat name by creating the destination
+// reserveChunkFileName tries to reserve a unique %04d.dat name by creating the destination
 // path with O_EXCL. The created file is a placeholder and will be replaced atomically by writeChunkFile.
 func reserveChunkFileName(folderPath string, startOrdinal int) (name string, nextOrdinal int, err error) {
 	ord := startOrdinal
 	for {
-		candidate := fmt.Sprintf("chunk_%04d.dat", ord)
+		candidate := chunkFileNameForOrdinal(uint32(ord))
 		fullPath := filepath.Join(folderPath, candidate)
 		f, openErr := os.OpenFile(fullPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 		if openErr == nil {
@@ -6085,9 +6178,6 @@ func (db *PrefixDB) rebuildSegmentIndexFilesLocked() error {
 		if !entry.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(entry.Name(), segmentedDirNamePrefix) {
-			continue
-		}
 		folderPath := filepath.Join(db.storageDir, entry.Name())
 		indexPath := filepath.Join(folderPath, segmentIndexFileName)
 		if _, err := os.Stat(indexPath); err != nil {
@@ -6168,7 +6258,7 @@ func (db *PrefixDB) GCCollectGarbageChunks(folderID uint32) (int, error) {
 		fullPath := filepath.Join(folderPath, name)
 
 		// Remove leftover temp files from atomic chunk writes.
-		if strings.HasPrefix(name, "chunk_") && strings.HasSuffix(name, ".dat.tmp") {
+		if strings.HasSuffix(name, ".dat.tmp") {
 			if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return deleted, err
 			}
@@ -6176,8 +6266,8 @@ func (db *PrefixDB) GCCollectGarbageChunks(folderID uint32) (int, error) {
 			continue
 		}
 
-		// Only consider chunk_*.dat files.
-		if !(strings.HasPrefix(name, "chunk_") && strings.HasSuffix(name, ".dat")) {
+		// Only consider *.dat files.
+		if !strings.HasSuffix(name, ".dat") {
 			continue
 		}
 		if _, ok := referenced[name]; ok {
@@ -6207,9 +6297,6 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
-			continue
-		}
-		if !strings.HasPrefix(entry.Name(), segmentedDirNamePrefix) {
 			continue
 		}
 		folderPath := filepath.Join(db.storageDir, entry.Name())
@@ -6254,7 +6341,7 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 		if len(allEntries) > 0 {
 			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
 			for i, chunk := range chunks {
-				fileName := fmt.Sprintf("chunk_%04d.dat", i)
+				fileName := chunkFileNameForOrdinal(uint32(i))
 				_, err := db.writeChunkFileWithUsage(folderPath, fileName, chunk, diskIOUsageStorageGC)
 				if err != nil {
 					unlock()

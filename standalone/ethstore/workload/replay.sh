@@ -26,7 +26,7 @@ fi
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
+END_BLOCK_ID="${END_BLOCK_ID:-20500200}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -114,6 +114,8 @@ CURRENT_MONITOR_PID=""
 
 # sudo 密码；留空则使用交互式 sudo
 SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
+# rsync 3.2.x 默认可能受 1GB max-alloc 限制影响；0 表示不额外限制。
+RSYNC_MAX_ALLOC="${RSYNC_MAX_ALLOC:-0}"
 
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then
@@ -133,8 +135,22 @@ report_error() {
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 sudo_rsync_run() {
+    local args=()
+    local has_max_alloc=0
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == --max-alloc=* ]]; then
+            has_max_alloc=1
+            break
+        fi
+    done
+    if [ "$has_max_alloc" -eq 0 ] && [ -n "$RSYNC_MAX_ALLOC" ]; then
+        args+=("--max-alloc=${RSYNC_MAX_ALLOC}")
+    fi
+    args+=("$@")
+
     set +e
-    sudo_run rsync "$@"
+    sudo_run rsync "${args[@]}"
     local rc=$?
     set -e
     if [ "$rc" -eq 24 ]; then
