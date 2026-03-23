@@ -3823,6 +3823,10 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 	if layout.nextMetaID == 0 {
 		layout.nextMetaID = uint32(len(layout.entries)) + 1
 	}
+	// Read-path hardening: keep top-level entries ordered even if on-disk
+	// layout was produced by an older/buggy writer. Key lookup relies on
+	// binary search and requires monotonic KeyStart order.
+	layout.entries = normalizeSegmentIndexL1EntriesOrder(layout.entries, nil)
 	return layout, nil
 }
 
@@ -4418,17 +4422,20 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 	if len(key) == 0 {
 		return db.readSegmentIndexLockedInternalByPath(folderPath, true)
 	}
-	if db.storageIndexCache != nil {
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		return nil, segmentIndexLookupSourceNoCache, err
+	}
+	// For multi-level indexes, key lookup should prefer level2 shard cache.
+	// Returning the full level1 metas slice can be significantly more expensive
+	// than selecting one level2 shard and causes slower cache-hit latency.
+	if layout.mode != indexLayoutMultiLevel && db.storageIndexCache != nil {
 		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
 			db.segmentIndexMu.Unlock()
 			return metas, segmentIndexLookupSourceL1Cache, nil
 		}
 		db.segmentIndexMu.Unlock()
-	}
-	layout, err := db.loadSegmentIndexLayout(folderPath)
-	if err != nil {
-		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if layout.mode != indexLayoutMultiLevel {
 		data := layout.flatData
@@ -4462,6 +4469,12 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
 			db.segmentIndexMu.Unlock()
+			if selectSegmentChunkMeta(metas, key) == nil {
+				fallbackMetas, fallbackSource, fallbackErr := db.readSegmentIndexLockedInternalByPath(folderPath, true)
+				if fallbackErr == nil && selectSegmentChunkMeta(fallbackMetas, key) != nil {
+					return fallbackMetas, fallbackSource, nil
+				}
+			}
 			return metas, segmentIndexLookupSourceL2Cache, nil
 		}
 		db.segmentIndexMu.Unlock()
@@ -4479,6 +4492,15 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 		db.segmentIndexMu.Lock()
 		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
 		db.segmentIndexMu.Unlock()
+	}
+	// Guard against stale/misaligned shard boundaries in multi-level indexes.
+	// If the selected L2 shard cannot resolve the key, fall back to a full-index
+	// view so boundary keys can still locate the correct chunk.
+	if selectSegmentChunkMeta(metas, key) == nil {
+		fallbackMetas, fallbackSource, fallbackErr := db.readSegmentIndexLockedInternalByPath(folderPath, true)
+		if fallbackErr == nil && selectSegmentChunkMeta(fallbackMetas, key) != nil {
+			return fallbackMetas, fallbackSource, nil
+		}
 	}
 	return metas, segmentIndexLookupSourceNoCache, nil
 }
@@ -6026,7 +6048,15 @@ func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, accountKey []byte, 
 
 func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKey []byte, storageKey []byte) ([]byte, *segmentedStorageReadFailure, error) {
 	unlock := db.lockSegmentIndexFolder(folderPath)
-	defer unlock()
+	var gcMeta *segmentChunkMeta
+	var gcBacking *bufferLease
+	defer func() {
+		unlock()
+		if gcMeta != nil {
+			db.maybeScheduleStorageGC(folderPath, gcMeta, gcBacking)
+			gcBacking = nil
+		}
+	}()
 	failure := &segmentedStorageReadFailure{folderPath: folderPath, indexFile: segmentIndexFileName}
 	indexStart := time.Now()
 	metas, segmentIndexSource, err := db.readSegmentIndexForKeyByPathWithSource(folderPath, storageKey)
@@ -6070,6 +6100,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		return nil, failure, err
 	}
 	if db.shouldStreamSegmentChunk(size) {
+		gcMeta = meta
 		return db.readSegmentedChunkToCacheStreamingByPath(folderPath, meta.FileName, accountKey, storageKey, failure)
 	}
 	chunkStart := time.Now()
@@ -6081,7 +6112,11 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		failure.reason = "segment-chunk-read-failed"
 		return nil, failure, err
 	}
-	defer lease.Release()
+	defer func() {
+		if lease != nil {
+			lease.Release()
+		}
+	}()
 	buf := lease.Bytes()
 	if len(buf) == 0 {
 		failure.reason = "segment-chunk-empty"
@@ -6092,6 +6127,8 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		failure.reason = "segment-chunk-corrupted"
 		return nil, failure, nil
 	}
+	gcMeta = meta
+	gcBacking = lease
 	cursor := 0
 	bufLen := len(buf)
 	prefetchLimit := db.storageGetCacheCount
@@ -6103,6 +6140,8 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	count := 0
 	for cursor < bufLen {
 		if cursor+headerSize > bufLen {
+			gcMeta = nil
+			gcBacking = nil
 			failure.reason = "segment-chunk-corrupted"
 			return nil, failure, nil
 		}
@@ -6112,6 +6151,8 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		cursor += headerSize
 		totalLen := klen + vlen
 		if cursor+totalLen > bufLen {
+			gcMeta = nil
+			gcBacking = nil
 			failure.reason = "segment-chunk-corrupted"
 			return nil, failure, nil
 		}
@@ -6148,6 +6189,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		if cache != nil {
 			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
 		}
+		lease = nil
 		failure.reason = "segment-chunk-key-not-found"
 		return nil, failure, nil
 	}
@@ -6155,6 +6197,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		if cache != nil {
 			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
 		}
+		lease = nil
 		failure.reason = "segment-chunk-tombstone"
 		return nil, failure, nil
 	}
@@ -6162,6 +6205,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	if cache != nil {
 		cache.Add(db.storageCacheKey(accountKey, storageKey), append([]byte(nil), exactValue...))
 	}
+	lease = nil
 	return result, nil, nil
 }
 

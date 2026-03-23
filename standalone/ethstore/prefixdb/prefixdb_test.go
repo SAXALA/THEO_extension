@@ -307,6 +307,51 @@ func TestReadSegmentIndexForKeyUsesPartialLevel2Cache(t *testing.T) {
 	}
 }
 
+func TestReadSegmentIndexForKeyWithSourcePrefersL2WhenL1IsPrimed(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 16, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(321)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Ensure multi-level index layout (payload large enough to cross threshold).
+	metas := make([]segmentChunkMeta, 1200)
+	for i := range metas {
+		start := []byte(fmt.Sprintf("k%08d", i*2))
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: start,
+		}
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	// Prime full level1 cache entry via full-index read path.
+	if _, _, err := db.readSegmentIndexLockedInternal(folderID, true); err != nil {
+		t.Fatalf("readSegmentIndexLockedInternal failed: %v", err)
+	}
+
+	targetKey := metas[777].KeyStart
+	if _, _, err := db.readSegmentIndexForKeyWithSource(folderID, targetKey); err != nil {
+		t.Fatalf("first readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, targetKey)
+	if err != nil {
+		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceL2Cache {
+		t.Fatalf("expected second key lookup to hit L2 cache for multi-level index, got source=%d", source)
+	}
+}
+
 func writeAccountRecordForTest(t *testing.T, file *os.File, key []byte, value []byte) int64 {
 	t.Helper()
 	info, err := file.Stat()
@@ -1741,6 +1786,69 @@ func TestWriteSegmentIndexReordersUnsortedMultiLevelTopEntries(t *testing.T) {
 	}
 }
 
+func TestReadSegmentIndexForKeyWithSourceNormalizesUnorderedMultiLevelTopEntries(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(33)
+	folderPath := db.segmentedFolderPath(folderID)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	groupLow := []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x10}}}
+	groupHigh := []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(2), KeyStart: []byte{0x20}}}
+
+	l2Low, err := encodeSegmentChunkMetas(groupLow)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas low failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 1), l2Low, 0o644); err != nil {
+		t.Fatalf("WriteFile low level2 failed: %v", err)
+	}
+	l2High, err := encodeSegmentChunkMetas(groupHigh)
+	if err != nil {
+		t.Fatalf("encodeSegmentChunkMetas high failed: %v", err)
+	}
+	if err := os.WriteFile(level2IndexFilePath(folderPath, 2), l2High, 0o644); err != nil {
+		t.Fatalf("WriteFile high level2 failed: %v", err)
+	}
+
+	// Intentionally write the top-level index in descending KeyStart order.
+	// Read path should normalize this before doing binary-search selection.
+	layout := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 3,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 2, ChunkCount: 1, KeyStart: []byte{0x20}},
+			{MetaID: 1, ChunkCount: 1, KeyStart: []byte{0x10}},
+		},
+	}
+	top, err := encodeTopLevelIndex(layout)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(folderPath, segmentIndexFileName), top, 0o644); err != nil {
+		t.Fatalf("WriteFile top-level failed: %v", err)
+	}
+
+	metas, _, err := db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
+	if err != nil {
+		t.Fatalf("readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	selected := selectSegmentChunkMeta(metas, []byte{0x10})
+	if selected == nil {
+		t.Fatal("expected chunk meta for key 0x10")
+	}
+	if selected.FileName != chunkFileNameForOrdinal(1) {
+		t.Fatalf("expected key 0x10 to resolve to %s, got %s", chunkFileNameForOrdinal(1), selected.FileName)
+	}
+}
+
 func TestSegmentIndexSmallPayloadStaysUncompressed(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, false, true, 0)
@@ -2201,6 +2309,85 @@ func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
 	l1CountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
 	if l1CountAfter != l1CountBefore {
 		t.Fatalf("expected flat fixed-width lookup to avoid L1 layer hits, before=%d after=%d", l1CountBefore, l1CountAfter)
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathFallsBackToFullIndexOnShardBoundaryMismatch(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderID := uint32(189)
+	folderPath := db.segmentedFolderPath(folderID)
+	accountKey := makeTestAccountKey(0x6a)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	metas := make([]segmentChunkMeta, 3000)
+	for i := range metas {
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: []byte{byte(i >> 8), byte(i), 0x5a},
+		}
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		t.Fatalf("loadSegmentIndexLayout failed: %v", err)
+	}
+	if layout.mode != indexLayoutMultiLevel {
+		t.Fatalf("expected multi-level layout, got mode=%d", layout.mode)
+	}
+
+	targetKey := cloneBytes(metas[len(metas)/2].KeyStart)
+	targetFile := metas[len(metas)/2].FileName
+	targetValue := []byte("boundary-hit")
+	if _, err := db.writeChunkFile(folderPath, targetFile, []kvPair{{key: cloneBytes(targetKey), val: append([]byte(nil), targetValue...)}}); err != nil {
+		t.Fatalf("writeChunkFile target failed: %v", err)
+	}
+
+	entry := selectSegmentL1Entry(layout.entries, targetKey)
+	if entry == nil {
+		t.Fatal("expected L1 entry for target key")
+	}
+	entryIdx := -1
+	for i := range layout.entries {
+		if layout.entries[i].MetaID == entry.MetaID {
+			entryIdx = i
+			break
+		}
+	}
+	if entryIdx <= 0 {
+		t.Fatalf("expected target entry to have a previous shard, got idx=%d", entryIdx)
+	}
+
+	poisonStart := append([]byte(nil), targetKey...)
+	poisonStart[len(poisonStart)-1]++
+	poison := []segmentChunkMeta{{
+		FileName: chunkFileNameForOrdinal(0),
+		KeyStart: poisonStart,
+	}}
+	if db.storageIndexCache == nil {
+		t.Fatal("expected storageIndexCache to be initialized")
+	}
+	db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, 0, poison)
+
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, targetKey)
+	if err != nil {
+		t.Fatalf("readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected read failure: %+v", *failure)
+	}
+	if !bytes.Equal(value, targetValue) {
+		t.Fatalf("unexpected value after fallback: got=%q want=%q", value, targetValue)
 	}
 }
 

@@ -1269,7 +1269,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 
 		//debug
-		// testKeyHex := "4f37d65eaa92c6bc4c13a5ec45527f0c18ea8932588728769ec7aecfe6d9f32e420e02030c"
+		// testKeyHex := "4fc01cf44b5fd388621bce9fca946de503c1f9fa5c34765867954352ad3baec0080f01"
 		// testKeyBytes, _ := hex.DecodeString(testKeyHex)
 		// val, err := backend.Get(testKeyBytes, ethstore.TrieNodeStorageDataType)
 		// if err != nil && !errors.Is(err, ethstore.ErrNotFound) {
@@ -1559,14 +1559,14 @@ func main() {
 		log.Println(http.ListenAndServe(":6060", nil))
 	}()
 
-	// // For quick debugging
-	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
-	// if ethErr != nil {
-	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
-	// }
-	// defer ethBackend.Close()
-	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
-	// // return
+	// For quick debugging
+	ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+	if ethErr != nil {
+		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+	}
+	defer ethBackend.Close()
+	replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// return
 
 	switch *mode {
 	case "ld":
