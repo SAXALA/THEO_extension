@@ -161,9 +161,9 @@ func (db *PrefixDB) StorageBatchPut(key, value, accountKey []byte) error {
 		db.storageBatch.putUnresolved(string(key), value)
 		return nil
 	}
-	if db.storageCache != nil {
-		db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
-	}
+	// Note: We don't need to invalidate storageCache here because:
+	// 1. batchGetOverlayNormalized is checked before storageCache in Get()
+	// 2. syncStorageCacheEntries in BatchCommit will update the cache correctly
 	db.storageBatch.put(string(accountKey), storageKey, value)
 	return nil
 }
@@ -369,7 +369,7 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 		}
 		if accountKey == nil {
 			unresolvedCount++
-			fmt.Printf("prepareStorageCommitPlans: unresolved storage entry will be dropped - storageKey=%x valueLen=%d reason=ParentKeyResolver returned nil\n",
+			prefixdbDebugf("prepareStorageCommitPlans: unresolved storage entry will be dropped - storageKey=%x valueLen=%d reason=ParentKeyResolver returned nil\n",
 				origKeyBytes, len(v))
 			continue
 		}

@@ -26,7 +26,7 @@ fi
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20500200}"
+END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble

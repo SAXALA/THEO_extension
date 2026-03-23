@@ -3366,26 +3366,7 @@ func segmentChunkMetaEqual(a, b segmentChunkMeta) bool {
 }
 
 func compareSegmentIndexKeyStarts(a, b []byte) int {
-	limit := len(a)
-	if len(b) < limit {
-		limit = len(b)
-	}
-	for i := 0; i < limit; i++ {
-		if a[i] < b[i] {
-			return -1
-		}
-		if a[i] > b[i] {
-			return 1
-		}
-	}
-	switch {
-	case len(a) < len(b):
-		return -1
-	case len(a) > len(b):
-		return 1
-	default:
-		return 0
-	}
+	return bytes.Compare(a, b)
 }
 
 var zeroSegmentIndexKeyPadding [segmentIndexKeyStartMaxBytes]byte
@@ -3660,36 +3641,11 @@ func selectSegmentL1Entry(entries []segmentIndexL1Entry, key []byte) *segmentInd
 	if len(key) == 0 {
 		return &entries[0]
 	}
-	idx := sort.Search(len(entries), func(i int) bool {
-		start := entries[i].KeyStart
-		if len(start) == 0 {
-			return false
-		}
-		return compareSegmentIndexKeyStarts(key, start) < 0
-	})
+	idx := upperBoundSegmentIndexL1Entries(entries, key)
 	if idx == 0 {
-		if len(entries[0].KeyStart) == 0 {
-			return &entries[0]
-		}
-		if compareSegmentIndexKeyStarts(key, entries[0].KeyStart) < 0 {
-			return nil
-		}
-		return &entries[0]
-	}
-	selected := &entries[idx-1]
-	if len(selected.KeyStart) == 0 {
-		return selected
-	}
-	if compareSegmentIndexKeyStarts(key, selected.KeyStart) < 0 {
 		return nil
 	}
-	if idx < len(entries) {
-		nextStart := entries[idx].KeyStart
-		if len(nextStart) > 0 && compareSegmentIndexKeyStarts(key, nextStart) >= 0 {
-			return nil
-		}
-	}
-	return selected
+	return &entries[idx-1]
 }
 
 func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]byte, appendExisting bool, chunkDir string) error {
@@ -4343,12 +4299,9 @@ func appendVarBytes(buf []byte, data []byte) ([]byte, error) {
 
 func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useLRU bool) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
 	if useLRU && db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
-			db.segmentIndexMu.Unlock()
 			return metas, segmentIndexLookupSourceL1Cache, nil
 		}
-		db.segmentIndexMu.Unlock()
 	}
 	layout, err := db.loadSegmentIndexLayout(folderPath)
 	if err != nil {
@@ -4389,9 +4342,7 @@ func (db *PrefixDB) readSegmentIndexLockedInternalByPath(folderPath string, useL
 	}
 	estimatedSize := estimateSegmentIndexSize(metas)
 	if useLRU && estimatedSize >= segmentIndexCacheThresholdBytes && db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
 		db.storageIndexCache.AddByPath(folderPath, metas)
-		db.segmentIndexMu.Unlock()
 	}
 	return metas, segmentIndexLookupSourceNoCache, nil
 }
@@ -4430,12 +4381,9 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 	// Returning the full level1 metas slice can be significantly more expensive
 	// than selecting one level2 shard and causes slower cache-hit latency.
 	if layout.mode != indexLayoutMultiLevel && db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetByPath(folderPath); ok {
-			db.segmentIndexMu.Unlock()
 			return metas, segmentIndexLookupSourceL1Cache, nil
 		}
-		db.segmentIndexMu.Unlock()
 	}
 	if layout.mode != indexLayoutMultiLevel {
 		data := layout.flatData
@@ -4466,9 +4414,7 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 		return nil, segmentIndexLookupSourceNoCache, fmt.Errorf("%w for folder %s", errSegmentIndexEntryNotFound, folderPath)
 	}
 	if db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
 		if metas, ok := db.storageIndexCache.GetLevel2ByPath(folderPath, entry.MetaID, generation); ok {
-			db.segmentIndexMu.Unlock()
 			if selectSegmentChunkMeta(metas, key) == nil {
 				fallbackMetas, fallbackSource, fallbackErr := db.readSegmentIndexLockedInternalByPath(folderPath, true)
 				if fallbackErr == nil && selectSegmentChunkMeta(fallbackMetas, key) != nil {
@@ -4477,7 +4423,6 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 			}
 			return metas, segmentIndexLookupSourceL2Cache, nil
 		}
-		db.segmentIndexMu.Unlock()
 	}
 	metas := make([]segmentChunkMeta, 0, entry.ChunkCount)
 	var arena []byte
@@ -4489,9 +4434,7 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 		return nil, segmentIndexLookupSourceNoCache, err
 	}
 	if db.storageIndexCache != nil {
-		db.segmentIndexMu.Lock()
 		db.storageIndexCache.AddLevel2ByPath(folderPath, entry.MetaID, generation, metas)
-		db.segmentIndexMu.Unlock()
 	}
 	// Guard against stale/misaligned shard boundaries in multi-level indexes.
 	// If the selected L2 shard cannot resolve the key, fall back to a full-index
@@ -4562,36 +4505,39 @@ func selectSegmentChunkMeta(metas []segmentChunkMeta, key []byte) *segmentChunkM
 	if len(key) == 0 {
 		return &metas[0]
 	}
-	idx := sort.Search(len(metas), func(i int) bool {
-		start := metas[i].KeyStart
-		if len(start) == 0 {
-			return false
-		}
-		return compareSegmentIndexKeyStarts(key, start) < 0
-	})
+	idx := upperBoundSegmentChunkMetas(metas, key)
 	if idx == 0 {
-		if len(metas[0].KeyStart) == 0 {
-			return &metas[0]
-		}
-		if compareSegmentIndexKeyStarts(key, metas[0].KeyStart) < 0 {
-			return nil
-		}
-		return &metas[0]
-	}
-	selected := &metas[idx-1]
-	if len(selected.KeyStart) == 0 {
-		return selected
-	}
-	if compareSegmentIndexKeyStarts(key, selected.KeyStart) < 0 {
 		return nil
 	}
-	if idx < len(metas) {
-		nextStart := metas[idx].KeyStart
-		if len(nextStart) > 0 && compareSegmentIndexKeyStarts(key, nextStart) >= 0 {
-			return nil
+	return &metas[idx-1]
+}
+
+func upperBoundSegmentIndexL1Entries(entries []segmentIndexL1Entry, key []byte) int {
+	lo, hi := 0, len(entries)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		start := entries[mid].KeyStart
+		if len(start) == 0 || compareSegmentIndexKeyStarts(start, key) <= 0 {
+			lo = mid + 1
+			continue
 		}
+		hi = mid
 	}
-	return selected
+	return lo
+}
+
+func upperBoundSegmentChunkMetas(metas []segmentChunkMeta, key []byte) int {
+	lo, hi := 0, len(metas)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		start := metas[mid].KeyStart
+		if len(start) == 0 || compareSegmentIndexKeyStarts(start, key) <= 0 {
+			lo = mid + 1
+			continue
+		}
+		hi = mid
+	}
+	return lo
 }
 
 func (db *PrefixDB) readSegmentChunkFile(folderID uint32, fileName string) ([]kvPair, *bufferLease, error) {

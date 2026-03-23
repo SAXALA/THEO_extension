@@ -279,11 +279,9 @@ func (c *segmentIndexCache) GetByPath(folderPath string) ([]segmentChunkMeta, bo
 	}
 	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
 	if !ok {
-		c.refreshUsage()
 		return nil, false
 	}
 	entry, _ := raw.(*segmentIndexCacheEntry)
-	c.refreshUsage()
 	if entry == nil {
 		return nil, false
 	}
@@ -300,11 +298,9 @@ func (c *segmentIndexCache) GetLevel2ByPath(folderPath string, metaID uint32, ge
 	}
 	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation))
 	if !ok {
-		c.refreshUsage()
 		return nil, false
 	}
 	entry, _ := raw.(*segmentIndexCacheEntry)
-	c.refreshUsage()
 	if entry == nil {
 		return nil, false
 	}

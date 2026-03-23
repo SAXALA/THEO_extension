@@ -1560,12 +1560,12 @@ func main() {
 	}()
 
 	// For quick debugging
-	ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
-	if ethErr != nil {
-		log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
-	}
-	defer ethBackend.Close()
-	replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+	// if ethErr != nil {
+	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+	// }
+	// defer ethBackend.Close()
+	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
 	// return
 
 	switch *mode {

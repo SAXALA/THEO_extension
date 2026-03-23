@@ -4750,3 +4750,105 @@ func TestRunStorageGCBatchMultipleJobs(t *testing.T) {
 
 	t.Logf("GC batch successfully processed %d jobs, resulting in %d chunks", len(jobs), len(updatedMetas))
 }
+
+// BenchmarkCompareSegmentIndexKeyStarts benchmarks the optimized comparison function
+func BenchmarkCompareSegmentIndexKeyStarts(b *testing.B) {
+	// Create test keys of various lengths
+	keys := [][]byte{
+		make([]byte, 8),
+		make([]byte, 16),
+		make([]byte, 24),
+		make([]byte, 32),
+	}
+	for i := range keys {
+		for j := range keys[i] {
+			keys[i][j] = byte(j + i)
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 4; j++ {
+			for k := 0; k < 4; k++ {
+				compareSegmentIndexKeyStarts(keys[j], keys[k])
+			}
+		}
+	}
+}
+
+func BenchmarkSelectSegmentChunkMeta220(b *testing.B) {
+	metas := make([]segmentChunkMeta, 220)
+	for i := range metas {
+		key := make([]byte, 32)
+		binary.BigEndian.PutUint32(key[:4], uint32(i)<<20)
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: key,
+		}
+	}
+	searchKey := append([]byte(nil), metas[137].KeyStart...)
+	searchKey[3]++
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := selectSegmentChunkMeta(metas, searchKey); got == nil {
+			b.Fatal("expected selected meta")
+		}
+	}
+}
+
+func BenchmarkSegmentIndexCacheLevel2Hit220(b *testing.B) {
+	shared := newSharedByteCache(4 * 1024 * 1024)
+	cache := newSharedSegmentIndexCache(shared)
+	folderPath := "/bench/folder"
+	const metaID uint32 = 17
+	const generation uint64 = 29
+	metas := make([]segmentChunkMeta, 220)
+	for i := range metas {
+		key := make([]byte, 32)
+		binary.BigEndian.PutUint32(key[:4], uint32(i)<<20)
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: key,
+		}
+	}
+	cache.AddLevel2ByPath(folderPath, metaID, generation, metas)
+	searchKey := append([]byte(nil), metas[137].KeyStart...)
+	searchKey[3]++
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cached, ok := cache.GetLevel2ByPath(folderPath, metaID, generation)
+		if !ok {
+			b.Fatal("expected cache hit")
+		}
+		if got := selectSegmentChunkMeta(cached, searchKey); got == nil {
+			b.Fatal("expected selected meta")
+		}
+	}
+}
+
+// BenchmarkCloneSegmentChunkMetas benchmarks the clone function
+func BenchmarkCloneSegmentChunkMetas(b *testing.B) {
+	// Create test metas of various sizes
+	for _, count := range []int{8, 16, 64, 256} {
+		metas := make([]segmentChunkMeta, count)
+		for i := range metas {
+			metas[i] = segmentChunkMeta{
+				FileName: chunkFileNameForOrdinal(uint32(i)),
+				KeyStart: make([]byte, 16),
+			}
+			for j := range metas[i].KeyStart {
+				metas[i].KeyStart[j] = byte(j)
+			}
+		}
+		b.Run(fmt.Sprintf("count-%d", count), func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = cloneSegmentChunkMetas(metas)
+			}
+		})
+	}
+}
