@@ -507,7 +507,7 @@ func writeLargeChunkFileForTest(t *testing.T, path string, entryCount int, targe
 	defer file.Close()
 
 	valueTemplate := bytes.Repeat([]byte{'x'}, 65535)
-	var header [4]byte
+	var trailer [4]byte
 	for i := 0; i < entryCount; i++ {
 		key := []byte{byte(i % 250), byte((i / 250) % 250)}
 		value := valueTemplate
@@ -515,16 +515,16 @@ func writeLargeChunkFileForTest(t *testing.T, path string, entryCount int, targe
 			key = append([]byte(nil), targetKey...)
 			value = targetValue
 		}
-		binary.BigEndian.PutUint16(header[0:2], uint16(len(key)))
-		binary.BigEndian.PutUint16(header[2:4], uint16(len(value)))
-		if _, err := file.Write(header[:]); err != nil {
-			t.Fatalf("Write header failed: %v", err)
-		}
 		if _, err := file.Write(key); err != nil {
 			t.Fatalf("Write key failed: %v", err)
 		}
 		if _, err := file.Write(value); err != nil {
 			t.Fatalf("Write value failed: %v", err)
+		}
+		binary.BigEndian.PutUint16(trailer[0:2], uint16(len(key)))
+		binary.BigEndian.PutUint16(trailer[2:4], uint16(len(value)))
+		if _, err := file.Write(trailer[:]); err != nil {
+			t.Fatalf("Write trailer failed: %v", err)
 		}
 	}
 }
@@ -1207,6 +1207,10 @@ func TestMissingFolderReadFallsBackToAccountEntry(t *testing.T) {
 		t.Fatalf("commitStorageForAccount failed: %v", err)
 	}
 	db.markAccountStorageFolder(accountKey)
+	db.storageCache.Remove(db.storageCacheKey(accountKey, []byte{0x01}))
+	if err := os.RemoveAll(db.segmentedFolderPathForAccount(accountKey)); err != nil {
+		t.Fatalf("RemoveAll segmented folder failed: %v", err)
+	}
 
 	value, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKey(accountKey, 0x01), accountKey)
 	if err != nil {
@@ -3362,10 +3366,10 @@ func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T
 	const totalChunks = 96
 	metas := make([]segmentChunkMeta, 0, totalChunks)
 	for i := 0; i < totalChunks; i++ {
-		key := []byte(fmt.Sprintf("storage-key-%03d-%s", i, strings.Repeat("k", 64)))
+		key := []byte(fmt.Sprintf("sk-%03d-%s", i, strings.Repeat("k", 20)))
 		value := []byte(fmt.Sprintf("value-%03d", i))
 		if i == totalChunks-1 {
-			key = []byte(fmt.Sprintf("storage-key-%03d-%s", 0, strings.Repeat("k", 64)))
+			key = []byte(fmt.Sprintf("sk-%03d-%s", 0, strings.Repeat("k", 20)))
 			value = []byte("value-latest")
 		}
 		entries := []kvPair{{key: key, val: value}}
@@ -3391,8 +3395,11 @@ func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T
 	if err != nil {
 		t.Fatalf("ReadFile index.meta failed: %v", err)
 	}
-	if len(rawIndex) < 4 || binary.BigEndian.Uint32(rawIndex[:4]) != compressedMetadataMagic {
-		t.Fatalf("expected compressed segment index after post-load GC")
+	if len(rawIndex) < 4 {
+		t.Fatal("expected segment index bytes after post-load GC")
+	}
+	if got := binary.BigEndian.Uint32(rawIndex[:4]); got != segmentIndexFlatMagic {
+		t.Fatalf("expected flat segment index after post-load GC, got 0x%x", got)
 	}
 
 	updatedMetas, err := db.readSegmentIndexNoCache(folderID)
@@ -3453,11 +3460,14 @@ func TestSegmentedChunkFileUsesPayloadWithoutLeadingKVCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	wantPrefix := []byte{0x00, 0x01, 0x00, 0x07}
-	if len(raw) < len(wantPrefix) || !bytes.Equal(raw[:len(wantPrefix)], wantPrefix) {
-		t.Fatalf("expected chunk to start with first kv header, got %x", raw)
+	wantSuffix := []byte{0x00, 0x01, 0x00, 0x07}
+	if len(raw) < len(wantSuffix) || !bytes.Equal(raw[len(raw)-len(wantSuffix):], wantSuffix) {
+		t.Fatalf("expected chunk to end with first kv trailer, got %x", raw)
 	}
-	if got, want := len(raw), len(wantPrefix)+1+len("value-a"); got != want {
+	if len(raw) == 0 || raw[0] != 0x0a {
+		t.Fatalf("expected chunk to start with key bytes, got %x", raw)
+	}
+	if got, want := len(raw), 1+len("value-a")+len(wantSuffix); got != want {
 		t.Fatalf("unexpected chunk size: got %d want %d", got, want)
 	}
 	if len(raw) >= 4 && binary.BigEndian.Uint32(raw[:4]) == uint32(len(entries)) {
@@ -3501,6 +3511,210 @@ func TestAppendChunkFileReadsBackWithoutLeadingKVCount(t *testing.T) {
 	}
 	if !bytes.Equal(entries[1].key, []byte{0x0b}) || !bytes.Equal(entries[1].val, []byte("value-b")) {
 		t.Fatalf("unexpected second entry after append: %+v", entries[1])
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathTailScansAndPrefetchesFollowingKeys(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	db.storageGetCacheCount = 2
+	accountKey := makeTestAccountKey(0x39)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	entries := []kvPair{
+		{key: []byte("aaaaa"), val: []byte("older-long")},
+		{key: []byte("aa"), val: []byte("target")},
+		{key: []byte("aaa"), val: []byte("newer-long")},
+		{key: []byte("b"), val: []byte("newest-short")},
+	}
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("aa")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("aa"))
+	if err != nil {
+		t.Fatalf("readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected failure: %+v", *failure)
+	}
+	if !bytes.Equal(value, []byte("target")) {
+		t.Fatalf("unexpected value: %q", value)
+	}
+
+	targetCached, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aa")))
+	if !ok {
+		t.Fatal("expected exact match to be cached")
+	}
+	if !bytes.Equal(targetCached.([]byte), []byte("target")) {
+		t.Fatalf("unexpected cached target value: %q", targetCached)
+	}
+
+	prefetched, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aaa")))
+	if !ok {
+		t.Fatal("expected following scanned key to be prefetched")
+	}
+	if !bytes.Equal(prefetched.([]byte), []byte("newer-long")) {
+		t.Fatalf("unexpected prefetched value: %q", prefetched)
+	}
+
+	prefetched, ok = db.storageCache.Get(db.storageCacheKey(accountKey, []byte("b")))
+	if !ok {
+		t.Fatal("expected following scanned key to fill remaining prefetch budget")
+	}
+	if !bytes.Equal(prefetched.([]byte), []byte("newest-short")) {
+		t.Fatalf("unexpected prefetched short value: %q", prefetched)
+	}
+
+	if _, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aaaaa"))); ok {
+		t.Fatal("expected tail scan to stop at exact match before older key")
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathMissDoesNotPrefetchPendingKeys(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	db.storageGetCacheCount = 2
+	accountKey := makeTestAccountKey(0x3a)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	entries := []kvPair{
+		{key: []byte("aaaaa"), val: []byte("older-long")},
+		{key: []byte("aaa"), val: []byte("newer-long")},
+		{key: []byte("b"), val: []byte("newest-short")},
+	}
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("aa")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("aa"))
+	if err != nil {
+		t.Fatalf("readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if value != nil {
+		t.Fatalf("expected miss to return nil value, got %q", value)
+	}
+	if failure == nil || failure.reason != "segment-chunk-key-not-found" {
+		t.Fatalf("expected key-not-found failure, got %+v", failure)
+	}
+
+	missCached, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aa")))
+	if !ok || missCached != nil {
+		t.Fatalf("expected miss marker to be cached as nil, ok=%t value=%v", ok, missCached)
+	}
+	if _, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aaa"))); ok {
+		t.Fatal("expected pending key not to be prefetched on miss")
+	}
+	if _, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("b"))); ok {
+		t.Fatal("expected pending short key not to be cached on miss")
+	}
+	if _, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("aaaaa"))); ok {
+		t.Fatal("expected older key outside prefetch budget not to be cached on miss")
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathDuplicateKeyReturnsLatestValue(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x3b)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	entries := []kvPair{
+		{key: []byte("dup"), val: []byte("older-value")},
+		{key: []byte("mid"), val: []byte("middle-value")},
+		{key: []byte("dup"), val: []byte("latest-value")},
+	}
+	if _, err := db.writeChunkFile(folderPath, chunkFileNameForOrdinal(0), entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("dup")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("dup"))
+	if err != nil {
+		t.Fatalf("readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected failure: %+v", *failure)
+	}
+	if !bytes.Equal(value, []byte("latest-value")) {
+		t.Fatalf("expected latest duplicate value, got %q", value)
+	}
+
+	cached, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("dup")))
+	if !ok {
+		t.Fatal("expected duplicate key lookup to populate cache")
+	}
+	if !bytes.Equal(cached.([]byte), []byte("latest-value")) {
+		t.Fatalf("unexpected cached duplicate value: %q", cached)
+	}
+}
+
+func TestReadSegmentedChunkToCacheByPathReturnsCorruptedFailureForTruncatedTrailer(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x3c)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	chunkPath := filepath.Join(folderPath, chunkFileNameForOrdinal(0))
+	if err := os.WriteFile(chunkPath, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("a"))
+	if err != nil {
+		t.Fatalf("readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if value != nil {
+		t.Fatalf("expected corrupted chunk read to return nil value, got %q", value)
+	}
+	if failure == nil || failure.reason != "segment-chunk-corrupted" {
+		t.Fatalf("expected corrupted failure, got %+v", failure)
+	}
+	if _, ok := db.storageCache.Get(db.storageCacheKey(accountKey, []byte("a"))); ok {
+		t.Fatal("expected corrupted chunk read not to populate storage cache")
 	}
 }
 
