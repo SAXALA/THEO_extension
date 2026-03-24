@@ -134,6 +134,32 @@ func TestSegmentIndexCacheRespectsByteBudget(t *testing.T) {
 	}
 }
 
+func TestSegmentIndexLayoutCacheRespectsSharedByteBudget(t *testing.T) {
+	cache := newSharedSegmentIndexCache(newSharedByteCache(512))
+	if cache == nil {
+		t.Fatal("expected non-nil cache")
+	}
+
+	layout1 := segmentIndexLayout{mode: indexLayoutFlat, nextMetaID: 1, flatData: bytes.Repeat([]byte{0x01}, 320)}
+	layout2 := segmentIndexLayout{mode: indexLayoutFlat, nextMetaID: 2, flatData: bytes.Repeat([]byte{0x02}, 320)}
+
+	cache.AddLayoutByPath("folder-1", layout1)
+	if got, ok := cache.GetLayoutByPath("folder-1"); !ok || len(got.flatData) != len(layout1.flatData) {
+		t.Fatal("expected first layout cache entry to exist")
+	}
+
+	cache.AddLayoutByPath("folder-2", layout2)
+	if got, ok := cache.GetLayoutByPath("folder-2"); !ok || len(got.flatData) != len(layout2.flatData) {
+		t.Fatal("expected second layout cache entry to exist")
+	}
+	if _, ok := cache.GetLayoutByPath("folder-1"); ok {
+		t.Fatal("expected first layout cache entry to be evicted after exceeding byte budget")
+	}
+	if cache.usedBytes > cache.capacityBytes {
+		t.Fatalf("layout cache exceeds byte budget: used=%d capacity=%d", cache.usedBytes, cache.capacityBytes)
+	}
+}
+
 func TestSharedCacheEvictsAcrossCacheTypes(t *testing.T) {
 	shared := newSharedByteCache(1024)
 	nodeCache := newSharedNodeCache(shared)
@@ -222,6 +248,69 @@ func TestSharedCacheHybridPolicyKeepsFrequentOldEntry(t *testing.T) {
 	}
 	if shared.usedBytes > shared.capacityBytes {
 		t.Fatalf("shared cache exceeds total budget: used=%d capacity=%d", shared.usedBytes, shared.capacityBytes)
+	}
+}
+
+func TestSharedCacheGetNoTouchDoesNotPromoteEntry(t *testing.T) {
+	shared := newSharedByteCache(3)
+	shared.Add(sharedCacheNamespaceStorage, "a", []byte{0x01}, 1)
+	shared.Add(sharedCacheNamespaceStorage, "b", []byte{0x02}, 1)
+	shared.Add(sharedCacheNamespaceStorage, "c", []byte{0x03}, 1)
+
+	for i := 0; i < 5; i++ {
+		if _, ok := shared.GetNoTouch(sharedCacheNamespaceStorage, "a"); !ok {
+			t.Fatal("expected a to remain present during no-touch reads")
+		}
+	}
+
+	shared.Add(sharedCacheNamespaceStorage, "d", []byte{0x04}, 1)
+
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "a"); ok {
+		t.Fatal("expected a to be evicted because no-touch reads should not promote it")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "d"); !ok {
+		t.Fatal("expected newest entry d to be cached")
+	}
+	stats := shared.LockStatsSnapshot()
+	if stats.GetNoTouch.Count < 5 {
+		t.Fatalf("expected no-touch reads to be recorded, got count=%d", stats.GetNoTouch.Count)
+	}
+}
+
+func TestStoragePrefetchStatsTrackLaterCacheHit(t *testing.T) {
+	db := &PrefixDB{
+		sharedCache:   newSharedByteCache(1024),
+		storageCache:  newSharedStorageValueCache(newSharedByteCache(1024)),
+	}
+	accountKey := []byte("acct")
+	storageKey := []byte("slot")
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+
+	db.addStorageCacheValue(accountKey, storageKey, []byte("value"), true)
+	if got := db.storagePrefetchPendingCount(); got != 1 {
+		t.Fatalf("expected one pending prefetched entry, got %d", got)
+	}
+	if count := atomic.LoadUint64(&db.trieStoragePrefetchStats.addCount); count != 1 {
+		t.Fatalf("expected one prefetch add, got %d", count)
+	}
+	if bytes := atomic.LoadUint64(&db.trieStoragePrefetchStats.addBytes); bytes != uint64(len("value")) {
+		t.Fatalf("expected prefetch add bytes %d, got %d", len("value"), bytes)
+	}
+
+	value, ok := db.storageCache.Get(cacheKey)
+	if !ok {
+		t.Fatal("expected prefetched cache value to exist")
+	}
+	db.noteStoragePrefetchHit(cacheKey, value)
+
+	if got := db.storagePrefetchPendingCount(); got != 0 {
+		t.Fatalf("expected prefetched entry to be consumed, got pending=%d", got)
+	}
+	if count := atomic.LoadUint64(&db.trieStoragePrefetchStats.hitCount); count != 1 {
+		t.Fatalf("expected one prefetch hit, got %d", count)
+	}
+	if bytes := atomic.LoadUint64(&db.trieStoragePrefetchStats.hitBytes); bytes != uint64(len("value")) {
+		t.Fatalf("expected prefetch hit bytes %d, got %d", len("value"), bytes)
 	}
 }
 
@@ -1336,6 +1425,87 @@ func TestParseMultiLevelLayoutSupportsFixedWidthKeyStarts(t *testing.T) {
 	}
 	if parsed.nextMetaID != layout.nextMetaID {
 		t.Fatalf("parsed nextMetaID mismatch: got %d want %d", parsed.nextMetaID, layout.nextMetaID)
+	}
+}
+
+func TestLoadSegmentIndexLayoutCachesMultipleFolders(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	folderPath1 := filepath.Join(baseDir, "seg-1")
+	folderPath2 := filepath.Join(baseDir, "seg-2")
+	if err := os.MkdirAll(folderPath1, 0o755); err != nil {
+		t.Fatalf("MkdirAll folder1 failed: %v", err)
+	}
+	if err := os.MkdirAll(folderPath2, 0o755); err != nil {
+		t.Fatalf("MkdirAll folder2 failed: %v", err)
+	}
+
+	layout1 := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 3,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 1, ChunkCount: 2, KeyStart: []byte{0x10}},
+			{MetaID: 2, ChunkCount: 1, KeyStart: []byte{0x20}},
+		},
+	}
+	layout2 := segmentIndexLayout{
+		mode:       indexLayoutMultiLevel,
+		nextMetaID: 2,
+		entries: []segmentIndexL1Entry{
+			{MetaID: 1, ChunkCount: 4, KeyStart: []byte{0x80}},
+		},
+	}
+
+	buf1, err := encodeTopLevelIndex(layout1)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex layout1 failed: %v", err)
+	}
+	buf2, err := encodeTopLevelIndex(layout2)
+	if err != nil {
+		t.Fatalf("encodeTopLevelIndex layout2 failed: %v", err)
+	}
+	if err := db.writeSegmentIndexFileAtomic(filepath.Join(folderPath1, segmentIndexFileName), buf1); err != nil {
+		t.Fatalf("write layout1 failed: %v", err)
+	}
+	if err := db.writeSegmentIndexFileAtomic(filepath.Join(folderPath2, segmentIndexFileName), buf2); err != nil {
+		t.Fatalf("write layout2 failed: %v", err)
+	}
+
+	got1, err := db.loadSegmentIndexLayout(folderPath1)
+	if err != nil {
+		t.Fatalf("loadSegmentIndexLayout folder1 failed: %v", err)
+	}
+	got2, err := db.loadSegmentIndexLayout(folderPath2)
+	if err != nil {
+		t.Fatalf("loadSegmentIndexLayout folder2 failed: %v", err)
+	}
+	got1Again, err := db.loadSegmentIndexLayout(folderPath1)
+	if err != nil {
+		t.Fatalf("loadSegmentIndexLayout folder1 again failed: %v", err)
+	}
+
+	if !layoutEntriesEqual(got1.entries, layout1.entries) || got1.nextMetaID != layout1.nextMetaID {
+		t.Fatalf("folder1 layout mismatch: got %+v want %+v", got1, layout1)
+	}
+	if !layoutEntriesEqual(got2.entries, layout2.entries) || got2.nextMetaID != layout2.nextMetaID {
+		t.Fatalf("folder2 layout mismatch: got %+v want %+v", got2, layout2)
+	}
+	if !layoutEntriesEqual(got1Again.entries, layout1.entries) || got1Again.nextMetaID != layout1.nextMetaID {
+		t.Fatalf("folder1 cached layout mismatch after folder2 access: got %+v want %+v", got1Again, layout1)
+	}
+	if db.storageIndexCache == nil {
+		t.Fatal("expected storageIndexCache to be configured")
+	}
+	if _, ok := db.storageIndexCache.GetLayoutByPath(folderPath1); !ok {
+		t.Fatal("expected folder1 layout to be stored in shared cache")
+	}
+	if _, ok := db.storageIndexCache.GetLayoutByPath(folderPath2); !ok {
+		t.Fatal("expected folder2 layout to be stored in shared cache")
 	}
 }
 

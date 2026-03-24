@@ -259,6 +259,16 @@ type trieStorageSegmentIndexLayerStats struct {
 	l2CacheNanos uint64
 }
 
+type trieStoragePrefetchStats struct {
+	addCount    uint64
+	addBytes    uint64
+	addNilCount uint64
+	hitCount    uint64
+	hitBytes    uint64
+	hitNilCount uint64
+	clearCount  uint64
+}
+
 type PrefixDB struct {
 	prefixTree  *PrefixTree
 	accountFile *os.File
@@ -300,10 +310,6 @@ type PrefixDB struct {
 	storageIndexPartialMetas      []segmentChunkMeta
 	storageIndexPartialReusable   bool
 	storageIndexPartialArena      []byte
-
-	storageIndexLayoutPath  string
-	storageIndexLayoutCache segmentIndexLayout
-	storageIndexLayoutReady bool
 
 	storageGCQueue    chan storageGCJob
 	storageGCInFlight map[string]struct{}
@@ -352,7 +358,10 @@ type PrefixDB struct {
 	trieStorageAccountEntryStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexLayerStats trieStorageSegmentIndexLayerStats
+	trieStoragePrefetchStats          trieStoragePrefetchStats
 	trieStorageKVStats                trieStorageGetBreakdownStepStats
+	storagePrefetchMu                 sync.Mutex
+	storagePrefetchPending            map[string]struct{}
 
 	// nodeCache access stats (read path)
 	nodeCacheLookups uint64
@@ -653,8 +662,10 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 	}
 
 	storageCacheStart := time.Now()
-	if value, ok := db.storageCache.Get(db.storageCacheKey(accountKey, storageKey)); ok {
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+	if value, ok := db.storageCache.Get(cacheKey); ok {
 		recordTrieStorageGetBreakdownStep(&db.trieStorageKVStats, true, time.Since(storageCacheStart))
+		db.noteStoragePrefetchHit(cacheKey, value)
 		if value == nil {
 			db.logStorageKVReadFailure(storageKey, accountKey, "storage-cache-tombstone", nil)
 			return nil, false, nil
@@ -780,7 +791,7 @@ func (db *PrefixDB) putStorage(key, value, accountKey []byte) error {
 	}
 	if db.storageCache != nil {
 		if accountKey != nil {
-			db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
+			db.removeStorageCacheValue(accountKey, storageKey)
 		}
 	}
 
@@ -1116,7 +1127,7 @@ func (db *PrefixDB) deleteStorage(key, accountKey []byte) error {
 
 	if db.storageCache != nil {
 		if accountKey != nil {
-			db.storageCache.Remove(db.storageCacheKey(accountKey, storageKey))
+			db.removeStorageCacheValue(accountKey, storageKey)
 		}
 	}
 
@@ -1674,6 +1685,63 @@ func printTrieStorageSegmentIndexLayerStats(stats *trieStorageSegmentIndexLayerS
 	)
 }
 
+func printSharedCacheLockOpStats(label string, stats sharedCacheLockOpSnapshot) {
+	if stats.Count == 0 {
+		return
+	}
+	waitAvgMicros := float64(stats.WaitNanos) / float64(stats.Count) / 1000.0
+	holdAvgMicros := float64(stats.HoldNanos) / float64(stats.Count) / 1000.0
+	fmt.Printf("PrefixDB shared cache lock stats [%s]: count=%d waitTotal=%s waitAvg=%0.2fus holdTotal=%s holdAvg=%0.2fus\n",
+		label,
+		stats.Count,
+		time.Duration(stats.WaitNanos),
+		waitAvgMicros,
+		time.Duration(stats.HoldNanos),
+		holdAvgMicros,
+	)
+}
+
+func printSharedCacheLockStats(shared *sharedByteCache) {
+	if shared == nil {
+		return
+	}
+	stats := shared.LockStatsSnapshot()
+	printSharedCacheLockOpStats("get-touch", stats.GetTouch)
+	printSharedCacheLockOpStats("get-notouch", stats.GetNoTouch)
+	printSharedCacheLockOpStats("add", stats.Add)
+	printSharedCacheLockOpStats("remove", stats.Remove)
+	printSharedCacheLockOpStats("namespace", stats.Namespace)
+}
+
+func printTrieStoragePrefetchStats(db *PrefixDB) {
+	if db == nil {
+		return
+	}
+	addCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.addCount)
+	addBytes := atomic.LoadUint64(&db.trieStoragePrefetchStats.addBytes)
+	addNilCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.addNilCount)
+	hitCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.hitCount)
+	hitBytes := atomic.LoadUint64(&db.trieStoragePrefetchStats.hitBytes)
+	hitNilCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.hitNilCount)
+	clearCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.clearCount)
+	pendingCount := db.storagePrefetchPendingCount()
+	hitRate := 0.0
+	if addCount > 0 {
+		hitRate = float64(hitCount) / float64(addCount) * 100.0
+	}
+	fmt.Printf("PrefixDB storage prefetch stats: addCount=%d addBytes=%d addNilCount=%d hitCount=%d hitBytes=%d hitNilCount=%d clearCount=%d pendingCount=%d hitRate=%0.2f%%\n",
+		addCount,
+		addBytes,
+		addNilCount,
+		hitCount,
+		hitBytes,
+		hitNilCount,
+		clearCount,
+		pendingCount,
+		hitRate,
+	)
+}
+
 func (db *PrefixDB) Close() error {
 	errs := []error{}
 	// Flush any pending storage batch writes before tearing down files.
@@ -1715,6 +1783,8 @@ func (db *PrefixDB) Close() error {
 	printTrieStorageGetBreakdownStep("account-entry", &db.trieStorageAccountEntryStats)
 	printTrieStorageGetBreakdownStep("segment-index", &db.trieStorageSegmentIndexStats)
 	printTrieStorageSegmentIndexLayerStats(&db.trieStorageSegmentIndexLayerStats)
+	printSharedCacheLockStats(db.sharedCache)
+	printTrieStoragePrefetchStats(db)
 	printTrieStorageGetBreakdownStep("storage-kv-pairs", &db.trieStorageKVStats)
 	lookups := atomic.LoadUint64(&db.nodeCacheLookups)
 	hits := atomic.LoadUint64(&db.nodeCacheHits)
@@ -3701,13 +3771,11 @@ func decodeSegmentIndexBuffer(data []byte, metas *[]segmentChunkMeta, arena *[]b
 }
 
 func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayout, error) {
-	db.segmentIndexMu.Lock()
-	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == folderPath {
-		layout := db.storageIndexLayoutCache
-		db.segmentIndexMu.Unlock()
-		return layout, nil
+	if db.storageIndexCache != nil {
+		if layout, ok := db.storageIndexCache.GetLayoutByPath(folderPath); ok {
+			return layout, nil
+		}
 	}
-	db.segmentIndexMu.Unlock()
 
 	indexPath := filepath.Join(folderPath, segmentIndexFileName)
 	data, err := db.readSegmentIndexFile(indexPath)
@@ -3729,11 +3797,9 @@ func (db *PrefixDB) loadSegmentIndexLayout(folderPath string) (segmentIndexLayou
 			return segmentIndexLayout{}, err
 		}
 	}
-	db.segmentIndexMu.Lock()
-	db.storageIndexLayoutPath = folderPath
-	db.storageIndexLayoutCache = layout
-	db.storageIndexLayoutReady = true
-	db.segmentIndexMu.Unlock()
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.AddLayoutByPath(folderPath, layout)
+	}
 	return layout, nil
 }
 
@@ -4232,13 +4298,7 @@ func (db *PrefixDB) invalidateSegmentIndexCacheByPath(folderPath string) {
 	}
 	if db.storageIndexCache != nil {
 		db.storageIndexCache.RemoveByPath(folderPath)
-	}
-	if db.storageIndexLayoutReady {
-		if db.storageIndexLayoutPath == folderPath {
-			db.storageIndexLayoutReady = false
-			db.storageIndexLayoutPath = ""
-			db.storageIndexLayoutCache = segmentIndexLayout{}
-		}
+		db.storageIndexCache.RemoveLayoutByPath(folderPath)
 	}
 }
 
@@ -4274,11 +4334,7 @@ func (db *PrefixDB) refreshSegmentIndexCacheByPathLocked(folderPath string, meta
 	}
 	if db.storageIndexCache != nil {
 		db.storageIndexCache.AddByPath(folderPath, cloned)
-	}
-	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == folderPath {
-		db.storageIndexLayoutReady = false
-		db.storageIndexLayoutPath = ""
-		db.storageIndexLayoutCache = segmentIndexLayout{}
+		db.storageIndexCache.RemoveLayoutByPath(folderPath)
 	}
 }
 
@@ -4473,6 +4529,43 @@ func cloneSegmentChunkMetas(src []segmentChunkMeta) []segmentChunkMeta {
 		dst[i].KeyStart = cloneBytes(src[i].KeyStart)
 	}
 	return dst
+}
+
+func cloneSegmentIndexLayout(src segmentIndexLayout) segmentIndexLayout {
+	dst := segmentIndexLayout{
+		mode:       src.mode,
+		nextMetaID: src.nextMetaID,
+	}
+	if len(src.flatData) > 0 {
+		dst.flatData = cloneBytes(src.flatData)
+	}
+	if len(src.entries) == 0 {
+		return dst
+	}
+	dst.entries = make([]segmentIndexL1Entry, len(src.entries))
+	for i := range src.entries {
+		dst.entries[i] = segmentIndexL1Entry{
+			MetaID:     src.entries[i].MetaID,
+			ChunkCount: src.entries[i].ChunkCount,
+			KeyStart:   cloneBytes(src.entries[i].KeyStart),
+			KeyEnd:     cloneBytes(src.entries[i].KeyEnd),
+		}
+	}
+	return dst
+}
+
+func estimateSegmentIndexLayoutMemory(layout segmentIndexLayout) uint64 {
+	total := uint64(unsafe.Sizeof(segmentIndexLayout{}))
+	total += uint64(len(layout.flatData))
+	total += uint64(len(layout.entries)) * uint64(unsafe.Sizeof(segmentIndexL1Entry{}))
+	for i := range layout.entries {
+		total += uint64(len(layout.entries[i].KeyStart))
+		total += uint64(len(layout.entries[i].KeyEnd))
+	}
+	if total == 0 {
+		return 1
+	}
+	return total
 }
 
 func estimateSegmentChunkMetasMemory(metas []segmentChunkMeta) uint64 {
@@ -4789,20 +4882,20 @@ func (db *PrefixDB) readSegmentedChunkToCacheStreamingByPath(folderPath string, 
 	}
 	if !exactFound {
 		if cache != nil {
-			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
+			db.addStorageCacheValue(accountKey, storageKey, nil, false)
 		}
 		failure.reason = "segment-chunk-key-not-found"
 		return nil, failure, nil
 	}
 	if exactTombstone {
 		if cache != nil {
-			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
+			db.addStorageCacheValue(accountKey, storageKey, nil, false)
 		}
 		failure.reason = "segment-chunk-tombstone"
 		return nil, failure, nil
 	}
 	if cache != nil {
-		cache.Add(db.storageCacheKey(accountKey, storageKey), append([]byte(nil), exactValue...))
+		db.addStorageCacheValue(accountKey, storageKey, exactValue, false)
 	}
 	return exactValue, nil, nil
 }
@@ -5082,20 +5175,18 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 					if bytes.Equal(key, storageKey) {
 						if value == nil {
 							ret = nil
-							db.storageCache.Add(db.storageCacheKey(accountKey, key), nil)
+							db.addStorageCacheValue(accountKey, key, nil, false)
 						} else {
 							ret = append([]byte(nil), value...)
-							valueCopy := append([]byte(nil), value...)
-							db.storageCache.Add(db.storageCacheKey(accountKey, key), valueCopy)
+							db.addStorageCacheValue(accountKey, key, value, false)
 						}
 						hit = true
 					}
 					if hit && count < 16 {
 						if value == nil {
-							db.storageCache.Add(db.storageCacheKey(accountKey, key), nil)
+							db.addStorageCacheValue(accountKey, key, nil, !bytes.Equal(key, storageKey))
 						} else {
-							valueCopy := append([]byte(nil), value...)
-							db.storageCache.Add(db.storageCacheKey(accountKey, key), valueCopy)
+							db.addStorageCacheValue(accountKey, key, value, !bytes.Equal(key, storageKey))
 						}
 						count++
 					}
@@ -5106,7 +5197,7 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 				db.logLargeLogReadFailure(accountKey, storageKey, p, fileID, offset, size, "corrupted-storage-segment", io.ErrUnexpectedEOF)
 			}
 			if !hit && !malformed {
-				db.storageCache.Add(db.storageCacheKey(accountKey, storageKey), nil)
+				db.addStorageCacheValue(accountKey, storageKey, nil, false)
 			}
 		}
 	}
@@ -5376,6 +5467,94 @@ func (db *PrefixDB) storageCacheKey(accountKey, storageKey []byte) string {
 	return b.String()
 }
 
+func (db *PrefixDB) storagePrefetchPendingCount() int {
+	if db == nil {
+		return 0
+	}
+	db.storagePrefetchMu.Lock()
+	defer db.storagePrefetchMu.Unlock()
+	return len(db.storagePrefetchPending)
+}
+
+func (db *PrefixDB) recordStoragePrefetchAdd(cacheKey string, value []byte) {
+	if db == nil || cacheKey == "" {
+		return
+	}
+	atomic.AddUint64(&db.trieStoragePrefetchStats.addCount, 1)
+	if value == nil {
+		atomic.AddUint64(&db.trieStoragePrefetchStats.addNilCount, 1)
+	} else {
+		atomic.AddUint64(&db.trieStoragePrefetchStats.addBytes, uint64(len(value)))
+	}
+	db.storagePrefetchMu.Lock()
+	if db.storagePrefetchPending == nil {
+		db.storagePrefetchPending = make(map[string]struct{})
+	}
+	db.storagePrefetchPending[cacheKey] = struct{}{}
+	db.storagePrefetchMu.Unlock()
+}
+
+func (db *PrefixDB) clearStoragePrefetch(cacheKey string) {
+	if db == nil || cacheKey == "" {
+		return
+	}
+	db.storagePrefetchMu.Lock()
+	if _, ok := db.storagePrefetchPending[cacheKey]; ok {
+		delete(db.storagePrefetchPending, cacheKey)
+		atomic.AddUint64(&db.trieStoragePrefetchStats.clearCount, 1)
+	}
+	db.storagePrefetchMu.Unlock()
+}
+
+func (db *PrefixDB) noteStoragePrefetchHit(cacheKey string, value interface{}) {
+	if db == nil || cacheKey == "" {
+		return
+	}
+	db.storagePrefetchMu.Lock()
+	if _, ok := db.storagePrefetchPending[cacheKey]; !ok {
+		db.storagePrefetchMu.Unlock()
+		return
+	}
+	delete(db.storagePrefetchPending, cacheKey)
+	db.storagePrefetchMu.Unlock()
+	atomic.AddUint64(&db.trieStoragePrefetchStats.hitCount, 1)
+	if value == nil {
+		atomic.AddUint64(&db.trieStoragePrefetchStats.hitNilCount, 1)
+		return
+	}
+	if valueBytes, ok := value.([]byte); ok {
+		atomic.AddUint64(&db.trieStoragePrefetchStats.hitBytes, uint64(len(valueBytes)))
+	}
+}
+
+func (db *PrefixDB) addStorageCacheValueByKey(cacheKey string, value []byte, prefetched bool) {
+	if db == nil || db.storageCache == nil || cacheKey == "" {
+		return
+	}
+	if prefetched {
+		db.recordStoragePrefetchAdd(cacheKey, value)
+	} else {
+		db.clearStoragePrefetch(cacheKey)
+	}
+	db.storageCache.Add(cacheKey, value)
+}
+
+func (db *PrefixDB) addStorageCacheValue(accountKey, storageKey, value []byte, prefetched bool) {
+	if db == nil || len(accountKey) == 0 || len(storageKey) == 0 {
+		return
+	}
+	db.addStorageCacheValueByKey(db.storageCacheKey(accountKey, storageKey), value, prefetched)
+}
+
+func (db *PrefixDB) removeStorageCacheValue(accountKey, storageKey []byte) {
+	if db == nil || db.storageCache == nil || len(accountKey) == 0 || len(storageKey) == 0 {
+		return
+	}
+	cacheKey := db.storageCacheKey(accountKey, storageKey)
+	db.clearStoragePrefetch(cacheKey)
+	db.storageCache.Remove(cacheKey)
+}
+
 func (db *PrefixDB) syncStorageCacheEntries(accountKey []byte, kvs []kvPair) {
 	if db == nil || db.storageCache == nil || len(accountKey) == 0 || len(kvs) == 0 {
 		return
@@ -5383,10 +5562,10 @@ func (db *PrefixDB) syncStorageCacheEntries(accountKey []byte, kvs []kvPair) {
 	for _, kv := range kvs {
 		cacheKey := db.storageCacheKey(accountKey, kv.key)
 		if kv.val == nil {
-			db.storageCache.Add(cacheKey, nil)
+			db.addStorageCacheValueByKey(cacheKey, nil, false)
 			continue
 		}
-		db.storageCache.Add(cacheKey, kv.val)
+		db.addStorageCacheValueByKey(cacheKey, kv.val, false)
 	}
 }
 
@@ -5417,12 +5596,8 @@ func isSegmentedStorage(fileID uint32) bool {
 }
 
 func (db *PrefixDB) invalidateSegmentIndexLayoutForPath(folderPath string) {
-	db.segmentIndexMu.Lock()
-	defer db.segmentIndexMu.Unlock()
-	if db.storageIndexLayoutReady && db.storageIndexLayoutPath == folderPath {
-		db.storageIndexLayoutReady = false
-		db.storageIndexLayoutPath = ""
-		db.storageIndexLayoutCache = segmentIndexLayout{}
+	if db.storageIndexCache != nil {
+		db.storageIndexCache.RemoveLayoutByPath(folderPath)
 	}
 }
 
@@ -6123,9 +6298,9 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 		}
 		if hit && prefetchLimit > 0 && count < prefetchLimit && bytes.HasPrefix(key, storageKey) && cache != nil {
 			if value == nil {
-				cache.Add(db.storageCacheKey(accountKey, key), nil)
+				db.addStorageCacheValue(accountKey, key, nil, true)
 			} else {
-				cache.Add(db.storageCacheKey(accountKey, key), append([]byte(nil), value...))
+				db.addStorageCacheValue(accountKey, key, value, true)
 			}
 			count++
 		}
@@ -6133,7 +6308,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	}
 	if !exactFound {
 		if cache != nil {
-			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
+			db.addStorageCacheValue(accountKey, storageKey, nil, false)
 		}
 		lease = nil
 		failure.reason = "segment-chunk-key-not-found"
@@ -6141,7 +6316,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	}
 	if exactTombstone {
 		if cache != nil {
-			cache.Add(db.storageCacheKey(accountKey, storageKey), nil)
+			db.addStorageCacheValue(accountKey, storageKey, nil, false)
 		}
 		lease = nil
 		failure.reason = "segment-chunk-tombstone"
@@ -6149,7 +6324,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 	}
 	result := append([]byte(nil), exactValue...)
 	if cache != nil {
-		cache.Add(db.storageCacheKey(accountKey, storageKey), append([]byte(nil), exactValue...))
+		db.addStorageCacheValue(accountKey, storageKey, exactValue, false)
 	}
 	lease = nil
 	return result, nil, nil

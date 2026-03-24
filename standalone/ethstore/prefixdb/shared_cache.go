@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -34,16 +36,45 @@ type sharedCacheEntry struct {
 	lastTouch uint64
 }
 
+type sharedCacheLockOpStats struct {
+	count     uint64
+	waitNanos uint64
+	holdNanos uint64
+}
+
+type sharedCacheLockOpSnapshot struct {
+	Count     uint64
+	WaitNanos uint64
+	HoldNanos uint64
+}
+
+type sharedCacheLockStats struct {
+	getTouch   sharedCacheLockOpStats
+	getNoTouch sharedCacheLockOpStats
+	add        sharedCacheLockOpStats
+	remove     sharedCacheLockOpStats
+	namespace  sharedCacheLockOpStats
+}
+
+type sharedCacheLockStatsSnapshot struct {
+	GetTouch   sharedCacheLockOpSnapshot
+	GetNoTouch sharedCacheLockOpSnapshot
+	Add        sharedCacheLockOpSnapshot
+	Remove     sharedCacheLockOpSnapshot
+	Namespace  sharedCacheLockOpSnapshot
+}
+
 const sharedCacheEvictionSample = 16 // lower means more close to pure LRU, higher means more LFU influence
 
 type sharedByteCache struct {
-	mu             sync.Mutex
+	mu             sync.RWMutex
 	capacityBytes  uint64
 	usedBytes      uint64
 	namespaceUsage map[sharedCacheNamespace]uint64
 	ll             *list.List
 	items          map[sharedCacheCompositeKey]*list.Element
 	clock          uint64
+	lockStats      sharedCacheLockStats
 }
 
 func newSharedByteCache(capacityBytes uint64) *sharedByteCache {
@@ -62,8 +93,8 @@ func (c *sharedByteCache) Get(namespace sharedCacheNamespace, key string) (inter
 	if c == nil || key == "" {
 		return nil, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	acquiredAt := c.lockWrite(&c.lockStats.getTouch)
+	defer c.unlockWrite(&c.lockStats.getTouch, acquiredAt)
 	lookup := sharedCacheCompositeKey{namespace: namespace, key: key}
 	elem, ok := c.items[lookup]
 	if !ok {
@@ -71,6 +102,24 @@ func (c *sharedByteCache) Get(namespace sharedCacheNamespace, key string) (inter
 	}
 	entry := elem.Value.(*sharedCacheEntry)
 	c.touchEntryLocked(elem, entry)
+	return entry.value, true
+}
+
+func (c *sharedByteCache) GetNoTouch(namespace sharedCacheNamespace, key string) (interface{}, bool) {
+	if c == nil || key == "" {
+		return nil, false
+	}
+	acquiredAt := c.lockRead(&c.lockStats.getNoTouch)
+	defer c.unlockRead(&c.lockStats.getNoTouch, acquiredAt)
+	lookup := sharedCacheCompositeKey{namespace: namespace, key: key}
+	elem, ok := c.items[lookup]
+	if !ok {
+		return nil, false
+	}
+	entry, _ := elem.Value.(*sharedCacheEntry)
+	if entry == nil {
+		return nil, false
+	}
 	return entry.value, true
 }
 
@@ -83,8 +132,8 @@ func (c *sharedByteCache) Add(namespace sharedCacheNamespace, key string, value 
 	}
 	lookup := sharedCacheCompositeKey{namespace: namespace, key: key}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	acquiredAt := c.lockWrite(&c.lockStats.add)
+	defer c.unlockWrite(&c.lockStats.add, acquiredAt)
 	freq := uint32(1)
 	if existing, ok := c.items[lookup]; ok {
 		freq = existing.Value.(*sharedCacheEntry).freq
@@ -119,8 +168,8 @@ func (c *sharedByteCache) Remove(namespace sharedCacheNamespace, key string) {
 		return
 	}
 	lookup := sharedCacheCompositeKey{namespace: namespace, key: key}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	acquiredAt := c.lockWrite(&c.lockStats.remove)
+	defer c.unlockWrite(&c.lockStats.remove, acquiredAt)
 	if elem, ok := c.items[lookup]; ok {
 		c.removeElementLocked(elem)
 	}
@@ -130,9 +179,69 @@ func (c *sharedByteCache) NamespaceStats(namespace sharedCacheNamespace) (usedBy
 	if c == nil {
 		return 0, 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	acquiredAt := c.lockRead(&c.lockStats.namespace)
+	defer c.unlockRead(&c.lockStats.namespace, acquiredAt)
 	return c.namespaceUsage[namespace], c.capacityBytes
+}
+
+func (c *sharedByteCache) LockStatsSnapshot() sharedCacheLockStatsSnapshot {
+	if c == nil {
+		return sharedCacheLockStatsSnapshot{}
+	}
+	return sharedCacheLockStatsSnapshot{
+		GetTouch:   snapshotSharedCacheLockOpStats(&c.lockStats.getTouch),
+		GetNoTouch: snapshotSharedCacheLockOpStats(&c.lockStats.getNoTouch),
+		Add:        snapshotSharedCacheLockOpStats(&c.lockStats.add),
+		Remove:     snapshotSharedCacheLockOpStats(&c.lockStats.remove),
+		Namespace:  snapshotSharedCacheLockOpStats(&c.lockStats.namespace),
+	}
+}
+
+func snapshotSharedCacheLockOpStats(stats *sharedCacheLockOpStats) sharedCacheLockOpSnapshot {
+	if stats == nil {
+		return sharedCacheLockOpSnapshot{}
+	}
+	return sharedCacheLockOpSnapshot{
+		Count:     atomic.LoadUint64(&stats.count),
+		WaitNanos: atomic.LoadUint64(&stats.waitNanos),
+		HoldNanos: atomic.LoadUint64(&stats.holdNanos),
+	}
+}
+
+func (c *sharedByteCache) lockWrite(stats *sharedCacheLockOpStats) time.Time {
+	start := time.Now()
+	c.mu.Lock()
+	acquiredAt := time.Now()
+	if stats != nil {
+		atomic.AddUint64(&stats.count, 1)
+		atomic.AddUint64(&stats.waitNanos, uint64(acquiredAt.Sub(start)))
+	}
+	return acquiredAt
+}
+
+func (c *sharedByteCache) unlockWrite(stats *sharedCacheLockOpStats, acquiredAt time.Time) {
+	if stats != nil {
+		atomic.AddUint64(&stats.holdNanos, uint64(time.Since(acquiredAt)))
+	}
+	c.mu.Unlock()
+}
+
+func (c *sharedByteCache) lockRead(stats *sharedCacheLockOpStats) time.Time {
+	start := time.Now()
+	c.mu.RLock()
+	acquiredAt := time.Now()
+	if stats != nil {
+		atomic.AddUint64(&stats.count, 1)
+		atomic.AddUint64(&stats.waitNanos, uint64(acquiredAt.Sub(start)))
+	}
+	return acquiredAt
+}
+
+func (c *sharedByteCache) unlockRead(stats *sharedCacheLockOpStats, acquiredAt time.Time) {
+	if stats != nil {
+		atomic.AddUint64(&stats.holdNanos, uint64(time.Since(acquiredAt)))
+	}
+	c.mu.RUnlock()
 }
 
 func (c *sharedByteCache) removeElementLocked(elem *list.Element) {
@@ -251,6 +360,11 @@ type segmentIndexCacheEntry struct {
 	sizeBytes uint64
 }
 
+type segmentIndexLayoutCacheEntry struct {
+	layout    segmentIndexLayout
+	sizeBytes uint64
+}
+
 type segmentIndexCache struct {
 	shared        *sharedByteCache
 	capacityBytes uint64
@@ -311,6 +425,21 @@ func (c *segmentIndexCache) GetLevel2(folderID uint32, metaID uint32, generation
 	return c.GetLevel2ByPath(segmentIndexFolderIDCacheKey(folderID), metaID, generation)
 }
 
+func (c *segmentIndexCache) GetLayoutByPath(folderPath string) (segmentIndexLayout, bool) {
+	if c == nil {
+		return segmentIndexLayout{}, false
+	}
+	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+	if !ok {
+		return segmentIndexLayout{}, false
+	}
+	entry, _ := raw.(*segmentIndexLayoutCacheEntry)
+	if entry == nil {
+		return segmentIndexLayout{}, false
+	}
+	return entry.layout, true
+}
+
 func (c *segmentIndexCache) AddByPath(folderPath string, metas []segmentChunkMeta) {
 	if c == nil {
 		return
@@ -357,6 +486,24 @@ func (c *segmentIndexCache) AddLevel2(folderID uint32, metaID uint32, generation
 	c.AddLevel2ByPath(segmentIndexFolderIDCacheKey(folderID), metaID, generation, metas)
 }
 
+func (c *segmentIndexCache) AddLayoutByPath(folderPath string, layout segmentIndexLayout) {
+	if c == nil {
+		return
+	}
+	sizeBytes := estimateSegmentIndexLayoutMemory(layout)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+		c.refreshUsage()
+		return
+	}
+	entry := &segmentIndexLayoutCacheEntry{
+		layout:    cloneSegmentIndexLayout(layout),
+		sizeBytes: sizeBytes,
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath), entry, sizeBytes)
+	c.refreshUsage()
+}
+
 func (c *segmentIndexCache) RemoveByPath(folderPath string) {
 	if c == nil {
 		return
@@ -367,6 +514,14 @@ func (c *segmentIndexCache) RemoveByPath(folderPath string) {
 
 func (c *segmentIndexCache) Remove(folderID uint32) {
 	c.RemoveByPath(segmentIndexFolderIDCacheKey(folderID))
+}
+
+func (c *segmentIndexCache) RemoveLayoutByPath(folderPath string) {
+	if c == nil {
+		return
+	}
+	c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+	c.refreshUsage()
 }
 
 func (c *segmentIndexCache) refreshUsage() {
@@ -384,6 +539,10 @@ func segmentIndexFolderIDCacheKey(folderID uint32) string {
 
 func segmentIndexCacheKey(folderKey string) string {
 	return "l1:" + folderKey
+}
+
+func segmentIndexLayoutCacheKey(folderKey string) string {
+	return "layout:" + folderKey
 }
 
 func segmentIndexLevel2CacheKey(folderKey string, metaID uint32, generation uint64) string {
