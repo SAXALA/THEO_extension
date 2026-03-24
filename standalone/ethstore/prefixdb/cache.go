@@ -10,6 +10,7 @@ type NodeCacheEntry struct {
 	Key           string
 	Value         []byte
 	AccountOffset int64
+	AccountSize   uint64
 	StorageInfo   StorageInfo
 }
 
@@ -23,6 +24,7 @@ type StorageInfo struct {
 type nodeCacheRecord struct {
 	value         []byte
 	accountOffset int64
+	accountSize   uint64
 	storageInfo   StorageInfo
 }
 
@@ -59,6 +61,7 @@ func (nc *NodeCache) Get(key string) (NodeCacheEntry, bool) {
 			Key:           key,
 			Value:         cloneBytes(rec.value),
 			AccountOffset: rec.accountOffset,
+			AccountSize:   rec.accountSize,
 			StorageInfo:   rec.storageInfo,
 		}, true
 	}
@@ -76,19 +79,20 @@ func (nc *NodeCache) Put(entry NodeCacheEntry) {
 	rec := &nodeCacheRecord{
 		value:         cloneBytes(entry.Value),
 		accountOffset: entry.AccountOffset,
+		accountSize:   entry.AccountSize,
 		storageInfo:   entry.StorageInfo,
 	}
 	nc.shared.Add(sharedCacheNamespaceNode, entry.Key, rec, estimateNodeCacheRecordSize(entry.Key, rec))
 }
 
 // StoreMetadata records node metadata while preserving any cached value.
-func (nc *NodeCache) StoreMetadata(key string, accountOffset int64, storageInfo StorageInfo) {
+func (nc *NodeCache) StoreMetadata(key string, accountOffset int64, accountSize uint64, storageInfo StorageInfo) {
 	if nc == nil || key == "" {
 		return
 	}
 	nc.lock.Lock()
 	defer nc.lock.Unlock()
-	rec := &nodeCacheRecord{accountOffset: accountOffset, storageInfo: storageInfo}
+	rec := &nodeCacheRecord{accountOffset: accountOffset, accountSize: accountSize, storageInfo: storageInfo}
 	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
 		current := raw.(*nodeCacheRecord)
 		rec.value = cloneBytes(current.value)
@@ -108,13 +112,14 @@ func (nc *NodeCache) UpdateValue(key string, value []byte) {
 		rec := &nodeCacheRecord{
 			value:         cloneBytes(value),
 			accountOffset: current.accountOffset,
+			accountSize:   current.accountSize,
 			storageInfo:   current.storageInfo,
 		}
 		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 	}
 }
 
-func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64) {
+func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64, accountSize uint64) {
 	if nc == nil || key == "" {
 		return
 	}
@@ -125,6 +130,7 @@ func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64) {
 		rec := &nodeCacheRecord{
 			value:         cloneBytes(current.value),
 			accountOffset: accountOffset,
+			accountSize:   accountSize,
 			storageInfo:   current.storageInfo,
 		}
 		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
@@ -143,6 +149,7 @@ func (nc *NodeCache) UpdateStoragePointer(key string, storageInfo StorageInfo) {
 		rec := &nodeCacheRecord{
 			value:         cloneBytes(current.value),
 			accountOffset: current.accountOffset,
+			accountSize:   current.accountSize,
 			storageInfo:   storageInfo,
 		}
 		nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))

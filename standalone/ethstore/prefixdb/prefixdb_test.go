@@ -874,7 +874,7 @@ func TestGetStorageLogsInvalidLargeLogPointer(t *testing.T) {
 
 	accountKey := makeTestAccountKey(0x16)
 	storageKey := makeTestStorageRawKey(accountKey, 0x01)
-	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 1, storageOffset: 0, storageSize: 0})
+	db.nodeCache.StoreMetadata(string(accountKey), 1, 0, StorageInfo{storageFileID: 1, storageOffset: 0, storageSize: 0})
 	node, err := db.getNode(accountKey)
 	if err != nil {
 		t.Fatalf("getNode failed: %v", err)
@@ -1067,7 +1067,7 @@ func TestGetStorageLogsMissingLargeLogFile(t *testing.T) {
 
 	accountKey := makeTestAccountKey(0x17)
 	storageKey := makeTestStorageRawKey(accountKey, 0x01)
-	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 7, storageOffset: 0, storageSize: 16})
+	db.nodeCache.StoreMetadata(string(accountKey), 1, 0, StorageInfo{storageFileID: 7, storageOffset: 0, storageSize: 16})
 
 	var logBuf bytes.Buffer
 	oldLogWriter := prefixdbLogWriter
@@ -1123,7 +1123,7 @@ func TestGetStorageLogsCorruptedLargeLogContent(t *testing.T) {
 	if err := os.WriteFile(storagePath, corrupted, 0o644); err != nil {
 		t.Fatalf("WriteFile corrupted storage failed: %v", err)
 	}
-	db.nodeCache.StoreMetadata(string(accountKey), 1, StorageInfo{storageFileID: 8, storageOffset: 0, storageSize: uint64(len(corrupted))})
+	db.nodeCache.StoreMetadata(string(accountKey), 1, 0, StorageInfo{storageFileID: 8, storageOffset: 0, storageSize: uint64(len(corrupted))})
 
 	var logBuf bytes.Buffer
 	oldLogWriter := prefixdbLogWriter
@@ -1277,7 +1277,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	shortKey := []byte("A1234")
 	shortValue := []byte("short-value")
 	shortOffset := writeAccountRecordForTest(t, db.accountFile, shortKey, shortValue)
-	if err := db.storeNode(shortKey, &TrieNode{offset: shortOffset}); err != nil {
+	if err := db.storeNode(shortKey, &TrieNode{accountOffset: shortOffset}); err != nil {
 		t.Fatalf("storeNode shortKey failed: %v", err)
 	}
 	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, shortKey, nil)
@@ -1294,7 +1294,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	longKey := []byte("A12345")
 	longValue := []byte("long-value")
 	longOffset := writeAccountRecordForTest(t, db.accountFile, longKey, longValue)
-	if err := db.storeNode(longKey, &TrieNode{offset: longOffset}); err != nil {
+	if err := db.storeNode(longKey, &TrieNode{accountOffset: longOffset}); err != nil {
 		t.Fatalf("storeNode longKey failed: %v", err)
 	}
 	value, found, err = db.Get(datatypepkg.TrieNodeAccountDataType, longKey, nil)
@@ -1306,6 +1306,65 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	}
 	if _, ok := db.nodeCache.Get(string(longKey)); !ok {
 		t.Fatal("expected bucket-backed key to keep using nodeCache")
+	}
+}
+
+func TestGetAccountUsesSingleReadWhenAccountSizeKnown(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := []byte("A12345")
+	accountValue := []byte("known-size-value")
+	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
+	entrySize := uint64(4 + len(accountKey) + len(accountValue))
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: offset, accountSize: entrySize}); err != nil {
+		t.Fatalf("storeNode failed: %v", err)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, accountValue) {
+		t.Fatalf("unexpected account value: found=%t value=%q", found, value)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected single account read op with known accountSize, got %d", got)
+	}
+}
+
+func TestGetAccountFallsBackToLegacyReadsWhenAccountSizeUnknown(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := []byte("A12345")
+	accountValue := []byte("legacy-size-value")
+	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: offset}); err != nil {
+		t.Fatalf("storeNode failed: %v", err)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, accountValue) {
+		t.Fatalf("unexpected account value: found=%t value=%q", found, value)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	if got := after - before; got != 2 {
+		t.Fatalf("expected legacy fallback to use two account read ops, got %d", got)
 	}
 }
 
@@ -2636,10 +2695,10 @@ func TestPrefixTreeProcessGCJobDoesNotSelfDeadlock(t *testing.T) {
 
 	key := bytes.Repeat([]byte{0x02}, 32)
 	fileID := pt.fileIDForKey(key)
-	if err := pt.putIntoFileNode(fileID, key, 1, 2, 3, 4); err != nil {
+	if err := pt.putIntoFileNode(fileID, key, 1, 10, 2, 3, 4); err != nil {
 		t.Fatalf("first putIntoFileNode failed: %v", err)
 	}
-	if err := pt.putIntoFileNode(fileID, key, 5, 6, 7, 8); err != nil {
+	if err := pt.putIntoFileNode(fileID, key, 5, 50, 6, 7, 8); err != nil {
 		t.Fatalf("second putIntoFileNode failed: %v", err)
 	}
 
@@ -2787,13 +2846,13 @@ func TestGlobalNodePutAppendsAndUpdatesSkipList(t *testing.T) {
 
 	key := []byte{0x0a, 0x0b, 0x0c}
 	headerSize := int64(binary.Size(FileNodeHeader{}))
-	if err := pt.Put(key, 11, 1, 101, 1001); err != nil {
+	if err := pt.Put(key, 11, 111, 1, 101, 1001); err != nil {
 		t.Fatalf("first Put failed: %v", err)
 	}
 	if pt.globalHeader.UnsortedEntryCount != 1 {
 		t.Fatalf("unexpected unsorted count after first append: %d", pt.globalHeader.UnsortedEntryCount)
 	}
-	if err := pt.Put(key, 22, 2, 202, 2002); err != nil {
+	if err := pt.Put(key, 22, 222, 2, 202, 2002); err != nil {
 		t.Fatalf("second Put failed: %v", err)
 	}
 	if pt.globalHeader.UnsortedEntryCount != 2 {
@@ -2861,7 +2920,7 @@ func TestPutIntoCompressedNodeFileAppendsAfterCompressedSortedPayload(t *testing
 	}
 
 	updated := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee}
-	if err := pt.putIntoFileNode(fileID, updated, 20, 2, 21, 22); err != nil {
+	if err := pt.putIntoFileNode(fileID, updated, 20, 200, 2, 21, 22); err != nil {
 		t.Fatalf("putIntoFileNode failed: %v", err)
 	}
 	node, found, err := pt.getFromFileNode(fileID, updated)
@@ -3089,10 +3148,10 @@ func TestGlobalNodeDeleteRewritesDedicatedFile(t *testing.T) {
 
 	key1 := []byte{0x01}
 	key2 := []byte{0x02}
-	if err := pt.Put(key1, 11, 1, 101, 1001); err != nil {
+	if err := pt.Put(key1, 11, 111, 1, 101, 1001); err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
-	if err := pt.Put(key2, 22, 2, 202, 2002); err != nil {
+	if err := pt.Put(key2, 22, 222, 2, 202, 2002); err != nil {
 		t.Fatalf("Put key2 failed: %v", err)
 	}
 	deleted, err := pt.Delete(key1)
@@ -3133,10 +3192,10 @@ func TestGlobalNodeCommitFlushesOnceAtEnd(t *testing.T) {
 	key2 := []byte{0x02}
 
 	pt.beginGlobalCommit()
-	if err := pt.Put(key1, 11, 1, 101, 1001); err != nil {
+	if err := pt.Put(key1, 11, 111, 1, 101, 1001); err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
-	if err := pt.Put(key2, 22, 2, 202, 2002); err != nil {
+	if err := pt.Put(key2, 22, 222, 2, 202, 2002); err != nil {
 		t.Fatalf("Put key2 failed: %v", err)
 	}
 	stat, err := os.Stat(filepath.Join(pt.fileNodeDir, globalFileName))
@@ -3183,7 +3242,7 @@ func TestGlobalNodeNestedCommitFlushesOnOuterEnd(t *testing.T) {
 
 	pt.beginGlobalCommit()
 	pt.beginGlobalCommit()
-	if err := pt.Put(key, 33, 3, 303, 3003); err != nil {
+	if err := pt.Put(key, 33, 333, 3, 303, 3003); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := pt.endGlobalCommit(); err != nil {
@@ -3222,10 +3281,10 @@ func TestGlobalNodeCloseCompactsDeferredUpdates(t *testing.T) {
 	key1 := []byte{0x04}
 	key2 := []byte{0x05}
 	pt.beginGlobalCommit()
-	if err := pt.Put(key1, 44, 4, 404, 4004); err != nil {
+	if err := pt.Put(key1, 44, 444, 4, 404, 4004); err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
-	if err := pt.Put(key2, 55, 5, 505, 5005); err != nil {
+	if err := pt.Put(key2, 55, 555, 5, 505, 5005); err != nil {
 		t.Fatalf("Put key2 failed: %v", err)
 	}
 	if err := pt.endGlobalCommit(); err != nil {
@@ -3279,10 +3338,10 @@ func TestRunPostLoadGCCompactsAllNodeFilesIgnoringRatio(t *testing.T) {
 
 	globalKey := []byte{0x01, 0x02, 0x03}
 	bucketKey := bytes.Repeat([]byte{0xaa}, 32)
-	if err := db.prefixTree.Put(globalKey, 11, 1, 101, 1001); err != nil {
+	if err := db.prefixTree.Put(globalKey, 11, 111, 1, 101, 1001); err != nil {
 		t.Fatalf("put global key failed: %v", err)
 	}
-	if err := db.prefixTree.Put(bucketKey, 22, 2, 202, 2002); err != nil {
+	if err := db.prefixTree.Put(bucketKey, 22, 222, 2, 202, 2002); err != nil {
 		t.Fatalf("put bucket key failed: %v", err)
 	}
 
@@ -4172,7 +4231,7 @@ func TestPrefixTreeGetDuringGCInFlightUsesSnapshot(t *testing.T) {
 
 	key := bytes.Repeat([]byte{0x01}, 32)
 	fileID := pt.fileIDForKey(key)
-	if err := pt.putIntoFileNode(fileID, key, 123, 7, 11, 13); err != nil {
+	if err := pt.putIntoFileNode(fileID, key, 123, 1230, 7, 11, 13); err != nil {
 		t.Fatalf("putIntoFileNode failed: %v", err)
 	}
 

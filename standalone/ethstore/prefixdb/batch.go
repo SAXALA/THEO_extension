@@ -330,7 +330,7 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) (err error) {
 				if db.nodeCache != nil {
 					db.nodeCache.Delete(key)
 				}
-				if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
+				if err := db.storeNode(keyBytes, &TrieNode{accountOffset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
 					return err
 				}
 				continue
@@ -347,13 +347,14 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) (err error) {
 				storageFileID: op.storageFileID,
 				storageOffset: op.storageOffset,
 				storageSize:   op.storageSize,
-				offset:        trieAccountOffset - int64(len(entry)),
+				accountOffset: trieAccountOffset - int64(len(entry)),
+				accountSize:   uint64(len(entry)),
 			}
 
 			if err := db.storeNode(keyBytes, node); err != nil {
 				return err
 			}
-			db.nodeCache.UpdateAccountOffset(key, trieAccountOffset-int64(len(entry)))
+			db.nodeCache.UpdateAccountOffset(key, trieAccountOffset-int64(len(entry)), uint64(len(entry)))
 
 			// cacheKeyHex := hex.EncodeToString([]byte(key))
 			// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))

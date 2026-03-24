@@ -408,7 +408,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		existingSize   uint64
 	)
 	if node != nil {
-		plan.accountOffset = node.offset
+		plan.accountOffset = node.accountOffset
 		existingFileID = node.storageFileID
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
@@ -451,11 +451,11 @@ func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOp
 			continue
 		}
 		accountKeyBytes := []byte(plan.accountKey)
-		if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
+		if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, 0, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
 			return err
 		}
 		if db.nodeCache != nil {
-			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.storageInfo)
+			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, 0, plan.storageInfo)
 		}
 		if updateAccountBatch && db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(plan.accountKey, plan.storageInfo)
@@ -478,7 +478,7 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 		return err
 	}
 	if node != nil {
-		accOff = node.offset
+		accOff = node.accountOffset
 		existingFileID = node.storageFileID
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
@@ -486,10 +486,10 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 	if len(kvs) == 0 {
 		fmt.Printf("commitStorageForAccount: no storage kvs to write for account - accountKey=%s\n",
 			accountKey)
-		if err := db.prefixTree.Put(accountKeyBytes, accOff, 0, 0, 0); err != nil {
+		if err := db.prefixTree.Put(accountKeyBytes, accOff, 0, 0, 0, 0); err != nil {
 			return err
 		}
-		db.nodeCache.StoreMetadata(accountKey, accOff, StorageInfo{})
+		db.nodeCache.StoreMetadata(accountKey, accOff, 0, StorageInfo{})
 		if db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(accountKey, StorageInfo{})
 		}
@@ -507,10 +507,10 @@ func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) err
 	}
 	skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
 	if !skipAccountPointerUpdate {
-		if err := db.prefixTree.Put(accountKeyBytes, accOff, fileID, off, sz); err != nil {
+		if err := db.prefixTree.Put(accountKeyBytes, accOff, 0, fileID, off, sz); err != nil {
 			return err
 		}
-		db.nodeCache.StoreMetadata(accountKey, accOff, info)
+		db.nodeCache.StoreMetadata(accountKey, accOff, 0, info)
 		if db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(accountKey, info)
 		}

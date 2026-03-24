@@ -617,16 +617,16 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 
 	node, err := db.getAccountNode(key)
 	if err != nil {
-		db.logAccountKVReadFailure(key, 0, "load-account-node", err)
+		db.logAccountKVReadFailure(key, 0, 0, "load-account-node", err)
 		return nil, false, err
 	}
 	if node == nil {
-		db.logAccountKVReadFailure(key, 0, "account-not-found", nil)
+		db.logAccountKVReadFailure(key, 0, 0, "account-not-found", nil)
 		return nil, false, nil
 	}
-	value, err := db.readFromFile(node.offset)
+	value, err := db.readFromFile(node.accountOffset, node.accountSize)
 	if err != nil {
-		db.logAccountKVReadFailure(key, node.offset, "read-account-file", err)
+		db.logAccountKVReadFailure(key, node.accountOffset, node.accountSize, "read-account-file", err)
 		return nil, false, err
 	}
 
@@ -634,7 +634,8 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 		db.nodeCache.Put(NodeCacheEntry{
 			Key:           cacheKey,
 			Value:         value,
-			AccountOffset: node.offset,
+			AccountOffset: node.accountOffset,
+			AccountSize:   node.accountSize,
 			StorageInfo: StorageInfo{
 				storageFileID: node.storageFileID,
 				storageOffset: node.storageOffset,
@@ -722,12 +723,12 @@ func splitLogPath(path string) (string, string) {
 	return filepath.Dir(path), filepath.Base(path)
 }
 
-func (db *PrefixDB) accountReadLogFields(offset int64) (string, string, int64, uint64) {
+func (db *PrefixDB) accountReadLogFields(offset int64, size uint64) (string, string, int64, uint64) {
 	if db == nil || db.accountFile == nil {
-		return "", "", offset, 0
+		return "", "", offset, size
 	}
 	dir, file := splitLogPath(db.accountFile.Name())
-	return dir, file, offset, 0
+	return dir, file, offset, size
 }
 
 func (db *PrefixDB) storageReadLogFields(accountKey []byte) (string, string, uint32, int64, uint64) {
@@ -753,8 +754,8 @@ func (db *PrefixDB) storageReadLogFields(accountKey []byte) (string, string, uin
 	return dir, file, node.storageFileID, node.storageOffset, node.storageSize
 }
 
-func (db *PrefixDB) logAccountKVReadFailure(key []byte, offset int64, reason string, err error) {
-	dir, file, offset, size := db.accountReadLogFields(offset)
+func (db *PrefixDB) logAccountKVReadFailure(key []byte, offset int64, size uint64, reason string, err error) {
+	dir, file, offset, size := db.accountReadLogFields(offset, size)
 	if err != nil {
 		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: account kv read failed key=%x dir=%s file=%s offset=%d size=%d reason=%s err=%v\n", key, dir, file, offset, size, reason, err)
 		return
@@ -953,7 +954,7 @@ func (db *PrefixDB) BatchCommit() (err error) {
 				if db.nodeCache != nil {
 					db.nodeCache.Delete(key)
 				}
-				if err := db.storeNode(keyBytes, &TrieNode{offset: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
+				if err := db.storeNode(keyBytes, &TrieNode{accountOffset: 0, accountSize: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
 					return err
 				}
 				continue
@@ -967,13 +968,14 @@ func (db *PrefixDB) BatchCommit() (err error) {
 				storageFileID: op.storageFileID,
 				storageOffset: op.storageOffset,
 				storageSize:   op.storageSize,
-				offset:        offset,
+				accountOffset: offset,
+				accountSize:   uint64(len(entry)),
 			}
 			if err := db.storeNode(keyBytes, node); err != nil {
 				return err
 			}
 			if db.nodeCache != nil {
-				db.nodeCache.StoreMetadata(key, offset, StorageInfo{
+				db.nodeCache.StoreMetadata(key, offset, uint64(len(entry)), StorageInfo{
 					storageFileID: op.storageFileID,
 					storageOffset: op.storageOffset,
 					storageSize:   op.storageSize,
@@ -1062,7 +1064,7 @@ func (db *PrefixDB) hasAccount(key []byte) (bool, error) {
 		fmt.Printf("Account key %s not found in index\n", string(key))
 		return false, nil
 	}
-	value, err := db.readFromFile(node.offset)
+	value, err := db.readFromFile(node.accountOffset, node.accountSize)
 	if err != nil {
 		return false, err
 	}
@@ -1071,7 +1073,8 @@ func (db *PrefixDB) hasAccount(key []byte) (bool, error) {
 		db.nodeCache.Put(NodeCacheEntry{
 			Key:           cacheKey,
 			Value:         value,
-			AccountOffset: node.offset,
+			AccountOffset: node.accountOffset,
+			AccountSize:   node.accountSize,
 			StorageInfo: StorageInfo{
 				storageFileID: node.storageFileID,
 				storageOffset: node.storageOffset,
@@ -1133,7 +1136,8 @@ func (db *PrefixDB) deleteAccount(key []byte) error {
 	return db.storeNode(key, &TrieNode{
 		storageFileID: 0,
 		storageOffset: 0,
-		offset:        0,
+		accountOffset: 0,
+		accountSize:   0,
 		storageSize:   0,
 	})
 }
@@ -1213,7 +1217,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 		return err
 	}
 	if node != nil {
-		accOff = node.offset
+		accOff = node.accountOffset
 		existingFileID = node.storageFileID
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
@@ -1221,7 +1225,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	if len(buf.storagekvs) == 0 {
 		fmt.Printf("flushStorageBuffer: empty buffer for account - accountKey=%s\n",
 			buf.accountKey)
-		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0); err != nil {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0, 0); err != nil {
 			return err
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{})
@@ -1237,7 +1241,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	}
 	skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
 	if !skipAccountPointerUpdate {
-		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, fileID, off, sz); err != nil {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, fileID, off, sz); err != nil {
 			return err
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{
@@ -1491,7 +1495,42 @@ func writeUint64BE(b []byte, v uint64) {
 	b[7] = byte(v)
 }
 
-func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
+func (db *PrefixDB) readFromFile(offset int64, accountSize uint64) ([]byte, error) {
+	if accountSize == 0 {
+		return db.readFromFileLegacy(offset)
+	}
+	if accountSize > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("account entry too large: %d", accountSize)
+	}
+	file := db.accountFile
+	totalSize := int(accountSize)
+	buf := getDataBuffer(totalSize)
+	defer putDataBuffer(buf)
+
+	n, err := file.ReadAt(buf[:totalSize], offset)
+	if err != nil && !(err == io.EOF && n == totalSize) {
+		return nil, fmt.Errorf("failed to read account entry at offset %d: %v", offset, err)
+	}
+	if n != totalSize {
+		return nil, fmt.Errorf("short account entry read at offset %d: got %d want %d", offset, n, totalSize)
+	}
+	db.addDiskRead(diskIOUsageAccountData, n)
+
+	if totalSize < 4 {
+		return nil, fmt.Errorf("corrupted account entry at offset %d: size %d", offset, totalSize)
+	}
+	keySize := int(uint16(buf[0])<<8 | uint16(buf[1]))
+	valueSize := int(uint16(buf[2])<<8 | uint16(buf[3]))
+	if 4+keySize+valueSize != totalSize {
+		return nil, fmt.Errorf("corrupted account entry at offset %d: header size %d payload size %d entry size %d", offset, keySize, valueSize, totalSize)
+	}
+
+	value := make([]byte, valueSize)
+	copy(value, buf[4+keySize:])
+	return value, nil
+}
+
+func (db *PrefixDB) readFromFileLegacy(offset int64) ([]byte, error) {
 	var file *os.File
 	file = db.accountFile
 	header := headerPool.Get().([]byte)
@@ -2102,7 +2141,7 @@ func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
 }
 
 func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
-	return db.prefixTree.Put(key, node.offset, node.storageFileID, node.storageOffset, node.storageSize)
+	return db.prefixTree.PutNode(key, node)
 }
 
 func (db *PrefixDB) shouldBypassNodeCache(key []byte) bool {
@@ -2128,12 +2167,13 @@ func (db *PrefixDB) getNodeWithSource(key []byte) (*TrieNode, bool, error) {
 			addUint64Stat(&db.nodeCacheHits, 1)
 			if entry.StorageInfo.storageFileID != 0 {
 				addUint64Stat(&db.nodeCacheServed, 1)
-				return &TrieNode{
+				return nodeInfoToTrieNode(NodeInfo{
+					accountOffset: entry.AccountOffset,
+					accountSize:   entry.AccountSize,
 					storageFileID: entry.StorageInfo.storageFileID,
 					storageOffset: entry.StorageInfo.storageOffset,
 					storageSize:   entry.StorageInfo.storageSize,
-					offset:        entry.AccountOffset,
-				}, true, nil
+				}), true, nil
 			}
 		} else {
 			addUint64Stat(&db.nodeCacheMisses, 1)
@@ -2156,18 +2196,13 @@ func (db *PrefixDB) getNodeWithSource(key []byte) (*TrieNode, bool, error) {
 		return nil, false, nil
 	}
 
-	node := &TrieNode{
-		storageFileID: nodeInfo.storageFileID,
-		storageOffset: nodeInfo.storageOffset,
-		storageSize:   nodeInfo.storageSize,
-		offset:        nodeInfo.accountOffset,
-	}
+	node := nodeInfoToTrieNode(nodeInfo)
 	// accountOffset==0 is a tombstone delete for account nodes.
-	if node.offset == 0 && node.storageFileID == 0 {
+	if node.accountOffset == 0 && node.storageFileID == 0 {
 		return nil, false, nil
 	}
 	if useNodeCache {
-		db.nodeCache.StoreMetadata(cacheKey, node.offset, StorageInfo{
+		db.nodeCache.StoreMetadata(cacheKey, node.accountOffset, node.accountSize, StorageInfo{
 			storageFileID: node.storageFileID,
 			storageOffset: node.storageOffset,
 			storageSize:   node.storageSize,
@@ -2198,12 +2233,13 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 			addUint64Stat(&db.nodeCacheHits, 1)
 			if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
 				addUint64Stat(&db.nodeCacheServed, 1)
-				return &TrieNode{
+				return nodeInfoToTrieNode(NodeInfo{
+					accountOffset: entry.AccountOffset,
+					accountSize:   entry.AccountSize,
 					storageFileID: entry.StorageInfo.storageFileID,
 					storageOffset: entry.StorageInfo.storageOffset,
 					storageSize:   entry.StorageInfo.storageSize,
-					offset:        entry.AccountOffset,
-				}, nil
+				}), nil
 			}
 		} else {
 			addUint64Stat(&db.nodeCacheMisses, 1)
@@ -2227,18 +2263,13 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 		return nil, nil
 	}
 
-	node := &TrieNode{
-		storageFileID: nodeInfo.storageFileID,
-		storageOffset: nodeInfo.storageOffset,
-		storageSize:   nodeInfo.storageSize,
-		offset:        nodeInfo.accountOffset,
-	}
+	node := nodeInfoToTrieNode(nodeInfo)
 	// accountOffset==0 is a tombstone delete for account nodes.
-	if node.offset == 0 && node.storageFileID == 0 {
+	if node.accountOffset == 0 && node.storageFileID == 0 {
 		return nil, nil
 	}
 	if useNodeCache {
-		db.nodeCache.StoreMetadata(cacheKey, node.offset, StorageInfo{
+		db.nodeCache.StoreMetadata(cacheKey, node.accountOffset, node.accountSize, StorageInfo{
 			storageFileID: node.storageFileID,
 			storageOffset: node.storageOffset,
 			storageSize:   node.storageSize,
