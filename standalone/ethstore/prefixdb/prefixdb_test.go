@@ -284,6 +284,18 @@ func TestStoragePrefetchStatsTrackLaterCacheHit(t *testing.T) {
 	}
 	accountKey := []byte("acct")
 	storageKey := []byte("slot")
+	foundSample := false
+	for i := 0; i < 1<<16; i++ {
+		candidate := []byte{byte(i >> 8), byte(i)}
+		if shouldSampleStoragePrefetchKey(db.storageCacheKey(accountKey, candidate)) {
+			storageKey = candidate
+			foundSample = true
+			break
+		}
+	}
+	if !foundSample {
+		t.Fatal("failed to find sampled storage key for prefetch stats test")
+	}
 	cacheKey := db.storageCacheKey(accountKey, storageKey)
 
 	db.addStorageCacheValue(accountKey, storageKey, []byte("value"), true)
@@ -1329,7 +1341,6 @@ func encodeLegacySegmentChunkMetasForTest(t *testing.T, metas []segmentChunkMeta
 		if buf, err = appendVarBytes(buf, meta.KeyStart); err != nil {
 			t.Fatalf("append KeyStart failed: %v", err)
 		}
-		// Legacy fields KeyEnd, KVCount, ChunkSize are no longer tracked
 	}
 	return buf
 }
@@ -3992,7 +4003,7 @@ func TestPrefixTreeGetDuringGCInFlightUsesSnapshot(t *testing.T) {
 // properly validates key ranges using KeyStart-only indexing.
 // A key matches chunk[i] if: key >= chunk[i].KeyStart AND key < chunk[i+1].KeyStart
 func TestFindChunkIndexForKeyBoundaryValidation(t *testing.T) {
-	// Note: KeyEnd fields are ignored in KeyStart-only indexing
+	// KeyStart-only indexing defines chunk ranges.
 	// Chunk ranges are: [a,d), [d,g), [g,i)
 	metas := []segmentChunkMeta{
 		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte("a")},

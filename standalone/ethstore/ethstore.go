@@ -26,7 +26,7 @@ type trieStorageGetBreakdownStepStats struct {
 }
 
 func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, fromCache bool, duration time.Duration) {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return
 	}
 	nanos := uint64(duration)
@@ -965,6 +965,9 @@ func (d *Database) GetParentAccountKey(key []byte) []byte {
 }
 
 func (d *Database) printTrieNodeStorageGetBreakdown() {
+	if !analysisStatsEnabled {
+		return
+	}
 	step := &d.trieStorageAccountPathStats
 	cacheCountNum := atomic.LoadUint64(&step.cacheCount)
 	cacheNanos := atomic.LoadUint64(&step.cacheNanos)

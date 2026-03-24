@@ -185,7 +185,7 @@ func (c *sharedByteCache) NamespaceStats(namespace sharedCacheNamespace) (usedBy
 }
 
 func (c *sharedByteCache) LockStatsSnapshot() sharedCacheLockStatsSnapshot {
-	if c == nil {
+	if !analysisStatsEnabled || c == nil {
 		return sharedCacheLockStatsSnapshot{}
 	}
 	return sharedCacheLockStatsSnapshot{
@@ -198,7 +198,7 @@ func (c *sharedByteCache) LockStatsSnapshot() sharedCacheLockStatsSnapshot {
 }
 
 func snapshotSharedCacheLockOpStats(stats *sharedCacheLockOpStats) sharedCacheLockOpSnapshot {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return sharedCacheLockOpSnapshot{}
 	}
 	return sharedCacheLockOpSnapshot{
@@ -209,6 +209,10 @@ func snapshotSharedCacheLockOpStats(stats *sharedCacheLockOpStats) sharedCacheLo
 }
 
 func (c *sharedByteCache) lockWrite(stats *sharedCacheLockOpStats) time.Time {
+	if !analysisStatsEnabled {
+		c.mu.Lock()
+		return time.Time{}
+	}
 	start := time.Now()
 	c.mu.Lock()
 	acquiredAt := time.Now()
@@ -220,13 +224,17 @@ func (c *sharedByteCache) lockWrite(stats *sharedCacheLockOpStats) time.Time {
 }
 
 func (c *sharedByteCache) unlockWrite(stats *sharedCacheLockOpStats, acquiredAt time.Time) {
-	if stats != nil {
+	if analysisStatsEnabled && stats != nil {
 		atomic.AddUint64(&stats.holdNanos, uint64(time.Since(acquiredAt)))
 	}
 	c.mu.Unlock()
 }
 
 func (c *sharedByteCache) lockRead(stats *sharedCacheLockOpStats) time.Time {
+	if !analysisStatsEnabled {
+		c.mu.RLock()
+		return time.Time{}
+	}
 	start := time.Now()
 	c.mu.RLock()
 	acquiredAt := time.Now()
@@ -238,7 +246,7 @@ func (c *sharedByteCache) lockRead(stats *sharedCacheLockOpStats) time.Time {
 }
 
 func (c *sharedByteCache) unlockRead(stats *sharedCacheLockOpStats, acquiredAt time.Time) {
-	if stats != nil {
+	if analysisStatsEnabled && stats != nil {
 		atomic.AddUint64(&stats.holdNanos, uint64(time.Since(acquiredAt)))
 	}
 	c.mu.RUnlock()
@@ -331,7 +339,11 @@ func (c *storageValueCache) Add(key string, value interface{}) {
 	}
 	storedValue := value
 	if valueBytes, ok := value.([]byte); ok {
-		storedValue = cloneBytes(valueBytes)
+		if valueBytes == nil {
+			storedValue = nil
+		} else {
+			storedValue = append(make([]byte, 0, len(valueBytes)), valueBytes...)
+		}
 	}
 	c.shared.Add(sharedCacheNamespaceStorage, key, storedValue, estimateStorageCacheValueSize(key, storedValue))
 }

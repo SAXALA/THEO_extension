@@ -105,7 +105,6 @@ const (
 type segmentIndexL1Entry struct {
 	MetaID     uint32
 	KeyStart   []byte
-	KeyEnd     []byte
 	ChunkCount uint32
 }
 
@@ -269,6 +268,38 @@ type trieStoragePrefetchStats struct {
 	clearCount  uint64
 }
 
+const storagePrefetchStatsSampleMask uint32 = 0xff
+
+func addUint64Stat(dst *uint64, delta uint64) {
+	if !analysisStatsEnabled || dst == nil || delta == 0 {
+		return
+	}
+	atomic.AddUint64(dst, delta)
+}
+
+func loadUint64Stat(src *uint64) uint64 {
+	if !analysisStatsEnabled || src == nil {
+		return 0
+	}
+	return atomic.LoadUint64(src)
+}
+
+func shouldSampleStoragePrefetchKey(cacheKey string) bool {
+	if !analysisStatsEnabled || cacheKey == "" {
+		return false
+	}
+	last := len(cacheKey) - 1
+	hash := uint32(len(cacheKey))
+	hash = hash*16777619 ^ uint32(cacheKey[0])
+	hash = hash*16777619 ^ uint32(cacheKey[len(cacheKey)/2])
+	hash = hash*16777619 ^ uint32(cacheKey[last])
+	return hash&storagePrefetchStatsSampleMask == 0
+}
+
+func storagePrefetchStatsSampleDenominator() uint64 {
+	return uint64(storagePrefetchStatsSampleMask) + 1
+}
+
 type PrefixDB struct {
 	prefixTree  *PrefixTree
 	accountFile *os.File
@@ -361,6 +392,7 @@ type PrefixDB struct {
 	trieStoragePrefetchStats          trieStoragePrefetchStats
 	trieStorageKVStats                trieStorageGetBreakdownStepStats
 	storagePrefetchMu                 sync.Mutex
+	storagePrefetchTrackedCount       uint64
 	storagePrefetchPending            map[string]struct{}
 
 	// nodeCache access stats (read path)
@@ -567,14 +599,8 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 }
 
 func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
-	readBefore := atomic.LoadUint64(&db.totalReadBytes)
-	defer func() {
-		readAfter := atomic.LoadUint64(&db.totalReadBytes)
-		if readAfter >= readBefore {
-			atomic.AddUint64(&db.getReadBytesSum, readAfter-readBefore)
-		}
-		atomic.AddUint64(&db.getReadReqCount, 1)
-	}()
+	readBefore := loadUint64Stat(&db.totalReadBytes)
+	defer db.finishGetReadStats(readBefore)
 	cacheKey := string(key)
 	useNodeCache := !db.shouldBypassNodeCache(key)
 
@@ -633,14 +659,8 @@ func (db *PrefixDB) Get(dataType datatypepkg.DataType, key []byte, accountKey []
 }
 
 func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, error) {
-	readBefore := atomic.LoadUint64(&db.totalReadBytes)
-	defer func() {
-		readAfter := atomic.LoadUint64(&db.totalReadBytes)
-		if readAfter >= readBefore {
-			atomic.AddUint64(&db.getReadBytesSum, readAfter-readBefore)
-		}
-		atomic.AddUint64(&db.getReadReqCount, 1)
-	}()
+	readBefore := loadUint64Stat(&db.totalReadBytes)
+	defer db.finishGetReadStats(readBefore)
 
 	storageKey, err := db.normalizeStorageKey(key)
 	if err != nil {
@@ -1511,22 +1531,27 @@ func (db *PrefixDB) readFromFile(offset int64) ([]byte, error) {
 }
 
 func (db *PrefixDB) addCommitOldKVReadStats(pairCount int, bytes uint64) {
-	if pairCount > 0 {
-		atomic.AddUint64(&db.commitOldKVReadCount, uint64(pairCount))
-	}
-	if bytes > 0 {
-		atomic.AddUint64(&db.commitOldKVReadBytes, bytes)
-	}
+	addUint64Stat(&db.commitOldKVReadCount, uint64(pairCount))
+	addUint64Stat(&db.commitOldKVReadBytes, bytes)
 }
 
 func (db *PrefixDB) addReadBytes(n int) {
-	if n > 0 {
-		atomic.AddUint64(&db.totalReadBytes, uint64(n))
+	addUint64Stat(&db.totalReadBytes, uint64(n))
+}
+
+func (db *PrefixDB) finishGetReadStats(readBefore uint64) {
+	if !analysisStatsEnabled || db == nil {
+		return
 	}
+	readAfter := atomic.LoadUint64(&db.totalReadBytes)
+	if readAfter >= readBefore {
+		atomic.AddUint64(&db.getReadBytesSum, readAfter-readBefore)
+	}
+	atomic.AddUint64(&db.getReadReqCount, 1)
 }
 
 func (db *PrefixDB) addDiskRead(usage diskIOUsage, n int) {
-	if db == nil || usage >= diskIOUsageCount {
+	if !analysisStatsEnabled || db == nil || usage >= diskIOUsageCount {
 		return
 	}
 	atomic.AddUint64(&db.diskIOStats[usage].readOps, 1)
@@ -1537,7 +1562,7 @@ func (db *PrefixDB) addDiskRead(usage diskIOUsage, n int) {
 }
 
 func (db *PrefixDB) addDiskWrite(usage diskIOUsage, n int) {
-	if db == nil || usage >= diskIOUsageCount {
+	if !analysisStatsEnabled || db == nil || usage >= diskIOUsageCount {
 		return
 	}
 	atomic.AddUint64(&db.diskIOStats[usage].writeOps, 1)
@@ -1563,7 +1588,7 @@ func (db *PrefixDB) writeFileWithStats(path string, data []byte, perm os.FileMod
 }
 
 func (db *PrefixDB) printDiskIOStats() {
-	if db == nil {
+	if !analysisStatsEnabled || db == nil {
 		return
 	}
 	var totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes uint64
@@ -1590,7 +1615,7 @@ func (db *PrefixDB) printDiskIOStats() {
 }
 
 func (db *PrefixDB) addTrieStorageFetchStats(fromCache bool, value []byte) {
-	if len(value) == 0 {
+	if !analysisStatsEnabled || len(value) == 0 {
 		return
 	}
 	valueSize := uint64(len(value))
@@ -1604,7 +1629,7 @@ func (db *PrefixDB) addTrieStorageFetchStats(fromCache bool, value []byte) {
 }
 
 func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, fromCache bool, duration time.Duration) {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return
 	}
 	nanos := uint64(duration)
@@ -1618,7 +1643,7 @@ func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, 
 }
 
 func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdownStepStats) {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return
 	}
 	cacheCount := atomic.LoadUint64(&stats.cacheCount)
@@ -1645,7 +1670,7 @@ func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdo
 }
 
 func recordTrieStorageSegmentIndexLayer(source segmentIndexLookupSource, duration time.Duration, stats *trieStorageSegmentIndexLayerStats) {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return
 	}
 	nanos := uint64(duration)
@@ -1660,7 +1685,7 @@ func recordTrieStorageSegmentIndexLayer(source segmentIndexLookupSource, duratio
 }
 
 func printTrieStorageSegmentIndexLayerStats(stats *trieStorageSegmentIndexLayerStats) {
-	if stats == nil {
+	if !analysisStatsEnabled || stats == nil {
 		return
 	}
 	l1Count := atomic.LoadUint64(&stats.l1CacheCount)
@@ -1686,6 +1711,9 @@ func printTrieStorageSegmentIndexLayerStats(stats *trieStorageSegmentIndexLayerS
 }
 
 func printSharedCacheLockOpStats(label string, stats sharedCacheLockOpSnapshot) {
+	if !analysisStatsEnabled {
+		return
+	}
 	if stats.Count == 0 {
 		return
 	}
@@ -1702,7 +1730,7 @@ func printSharedCacheLockOpStats(label string, stats sharedCacheLockOpSnapshot) 
 }
 
 func printSharedCacheLockStats(shared *sharedByteCache) {
-	if shared == nil {
+	if !analysisStatsEnabled || shared == nil {
 		return
 	}
 	stats := shared.LockStatsSnapshot()
@@ -1714,7 +1742,7 @@ func printSharedCacheLockStats(shared *sharedByteCache) {
 }
 
 func printTrieStoragePrefetchStats(db *PrefixDB) {
-	if db == nil {
+	if !analysisStatsEnabled || db == nil {
 		return
 	}
 	addCount := atomic.LoadUint64(&db.trieStoragePrefetchStats.addCount)
@@ -1729,7 +1757,8 @@ func printTrieStoragePrefetchStats(db *PrefixDB) {
 	if addCount > 0 {
 		hitRate = float64(hitCount) / float64(addCount) * 100.0
 	}
-	fmt.Printf("PrefixDB storage prefetch stats: addCount=%d addBytes=%d addNilCount=%d hitCount=%d hitBytes=%d hitNilCount=%d clearCount=%d pendingCount=%d hitRate=%0.2f%%\n",
+	fmt.Printf("PrefixDB storage prefetch stats: sampleRate=1/%d addCount=%d addBytes=%d addNilCount=%d hitCount=%d hitBytes=%d hitNilCount=%d clearCount=%d pendingCount=%d hitRate=%0.2f%%\n",
+		storagePrefetchStatsSampleDenominator(),
 		addCount,
 		addBytes,
 		addNilCount,
@@ -1755,51 +1784,54 @@ func (db *PrefixDB) Close() error {
 
 	db.stopStorageGCWorker()
 
-	fmt.Printf("PrefixDB GC stats: count=%d writeBytes=%d\n",
-		atomic.LoadUint64(&db.GCCount),
-		atomic.LoadUint64(&db.GCWriteBytes),
-	)
-	getReqs := atomic.LoadUint64(&db.getReadReqCount)
-	getReadBytes := atomic.LoadUint64(&db.getReadBytesSum)
-	avgGetReadBytes := float64(0)
-	if getReqs > 0 {
-		avgGetReadBytes = float64(getReadBytes) / float64(getReqs)
+	if analysisStatsEnabled {
+		fmt.Printf("PrefixDB GC stats: count=%d writeBytes=%d\n",
+			atomic.LoadUint64(&db.GCCount),
+			atomic.LoadUint64(&db.GCWriteBytes),
+		)
+		getReqs := atomic.LoadUint64(&db.getReadReqCount)
+		getReadBytes := atomic.LoadUint64(&db.getReadBytesSum)
+		avgGetReadBytes := float64(0)
+		if getReqs > 0 {
+			avgGetReadBytes = float64(getReadBytes) / float64(getReqs)
+		}
+		fmt.Printf("PrefixDB commit old KV read stats: pairs=%d bytes=%d\n",
+			atomic.LoadUint64(&db.commitOldKVReadCount),
+			atomic.LoadUint64(&db.commitOldKVReadBytes),
+		)
+		fmt.Printf("PrefixDB get read stats: requests=%d totalBytes=%d avgBytes=%.2f\n",
+			getReqs,
+			getReadBytes,
+			avgGetReadBytes,
+		)
+		fmt.Printf("PrefixDB TrieNodeStorage fetch stats: cachePairs=%d cacheBytes=%d logPairs=%d logBytes=%d\n",
+			atomic.LoadUint64(&db.trieStorageCachePairs),
+			atomic.LoadUint64(&db.trieStorageCacheBytes),
+			atomic.LoadUint64(&db.trieStorageLogPairs),
+			atomic.LoadUint64(&db.trieStorageLogBytes),
+		)
+		printTrieStorageGetBreakdownStep("account-entry", &db.trieStorageAccountEntryStats)
+		printTrieStorageGetBreakdownStep("segment-index", &db.trieStorageSegmentIndexStats)
+		printTrieStorageSegmentIndexLayerStats(&db.trieStorageSegmentIndexLayerStats)
+		printSharedCacheLockStats(db.sharedCache)
+		printTrieStoragePrefetchStats(db)
+		printTrieStorageGetBreakdownStep("storage-kv-pairs", &db.trieStorageKVStats)
+		lookups := atomic.LoadUint64(&db.nodeCacheLookups)
+		hits := atomic.LoadUint64(&db.nodeCacheHits)
+		misses := atomic.LoadUint64(&db.nodeCacheMisses)
+		served := atomic.LoadUint64(&db.nodeCacheServed)
+		toNodeFile := atomic.LoadUint64(&db.nodeCacheToNodeFile)
+		missToNodeFile := atomic.LoadUint64(&db.nodeCacheMissToNodeFile)
+		hitFallbackToNodeFile := atomic.LoadUint64(&db.nodeCacheHitFallbackToNodeFile)
+		fallback := uint64(0)
+		if hits >= served {
+			fallback = hits - served
+		}
+		fmt.Printf("PrefixDB nodeCache stats: lookups=%d hits=%d misses=%d served=%d fallback=%d toNodeFile=%d missToNodeFile=%d hitFallbackToNodeFile=%d\n",
+			lookups, hits, misses, served, fallback, toNodeFile, missToNodeFile, hitFallbackToNodeFile,
+		)
+		db.printDiskIOStats()
 	}
-	fmt.Printf("PrefixDB commit old KV read stats: pairs=%d bytes=%d\n",
-		atomic.LoadUint64(&db.commitOldKVReadCount),
-		atomic.LoadUint64(&db.commitOldKVReadBytes),
-	)
-	fmt.Printf("PrefixDB get read stats: requests=%d totalBytes=%d avgBytes=%.2f\n",
-		getReqs,
-		getReadBytes,
-		avgGetReadBytes,
-	)
-	fmt.Printf("PrefixDB TrieNodeStorage fetch stats: cachePairs=%d cacheBytes=%d logPairs=%d logBytes=%d\n",
-		atomic.LoadUint64(&db.trieStorageCachePairs),
-		atomic.LoadUint64(&db.trieStorageCacheBytes),
-		atomic.LoadUint64(&db.trieStorageLogPairs),
-		atomic.LoadUint64(&db.trieStorageLogBytes),
-	)
-	printTrieStorageGetBreakdownStep("account-entry", &db.trieStorageAccountEntryStats)
-	printTrieStorageGetBreakdownStep("segment-index", &db.trieStorageSegmentIndexStats)
-	printTrieStorageSegmentIndexLayerStats(&db.trieStorageSegmentIndexLayerStats)
-	printSharedCacheLockStats(db.sharedCache)
-	printTrieStoragePrefetchStats(db)
-	printTrieStorageGetBreakdownStep("storage-kv-pairs", &db.trieStorageKVStats)
-	lookups := atomic.LoadUint64(&db.nodeCacheLookups)
-	hits := atomic.LoadUint64(&db.nodeCacheHits)
-	misses := atomic.LoadUint64(&db.nodeCacheMisses)
-	served := atomic.LoadUint64(&db.nodeCacheServed)
-	toNodeFile := atomic.LoadUint64(&db.nodeCacheToNodeFile)
-	missToNodeFile := atomic.LoadUint64(&db.nodeCacheMissToNodeFile)
-	hitFallbackToNodeFile := atomic.LoadUint64(&db.nodeCacheHitFallbackToNodeFile)
-	fallback := uint64(0)
-	if hits >= served {
-		fallback = hits - served
-	}
-	fmt.Printf("PrefixDB nodeCache stats: lookups=%d hits=%d misses=%d served=%d fallback=%d toNodeFile=%d missToNodeFile=%d hitFallbackToNodeFile=%d\n",
-		lookups, hits, misses, served, fallback, toNodeFile, missToNodeFile, hitFallbackToNodeFile,
-	)
 
 	if err := db.flushStorageBuffer(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to flush storage buffer: %v", err))
@@ -2053,13 +2085,6 @@ func (db *PrefixDB) normalizeStorageKey(rawKey []byte) ([]byte, error) {
 	return rawKey[storageKeyTrimOffset:], nil
 }
 
-func normalizeStoredStorageKey(key []byte) []byte {
-	if len(key) > storageKeyTrimOffset && key[0] == 'O' {
-		return key[storageKeyTrimOffset:]
-	}
-	return key
-}
-
 // GetParentAccountKey retrieves the parent account key from a given (storage)key.
 func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
 	if len(key) < 21 {
@@ -2098,12 +2123,12 @@ func (db *PrefixDB) getNodeWithSource(key []byte) (*TrieNode, bool, error) {
 	cacheHit := false
 	useNodeCache := !db.shouldBypassNodeCache(key)
 	if useNodeCache {
-		atomic.AddUint64(&db.nodeCacheLookups, 1)
+		addUint64Stat(&db.nodeCacheLookups, 1)
 		if entry, ok := db.nodeCache.Get(cacheKey); ok {
 			cacheHit = true
-			atomic.AddUint64(&db.nodeCacheHits, 1)
+			addUint64Stat(&db.nodeCacheHits, 1)
 			if entry.StorageInfo.storageFileID != 0 {
-				atomic.AddUint64(&db.nodeCacheServed, 1)
+				addUint64Stat(&db.nodeCacheServed, 1)
 				return &TrieNode{
 					storageFileID: entry.StorageInfo.storageFileID,
 					storageOffset: entry.StorageInfo.storageOffset,
@@ -2112,16 +2137,16 @@ func (db *PrefixDB) getNodeWithSource(key []byte) (*TrieNode, bool, error) {
 				}, true, nil
 			}
 		} else {
-			atomic.AddUint64(&db.nodeCacheMisses, 1)
+			addUint64Stat(&db.nodeCacheMisses, 1)
 		}
 	}
 
 	if useNodeCache {
-		atomic.AddUint64(&db.nodeCacheToNodeFile, 1)
+		addUint64Stat(&db.nodeCacheToNodeFile, 1)
 		if cacheHit {
-			atomic.AddUint64(&db.nodeCacheHitFallbackToNodeFile, 1)
+			addUint64Stat(&db.nodeCacheHitFallbackToNodeFile, 1)
 		} else {
-			atomic.AddUint64(&db.nodeCacheMissToNodeFile, 1)
+			addUint64Stat(&db.nodeCacheMissToNodeFile, 1)
 		}
 	}
 	nodeInfo, found, err := db.prefixTree.Get(key)
@@ -2168,12 +2193,12 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 	cacheHit := false
 	useNodeCache := !db.shouldBypassNodeCache(key)
 	if useNodeCache {
-		atomic.AddUint64(&db.nodeCacheLookups, 1)
+		addUint64Stat(&db.nodeCacheLookups, 1)
 		if entry, ok := db.nodeCache.Get(cacheKey); ok {
 			cacheHit = true
-			atomic.AddUint64(&db.nodeCacheHits, 1)
+			addUint64Stat(&db.nodeCacheHits, 1)
 			if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
-				atomic.AddUint64(&db.nodeCacheServed, 1)
+				addUint64Stat(&db.nodeCacheServed, 1)
 				return &TrieNode{
 					storageFileID: entry.StorageInfo.storageFileID,
 					storageOffset: entry.StorageInfo.storageOffset,
@@ -2182,16 +2207,16 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 				}, nil
 			}
 		} else {
-			atomic.AddUint64(&db.nodeCacheMisses, 1)
+			addUint64Stat(&db.nodeCacheMisses, 1)
 		}
 	}
 
 	if useNodeCache {
-		atomic.AddUint64(&db.nodeCacheToNodeFile, 1)
+		addUint64Stat(&db.nodeCacheToNodeFile, 1)
 		if cacheHit {
-			atomic.AddUint64(&db.nodeCacheHitFallbackToNodeFile, 1)
+			addUint64Stat(&db.nodeCacheHitFallbackToNodeFile, 1)
 		} else {
-			atomic.AddUint64(&db.nodeCacheMissToNodeFile, 1)
+			addUint64Stat(&db.nodeCacheMissToNodeFile, 1)
 		}
 	}
 
@@ -2864,7 +2889,7 @@ func adjustMetaRange(meta *segmentChunkMeta, additions []kvPair) {
 	if len(meta.KeyStart) == 0 || bytes.Compare(first, meta.KeyStart) < 0 {
 		meta.KeyStart = cloneBytes(first)
 	}
-	// Note: KeyEnd is no longer tracked - ranges are KeyStart-only
+	// Ranges are KeyStart-only.
 }
 
 func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
@@ -3838,7 +3863,6 @@ func parseMultiLevelLayout(data []byte) (segmentIndexLayout, error) {
 		layout.entries = append(layout.entries, segmentIndexL1Entry{
 			MetaID:     metaID,
 			KeyStart:   start,
-			KeyEnd:     nil,
 			ChunkCount: chunkCount,
 		})
 	}
@@ -4548,7 +4572,6 @@ func cloneSegmentIndexLayout(src segmentIndexLayout) segmentIndexLayout {
 			MetaID:     src.entries[i].MetaID,
 			ChunkCount: src.entries[i].ChunkCount,
 			KeyStart:   cloneBytes(src.entries[i].KeyStart),
-			KeyEnd:     cloneBytes(src.entries[i].KeyEnd),
 		}
 	}
 	return dst
@@ -4560,7 +4583,6 @@ func estimateSegmentIndexLayoutMemory(layout segmentIndexLayout) uint64 {
 	total += uint64(len(layout.entries)) * uint64(unsafe.Sizeof(segmentIndexL1Entry{}))
 	for i := range layout.entries {
 		total += uint64(len(layout.entries[i].KeyStart))
-		total += uint64(len(layout.entries[i].KeyEnd))
 	}
 	if total == 0 {
 		return 1
@@ -4819,7 +4841,7 @@ func (db *PrefixDB) streamSegmentChunkEntriesByPath(folderPath string, fileName 
 		if readErr != nil {
 			return readErr
 		}
-		key := normalizeStoredStorageKey(entryBuf[:klen])
+		key := entryBuf[:klen]
 		var value []byte
 		if vlen > 0 {
 			value = entryBuf[klen:totalLen]
@@ -5166,7 +5188,7 @@ func (db *PrefixDB) readStorageSegmentFile(fileID uint32, offset int64, size uin
 					break
 				}
 				keyRaw := payload[cursor : cursor+klen]
-				key := normalizeStoredStorageKey(keyRaw)
+				key := keyRaw
 				if bytes.HasPrefix(key, storageKey) {
 					var value []byte
 					if vlen > 0 {
@@ -5326,7 +5348,7 @@ func buildPairsFromPayload(payload []byte, kvCount int, headerSize int, dst []kv
 			val = payload[cursor+klen : cursor+totalLen]
 		}
 		entries[i] = kvPair{
-			key: normalizeStoredStorageKey(payload[cursor : cursor+klen]),
+			key: payload[cursor : cursor+klen],
 			// vlen==0 is a tombstone delete; preserve it as nil
 			// so cache/read paths treat it as not-found.
 			val: val,
@@ -5468,16 +5490,14 @@ func (db *PrefixDB) storageCacheKey(accountKey, storageKey []byte) string {
 }
 
 func (db *PrefixDB) storagePrefetchPendingCount() int {
-	if db == nil {
+	if !analysisStatsEnabled || db == nil {
 		return 0
 	}
-	db.storagePrefetchMu.Lock()
-	defer db.storagePrefetchMu.Unlock()
-	return len(db.storagePrefetchPending)
+	return int(atomic.LoadUint64(&db.storagePrefetchTrackedCount))
 }
 
 func (db *PrefixDB) recordStoragePrefetchAdd(cacheKey string, value []byte) {
-	if db == nil || cacheKey == "" {
+	if db == nil || !shouldSampleStoragePrefetchKey(cacheKey) {
 		return
 	}
 	atomic.AddUint64(&db.trieStoragePrefetchStats.addCount, 1)
@@ -5490,32 +5510,51 @@ func (db *PrefixDB) recordStoragePrefetchAdd(cacheKey string, value []byte) {
 	if db.storagePrefetchPending == nil {
 		db.storagePrefetchPending = make(map[string]struct{})
 	}
-	db.storagePrefetchPending[cacheKey] = struct{}{}
+	if _, exists := db.storagePrefetchPending[cacheKey]; !exists {
+		db.storagePrefetchPending[cacheKey] = struct{}{}
+		atomic.AddUint64(&db.storagePrefetchTrackedCount, 1)
+	}
 	db.storagePrefetchMu.Unlock()
 }
 
 func (db *PrefixDB) clearStoragePrefetch(cacheKey string) {
-	if db == nil || cacheKey == "" {
+	if !analysisStatsEnabled || db == nil || cacheKey == "" {
+		return
+	}
+	if atomic.LoadUint64(&db.storagePrefetchTrackedCount) == 0 {
 		return
 	}
 	db.storagePrefetchMu.Lock()
+	if len(db.storagePrefetchPending) == 0 {
+		db.storagePrefetchMu.Unlock()
+		return
+	}
 	if _, ok := db.storagePrefetchPending[cacheKey]; ok {
 		delete(db.storagePrefetchPending, cacheKey)
+		atomic.AddUint64(&db.storagePrefetchTrackedCount, ^uint64(0))
 		atomic.AddUint64(&db.trieStoragePrefetchStats.clearCount, 1)
 	}
 	db.storagePrefetchMu.Unlock()
 }
 
 func (db *PrefixDB) noteStoragePrefetchHit(cacheKey string, value interface{}) {
-	if db == nil || cacheKey == "" {
+	if !analysisStatsEnabled || db == nil || cacheKey == "" {
+		return
+	}
+	if atomic.LoadUint64(&db.storagePrefetchTrackedCount) == 0 {
 		return
 	}
 	db.storagePrefetchMu.Lock()
+	if len(db.storagePrefetchPending) == 0 {
+		db.storagePrefetchMu.Unlock()
+		return
+	}
 	if _, ok := db.storagePrefetchPending[cacheKey]; !ok {
 		db.storagePrefetchMu.Unlock()
 		return
 	}
 	delete(db.storagePrefetchPending, cacheKey)
+	atomic.AddUint64(&db.storagePrefetchTrackedCount, ^uint64(0))
 	db.storagePrefetchMu.Unlock()
 	atomic.AddUint64(&db.trieStoragePrefetchStats.hitCount, 1)
 	if value == nil {
@@ -6100,7 +6139,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 	merged := mergeAndDedupPairs(existing, additions)
 	if len(merged) == 0 {
 		// Nothing left; caller should remove from index. Original file is left as garbage.
-		atomic.AddUint64(&db.GCCount, 1)
+		addUint64Stat(&db.GCCount, 1)
 		return nil, startOrdinal, nil
 	}
 	chunks := splitEntriesBySize(merged, db.segmentedChunkTargetSize())
@@ -6137,8 +6176,8 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 			KeyStart: cloneBytes(chunk[0].key),
 		})
 	}
-	atomic.AddUint64(&db.GCCount, 1)
-	atomic.AddUint64(&db.GCWriteBytes, bytesWritten)
+	addUint64Stat(&db.GCCount, 1)
+	addUint64Stat(&db.GCWriteBytes, bytesWritten)
 	return result, ordinal, nil
 }
 
@@ -6278,7 +6317,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 			return nil, failure, nil
 		}
 		keyRaw := buf[cursor : cursor+klen]
-		key := normalizeStoredStorageKey(keyRaw)
+		key := keyRaw
 		var value []byte
 		if vlen > 0 {
 			value = buf[cursor+klen : cursor+totalLen]
