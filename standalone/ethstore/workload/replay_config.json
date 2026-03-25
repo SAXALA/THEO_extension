@@ -3,7 +3,7 @@
   "aolDataFile": "/mnt/ssd/ethstore/database/aol/print_all_output.txt",
   "traceFile": "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000",
   "traceFileNocache": "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000",
-  "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot-10K-blocks",
+  "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot",
   "ethstoreDir": "/mnt/ssd2/running/ethstore",
   "pebbleDir": "/mnt/ssd2/running/pebble",
   "chainKVDir": "/mnt/ssd2/running/chainkv",

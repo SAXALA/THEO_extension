@@ -16,6 +16,7 @@ const (
 	sharedCacheNamespaceStorage
 	sharedCacheNamespaceSegmentIndex
 	sharedCacheNamespaceFileNode
+	sharedCacheNamespaceSegmentChunk
 )
 
 type sharedCacheEvictor interface {
@@ -360,6 +361,120 @@ func estimateStorageCacheValueSize(key string, value interface{}) uint64 {
 	if valueBytes, ok := value.([]byte); ok {
 		total += uint64(len(valueBytes))
 	}
+	if total == 0 {
+		return 1
+	}
+	return total
+}
+
+type segmentChunkReadCacheEntry struct {
+	buf       []byte
+	lease     *bufferLease
+	sizeBytes uint64
+}
+
+func (e *segmentChunkReadCacheEntry) onSharedCacheEvict() {
+	if e == nil || e.lease == nil {
+		return
+	}
+	e.lease.Release()
+	e.lease = nil
+}
+
+type segmentChunkReadCache struct {
+	shared *sharedByteCache
+}
+
+func newSharedSegmentChunkReadCache(shared *sharedByteCache) *segmentChunkReadCache {
+	if shared == nil {
+		return nil
+	}
+	return &segmentChunkReadCache{shared: shared}
+}
+
+func (c *segmentChunkReadCache) GetByPath(folderPath string, fileName string) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
+	if !ok {
+		return nil, false
+	}
+	entry, _ := raw.(*segmentChunkReadCacheEntry)
+	if entry == nil {
+		return nil, false
+	}
+	return entry.buf, true
+}
+
+func (c *segmentChunkReadCache) PeekByPath(folderPath string, fileName string) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
+	if !ok {
+		return nil, false
+	}
+	entry, _ := raw.(*segmentChunkReadCacheEntry)
+	if entry == nil {
+		return nil, false
+	}
+	return entry.buf, true
+}
+
+func (c *segmentChunkReadCache) AddByPath(folderPath string, fileName string, buf []byte) {
+	if c == nil || folderPath == "" || fileName == "" {
+		return
+	}
+	key := segmentChunkReadCacheKey(folderPath, fileName)
+	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
+		return
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: cloneBytes(buf), sizeBytes: sizeBytes}, sizeBytes)
+}
+
+func (c *segmentChunkReadCache) AddOwnedByPath(folderPath string, fileName string, buf []byte) {
+	if c == nil || folderPath == "" || fileName == "" {
+		return
+	}
+	key := segmentChunkReadCacheKey(folderPath, fileName)
+	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
+		return
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: buf, sizeBytes: sizeBytes}, sizeBytes)
+}
+
+func (c *segmentChunkReadCache) AddLeasedByPath(folderPath string, fileName string, lease *bufferLease) {
+	if c == nil || folderPath == "" || fileName == "" || lease == nil {
+		return
+	}
+	buf := lease.Bytes()
+	key := segmentChunkReadCacheKey(folderPath, fileName)
+	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
+	if sizeBytes == 0 {
+		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
+		return
+	}
+	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: buf, lease: lease.Retain(), sizeBytes: sizeBytes}, sizeBytes)
+}
+
+func (c *segmentChunkReadCache) RemoveByPath(folderPath string, fileName string) {
+	if c == nil || folderPath == "" || fileName == "" {
+		return
+	}
+	c.shared.Remove(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
+}
+
+func segmentChunkReadCacheKey(folderPath string, fileName string) string {
+	return folderPath + "\x00" + fileName
+}
+
+func estimateSegmentChunkBufferSize(key string, buf []byte) uint64 {
+	total := uint64(len(key) + len(buf))
 	if total == 0 {
 		return 1
 	}

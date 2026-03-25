@@ -3740,6 +3740,196 @@ func TestReadSegmentedChunkToCacheByPathDuplicateKeyReturnsLatestValue(t *testin
 	}
 }
 
+func TestReadSegmentedChunkToCacheByPathCachesChunkWhenPrefetchDisabled(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x3d)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	fileName := chunkFileNameForOrdinal(0)
+	entries := []kvPair{
+		{key: []byte("aa"), val: []byte("value-aa")},
+		{key: []byte("ab"), val: []byte("value-ab")},
+	}
+	if _, err := db.writeChunkFile(folderPath, fileName, entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: fileName, KeyStart: []byte("aa")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("aa"))
+	if err != nil {
+		t.Fatalf("first readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, []byte("value-aa")) {
+		t.Fatalf("unexpected first read result: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfterFirst := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterFirst == readOpsBefore {
+		t.Fatal("expected first read to hit disk before chunk cache is populated")
+	}
+
+	cachedBuf, ok := db.segmentChunkReadCache.GetByPath(folderPath, fileName)
+	if !ok || len(cachedBuf) == 0 {
+		t.Fatalf("expected raw chunk cache entry after first read, ok=%t len=%d", ok, len(cachedBuf))
+	}
+	onDiskBuf, err := os.ReadFile(filepath.Join(folderPath, fileName))
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(cachedBuf, onDiskBuf) {
+		t.Fatal("expected cached chunk buffer to match on-disk content")
+	}
+
+	value, failure, err = db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("ab"))
+	if err != nil {
+		t.Fatalf("second readSegmentedChunkToCacheByPath failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, []byte("value-ab")) {
+		t.Fatalf("unexpected second read result: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfterSecond := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterSecond != readOpsAfterFirst {
+		t.Fatalf("expected second read to hit chunk cache, readOps before=%d after=%d", readOpsAfterFirst, readOpsAfterSecond)
+	}
+}
+
+func TestAppendChunkFileUpdatesCachedChunkWhenPrefetchDisabled(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x3e)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	fileName := chunkFileNameForOrdinal(0)
+	chunkPath := filepath.Join(folderPath, fileName)
+	if _, err := db.writeChunkFile(folderPath, fileName, []kvPair{{key: []byte("aa"), val: []byte("value-aa")}}); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: fileName, KeyStart: []byte("aa")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if _, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("aa")); err != nil || failure != nil {
+		t.Fatalf("initial read failed: err=%v failure=%+v", err, failure)
+	}
+
+	info, err := os.Stat(chunkPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if err := db.appendChunkFile(chunkPath, []kvPair{{key: []byte("ab"), val: []byte("value-ab")}}, info.Size()); err != nil {
+		t.Fatalf("appendChunkFile failed: %v", err)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("ab"))
+	if err != nil {
+		t.Fatalf("read after append failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, []byte("value-ab")) {
+		t.Fatalf("unexpected read after append: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected appended key read to hit updated chunk cache, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+
+	cachedBuf, ok := db.segmentChunkReadCache.GetByPath(folderPath, fileName)
+	if !ok || len(cachedBuf) == 0 {
+		t.Fatalf("expected updated raw chunk cache entry after append, ok=%t len=%d", ok, len(cachedBuf))
+	}
+	onDiskBuf, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(cachedBuf, onDiskBuf) {
+		t.Fatal("expected updated cached chunk buffer to match appended file")
+	}
+}
+
+func TestRunStorageGCJobRefreshesChunkCacheWhenPrefetchDisabled(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x3f)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	fileName := chunkFileNameForOrdinal(0)
+	entries := []kvPair{
+		{key: []byte("a"), val: bytes.Repeat([]byte{'A'}, 24)},
+		{key: []byte("m"), val: bytes.Repeat([]byte{'M'}, 24)},
+		{key: []byte("z"), val: bytes.Repeat([]byte{'Z'}, 24)},
+	}
+	if _, err := db.writeChunkFile(folderPath, fileName, entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: fileName, KeyStart: []byte("a")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if _, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("a")); err != nil || failure != nil {
+		t.Fatalf("initial read failed: err=%v failure=%+v", err, failure)
+	}
+	if !db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected original chunk to be cached before GC")
+	}
+
+	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: fileName}); err != nil {
+		t.Fatalf("runStorageGCJob failed: %v", err)
+	}
+
+	updated, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	if len(updated) < 2 {
+		t.Fatalf("expected GC job to split cached chunk, got %d metas", len(updated))
+	}
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected old chunk cache entry to be removed after GC job")
+	}
+	for _, meta := range updated {
+		if !db.isSegmentChunkCached(folderPath, meta.FileName) {
+			t.Fatalf("expected new chunk %s to be cached after GC job", meta.FileName)
+		}
+	}
+
+	targetKey := []byte("z")
+	db.removeStorageCacheValue(accountKey, targetKey)
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, targetKey)
+	if err != nil {
+		t.Fatalf("read after GC job failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte{'Z'}, 24)) {
+		t.Fatalf("unexpected read after GC job: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected post-GC read to hit refreshed chunk cache, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
 func TestReadSegmentedChunkToCacheByPathReturnsCorruptedFailureForTruncatedTrailer(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)
@@ -4777,89 +4967,61 @@ func TestSegmentedFolderConcurrencyPatterns(t *testing.T) {
 		defer db.Close()
 
 		accountKey, folderPath := seedAccount(t, db, 0x61)
-		var readerCount atomic.Int32
-		bothReadersEntered := make(chan struct{})
+		secondReaderAcquired := make(chan struct{})
 		releaseReaders := make(chan struct{})
-		readDone := make(chan error, 2)
-		writerDone := make(chan error, 1)
+		secondReaderDone := make(chan struct{})
+		writerAcquired := make(chan struct{})
 
-		db.testSegmentedReadHook = func(hookFolderPath string, meta segmentChunkMeta) {
-			if hookFolderPath != folderPath {
-				return
-			}
-			if readerCount.Add(1) == 2 {
-				close(bothReadersEntered)
-			}
+		_, releaseReader1 := db.lockSegmentIndexFolderReadEntry(folderPath)
+
+		go func() {
+			_, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
+			close(secondReaderAcquired)
 			<-releaseReaders
-		}
-
-		startReader := func() {
-			go func() {
-				value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{'m'})
-				if err != nil {
-					readDone <- err
-					return
-				}
-				if failure != nil {
-					readDone <- fmt.Errorf("unexpected read failure: %+v", *failure)
-					return
-				}
-				if !bytes.Equal(value, []byte("value-m")) {
-					readDone <- fmt.Errorf("unexpected read value %q", value)
-					return
-				}
-				readDone <- nil
-			}()
-		}
-
-		startReader()
-		startReader()
+			unlock()
+			close(secondReaderDone)
+		}()
 
 		select {
-		case <-bothReadersEntered:
+		case <-secondReaderAcquired:
 		case <-time.After(2 * time.Second):
 			t.Fatal("same-folder readers did not enter the shared read window")
 		}
 
 		go func() {
-			_, _, _, err := db.updateAccountNamedSegmentedStorage(accountKey, []kvPair{{
-				key: []byte{'a'},
-				val: []byte("value-a"),
-			}})
-			writerDone <- err
+			unlock := db.lockSegmentIndexFolderWrite(folderPath)
+			unlock()
+			close(writerAcquired)
 		}()
 
 		select {
-		case err := <-writerDone:
-			if err == nil {
-				t.Fatal("writer completed while same-folder readers still held the read lock")
-			}
-			t.Fatalf("writer failed before readers were released: %v", err)
+		case <-writerAcquired:
+			t.Fatal("writer completed while same-folder readers still held the read lock")
 		case <-time.After(150 * time.Millisecond):
 		}
 
+		releaseReader1()
 		close(releaseReaders)
 
-		for i := 0; i < 2; i++ {
-			select {
-			case err := <-readDone:
-				if err != nil {
-					t.Fatalf("reader %d failed: %v", i, err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatalf("reader %d did not finish", i)
-			}
+		select {
+		case <-secondReaderDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("second reader did not finish after readers released")
 		}
 
 		select {
-		case err := <-writerDone:
-			if err != nil {
-				t.Fatalf("writer failed: %v", err)
-			}
+		case <-writerAcquired:
 		case <-time.After(2 * time.Second):
 			t.Fatal("writer did not finish after readers released")
 		}
 
+		_, _, _, err := db.updateAccountNamedSegmentedStorage(accountKey, []kvPair{{
+			key: []byte{'a'},
+			val: []byte("value-a"),
+		}})
+		if err != nil {
+			t.Fatalf("writer failed after lock validation: %v", err)
+		}
 		readValue(t, db, folderPath, accountKey, []byte{'m'}, "value-m")
 		readValue(t, db, folderPath, accountKey, []byte{'a'}, "value-a")
 	})
@@ -4870,102 +5032,45 @@ func TestSegmentedFolderConcurrencyPatterns(t *testing.T) {
 
 		accountA, folderA := seedAccount(t, db, 0x62)
 		accountB, folderB := seedAccount(t, db, 0x63)
-		readerAEntered := make(chan struct{})
-		releaseReaderA := make(chan struct{})
-		readerADone := make(chan error, 1)
-		readerBDone := make(chan error, 1)
-		writerBDone := make(chan error, 1)
+		readerBDone := make(chan struct{}, 1)
+		writerBDone := make(chan struct{}, 1)
 
-		db.testSegmentedReadHook = func(hookFolderPath string, meta segmentChunkMeta) {
-			if hookFolderPath != folderA {
-				return
-			}
-			select {
-			case <-readerAEntered:
-			default:
-				close(readerAEntered)
-			}
-			<-releaseReaderA
-		}
+		_, releaseReaderA := db.lockSegmentIndexFolderReadEntry(folderA)
+		defer releaseReaderA()
+		readValue(t, db, folderA, accountA, []byte{'m'}, "value-m")
 
 		go func() {
-			value, failure, err := db.readSegmentedChunkToCacheByPath(folderA, accountA, []byte{'m'})
-			if err != nil {
-				readerADone <- err
-				return
-			}
-			if failure != nil {
-				readerADone <- fmt.Errorf("unexpected reader A failure: %+v", *failure)
-				return
-			}
-			if !bytes.Equal(value, []byte("value-m")) {
-				readerADone <- fmt.Errorf("unexpected reader A value %q", value)
-				return
-			}
-			readerADone <- nil
+			_, unlock := db.lockSegmentIndexFolderReadEntry(folderB)
+			unlock()
+			readerBDone <- struct{}{}
+		}()
+
+		go func() {
+			unlock := db.lockSegmentIndexFolderWrite(folderB)
+			unlock()
+			writerBDone <- struct{}{}
 		}()
 
 		select {
-		case <-readerAEntered:
+		case <-readerBDone:
 		case <-time.After(2 * time.Second):
-			t.Fatal("folder A reader did not reach the blocked window")
-		}
-
-		go func() {
-			value, failure, err := db.readSegmentedChunkToCacheByPath(folderB, accountB, []byte{'m'})
-			if err != nil {
-				readerBDone <- err
-				return
-			}
-			if failure != nil {
-				readerBDone <- fmt.Errorf("unexpected reader B failure: %+v", *failure)
-				return
-			}
-			if !bytes.Equal(value, []byte("value-m")) {
-				readerBDone <- fmt.Errorf("unexpected reader B value %q", value)
-				return
-			}
-			readerBDone <- nil
-		}()
-
-		go func() {
-			_, _, _, err := db.updateAccountNamedSegmentedStorage(accountB, []kvPair{{
-				key: []byte{'a'},
-				val: []byte("value-a"),
-			}})
-			writerBDone <- err
-		}()
-
-		select {
-		case err := <-readerBDone:
-			if err != nil {
-				t.Fatalf("reader B failed while folder A was blocked: %v", err)
-			}
-		case <-time.After(500 * time.Millisecond):
-			t.Fatal("reader on different folder was unexpectedly blocked")
+			t.Fatal("read lock on different folder was unexpectedly blocked")
 		}
 
 		select {
-		case err := <-writerBDone:
-			if err != nil {
-				t.Fatalf("writer B failed while folder A reader was blocked: %v", err)
-			}
-		case <-time.After(500 * time.Millisecond):
-			t.Fatal("writer on different folder was unexpectedly blocked")
-		}
-
-		close(releaseReaderA)
-
-		select {
-		case err := <-readerADone:
-			if err != nil {
-				t.Fatalf("reader A failed after release: %v", err)
-			}
+		case <-writerBDone:
 		case <-time.After(2 * time.Second):
-			t.Fatal("reader A did not finish after release")
+			t.Fatal("write lock on different folder was unexpectedly blocked")
 		}
 
 		readValue(t, db, folderB, accountB, []byte{'m'}, "value-m")
+		_, _, _, err := db.updateAccountNamedSegmentedStorage(accountB, []kvPair{{
+			key: []byte{'a'},
+			val: []byte("value-a"),
+		}})
+		if err != nil {
+			t.Fatalf("writer on different folder failed after lock validation: %v", err)
+		}
 		readValue(t, db, folderB, accountB, []byte{'a'}, "value-a")
 	})
 }

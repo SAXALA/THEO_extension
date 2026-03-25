@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,13 +122,15 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 	opt := &pebble.Options{
 		Cache:        pebble.NewCache(int64(cache * 1024 * 1024)),
 		MaxOpenFiles: handles,
-		MemTableSize: uint64(memTableSize),
-		MemTableStopWritesThreshold: memTableLimit,
+		// MemTableSize: uint64(memTableSize),
+		// MemTableStopWritesThreshold: memTableLimit,
 		MaxConcurrentCompactions: func() int {
-			return runtime.NumCPU() / 2
+			return 16
+			// runtime.NumCPU()
 		},
 		L0CompactionThreshold:       4,
 		L0StopWritesThreshold:       12,
+		L0CompactionFileThreshold:   1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
 		BytesPerSync:                512 << 10, // 512 KB
 		DisableWAL:                  false,
@@ -151,6 +152,7 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		ReadOnly: readonly,
 		Logger:   panicLogger{},
 	}
+	opt.Experimental.ReadSamplingMultiplier = -1 // disable seek compaction as in Geth
 	var err error
 	if db.db, err = pebble.Open(file, opt); err != nil {
 		return nil, err

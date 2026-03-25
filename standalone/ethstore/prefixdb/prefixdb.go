@@ -355,6 +355,7 @@ type PrefixDB struct {
 	segmentIndexCompression          bool
 
 	storageCache            *storageValueCache
+	segmentChunkReadCache   *segmentChunkReadCache
 	stroageCacheSizeLimit   uint64
 	storageChunkSize        int
 	segmentedChunkHardLimit int // hard cap for individual chunk files
@@ -588,6 +589,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 
 	db.storageIndexCache = newSharedSegmentIndexCache(sharedCache)
 	db.storageCache = newSharedStorageValueCache(sharedCache)
+	db.segmentChunkReadCache = newSharedSegmentChunkReadCache(sharedCache)
 
 	db.startStorageGCWorker()
 
@@ -2906,6 +2908,7 @@ func (db *PrefixDB) appendChunkFile(path string, additions []kvPair, currentSize
 		return err
 	}
 	db.addDiskWrite(diskIOUsageStorageSeparatedLogs, len(seg))
+	db.appendCachedSegmentChunkBuffer(filepath.Dir(path), filepath.Base(path), seg)
 	return nil
 }
 
@@ -2922,6 +2925,7 @@ func adjustMetaRange(meta *segmentChunkMeta, additions []kvPair) {
 
 func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMeta, additions []kvPair, allocator *chunkFileAllocator, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, bool, error) {
 	var err error
+	wasCached := db.isSegmentChunkCached(folderPath, meta.FileName)
 	if existing == nil {
 		existing, backing, err = db.readSegmentChunkFileWithUsageByPath(folderPath, meta.FileName, diskIOUsageStorageSeparatedLogs)
 		if err != nil {
@@ -2957,6 +2961,15 @@ func (db *PrefixDB) rewriteChunkWithDedup(folderPath string, meta segmentChunkMe
 			FileName: name,
 			KeyStart: cloneBytes(chunk[0].key),
 		})
+	}
+	if wasCached {
+		for i := range result {
+			chunkBuf, _, _, err := serializeChunkPayload(chunks[i])
+			if err != nil {
+				return nil, false, err
+			}
+			db.cacheSegmentChunkOwnedBuffer(folderPath, result[i].FileName, chunkBuf)
+		}
 	}
 	return result, false, nil
 }
@@ -3128,6 +3141,7 @@ func (db *PrefixDB) writeChunkFileWithUsage(folderPath, fileName string, entries
 		_ = os.Remove(tmpPath)
 		return 0, err
 	}
+	db.replaceCachedSegmentChunkBuffer(folderPath, fileName, seg)
 	return chunkSize, nil
 }
 
@@ -3214,6 +3228,11 @@ func shouldSkipAccountEntryPointerUpdate(existingFileID uint32, fileID uint32, o
 
 func (db *PrefixDB) lockSegmentIndexFolder(folderPath string) func() {
 	_, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
+	return unlock
+}
+
+func (db *PrefixDB) lockSegmentIndexFolderWrite(folderPath string) func() {
+	_, unlock := db.lockSegmentIndexFolderEntry(folderPath)
 	return unlock
 }
 
@@ -4328,7 +4347,7 @@ func (db *PrefixDB) writeSegmentIndexIncrementalGCLocked(folderPath string, late
 }
 
 func (db *PrefixDB) invalidateSegmentIndexCacheByPath(folderPath string) {
-	unlock := db.lockSegmentIndexFolder(folderPath)
+	unlock := db.lockSegmentIndexFolderWrite(folderPath)
 	defer unlock()
 	if folderPath == "" {
 		return
@@ -4359,7 +4378,7 @@ func (db *PrefixDB) invalidateSegmentIndexCache(folderID uint32) {
 }
 
 func (db *PrefixDB) refreshSegmentIndexCacheByPath(folderPath string, metas []segmentChunkMeta) {
-	unlock := db.lockSegmentIndexFolder(folderPath)
+	unlock := db.lockSegmentIndexFolderWrite(folderPath)
 	defer unlock()
 	db.refreshSegmentIndexCacheByPathLocked(folderPath, metas)
 }
@@ -4777,6 +4796,10 @@ func (db *PrefixDB) segmentChunkFileSizeByPath(folderPath string, fileName strin
 }
 
 func (db *PrefixDB) readSegmentedChunkToCacheStreamingByPath(folderPath string, fileName string, accountKey []byte, storageKey []byte, failure *segmentedStorageReadFailure) ([]byte, *segmentedStorageReadFailure, *bufferLease, error) {
+	if cachedBuf, ok := db.getCachedSegmentChunkBuffer(folderPath, fileName); ok {
+		value, readFailure := db.readSegmentedChunkBufferToCache(cachedBuf, accountKey, storageKey, failure)
+		return value, readFailure, nil, nil
+	}
 	lease, err := db.readSegmentFileBufferByPathWithUsage(folderPath, fileName, diskIOUsageStorageSeparatedLogs)
 	if err != nil {
 		failure.reason = "segment-chunk-read-failed"
@@ -4791,6 +4814,11 @@ func (db *PrefixDB) readSegmentedChunkToCacheStreamingByPath(folderPath string, 
 
 	cache := db.storageCache
 	prefetchLimit := db.storageGetCacheCount
+	if prefetchLimit == 0 {
+		db.cacheSegmentChunkLease(folderPath, fileName, lease)
+		value, readFailure := db.readSegmentedChunkBufferToCache(buf, accountKey, storageKey, failure)
+		return value, readFailure, lease, nil
+	}
 	pending := make([]kvPair, 0, prefetchLimit)
 	for cursor := len(buf); cursor > 0; {
 		if cursor < segmentedChunkEntryHeaderSize {
@@ -5610,6 +5638,120 @@ func (db *PrefixDB) refreshManagedFolderStorageCache(folderPath string) error {
 	return nil
 }
 
+func (db *PrefixDB) shouldUseSegmentChunkReadCache() bool {
+	return db != nil && db.storageGetCacheCount == 0 && db.segmentChunkReadCache != nil
+}
+
+func (db *PrefixDB) getCachedSegmentChunkBuffer(folderPath string, fileName string) ([]byte, bool) {
+	if !db.shouldUseSegmentChunkReadCache() {
+		return nil, false
+	}
+	return db.segmentChunkReadCache.GetByPath(folderPath, fileName)
+}
+
+func (db *PrefixDB) peekCachedSegmentChunkBuffer(folderPath string, fileName string) ([]byte, bool) {
+	if !db.shouldUseSegmentChunkReadCache() {
+		return nil, false
+	}
+	return db.segmentChunkReadCache.PeekByPath(folderPath, fileName)
+}
+
+func (db *PrefixDB) isSegmentChunkCached(folderPath string, fileName string) bool {
+	_, ok := db.peekCachedSegmentChunkBuffer(folderPath, fileName)
+	return ok
+}
+
+func (db *PrefixDB) cacheSegmentChunkBuffer(folderPath string, fileName string, buf []byte) {
+	if !db.shouldUseSegmentChunkReadCache() {
+		return
+	}
+	db.segmentChunkReadCache.AddByPath(folderPath, fileName, buf)
+}
+
+func (db *PrefixDB) cacheSegmentChunkOwnedBuffer(folderPath string, fileName string, buf []byte) {
+	if !db.shouldUseSegmentChunkReadCache() {
+		return
+	}
+	db.segmentChunkReadCache.AddOwnedByPath(folderPath, fileName, buf)
+}
+
+func (db *PrefixDB) cacheSegmentChunkLease(folderPath string, fileName string, lease *bufferLease) {
+	if !db.shouldUseSegmentChunkReadCache() || lease == nil {
+		return
+	}
+	db.segmentChunkReadCache.AddLeasedByPath(folderPath, fileName, lease)
+}
+
+func (db *PrefixDB) replaceCachedSegmentChunkBuffer(folderPath string, fileName string, buf []byte) {
+	if !db.isSegmentChunkCached(folderPath, fileName) {
+		return
+	}
+	db.segmentChunkReadCache.AddByPath(folderPath, fileName, buf)
+}
+
+func (db *PrefixDB) appendCachedSegmentChunkBuffer(folderPath string, fileName string, additionBuf []byte) {
+	if len(additionBuf) == 0 {
+		return
+	}
+	existing, ok := db.peekCachedSegmentChunkBuffer(folderPath, fileName)
+	if !ok {
+		return
+	}
+	updated := make([]byte, 0, len(existing)+len(additionBuf))
+	updated = append(updated, existing...)
+	updated = append(updated, additionBuf...)
+	db.segmentChunkReadCache.AddOwnedByPath(folderPath, fileName, updated)
+}
+
+func (db *PrefixDB) removeCachedSegmentChunkEntries(folderPath string, fileName string) {
+	if !db.shouldUseSegmentChunkReadCache() {
+		return
+	}
+	db.segmentChunkReadCache.RemoveByPath(folderPath, fileName)
+}
+
+func (db *PrefixDB) readSegmentedChunkBufferToCache(buf []byte, accountKey []byte, storageKey []byte, failure *segmentedStorageReadFailure) ([]byte, *segmentedStorageReadFailure) {
+	cache := db.storageCache
+	for cursor := len(buf); cursor > 0; {
+		if cursor < segmentedChunkEntryHeaderSize {
+			failure.reason = "segment-chunk-corrupted"
+			return nil, failure
+		}
+		footer := buf[cursor-segmentedChunkEntryHeaderSize : cursor]
+		klen := int(readUint16BE(footer[:2]))
+		vlen := int(readUint16BE(footer[2:4]))
+		recordDataLen := klen + vlen
+		recordStart := cursor - segmentedChunkEntryHeaderSize - recordDataLen
+		if recordStart < 0 {
+			failure.reason = "segment-chunk-corrupted"
+			return nil, failure
+		}
+
+		entryBuf := buf[recordStart : cursor-segmentedChunkEntryHeaderSize]
+		key := entryBuf[:klen]
+		if bytes.Equal(key, storageKey) {
+			if vlen == 0 {
+				if cache != nil {
+					db.addStorageCacheValue(accountKey, storageKey, nil, false)
+				}
+				failure.reason = "segment-chunk-tombstone"
+				return nil, failure
+			}
+			result := cloneBytes(entryBuf[klen:recordDataLen])
+			if cache != nil {
+				db.addStorageCacheValue(accountKey, storageKey, result, false)
+			}
+			return result, nil
+		}
+		cursor = recordStart
+	}
+	if cache != nil {
+		db.addStorageCacheValue(accountKey, storageKey, nil, false)
+	}
+	failure.reason = "segment-chunk-key-not-found"
+	return nil, failure
+}
+
 func isSegmentedStorage(fileID uint32) bool {
 	return fileID&segmentedStorageFlag != 0
 }
@@ -5940,6 +6082,22 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 	if !applied {
 		return nil
 	}
+	for oldFileName, chunkMetas := range replacements {
+		if !db.isSegmentChunkCached(folderPath, oldFileName) {
+			continue
+		}
+		for _, meta := range chunkMetas {
+			backing, err := db.readSegmentFileBufferByPathWithUsage(folderPath, meta.FileName, diskIOUsageStorageGC)
+			if err != nil {
+				return err
+			}
+			db.cacheSegmentChunkLease(folderPath, meta.FileName, backing)
+			if backing != nil {
+				backing.Release()
+			}
+		}
+		db.removeCachedSegmentChunkEntries(folderPath, oldFileName)
+	}
 	committed, err := db.readSegmentIndexNoCacheByPath(folderPath)
 	if err != nil {
 		return err
@@ -6065,6 +6223,19 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	}
 	if !applied {
 		return nil
+	}
+	if db.isSegmentChunkCached(folderPath, job.fileName) {
+		for _, meta := range chunkMetas {
+			backing, err := db.readSegmentFileBufferByPathWithUsage(folderPath, meta.FileName, diskIOUsageStorageGC)
+			if err != nil {
+				return err
+			}
+			db.cacheSegmentChunkLease(folderPath, meta.FileName, backing)
+			if backing != nil {
+				backing.Release()
+			}
+		}
+		db.removeCachedSegmentChunkEntries(folderPath, job.fileName)
 	}
 	committed, err := db.readSegmentIndexNoCacheByPath(folderPath)
 	if err != nil {
@@ -6417,6 +6588,13 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 
 		updated := make([]segmentChunkMeta, 0, len(metas))
 		keep := make(map[string]struct{})
+		cachedFolder := false
+		for _, meta := range metas {
+			if db.isSegmentChunkCached(folderPath, meta.FileName) {
+				cachedFolder = true
+				break
+			}
+		}
 		if len(allEntries) > 0 {
 			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
 			for i, chunk := range chunks {
@@ -6431,12 +6609,23 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 					KeyStart: cloneBytes(chunk[0].key),
 				})
 				keep[fileName] = struct{}{}
+				if cachedFolder {
+					chunkBuf, _, _, err := serializeChunkPayload(chunk)
+					if err != nil {
+						unlock()
+						return err
+					}
+					db.cacheSegmentChunkOwnedBuffer(folderPath, fileName, chunkBuf)
+				}
 			}
 		}
 
 		for _, meta := range metas {
 			if _, ok := keep[meta.FileName]; ok {
 				continue
+			}
+			if cachedFolder {
+				db.removeCachedSegmentChunkEntries(folderPath, meta.FileName)
 			}
 			fullPath := filepath.Join(folderPath, meta.FileName)
 			if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
