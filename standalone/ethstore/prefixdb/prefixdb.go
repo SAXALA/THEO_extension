@@ -1157,11 +1157,10 @@ func (db *PrefixDB) storageReadLogFields(accountKey []byte) (string, string, uin
 }
 
 func (db *PrefixDB) logAccountKVReadFailure(key []byte, offset uint64, size uint32, reason string, err error) {
-	dir, file, offset, size := db.accountReadLogFields(offset, size)
-	if err != nil {
-		fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: account kv read failed key=%x dir=%s file=%s offset=%d size=%d reason=%s err=%v\n", key, dir, file, offset, size, reason, err)
+	if !shouldEmitStorageMissLogForTestsOnly(err) {
 		return
 	}
+	dir, file, offset, size := db.accountReadLogFields(offset, size)
 	fmt.Fprintf(prefixdbLogWriter, "prefixdb ERROR: account kv read failed key=%x dir=%s file=%s offset=%d size=%d reason=%s\n", key, dir, file, offset, size, reason)
 }
 

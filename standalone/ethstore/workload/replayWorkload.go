@@ -1094,6 +1094,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		lineCounter        int64
 		logicReadSize      int64
 		logicWriteSize     int64
+		traceBytesRead     int64
 		stopAtNextBlockEnd bool
 		committedAtExit    bool
 		replayStarted      bool
@@ -1150,6 +1151,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 		line = strings.TrimSpace(line)
 		lineCounter++
+		traceBytesRead += int64(len(line) + 1) // +1 for newline character
 
 		if marker := blockMarkerRegex.FindStringSubmatch(line); len(marker) == 3 {
 			markerType := marker[1]
@@ -1352,6 +1354,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	}
 	fmt.Printf("\n[%s] Replay finished. ops=%d time=%.2fs throughput=%.2f ops/s read=%d write=%d\n",
 		backend.Name(), counter, totalTime.Seconds(), float64(counter)/totalTime.Seconds(), logicReadSize, logicWriteSize)
+	fmt.Printf("\n[%s] Trace file bytes read: %d bytes (%.2f GiB)\n",
+		backend.Name(), traceBytesRead, float64(traceBytesRead)/1024/1024/1024)
 	reportLatencyStats(stats)
 	reportGlobalLatencyStats(globalStats)
 	reportReplayReadStats("GetStats", getSuccessByType, getNotFoundByType, getSuccessTotal, getNotFoundTotal)

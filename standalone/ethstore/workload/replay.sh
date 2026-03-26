@@ -346,8 +346,8 @@ build_replay_binary() {
         exit 1
     fi
     mkdir -p ./bin
-    # if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
-    if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
+    if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
+    # if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
         echo "构建 replayWorkload 失败，退出。"
         exit 1
     fi

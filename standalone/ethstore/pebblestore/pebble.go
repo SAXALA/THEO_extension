@@ -153,6 +153,32 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		Logger:   panicLogger{},
 	}
 	opt.Experimental.ReadSamplingMultiplier = -1 // disable seek compaction as in Geth
+
+	// Log all options values at startup
+	logger.Info("Pebble options configured",
+		"Cache", common.StorageSize(cache*1024*1024),
+		"MaxOpenFiles", opt.MaxOpenFiles,
+		"MemTableSize", common.StorageSize(opt.MemTableSize),
+		"MemTableStopWritesThreshold", opt.MemTableStopWritesThreshold,
+		"L0CompactionThreshold", opt.L0CompactionThreshold,
+		"L0StopWritesThreshold", opt.L0StopWritesThreshold,
+		"L0CompactionFileThreshold", opt.L0CompactionFileThreshold,
+		"LBaseMaxBytes", common.StorageSize(opt.LBaseMaxBytes),
+		"BytesPerSync", common.StorageSize(opt.BytesPerSync),
+		"DisableWAL", opt.DisableWAL,
+		"ReadOnly", opt.ReadOnly,
+		"Levels", len(opt.Levels),
+		"ReadSamplingMultiplier", opt.Experimental.ReadSamplingMultiplier,
+	)
+	for i, level := range opt.Levels {
+		logger.Info("Pebble level options",
+			"level", i,
+			"TargetFileSize", common.StorageSize(level.TargetFileSize),
+			"FilterPolicy", fmt.Sprintf("%T", level.FilterPolicy),
+			"Compression", level.Compression,
+		)
+	}
+
 	var err error
 	if db.db, err = pebble.Open(file, opt); err != nil {
 		return nil, err
@@ -165,6 +191,131 @@ func (d *PebbleStore) Close() error {
 	if d.quitChan == nil {
 		return nil
 	}
+
+	// Log metrics before closing
+	metrics := d.db.Metrics()
+	d.log.Info("Pebble metrics on close",
+		"diskSpaceUsage", common.StorageSize(metrics.DiskSpaceUsage()),
+		"uptime", metrics.Uptime,
+		"numVirtual", metrics.NumVirtual(),
+		"readAmp", metrics.ReadAmp(),
+	)
+
+	// Log keys metrics
+	d.log.Info("Pebble keys metrics on close",
+		"rangeKeySetsCount", metrics.Keys.RangeKeySetsCount,
+		"tombstoneCount", metrics.Keys.TombstoneCount,
+		"missizedTombstonesCount", metrics.Keys.MissizedTombstonesCount,
+	)
+
+	// Log memtable metrics
+	d.log.Info("Pebble memtable metrics on close",
+		"size", common.StorageSize(metrics.MemTable.Size),
+		"count", metrics.MemTable.Count,
+		"zombieSize", common.StorageSize(metrics.MemTable.ZombieSize),
+		"zombieCount", metrics.MemTable.ZombieCount,
+	)
+
+	// Log table metrics
+	d.log.Info("Pebble table metrics on close",
+		"obsoleteSize", common.StorageSize(metrics.Table.ObsoleteSize),
+		"obsoleteCount", metrics.Table.ObsoleteCount,
+		"zombieSize", common.StorageSize(metrics.Table.ZombieSize),
+		"zombieCount", metrics.Table.ZombieCount,
+		"backingTableCount", metrics.Table.BackingTableCount,
+		"backingTableSize", common.StorageSize(metrics.Table.BackingTableSize),
+	)
+
+	// Log WAL metrics
+	d.log.Info("Pebble WAL metrics on close",
+		"files", metrics.WAL.Files,
+		"obsoleteFiles", metrics.WAL.ObsoleteFiles,
+		"size", common.StorageSize(metrics.WAL.Size),
+		"physicalSize", common.StorageSize(metrics.WAL.PhysicalSize),
+		"bytesIn", common.StorageSize(metrics.WAL.BytesIn),
+		"bytesWritten", common.StorageSize(metrics.WAL.BytesWritten),
+	)
+
+	// Log compaction metrics
+	d.log.Info("Pebble compaction metrics on close",
+		"count", metrics.Compact.Count,
+		"defaultCount", metrics.Compact.DefaultCount,
+		"deleteOnlyCount", metrics.Compact.DeleteOnlyCount,
+		"elisionOnlyCount", metrics.Compact.ElisionOnlyCount,
+		"moveCount", metrics.Compact.MoveCount,
+		"readCount", metrics.Compact.ReadCount,
+		"rewriteCount", metrics.Compact.RewriteCount,
+		"multiLevelCount", metrics.Compact.MultiLevelCount,
+		"estimatedDebt", common.StorageSize(metrics.Compact.EstimatedDebt),
+		"inProgressBytes", common.StorageSize(metrics.Compact.InProgressBytes),
+		"numInProgress", metrics.Compact.NumInProgress,
+		"markedFiles", metrics.Compact.MarkedFiles,
+		"duration", metrics.Compact.Duration,
+	)
+
+	// Log flush metrics
+	d.log.Info("Pebble flush metrics on close",
+		"count", metrics.Flush.Count,
+		"numInProgress", metrics.Flush.NumInProgress,
+		"asIngestCount", metrics.Flush.AsIngestCount,
+		"asIngestTableCount", metrics.Flush.AsIngestTableCount,
+		"asIngestBytes", common.StorageSize(metrics.Flush.AsIngestBytes),
+	)
+
+	// Log ingest metrics
+	d.log.Info("Pebble ingest metrics on close",
+		"count", metrics.Ingest.Count,
+	)
+
+	// Log snapshot metrics
+	d.log.Info("Pebble snapshot metrics on close",
+		"count", metrics.Snapshots.Count,
+		"earliestSeqNum", metrics.Snapshots.EarliestSeqNum,
+		"pinnedKeys", metrics.Snapshots.PinnedKeys,
+		"pinnedSize", common.StorageSize(metrics.Snapshots.PinnedSize),
+	)
+
+	// Log block cache metrics
+	d.log.Info("Pebble block cache metrics on close",
+		"hits", metrics.BlockCache.Hits,
+		"misses", metrics.BlockCache.Misses,
+		"hitRate", fmt.Sprintf("%.2f%%", float64(metrics.BlockCache.Hits)/float64(metrics.BlockCache.Hits+metrics.BlockCache.Misses+1)*100),
+	)
+
+	// Log table cache metrics
+	d.log.Info("Pebble table cache metrics on close",
+		"hits", metrics.TableCache.Hits,
+		"misses", metrics.TableCache.Misses,
+		"hitRate", fmt.Sprintf("%.2f%%", float64(metrics.TableCache.Hits)/float64(metrics.TableCache.Hits+metrics.TableCache.Misses+1)*100),
+	)
+
+	// Log level-specific metrics
+	for i := 0; i < len(metrics.Levels); i++ {
+		level := metrics.Levels[i]
+		if level.NumFiles == 0 && level.Size == 0 {
+			continue
+		}
+		d.log.Info("Pebble level metrics on close",
+			"level", i,
+			"sublevels", level.Sublevels,
+			"numFiles", level.NumFiles,
+			"numVirtualFiles", level.NumVirtualFiles,
+			"size", common.StorageSize(level.Size),
+			"virtualSize", common.StorageSize(level.VirtualSize),
+			"score", level.Score,
+			"bytesIn", common.StorageSize(level.BytesIn),
+			"bytesIngested", common.StorageSize(level.BytesIngested),
+			"bytesMoved", common.StorageSize(level.BytesMoved),
+			"bytesRead", common.StorageSize(level.BytesRead),
+			"bytesCompacted", common.StorageSize(level.BytesCompacted),
+			"bytesFlushed", common.StorageSize(level.BytesFlushed),
+			"tablesCompacted", level.TablesCompacted,
+			"tablesFlushed", level.TablesFlushed,
+			"tablesIngested", level.TablesIngested,
+			"tablesMoved", level.TablesMoved,
+		)
+	}
+
 	errc := make(chan error)
 	d.quitChan <- errc
 	if err := <-errc; err != nil {
