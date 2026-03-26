@@ -1035,5 +1035,5 @@ func (d *Database) InsertAccountHashPebble(key []byte, accounthash []byte) error
 	if d.accountHashKeyCache != nil {
 		d.accountHashKeyCache.Put(accounthash, key)
 	}
-	return d.statepdb.InsertAccountHashPebble(accounthash, key)
+	return d.pebble.Put(accounthash, key)
 }

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,11 +18,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/rlp"
 	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 )
 
 const storageMaxFileSize int64 = 1 << 30 // 1GB
@@ -342,10 +337,6 @@ func (c *currentSegmentChunkBuffer) peekLeaseByPath(folderPath string, fileName 
 	return lease, true
 }
 
-func (c *currentSegmentChunkBuffer) SetLeaseByPath(folderPath string, fileName string, lease *bufferLease) {
-	c.SetReadLeaseByPath(folderPath, fileName, lease)
-}
-
 func (c *currentSegmentChunkBuffer) SetReadLeaseByPath(folderPath string, fileName string, lease *bufferLease) {
 	if c == nil || folderPath == "" || fileName == "" || lease == nil || len(lease.Bytes()) == 0 {
 		return
@@ -648,13 +639,6 @@ const (
 	ContractAccount
 )
 
-type StateAccount struct {
-	Nonce    uint64
-	Balance  *big.Int
-	Root     common.Hash
-	CodeHash []byte
-}
-
 type storageOpBuffer struct {
 	accountKey   string
 	storagekvs   []kvPair
@@ -736,7 +720,6 @@ type PrefixDB struct {
 	sharedCache  *sharedByteCache
 	accountBatch *WriteBatch
 	// triePath             string       // path to the prefix tree file
-	accountHashKeyPebble *pebblestore.PebbleStore // pebble store for account hash key index
 	// hashIndex  hashIndex to aviod hash collision
 	writeMutex sync.Mutex // mutex for writeCommit
 
@@ -893,17 +876,6 @@ type segmentIndexFolderLock struct {
 */
 func NewPrefixDB(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
 	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, 0)
-}
-
-// NewPrefixDBWithCacheSettings creates PrefixDB with a single shared cache
-// budget in MiB. All PrefixDB caches share this total budget.
-// Use <=0 values to fallback to the default shared cache size.
-func NewPrefixDBWithCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, 0)
-}
-
-func NewPrefixDBWithFileHandleCacheSettings(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, fileHandleCacheSize int) (*PrefixDB, error) {
-	return NewPrefixDBWithRuntimeOptions(dirpath, storageChunkFileSize, totalCacheSizeMiB, storageGetCacheCount, 0, 0, 0, false, false, fileHandleCacheSize)
 }
 
 func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, totalCacheSizeMiB int, storageGetCacheCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, fileHandleCacheSize int) (*PrefixDB, error) {
@@ -1279,16 +1251,12 @@ func (db *PrefixDB) batchPutAccount(key, value []byte) error {
 	return nil
 }
 
-func (db *PrefixDB) batchPutStorage(key, value, accountKey []byte) error {
-	return db.StorageBatchPut(key, value, accountKey)
-}
-
 func (db *PrefixDB) BatchPut(dataType datatypepkg.DataType, key, value, accountKey []byte) error {
 	switch dataType {
 	case datatypepkg.TrieNodeAccountDataType:
 		return db.batchPutAccount(key, value)
 	case datatypepkg.TrieNodeStorageDataType:
-		return db.batchPutStorage(key, value, accountKey)
+		return db.StorageBatchPut(key, value, accountKey)
 	default:
 		return errors.New("unknown data type")
 	}
@@ -2348,156 +2316,7 @@ func (db *PrefixDB) Close() error {
 		fmt.Printf("Errors occurred during closing: %v\n", errs)
 		return errs[0]
 	}
-
-	if db.accountHashKeyPebble != nil {
-		if err := db.accountHashKeyPebble.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close pebble store: %v", err))
-		}
-		db.accountHashKeyPebble = nil
-	}
 	return nil
-}
-
-// ExtractAccountData extracts account data from the value of a TrieAccount node.
-func (db *PrefixDB) ExtractAccountData(key, value []byte) (*StateAccount, error) {
-	if key == nil || value == nil || key[0] != 'A' {
-		return nil, errors.New("invalid key or value")
-	}
-
-	var rawNode []interface{}
-	if err := rlp.DecodeBytes(value, &rawNode); err != nil {
-		return nil, errors.New("failed to decode account data")
-	}
-
-	var accountRLP []byte
-
-	switch len(rawNode) {
-	case 2:
-		// leaf node
-		firstItem, ok := rawNode[0].([]byte)
-		if !ok || len(firstItem) == 0 {
-			return nil, errors.New("invalid node format")
-		}
-
-		// check prefix
-		prefix := firstItem[0] >> 4
-		if prefix == 2 || prefix == 3 { // the prefix indicates a leaf node
-			if valBytes, ok := rawNode[1].([]byte); ok {
-				accountRLP = valBytes
-			} else {
-				return nil, errors.New("invalid account data format")
-			}
-		} else {
-			fmt.Println("extend node, not a leaf node")
-			return nil, nil // not a leaf node
-		}
-
-	case 17:
-		// branch node
-		if valBytes, ok := rawNode[16].([]byte); ok && len(valBytes) > 0 {
-			accountRLP = valBytes
-		} else {
-			fmt.Println("Branch node without value")
-			return nil, nil
-		}
-
-	default:
-		return nil, errors.New("unknow node format") // unknown node format
-	}
-
-	if len(accountRLP) == 0 {
-		return nil, errors.New("no account data found in node")
-	}
-
-	// RLP decode
-	var account StateAccount
-	err := db.decodeAccountRLP(accountRLP, &account)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode account data: %v", err)
-	}
-
-	return &account, nil
-}
-
-// decodeAccountRLP decodes the RLP encoded account data into a StateAccount struct.
-func (db *PrefixDB) decodeAccountRLP(accountRLP []byte, account *StateAccount) error {
-	// Decode the RLP encoded account data
-	kind, content, _, err := rlp.Split(accountRLP)
-	if err != nil {
-		return fmt.Errorf("failed to split RLP data: %v", err)
-	}
-	if kind != rlp.List {
-		return fmt.Errorf("expected RLP list, got %v", kind)
-	}
-
-	remainingData := content
-	var fields [][]byte
-
-	for i := 0; i < 4; i++ {
-		if len(remainingData) == 0 {
-			return fmt.Errorf("not enough fields in RLP data, expected 4, got %d", i)
-		}
-
-		_, val, rest, err := rlp.Split(remainingData)
-		if err != nil {
-			return fmt.Errorf("failed to split field %d: %v", i, err)
-		}
-
-		remainingData = rest
-		fields = append(fields, val)
-
-		// fmt.Printf("字段 %d: 类型=%d, 长度=%d\n", i, kind, len(val))
-	}
-
-	// decode nonce
-	if len(fields[0]) > 0 {
-		nonce, err := decodeUint64(fields[0])
-		if err != nil {
-			return fmt.Errorf("解码nonce失败: %w", err)
-		}
-		account.Nonce = nonce
-	}
-
-	// decode balance
-	if len(fields[1]) > 0 {
-		account.Balance = new(big.Int)
-		account.Balance.SetBytes(fields[1])
-	} else {
-		account.Balance = new(big.Int)
-	}
-
-	// decode storage root
-	if len(fields[2]) != common.HashLength {
-		return fmt.Errorf("invalid storage root length: %d, expected %d", len(fields[2]), common.HashLength)
-	}
-	copy(account.Root[:], fields[2])
-
-	// decode code hash
-	if len(fields[3]) > 0 {
-		if len(fields[3]) != common.HashLength {
-			return fmt.Errorf("invalid code hash length: %d, expected %d", len(fields[3]), common.HashLength)
-		}
-		account.CodeHash = make([]byte, len(fields[3]))
-		copy(account.CodeHash, fields[3])
-	}
-
-	return nil
-}
-
-// decodeUint64 decodes a uint64 from RLP-encoded bytes.
-func decodeUint64(b []byte) (uint64, error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	if len(b) == 1 && b[0] < 128 {
-		return uint64(b[0]), nil
-	}
-
-	var n uint64
-	for _, byte := range b {
-		n = (n << 8) | uint64(byte)
-	}
-	return n, nil
 }
 
 // Convert key-value pair to byte array: <key size (short) + value size (short) + key + value>
@@ -2536,23 +2355,6 @@ func (db *PrefixDB) normalizeStorageKey(rawKey []byte) ([]byte, error) {
 		return []byte{0x4f}, nil
 	}
 	return rawKey[storageKeyTrimOffset:], nil
-}
-
-// GetParentAccountKey retrieves the parent account key from a given (storage)key.
-func (db *PrefixDB) GetParentAccountKey(key []byte) []byte {
-	if len(key) < 21 {
-		return nil
-	}
-	accountHash := key[1:33]
-
-	key, err := db.accountHashKeyPebble.Get(accountHash)
-	if err != nil {
-		if err == pebble.ErrNotFound {
-			return nil // account not found
-		}
-		return nil
-	}
-	return key
 }
 
 func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
@@ -6918,10 +6720,6 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 	addUint64Stat(&db.GCCount, 1)
 	addUint64Stat(&db.GCWriteBytes, bytesWritten)
 	return result, ordinal, nil
-}
-
-func (db *PrefixDB) InsertAccountHashPebble(accountHash []byte, pebbleKey []byte) error {
-	return db.accountHashKeyPebble.Put(accountHash, pebbleKey)
 }
 
 func (db *PrefixDB) readSegmentedChunkToCache(fileID uint32, accountKey []byte, storageKey []byte) ([]byte, *segmentedStorageReadFailure) {
