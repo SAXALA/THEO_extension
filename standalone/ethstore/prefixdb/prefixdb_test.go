@@ -300,8 +300,8 @@ func TestSharedCacheGetNoTouchDoesNotPromoteEntry(t *testing.T) {
 
 func TestStoragePrefetchStatsTrackLaterCacheHit(t *testing.T) {
 	db := &PrefixDB{
-		sharedCache:   newSharedByteCache(1024),
-		storageCache:  newSharedStorageValueCache(newSharedByteCache(1024)),
+		sharedCache:  newSharedByteCache(1024),
+		storageCache: newSharedStorageValueCache(newSharedByteCache(1024)),
 	}
 	accountKey := []byte("acct")
 	storageKey := []byte("slot")
@@ -2371,6 +2371,163 @@ func TestCommitStorageForAccountRefreshesSegmentIndexCacheAfterRewrite(t *testin
 	}
 	if !isSegmentChunkMetasOrdered(fresh) {
 		t.Fatalf("expected rewritten segment index metas to remain ordered after commit, got %+v", fresh)
+	}
+}
+
+func TestAccountNamedSegmentedUpdateSplitRefreshesChunkBufferAndIndex(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+	db.segmentedChunkHardLimit = 64
+
+	accountKey := makeTestAccountKey(0x2b)
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 20)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 20)},
+	}
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorage(accountKey, initial); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorage failed: %v", err)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	before, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath before rewrite failed: %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("expected single initial chunk before split rewrite, got %d", len(before))
+	}
+	oldFileName := before[0].FileName
+	if _, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{0x01}); err != nil || failure != nil {
+		t.Fatalf("warm chunk cache failed: err=%v failure=%+v", err, failure)
+	}
+	if !db.isSegmentChunkCached(folderPath, oldFileName) {
+		t.Fatal("expected original chunk to be cached before commit rewrite")
+	}
+
+	readOpsBeforeUpdate := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if _, _, _, err := db.updateAccountNamedSegmentedStorage(accountKey, []kvPair{{key: []byte{0x02}, val: bytes.Repeat([]byte("b"), 20)}}); err != nil {
+		t.Fatalf("updateAccountNamedSegmentedStorage failed: %v", err)
+	}
+	readOpsAfterUpdate := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterUpdate != readOpsBeforeUpdate {
+		t.Fatalf("expected split rewrite to reuse cached chunk data and in-memory replacement payloads, before=%d after=%d", readOpsBeforeUpdate, readOpsAfterUpdate)
+	}
+
+	after, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath after rewrite failed: %v", err)
+	}
+	if len(after) < 2 {
+		t.Fatalf("expected split rewrite to produce multiple chunks, got %d", len(after))
+	}
+	for _, meta := range after {
+		if meta.FileName == oldFileName {
+			t.Fatalf("expected split rewrite to stop referencing old chunk file %s", oldFileName)
+		}
+		if !db.isSegmentChunkCached(folderPath, meta.FileName) {
+			t.Fatalf("expected replacement chunk %s to be cached after commit rewrite", meta.FileName)
+		}
+	}
+	if db.isSegmentChunkCached(folderPath, oldFileName) {
+		t.Fatal("expected old chunk buffer entry to be removed after split rewrite")
+	}
+
+	cached, ok := db.storageIndexCache.GetByPath(folderPath)
+	if !ok {
+		t.Fatal("expected refreshed segment-index cache after split rewrite")
+	}
+	if !segmentChunkMetasEqual(cached, after) {
+		t.Fatalf("segment-index cache stale after split rewrite: cached=%+v fresh=%+v", cached, after)
+	}
+
+	targetKey := []byte{0x03}
+	db.removeStorageCacheValue(accountKey, targetKey)
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, targetKey)
+	if err != nil {
+		t.Fatalf("read after split rewrite failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte("c"), 20)) {
+		t.Fatalf("unexpected read after split rewrite: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected read after split rewrite to reuse refreshed chunk buffer, before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
+func TestAccountNamedSegmentedAppendDoesNotReadDiskToRefreshChunkBuffer(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+	db.segmentedChunkHardLimit = 256
+
+	accountKey := makeTestAccountKey(0x2c)
+	initial := []kvPair{{key: []byte{0x03}, val: bytes.Repeat([]byte("c"), 12)}}
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorage(accountKey, initial); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorage failed: %v", err)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	before, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath before append failed: %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("expected single chunk before append, got %d", len(before))
+	}
+	fileName := before[0].FileName
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected chunk buffer to start cold before append test")
+	}
+
+	readOpsBeforeUpdate := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if _, _, _, err := db.updateAccountNamedSegmentedStorage(accountKey, []kvPair{{key: []byte{0x04}, val: bytes.Repeat([]byte("d"), 12)}}); err != nil {
+		t.Fatalf("updateAccountNamedSegmentedStorage append failed: %v", err)
+	}
+	readOpsAfterUpdate := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterUpdate != readOpsBeforeUpdate {
+		t.Fatalf("expected append update to avoid rereading chunk from disk, before=%d after=%d", readOpsBeforeUpdate, readOpsAfterUpdate)
+	}
+
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected cold chunk append to keep read buffer cold")
+	}
+
+	readOpsBeforeGet := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{0x04})
+	if err != nil {
+		t.Fatalf("read appended key failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte("d"), 12)) {
+		t.Fatalf("unexpected appended key result: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfterGet := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterGet != readOpsBeforeGet+1 {
+		t.Fatalf("expected first post-append read to hit disk exactly once, before=%d after=%d", readOpsBeforeGet, readOpsAfterGet)
+	}
+	if !db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected post-read chunk buffer to become warm")
+	}
+
+	readOpsBeforeSecondGet := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err = db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{0x03})
+	if err != nil {
+		t.Fatalf("read original key after warming cache failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte("c"), 12)) {
+		t.Fatalf("unexpected original key result after warming cache: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfterSecondGet := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfterSecondGet != readOpsBeforeSecondGet {
+		t.Fatalf("expected warmed chunk to satisfy second read without disk IO, before=%d after=%d", readOpsBeforeSecondGet, readOpsAfterSecondGet)
 	}
 }
 
