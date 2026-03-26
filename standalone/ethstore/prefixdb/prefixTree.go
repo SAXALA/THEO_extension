@@ -21,7 +21,7 @@ import (
 
 const (
 	MaxPrefixDepth                  = 6          // the maximum depth of the prefix tree
-	NodeEntrySize                   = 76         // (1 + 32 + 8 + 8 + 4 + 8 + 8 + 7) bytes
+	NodeEntrySize                   = 65         // (1 + 32 + 8 + 4 + 4 + 8 + 8) bytes
 	FileNodeMagic                   = 0x50544E46 // "PTNF" - file node magic number
 	MaxKeySize                      = 32         // maximum key size in bytes
 	TreeFileMagic                   = 0x50545246 // "PTRF" - prefix tree file magic number
@@ -29,7 +29,7 @@ const (
 	maxPooledBufferSize             = 1024 * 1024 // 1MB
 	globalFileName                  = "global.node"
 	defaultNodeFileGCRatioThreshold = 1.0
-	maxPrefixTreeGCWorkers          = 128
+	maxPrefixTreeGCWorkers          = 64
 )
 
 type NodeType byte
@@ -59,20 +59,20 @@ func (s *stripedRWLocks) pick(key []byte) *sync.RWMutex {
 
 // TrieNode
 type TrieNode struct {
-	accountOffset int64 // in the account file
-	accountSize uint64
+	accountOffset uint64 // in the account file
+	accountSize uint32
 
 	storageFileID  uint32
-	storageOffset  int64
+	storageOffset  uint64
 	storageSize    uint64
 }
 
 type NodeInfo struct {
 	key           []byte
-	accountOffset int64
-	accountSize   uint64
+	accountOffset uint64
+	accountSize   uint32
 	storageFileID uint32
-	storageOffset int64
+	storageOffset uint64
 	storageSize   uint64
 }
 
@@ -822,7 +822,7 @@ func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
 	return nil
 }
 
-func (pt *PrefixTree) putIntoGlobalFileNode(key []byte, accountOffset int64, accountSize uint64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
+func (pt *PrefixTree) putIntoGlobalFileNode(key []byte, accountOffset uint64, accountSize uint32, storageFileID uint32, storageOffset uint64, storageSize uint64) error {
 	pt.globalNodeMu.Lock()
 	defer pt.globalNodeMu.Unlock()
 	if pt.globalNodeIndex == nil {
@@ -1023,13 +1023,12 @@ func (pt *PrefixTree) getBucketID(key []byte) string {
 
 // encodeNodeEntry encode node information into a fixed-size entry
 // [0]        : keyLen (1B)
-// [1..32]    : key (max 32B，padded with zeros if shorter)
-// [33..40]   : accountOffset (8B)
-// [41..48]   : accountSize (8B)
-// [49..52]   : storageFileID (4B)
-// [53..60]   : storageOffset (8B)
-// [61..68]   : storageSize (8B)
-// [69..75]   : reserved (7B)
+// [1..33]    : key (max 32B，padded with zeros if shorter)
+// [33..41]   : accountOffset (8B)
+// [41..45]   : accountSize (4B)
+// [45..49]   : storageFileID (4B)
+// [49..57]   : storageOffset (8B)
+// [57..65]   : storageSize (8B)
 func encodeNodeEntry(nodeInfo NodeInfo) []byte {
 	entry := make([]byte, NodeEntrySize)
 
@@ -1043,14 +1042,13 @@ func encodeNodeEntry(nodeInfo NodeInfo) []byte {
 	// account offset
 	binary.BigEndian.PutUint64(entry[33:41], uint64(nodeInfo.accountOffset))
 	// account size
-	binary.BigEndian.PutUint64(entry[41:49], nodeInfo.accountSize)
+	binary.BigEndian.PutUint32(entry[41:45], nodeInfo.accountSize)
 	// storage file id
-	binary.BigEndian.PutUint32(entry[49:53], nodeInfo.storageFileID)
+	binary.BigEndian.PutUint32(entry[45:49], nodeInfo.storageFileID)
 	// storage offset
-	binary.BigEndian.PutUint64(entry[53:61], uint64(nodeInfo.storageOffset))
+	binary.BigEndian.PutUint64(entry[49:57], uint64(nodeInfo.storageOffset))
 	// storage size
-	binary.BigEndian.PutUint64(entry[61:69], nodeInfo.storageSize)
-
+	binary.BigEndian.PutUint64(entry[57:65], nodeInfo.storageSize)
 	return entry
 }
 
@@ -1065,11 +1063,11 @@ func decodeNodeEntry(entry []byte) NodeInfo {
 	}
 	res.key = entry[1 : 1+keyLen]
 
-	res.accountOffset = int64(binary.BigEndian.Uint64(entry[33:41]))
-	res.accountSize = binary.BigEndian.Uint64(entry[41:49])
-	res.storageFileID = binary.BigEndian.Uint32(entry[49:53])
-	res.storageOffset = int64(binary.BigEndian.Uint64(entry[53:61]))
-	res.storageSize = binary.BigEndian.Uint64(entry[61:69])
+	res.accountOffset = binary.BigEndian.Uint64(entry[33:41])
+	res.accountSize = binary.BigEndian.Uint32(entry[41:45])
+	res.storageFileID = binary.BigEndian.Uint32(entry[45:49])
+	res.storageOffset = binary.BigEndian.Uint64(entry[49:57])
+	res.storageSize = binary.BigEndian.Uint64(entry[57:65])
 	return res
 }
 
@@ -1086,7 +1084,7 @@ func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error)
 }
 
 // Put inserts or updates a key in the prefix tree
-func (pt *PrefixTree) Put(key []byte, accountOffset int64, accountSize uint64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
+func (pt *PrefixTree) Put(key []byte, accountOffset uint64, accountSize uint32, storageFileID uint32, storageOffset uint64, storageSize uint64) error {
 	pt.lock.Lock()
 	defer pt.lock.Unlock()
 	if len(key) == 0 {
@@ -1103,7 +1101,7 @@ func (pt *PrefixTree) PutNode(key []byte, node *TrieNode) error {
 	return pt.Put(entry.key, entry.accountOffset, entry.accountSize, entry.storageFileID, entry.storageOffset, entry.storageSize)
 }
 
-func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset int64, accountSize uint64, storageFileID uint32, storageOffset int64, storageSize uint64) error {
+func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset uint64, accountSize uint32, storageFileID uint32, storageOffset uint64, storageSize uint64) error {
 	if fileID == pt.globalFileID {
 		return pt.putIntoGlobalFileNode(key, accountOffset, accountSize, storageFileID, storageOffset, storageSize)
 	}

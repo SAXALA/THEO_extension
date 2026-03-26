@@ -21,7 +21,7 @@ type storageCommitResult struct {
 
 type storageCommitPlan struct {
 	accountKey    string
-	accountOffset int64
+	accountOffset uint64
 	storageInfo   StorageInfo
 	skipNodeWrite bool
 	cacheEntries  []kvPair
@@ -404,7 +404,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 	}
 	var (
 		existingFileID uint32
-		existingOffset int64
+		existingOffset uint64
 		existingSize   uint64
 	)
 	if node != nil {
@@ -466,9 +466,9 @@ func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOp
 
 func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) error {
 	var (
-		accOff         int64
+		accOff         uint64
 		existingFileID uint32
-		existingOffset int64
+		existingOffset uint64
 		existingSize   uint64
 	)
 

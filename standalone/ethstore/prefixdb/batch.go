@@ -33,7 +33,7 @@ type WriteOperation struct {
 	value         []byte
 	modifiedType  ModifiedType // type of modification (0: None, 1: value changed)
 	storageFileID uint32       // ID of the storage file for the account
-	storageOffset int64        // offset in the file for the account
+	storageOffset uint64       // offset in the file for the account
 	storageSize   uint64       // size of the stored data
 }
 
@@ -213,7 +213,7 @@ func (wb *WriteBatch) CommitBatch() error {
 	}
 }
 
-func (wb *WriteBatch) add(key, value []byte, storageFileID uint32, storageOffset int64, storageSize uint64, modifiedType ModifiedType) {
+func (wb *WriteBatch) add(key, value []byte, storageFileID uint32, storageOffset uint64, storageSize uint64, modifiedType ModifiedType) {
 	wb.lock.Lock()
 	wb.operations[string(key)] = WriteOperation{value: value, storageFileID: storageFileID, storageOffset: storageOffset, storageSize: storageSize, modifiedType: modifiedType}
 	wb.lock.Unlock()
@@ -347,14 +347,14 @@ func (db *PrefixDB) WriteCommit(batch *WriteBatch) (err error) {
 				storageFileID: op.storageFileID,
 				storageOffset: op.storageOffset,
 				storageSize:   op.storageSize,
-				accountOffset: trieAccountOffset - int64(len(entry)),
-				accountSize:   uint64(len(entry)),
+				accountOffset: uint64(trieAccountOffset - int64(len(entry))),
+				accountSize:   uint32(len(entry)),
 			}
 
 			if err := db.storeNode(keyBytes, node); err != nil {
 				return err
 			}
-			db.nodeCache.UpdateAccountOffset(key, trieAccountOffset-int64(len(entry)), uint64(len(entry)))
+			db.nodeCache.UpdateAccountOffset(key, uint64(trieAccountOffset-int64(len(entry))), uint32(len(entry)))
 
 			// cacheKeyHex := hex.EncodeToString([]byte(key))
 			// fmt.Println("store nodeCache:" + cacheKeyHex + ", fileID:" + fmt.Sprintf("%d", node.storageFileID) + ", offset:" + fmt.Sprintf("%d", node.storageOffset) + ", size:" + fmt.Sprintf("%d", node.storageSize))

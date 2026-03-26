@@ -9,22 +9,22 @@ import (
 type NodeCacheEntry struct {
 	Key           string
 	Value         []byte
-	AccountOffset int64
-	AccountSize   uint64
+	AccountOffset uint64
+	AccountSize   uint32
 	StorageInfo   StorageInfo
 }
 
 // StorageInfo keeps track of persisted storage metadata for a trie account node.
 type StorageInfo struct {
 	storageFileID uint32
-	storageOffset int64
+	storageOffset uint64
 	storageSize   uint64
 }
 
 type nodeCacheRecord struct {
 	value         []byte
-	accountOffset int64
-	accountSize   uint64
+	accountOffset uint64
+	accountSize   uint32
 	storageInfo   StorageInfo
 }
 
@@ -86,7 +86,7 @@ func (nc *NodeCache) Put(entry NodeCacheEntry) {
 }
 
 // StoreMetadata records node metadata while preserving any cached value.
-func (nc *NodeCache) StoreMetadata(key string, accountOffset int64, accountSize uint64, storageInfo StorageInfo) {
+func (nc *NodeCache) StoreMetadata(key string, accountOffset uint64, accountSize uint32, storageInfo StorageInfo) {
 	if nc == nil || key == "" {
 		return
 	}
@@ -119,7 +119,7 @@ func (nc *NodeCache) UpdateValue(key string, value []byte) {
 	}
 }
 
-func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset int64, accountSize uint64) {
+func (nc *NodeCache) UpdateAccountOffset(key string, accountOffset uint64, accountSize uint32) {
 	if nc == nil || key == "" {
 		return
 	}

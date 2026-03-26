@@ -147,13 +147,16 @@ func TestSegmentIndexLayoutCacheRespectsSharedByteBudget(t *testing.T) {
 	if got, ok := cache.GetLayoutByPath("folder-1"); !ok || len(got.flatData) != len(layout1.flatData) {
 		t.Fatal("expected first layout cache entry to exist")
 	}
+	if _, ok := cache.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey("folder-1")); !ok {
+		t.Fatal("expected first flat layout cache entry to be stored in shared cache")
+	}
 
 	cache.AddLayoutByPath("folder-2", layout2)
 	if got, ok := cache.GetLayoutByPath("folder-2"); !ok || len(got.flatData) != len(layout2.flatData) {
 		t.Fatal("expected second layout cache entry to exist")
 	}
 	if _, ok := cache.GetLayoutByPath("folder-1"); ok {
-		t.Fatal("expected first layout cache entry to be evicted after exceeding byte budget")
+		t.Fatal("expected first flat layout cache entry to be evicted after exceeding byte budget")
 	}
 	if cache.usedBytes > cache.capacityBytes {
 		t.Fatalf("layout cache exceeds byte budget: used=%d capacity=%d", cache.usedBytes, cache.capacityBytes)
@@ -256,20 +259,38 @@ func TestSharedCacheGetNoTouchDoesNotPromoteEntry(t *testing.T) {
 	shared.Add(sharedCacheNamespaceStorage, "a", []byte{0x01}, 1)
 	shared.Add(sharedCacheNamespaceStorage, "b", []byte{0x02}, 1)
 	shared.Add(sharedCacheNamespaceStorage, "c", []byte{0x03}, 1)
+	entryA, ok := shared.items[sharedCacheCompositeKey{namespace: sharedCacheNamespaceStorage, key: "a"}]
+	if !ok {
+		t.Fatal("expected a to be present in cache")
+	}
+	initialFreq := atomic.LoadUint32(&entryA.Value.(*sharedCacheEntry).freq)
 
 	for i := 0; i < 5; i++ {
 		if _, ok := shared.GetNoTouch(sharedCacheNamespaceStorage, "a"); !ok {
 			t.Fatal("expected a to remain present during no-touch reads")
 		}
 	}
+	if shared.ll.Back() != entryA {
+		t.Fatal("expected no-touch reads not to move a within the LRU list")
+	}
+	updatedFreq := atomic.LoadUint32(&entryA.Value.(*sharedCacheEntry).freq)
+	if updatedFreq != initialFreq+5 {
+		t.Fatalf("expected no-touch reads to increase freq without promotion, initial=%d updated=%d", initialFreq, updatedFreq)
+	}
 
 	shared.Add(sharedCacheNamespaceStorage, "d", []byte{0x04}, 1)
 
-	if _, ok := shared.Get(sharedCacheNamespaceStorage, "a"); ok {
-		t.Fatal("expected a to be evicted because no-touch reads should not promote it")
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "a"); !ok {
+		t.Fatal("expected a to survive because no-touch reads should still increase LFU")
 	}
 	if _, ok := shared.Get(sharedCacheNamespaceStorage, "d"); !ok {
 		t.Fatal("expected newest entry d to be cached")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "b"); ok {
+		t.Fatal("expected lower-frequency older entry b to be evicted")
+	}
+	if _, ok := shared.Get(sharedCacheNamespaceStorage, "c"); !ok {
+		t.Fatal("expected c to remain because no-touch should not move a to the front")
 	}
 	stats := shared.LockStatsSnapshot()
 	if stats.GetNoTouch.Count < 5 {
@@ -1277,7 +1298,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	shortKey := []byte("A1234")
 	shortValue := []byte("short-value")
 	shortOffset := writeAccountRecordForTest(t, db.accountFile, shortKey, shortValue)
-	if err := db.storeNode(shortKey, &TrieNode{accountOffset: shortOffset}); err != nil {
+	if err := db.storeNode(shortKey, &TrieNode{accountOffset: uint64(shortOffset)}); err != nil {
 		t.Fatalf("storeNode shortKey failed: %v", err)
 	}
 	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, shortKey, nil)
@@ -1294,7 +1315,7 @@ func TestGlobalNodeKeysBypassNodeCache(t *testing.T) {
 	longKey := []byte("A12345")
 	longValue := []byte("long-value")
 	longOffset := writeAccountRecordForTest(t, db.accountFile, longKey, longValue)
-	if err := db.storeNode(longKey, &TrieNode{accountOffset: longOffset}); err != nil {
+	if err := db.storeNode(longKey, &TrieNode{accountOffset: uint64(longOffset)}); err != nil {
 		t.Fatalf("storeNode longKey failed: %v", err)
 	}
 	value, found, err = db.Get(datatypepkg.TrieNodeAccountDataType, longKey, nil)
@@ -1320,8 +1341,8 @@ func TestGetAccountUsesSingleReadWhenAccountSizeKnown(t *testing.T) {
 	accountKey := []byte("A12345")
 	accountValue := []byte("known-size-value")
 	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
-	entrySize := uint64(4 + len(accountKey) + len(accountValue))
-	if err := db.storeNode(accountKey, &TrieNode{accountOffset: offset, accountSize: entrySize}); err != nil {
+	entrySize := uint32(4 + len(accountKey) + len(accountValue))
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: uint64(offset), accountSize: entrySize}); err != nil {
 		t.Fatalf("storeNode failed: %v", err)
 	}
 
@@ -1350,7 +1371,7 @@ func TestGetAccountFallsBackToLegacyReadsWhenAccountSizeUnknown(t *testing.T) {
 	accountKey := []byte("A12345")
 	accountValue := []byte("legacy-size-value")
 	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
-	if err := db.storeNode(accountKey, &TrieNode{accountOffset: offset}); err != nil {
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: uint64(offset)}); err != nil {
 		t.Fatalf("storeNode failed: %v", err)
 	}
 
@@ -1576,10 +1597,13 @@ func TestLoadSegmentIndexLayoutCachesMultipleFolders(t *testing.T) {
 		t.Fatal("expected storageIndexCache to be configured")
 	}
 	if _, ok := db.storageIndexCache.GetLayoutByPath(folderPath1); !ok {
-		t.Fatal("expected folder1 layout to be stored in shared cache")
+		t.Fatal("expected folder1 layout to be stored in the non-evicting layout map")
 	}
 	if _, ok := db.storageIndexCache.GetLayoutByPath(folderPath2); !ok {
-		t.Fatal("expected folder2 layout to be stored in shared cache")
+		t.Fatal("expected folder2 layout to be stored in the non-evicting layout map")
+	}
+	if _, ok := db.storageIndexCache.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath1)); ok {
+		t.Fatal("expected folder1 layout to bypass shared cache storage")
 	}
 }
 
@@ -1612,11 +1636,21 @@ func TestReadSegmentIndexForKeyWithSourceUsesFixedFlatBufferSearch(t *testing.T)
 	if err != nil {
 		t.Fatalf("readSegmentIndexForKeyWithSource failed: %v", err)
 	}
-	if source != segmentIndexLookupSourceNoCache {
-		t.Fatalf("expected no-cache source for flat direct search, got %d", source)
+	if source != segmentIndexLookupSourceL2Cache {
+		t.Fatalf("expected first flat direct search to use the shared-cache layout path, got %d", source)
 	}
 	if len(selected) != 1 || selected[0].FileName != chunkFileNameForOrdinal(1) {
 		t.Fatalf("expected direct flat search to return selected chunk only, got %+v", selected)
+	}
+	selected, source, err = db.readSegmentIndexForKeyWithSource(folderID, []byte{0xaa, 0xbb, 0x00})
+	if err != nil {
+		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
+	}
+	if source != segmentIndexLookupSourceL2Cache {
+		t.Fatalf("expected second flat direct search to hit shared-cache layout path, got %d", source)
+	}
+	if len(selected) != 1 || selected[0].FileName != chunkFileNameForOrdinal(1) {
+		t.Fatalf("expected second direct flat search to return selected chunk only, got %+v", selected)
 	}
 }
 
@@ -2410,9 +2444,12 @@ func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
 	if err := os.MkdirAll(folderPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	metas := []segmentChunkMeta{
-		{FileName: chunkFileNameForOrdinal(0), KeyStart: []byte{0x10}},
-		{FileName: chunkFileNameForOrdinal(1), KeyStart: []byte{0x20}},
+	metas := make([]segmentChunkMeta, 3000)
+	for i := range metas {
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: []byte{byte(i >> 8), byte(i), 0x21},
+		}
 	}
 	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
 		t.Fatalf("writeSegmentIndex failed: %v", err)
@@ -2421,20 +2458,12 @@ func TestReadSegmentIndexForKeyWithSourceReportsL1CacheHit(t *testing.T) {
 		db.storageIndexCache.RemoveByPath(folderPath)
 	}
 
-	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
+	_, source, err := db.readSegmentIndexForKeyWithSource(folderID, cloneBytes(metas[len(metas)/2].KeyStart))
 	if err != nil {
 		t.Fatalf("first readSegmentIndexForKeyWithSource failed: %v", err)
 	}
-	if source != segmentIndexLookupSourceNoCache {
-		t.Fatalf("expected first lookup to miss cache, got source=%d", source)
-	}
-
-	_, source, err = db.readSegmentIndexForKeyWithSource(folderID, []byte{0x10})
-	if err != nil {
-		t.Fatalf("second readSegmentIndexForKeyWithSource failed: %v", err)
-	}
-	if source != segmentIndexLookupSourceNoCache {
-		t.Fatalf("expected flat fixed-width lookup to continue using direct buffer search, got source=%d", source)
+	if source != segmentIndexLookupSourceL1Cache {
+		t.Fatalf("expected first multi-level lookup to use the persistent top-level layout, got source=%d", source)
 	}
 }
 
@@ -2478,8 +2507,8 @@ func TestReadSegmentIndexForKeyWithSourceReportsL2CacheHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first readSegmentIndexForKeyWithSource failed: %v", err)
 	}
-	if source != segmentIndexLookupSourceNoCache {
-		t.Fatalf("expected first lookup to miss cache, got source=%d", source)
+	if source != segmentIndexLookupSourceL1Cache {
+		t.Fatalf("expected first lookup to hit the persistent layout cache and read L2 from disk, got source=%d", source)
 	}
 
 	_, source, err = db.readSegmentIndexForKeyWithSource(folderID, targetKey)
@@ -2531,7 +2560,6 @@ func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
 	}
 
 	cacheCountBefore := atomic.LoadUint64(&db.trieStorageSegmentIndexStats.cacheCount)
-	l1CountBefore := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
 	value, failure, err = db.readSegmentedChunkToCacheByPath(folderPath, accountKey, storageKey)
 	if err != nil {
 		t.Fatalf("second readSegmentedChunkToCacheByPath failed: %v", err)
@@ -2547,12 +2575,8 @@ func TestReadSegmentedChunkToCacheByPathUsesSegmentIndexCache(t *testing.T) {
 		t.Fatalf("expected second read to reuse flat segment index data without extra disk IO, readOps first=%d second=%d", afterFirstReadOps, afterSecondReadOps)
 	}
 	cacheCountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexStats.cacheCount)
-	if cacheCountAfter != cacheCountBefore {
-		t.Fatalf("expected flat fixed-width lookup to avoid L1 cache accounting, before=%d after=%d", cacheCountBefore, cacheCountAfter)
-	}
-	l1CountAfter := atomic.LoadUint64(&db.trieStorageSegmentIndexLayerStats.l1CacheCount)
-	if l1CountAfter != l1CountBefore {
-		t.Fatalf("expected flat fixed-width lookup to avoid L1 layer hits, before=%d after=%d", l1CountBefore, l1CountAfter)
+	if cacheCountAfter != cacheCountBefore+1 {
+		t.Fatalf("expected second read to count as a cached segment-index lookup, before=%d after=%d", cacheCountBefore, cacheCountAfter)
 	}
 }
 
@@ -2954,7 +2978,7 @@ func TestGetFromFileNodeFindsSortedEntryInSortedPart(t *testing.T) {
 	entries := make([]NodeInfo, 0, 64)
 	for i := 0; i < 64; i++ {
 		entryKey := []byte{0xaa, 0xbb, 0xcc, 0xdd, byte(i)}
-		entries = append(entries, NodeInfo{key: entryKey, accountOffset: int64(100 + i), storageFileID: uint32(i + 1), storageOffset: int64(200 + i), storageSize: uint64(300 + i)})
+		entries = append(entries, NodeInfo{key: entryKey, accountOffset: uint64(100 + i), storageFileID: uint32(i + 1), storageOffset: uint64(200 + i), storageSize: uint64(300 + i)})
 	}
 	header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: uint32(len(entries))}
 	payload, err := encodeNodeFilePayload(&header, encodeNodeEntries(entries), nil, true)
@@ -3778,7 +3802,7 @@ func TestReadSegmentedChunkToCacheByPathCachesChunkWhenPrefetchDisabled(t *testi
 		t.Fatal("expected first read to hit disk before chunk cache is populated")
 	}
 
-	cachedBuf, ok := db.segmentChunkReadCache.GetByPath(folderPath, fileName)
+	cachedBuf, ok := db.currentSegmentChunkBuffer.GetByPath(folderPath, fileName)
 	if !ok || len(cachedBuf) == 0 {
 		t.Fatalf("expected raw chunk cache entry after first read, ok=%t len=%d", ok, len(cachedBuf))
 	}
@@ -3835,6 +3859,9 @@ func TestAppendChunkFileUpdatesCachedChunkWhenPrefetchDisabled(t *testing.T) {
 	if err := db.appendChunkFile(chunkPath, []kvPair{{key: []byte("ab"), val: []byte("value-ab")}}, info.Size()); err != nil {
 		t.Fatalf("appendChunkFile failed: %v", err)
 	}
+	if !db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected append to refresh the standalone chunk buffer")
+	}
 
 	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
 	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("ab"))
@@ -3846,10 +3873,10 @@ func TestAppendChunkFileUpdatesCachedChunkWhenPrefetchDisabled(t *testing.T) {
 	}
 	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
 	if readOpsAfter != readOpsBefore {
-		t.Fatalf("expected appended key read to hit updated chunk cache, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
+		t.Fatalf("expected first read after append to reuse the refreshed chunk buffer, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
 	}
 
-	cachedBuf, ok := db.segmentChunkReadCache.GetByPath(folderPath, fileName)
+	cachedBuf, ok := db.currentSegmentChunkBuffer.GetByPath(folderPath, fileName)
 	if !ok || len(cachedBuf) == 0 {
 		t.Fatalf("expected updated raw chunk cache entry after append, ok=%t len=%d", ok, len(cachedBuf))
 	}
@@ -3858,11 +3885,11 @@ func TestAppendChunkFileUpdatesCachedChunkWhenPrefetchDisabled(t *testing.T) {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
 	if !bytes.Equal(cachedBuf, onDiskBuf) {
-		t.Fatal("expected updated cached chunk buffer to match appended file")
+		t.Fatal("expected reloaded chunk buffer to match appended file")
 	}
 }
 
-func TestRunStorageGCJobRefreshesChunkCacheWhenPrefetchDisabled(t *testing.T) {
+func TestRunStorageGCJobLeavesChunkBufferDecoupledWhenPrefetchDisabled(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 0)
 	if err != nil {
@@ -3905,16 +3932,20 @@ func TestRunStorageGCJobRefreshesChunkCacheWhenPrefetchDisabled(t *testing.T) {
 	if len(updated) < 2 {
 		t.Fatalf("expected GC job to split cached chunk, got %d metas", len(updated))
 	}
-	if db.isSegmentChunkCached(folderPath, fileName) {
-		t.Fatal("expected old chunk cache entry to be removed after GC job")
-	}
 	for _, meta := range updated {
 		if !db.isSegmentChunkCached(folderPath, meta.FileName) {
-			t.Fatalf("expected new chunk %s to be cached after GC job", meta.FileName)
+			t.Fatalf("expected GC job to refresh new chunk %s into standalone buffer", meta.FileName)
 		}
+	}
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected old chunk buffer to be dropped once GC commits the replacement chunks")
 	}
 
 	targetKey := []byte("z")
+	targetMeta := selectSegmentChunkMeta(updated, targetKey)
+	if targetMeta == nil {
+		t.Fatal("expected post-GC metas to resolve target key")
+	}
 	db.removeStorageCacheValue(accountKey, targetKey)
 	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
 	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, targetKey)
@@ -3926,8 +3957,219 @@ func TestRunStorageGCJobRefreshesChunkCacheWhenPrefetchDisabled(t *testing.T) {
 	}
 	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
 	if readOpsAfter != readOpsBefore {
-		t.Fatalf("expected post-GC read to hit refreshed chunk cache, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
+		t.Fatalf("expected post-GC read to reuse the refreshed chunk buffer, readOps before=%d after=%d", readOpsBefore, readOpsAfter)
 	}
+	if !db.isSegmentChunkCached(folderPath, targetMeta.FileName) {
+		t.Fatalf("expected post-GC read to cache the new chunk %s", targetMeta.FileName)
+	}
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected old chunk buffer to stay removed after GC commit")
+	}
+}
+
+func TestRunStorageGCJobUsesCachedChunkDataWithoutSecondRead(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x40)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	fileName := chunkFileNameForOrdinal(0)
+	entries := []kvPair{
+		{key: []byte("a"), val: bytes.Repeat([]byte{'A'}, 24)},
+		{key: []byte("m"), val: bytes.Repeat([]byte{'M'}, 24)},
+		{key: []byte("z"), val: bytes.Repeat([]byte{'Z'}, 24)},
+	}
+	if _, err := db.writeChunkFile(folderPath, fileName, entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: fileName, KeyStart: []byte("a")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+	if _, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("a")); err != nil || failure != nil {
+		t.Fatalf("warm cache failed: err=%v failure=%+v", err, failure)
+	}
+	cachedBuf, ok := db.getCachedSegmentChunkBuffer(folderPath, fileName)
+	if !ok || len(cachedBuf) == 0 {
+		t.Fatal("expected warm read to populate standalone chunk buffer")
+	}
+
+	gcReadOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageGC].readOps)
+	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: fileName, chunkBuffer: newStorageGCChunkBufferFromBytes(cachedBuf)}); err != nil {
+		t.Fatalf("runStorageGCJob failed: %v", err)
+	}
+	gcReadOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageGC].readOps)
+	if gcReadOpsAfter != gcReadOpsBefore {
+		t.Fatalf("expected GC job to reuse cached chunkData without storage-GC reread, before=%d after=%d", gcReadOpsBefore, gcReadOpsAfter)
+	}
+
+	updated, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	if len(updated) < 2 {
+		t.Fatalf("expected GC job to split cached chunk, got %d metas", len(updated))
+	}
+	for _, meta := range updated {
+		if !db.isSegmentChunkCached(folderPath, meta.FileName) {
+			t.Fatalf("expected GC rewrite to prefill chunk buffer for %s", meta.FileName)
+		}
+	}
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte("z"))
+	if err != nil {
+		t.Fatalf("read after GC job failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte{'Z'}, 24)) {
+		t.Fatalf("unexpected read after GC job: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected read after GC job to reuse refreshed chunk buffers, before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
+func TestRunStorageGCJobDoesNotCacheReplacementChunksWhenSourceWasNotLRU(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x41)
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	fileName := chunkFileNameForOrdinal(0)
+	entries := []kvPair{
+		{key: []byte("a"), val: bytes.Repeat([]byte{'A'}, 24)},
+		{key: []byte("m"), val: bytes.Repeat([]byte{'M'}, 24)},
+		{key: []byte("z"), val: bytes.Repeat([]byte{'Z'}, 24)},
+	}
+	if _, err := db.writeChunkFile(folderPath, fileName, entries); err != nil {
+		t.Fatalf("writeChunkFile failed: %v", err)
+	}
+	if err := db.writeSegmentIndex(folderPath, []segmentChunkMeta{{FileName: fileName, KeyStart: []byte("a")}}); err != nil {
+		t.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	if err := db.runStorageGCJob(storageGCJob{folderPath: folderPath, fileName: fileName}); err != nil {
+		t.Fatalf("runStorageGCJob failed: %v", err)
+	}
+
+	updated, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	if len(updated) < 2 {
+		t.Fatalf("expected GC job to split uncached chunk, got %d metas", len(updated))
+	}
+	for _, meta := range updated {
+		if db.isSegmentChunkCached(folderPath, meta.FileName) {
+			t.Fatalf("expected replacement chunk %s to stay uncached when source chunk was not in LRU", meta.FileName)
+		}
+	}
+	if db.isSegmentChunkCached(folderPath, fileName) {
+		t.Fatal("expected original uncached chunk to remain absent from the chunk buffer")
+	}
+
+	targetKey := []byte("z")
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, targetKey)
+	if err != nil {
+		t.Fatalf("read after uncached GC job failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte{'Z'}, 24)) {
+		t.Fatalf("unexpected read after uncached GC job: value=%q failure=%+v", value, failure)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
+	if readOpsAfter == readOpsBefore {
+		t.Fatalf("expected first read after uncached GC job to hit disk, before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+	selected := selectSegmentChunkMeta(updated, targetKey)
+	if selected == nil || !db.isSegmentChunkCached(folderPath, selected.FileName) {
+		t.Fatal("expected post-read access to repopulate the selected replacement chunk into the LRU")
+	}
+}
+
+func TestCurrentSegmentChunkBufferEvictsLeastRecentlyUsedReadEntry(t *testing.T) {
+	cache := newCurrentSegmentChunkBuffer()
+	folderPath := "/tmp/folder"
+	for i := 0; i < segmentChunkBufferEntryLimit; i++ {
+		cache.SetByPath(folderPath, chunkFileNameForOrdinal(uint32(i)), []byte{byte(i)})
+	}
+	if _, ok := cache.GetByPath(folderPath, chunkFileNameForOrdinal(0)); !ok {
+		t.Fatal("expected touched entry 0 to exist")
+	}
+	if _, ok := cache.GetByPath(folderPath, chunkFileNameForOrdinal(1)); !ok {
+		t.Fatal("expected touched entry 1 to exist")
+	}
+
+	cache.SetByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit), []byte{0xff})
+
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(0)) {
+		t.Fatal("expected recently used entry 0 to remain cached")
+	}
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(1)) {
+		t.Fatal("expected recently used entry 1 to remain cached")
+	}
+	if cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(2)) {
+		t.Fatal("expected least recently used read entry to be evicted")
+	}
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit)) {
+		t.Fatal("expected newest entry to be inserted into the cache")
+	}
+	cache.Close()
+}
+
+func TestCurrentSegmentChunkBufferAllowsGCEntriesBeyondReadLimit(t *testing.T) {
+	cache := newCurrentSegmentChunkBuffer()
+	folderPath := "/tmp/folder"
+	for i := 0; i < segmentChunkBufferEntryLimit; i++ {
+		cache.SetByPath(folderPath, chunkFileNameForOrdinal(uint32(i)), []byte{byte(i)})
+	}
+	for _, idx := range []uint32{0, 1} {
+		if _, ok := cache.GetByPath(folderPath, chunkFileNameForOrdinal(idx)); !ok {
+			t.Fatalf("expected read entry %d to exist", idx)
+		}
+	}
+
+	for _, idx := range []uint32{segmentChunkBufferEntryLimit, segmentChunkBufferEntryLimit + 1} {
+		buf := getDataBuffer(1)
+		buf[0] = byte(idx)
+		lease := newBufferLease(buf[:1])
+		cache.SetGCLeaseByPath(folderPath, chunkFileNameForOrdinal(idx), lease)
+		lease.Release()
+	}
+
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(2)) {
+		t.Fatal("expected GC entries to avoid evicting read-managed entries immediately")
+	}
+
+	cache.SetByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit+2), []byte{0xee})
+
+	if cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(2)) {
+		t.Fatal("expected the next read-managed insert to evict the least recently used read entry")
+	}
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit)) {
+		t.Fatal("expected GC entry to remain cached outside the read LRU budget")
+	}
+	if !cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit+1)) {
+		t.Fatal("expected second GC entry to remain cached outside the read LRU budget")
+	}
+	cache.RemoveGCEntriesByPath(folderPath, []string{chunkFileNameForOrdinal(segmentChunkBufferEntryLimit), chunkFileNameForOrdinal(segmentChunkBufferEntryLimit + 1)})
+	if cache.ContainsByPath(folderPath, chunkFileNameForOrdinal(segmentChunkBufferEntryLimit)) {
+		t.Fatal("expected GC entry to be removable when the GC lifecycle finishes")
+	}
+	cache.Close()
 }
 
 func TestReadSegmentedChunkToCacheByPathReturnsCorruptedFailureForTruncatedTrailer(t *testing.T) {
@@ -3988,7 +4230,7 @@ func TestCommonStorageSegmentUsesPayloadWithoutLeadingKVCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	segment := raw[offset : offset+int64(size)]
+	segment := raw[offset : offset+size]
 	wantPrefix := []byte{0x00, 0x01, 0x00, 0x07}
 	if len(segment) < len(wantPrefix) || !bytes.Equal(segment[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("expected common storage segment to start with first kv header, got %x", segment)
@@ -5287,7 +5529,6 @@ func TestRunStorageGCBatchMultipleJobs(t *testing.T) {
 		jobs = append(jobs, storageGCJob{
 			folderPath: folderPath,
 			fileName:   metas[i].FileName,
-			backing:    nil,
 		})
 	}
 
@@ -5386,6 +5627,172 @@ func BenchmarkSegmentIndexCacheLevel2Hit220(b *testing.B) {
 		if got := selectSegmentChunkMeta(cached, searchKey); got == nil {
 			b.Fatal("expected selected meta")
 		}
+	}
+}
+
+type segmentIndexQueryBenchmarkFixture struct {
+	db         *PrefixDB
+	folderPath string
+	searchKey  []byte
+	l2Shards   int
+}
+
+func newSegmentIndexQueryBenchmarkFixture(b *testing.B, level2Size int) *segmentIndexQueryBenchmarkFixture {
+	b.Helper()
+
+	prevLevel2Size := segmentIndexLevel2Size
+	segmentIndexLevel2Size = level2Size
+	b.Cleanup(func() {
+		segmentIndexLevel2Size = prevLevel2Size
+	})
+
+	baseDir := b.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 64, 0)
+	if err != nil {
+		b.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	b.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	accountKey := makeTestAccountKey(byte(level2Size >> 10))
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if err := os.MkdirAll(folderPath, 0o755); err != nil {
+		b.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	const metaCount = 4096
+	metas := make([]segmentChunkMeta, metaCount)
+	for i := range metas {
+		key := make([]byte, 32)
+		binary.BigEndian.PutUint32(key[:4], uint32(i*2))
+		metas[i] = segmentChunkMeta{
+			FileName: chunkFileNameForOrdinal(uint32(i)),
+			KeyStart: key,
+		}
+	}
+	if err := db.writeSegmentIndex(folderPath, metas); err != nil {
+		b.Fatalf("writeSegmentIndex failed: %v", err)
+	}
+
+	layout, err := db.loadSegmentIndexLayout(folderPath)
+	if err != nil {
+		b.Fatalf("loadSegmentIndexLayout failed: %v", err)
+	}
+	if layout.mode != indexLayoutMultiLevel {
+		b.Fatalf("expected multi-level segment index, got mode=%d", layout.mode)
+	}
+
+	searchKey := append([]byte(nil), metas[len(metas)/2].KeyStart...)
+	searchKey[3]++
+
+	return &segmentIndexQueryBenchmarkFixture{
+		db:         db,
+		folderPath: folderPath,
+		searchKey:  searchKey,
+		l2Shards:   len(layout.entries),
+	}
+}
+
+func resetSegmentIndexCacheForBenchmark(fixture *segmentIndexQueryBenchmarkFixture) {
+	if fixture == nil || fixture.db == nil {
+		return
+	}
+	fixture.db.storageIndexCache = newSharedSegmentIndexCache(newSharedByteCache(fixture.db.stroageCacheSizeLimit))
+}
+
+func BenchmarkSegmentIndexLevel2SizeQueryCost(b *testing.B) {
+	for _, level2Size := range []int{4 * 1024, 8 * 1024, 16 * 1024} {
+		level2Size := level2Size
+		b.Run(fmt.Sprintf("L2-%dK", level2Size/1024), func(b *testing.B) {
+			fixture := newSegmentIndexQueryBenchmarkFixture(b, level2Size)
+			b.ReportMetric(float64(fixture.l2Shards), "l2-shards")
+
+			b.Run("disk-read", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					resetSegmentIndexCacheForBenchmark(fixture)
+					metas, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey)
+					if err != nil {
+						b.Fatalf("readSegmentIndexForKeyByPathWithSource failed: %v", err)
+					}
+					if len(metas) == 0 {
+						b.Fatal("expected non-empty metas from disk read")
+					}
+				}
+			})
+
+			b.Run("cache-read", func(b *testing.B) {
+				resetSegmentIndexCacheForBenchmark(fixture)
+				if _, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey); err != nil {
+					b.Fatalf("cache warmup failed: %v", err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					metas, source, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey)
+					if err != nil {
+						b.Fatalf("readSegmentIndexForKeyByPathWithSource failed: %v", err)
+					}
+					if len(metas) == 0 {
+						b.Fatal("expected non-empty metas from cache read")
+					}
+					if source != segmentIndexLookupSourceL2Cache {
+						b.Fatalf("expected L2 cache hit, got source=%d", source)
+					}
+				}
+			})
+
+			b.Run("retrieve", func(b *testing.B) {
+				resetSegmentIndexCacheForBenchmark(fixture)
+				metas, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey)
+				if err != nil {
+					b.Fatalf("fixture metas load failed: %v", err)
+				}
+				if len(metas) == 0 {
+					b.Fatal("expected metas for retrieval benchmark")
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if got := selectSegmentChunkMeta(metas, fixture.searchKey); got == nil {
+						b.Fatal("expected selected chunk meta")
+					}
+				}
+			})
+
+			b.Run("total-cold", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					resetSegmentIndexCacheForBenchmark(fixture)
+					metas, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey)
+					if err != nil {
+						b.Fatalf("readSegmentIndexForKeyByPathWithSource failed: %v", err)
+					}
+					if got := selectSegmentChunkMeta(metas, fixture.searchKey); got == nil {
+						b.Fatal("expected selected chunk meta")
+					}
+				}
+			})
+
+			b.Run("total-cache", func(b *testing.B) {
+				resetSegmentIndexCacheForBenchmark(fixture)
+				if _, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey); err != nil {
+					b.Fatalf("cache warmup failed: %v", err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					metas, _, err := fixture.db.readSegmentIndexForKeyByPathWithSource(fixture.folderPath, fixture.searchKey)
+					if err != nil {
+						b.Fatalf("readSegmentIndexForKeyByPathWithSource failed: %v", err)
+					}
+					if got := selectSegmentChunkMeta(metas, fixture.searchKey); got == nil {
+						b.Fatal("expected selected chunk meta")
+					}
+				}
+			})
+		})
 	}
 }
 

@@ -16,7 +16,6 @@ const (
 	sharedCacheNamespaceStorage
 	sharedCacheNamespaceSegmentIndex
 	sharedCacheNamespaceFileNode
-	sharedCacheNamespaceSegmentChunk
 )
 
 type sharedCacheEvictor interface {
@@ -65,7 +64,7 @@ type sharedCacheLockStatsSnapshot struct {
 	Namespace  sharedCacheLockOpSnapshot
 }
 
-const sharedCacheEvictionSample = 16 // lower means more close to pure LRU, higher means more LFU influence
+const sharedCacheEvictionSample = 32 // lower means more close to pure LRU, higher means more LFU influence
 
 type sharedByteCache struct {
 	mu             sync.RWMutex
@@ -121,6 +120,7 @@ func (c *sharedByteCache) GetNoTouch(namespace sharedCacheNamespace, key string)
 	if entry == nil {
 		return nil, false
 	}
+	bumpSharedCacheEntryFreq(entry)
 	return entry.value, true
 }
 
@@ -137,7 +137,7 @@ func (c *sharedByteCache) Add(namespace sharedCacheNamespace, key string, value 
 	defer c.unlockWrite(&c.lockStats.add, acquiredAt)
 	freq := uint32(1)
 	if existing, ok := c.items[lookup]; ok {
-		freq = existing.Value.(*sharedCacheEntry).freq
+		freq = atomic.LoadUint32(&existing.Value.(*sharedCacheEntry).freq)
 		c.removeElementLocked(existing)
 	}
 	if sizeBytes > c.capacityBytes {
@@ -280,12 +280,25 @@ func (c *sharedByteCache) touchEntryLocked(elem *list.Element, entry *sharedCach
 	if c == nil || elem == nil || entry == nil {
 		return
 	}
-	if entry.freq < ^uint32(0) {
-		entry.freq++
-	}
+	bumpSharedCacheEntryFreq(entry)
 	c.clock++
 	entry.lastTouch = c.clock
 	c.ll.MoveToFront(elem)
+}
+
+func bumpSharedCacheEntryFreq(entry *sharedCacheEntry) {
+	if entry == nil {
+		return
+	}
+	for {
+		freq := atomic.LoadUint32(&entry.freq)
+		if freq == ^uint32(0) {
+			return
+		}
+		if atomic.CompareAndSwapUint32(&entry.freq, freq, freq+1) {
+			return
+		}
+	}
 }
 
 func (c *sharedByteCache) selectVictimLocked() *list.Element {
@@ -305,7 +318,12 @@ func (c *sharedByteCache) selectVictimLocked() *list.Element {
 			continue
 		}
 		sampled++
-		if victimEntry == nil || entry.freq < victimEntry.freq || (entry.freq == victimEntry.freq && entry.lastTouch < victimEntry.lastTouch) {
+		entryFreq := atomic.LoadUint32(&entry.freq)
+		victimFreq := uint32(0)
+		if victimEntry != nil {
+			victimFreq = atomic.LoadUint32(&victimEntry.freq)
+		}
+		if victimEntry == nil || entryFreq < victimFreq || (entryFreq == victimFreq && entry.lastTouch < victimEntry.lastTouch) {
 			victim = elem
 			victimEntry = entry
 		}
@@ -367,120 +385,6 @@ func estimateStorageCacheValueSize(key string, value interface{}) uint64 {
 	return total
 }
 
-type segmentChunkReadCacheEntry struct {
-	buf       []byte
-	lease     *bufferLease
-	sizeBytes uint64
-}
-
-func (e *segmentChunkReadCacheEntry) onSharedCacheEvict() {
-	if e == nil || e.lease == nil {
-		return
-	}
-	e.lease.Release()
-	e.lease = nil
-}
-
-type segmentChunkReadCache struct {
-	shared *sharedByteCache
-}
-
-func newSharedSegmentChunkReadCache(shared *sharedByteCache) *segmentChunkReadCache {
-	if shared == nil {
-		return nil
-	}
-	return &segmentChunkReadCache{shared: shared}
-}
-
-func (c *segmentChunkReadCache) GetByPath(folderPath string, fileName string) ([]byte, bool) {
-	if c == nil {
-		return nil, false
-	}
-	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
-	if !ok {
-		return nil, false
-	}
-	entry, _ := raw.(*segmentChunkReadCacheEntry)
-	if entry == nil {
-		return nil, false
-	}
-	return entry.buf, true
-}
-
-func (c *segmentChunkReadCache) PeekByPath(folderPath string, fileName string) ([]byte, bool) {
-	if c == nil {
-		return nil, false
-	}
-	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
-	if !ok {
-		return nil, false
-	}
-	entry, _ := raw.(*segmentChunkReadCacheEntry)
-	if entry == nil {
-		return nil, false
-	}
-	return entry.buf, true
-}
-
-func (c *segmentChunkReadCache) AddByPath(folderPath string, fileName string, buf []byte) {
-	if c == nil || folderPath == "" || fileName == "" {
-		return
-	}
-	key := segmentChunkReadCacheKey(folderPath, fileName)
-	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
-	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
-		return
-	}
-	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: cloneBytes(buf), sizeBytes: sizeBytes}, sizeBytes)
-}
-
-func (c *segmentChunkReadCache) AddOwnedByPath(folderPath string, fileName string, buf []byte) {
-	if c == nil || folderPath == "" || fileName == "" {
-		return
-	}
-	key := segmentChunkReadCacheKey(folderPath, fileName)
-	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
-	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
-		return
-	}
-	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: buf, sizeBytes: sizeBytes}, sizeBytes)
-}
-
-func (c *segmentChunkReadCache) AddLeasedByPath(folderPath string, fileName string, lease *bufferLease) {
-	if c == nil || folderPath == "" || fileName == "" || lease == nil {
-		return
-	}
-	buf := lease.Bytes()
-	key := segmentChunkReadCacheKey(folderPath, fileName)
-	sizeBytes := estimateSegmentChunkBufferSize(key, buf)
-	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentChunk, key)
-		return
-	}
-	c.shared.Add(sharedCacheNamespaceSegmentChunk, key, &segmentChunkReadCacheEntry{buf: buf, lease: lease.Retain(), sizeBytes: sizeBytes}, sizeBytes)
-}
-
-func (c *segmentChunkReadCache) RemoveByPath(folderPath string, fileName string) {
-	if c == nil || folderPath == "" || fileName == "" {
-		return
-	}
-	c.shared.Remove(sharedCacheNamespaceSegmentChunk, segmentChunkReadCacheKey(folderPath, fileName))
-}
-
-func segmentChunkReadCacheKey(folderPath string, fileName string) string {
-	return folderPath + "\x00" + fileName
-}
-
-func estimateSegmentChunkBufferSize(key string, buf []byte) uint64 {
-	total := uint64(len(key) + len(buf))
-	if total == 0 {
-		return 1
-	}
-	return total
-}
-
 type segmentIndexCacheEntry struct {
 	folderKey string
 	metas     []segmentChunkMeta
@@ -496,6 +400,8 @@ type segmentIndexCache struct {
 	shared        *sharedByteCache
 	capacityBytes uint64
 	usedBytes     uint64
+	layoutMu      sync.RWMutex
+	layouts       map[string]segmentIndexLayout
 }
 
 func newSegmentIndexCache(capacityMiB int) *segmentIndexCache {
@@ -509,7 +415,10 @@ func newSharedSegmentIndexCache(shared *sharedByteCache) *segmentIndexCache {
 	if shared == nil {
 		return nil
 	}
-	cache := &segmentIndexCache{shared: shared}
+	cache := &segmentIndexCache{
+		shared:  shared,
+		layouts: make(map[string]segmentIndexLayout),
+	}
 	cache.refreshUsage()
 	return cache
 }
@@ -518,7 +427,7 @@ func (c *segmentIndexCache) GetByPath(folderPath string) ([]segmentChunkMeta, bo
 	if c == nil {
 		return nil, false
 	}
-	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
+	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath))
 	if !ok {
 		return nil, false
 	}
@@ -537,7 +446,7 @@ func (c *segmentIndexCache) GetLevel2ByPath(folderPath string, metaID uint32, ge
 	if c == nil {
 		return nil, false
 	}
-	raw, ok := c.shared.Get(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation))
+	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation))
 	if !ok {
 		return nil, false
 	}
@@ -556,15 +465,21 @@ func (c *segmentIndexCache) GetLayoutByPath(folderPath string) (segmentIndexLayo
 	if c == nil {
 		return segmentIndexLayout{}, false
 	}
-	raw, ok := c.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+	c.layoutMu.RLock()
+	layout, ok := c.layouts[folderPath]
+	c.layoutMu.RUnlock()
 	if !ok {
-		return segmentIndexLayout{}, false
+		raw, sharedOK := c.shared.GetNoTouch(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+		if !sharedOK {
+			return segmentIndexLayout{}, false
+		}
+		entry, _ := raw.(*segmentIndexLayoutCacheEntry)
+		if entry == nil {
+			return segmentIndexLayout{}, false
+		}
+		return entry.layout, true
 	}
-	entry, _ := raw.(*segmentIndexLayoutCacheEntry)
-	if entry == nil {
-		return segmentIndexLayout{}, false
-	}
-	return entry.layout, true
+	return layout, true
 }
 
 func (c *segmentIndexCache) AddByPath(folderPath string, metas []segmentChunkMeta) {
@@ -617,18 +532,32 @@ func (c *segmentIndexCache) AddLayoutByPath(folderPath string, layout segmentInd
 	if c == nil {
 		return
 	}
-	sizeBytes := estimateSegmentIndexLayoutMemory(layout)
-	if sizeBytes == 0 {
-		c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+	if folderPath == "" {
+		return
+	}
+	if layout.mode != indexLayoutMultiLevel {
+		c.layoutMu.Lock()
+		delete(c.layouts, folderPath)
+		c.layoutMu.Unlock()
+		sizeBytes := estimateSegmentIndexLayoutMemory(layout)
+		if sizeBytes == 0 {
+			c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
+			c.refreshUsage()
+			return
+		}
+		entry := &segmentIndexLayoutCacheEntry{
+			layout:    cloneSegmentIndexLayout(layout),
+			sizeBytes: sizeBytes,
+		}
+		c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath), entry, sizeBytes)
 		c.refreshUsage()
 		return
 	}
-	entry := &segmentIndexLayoutCacheEntry{
-		layout:    cloneSegmentIndexLayout(layout),
-		sizeBytes: sizeBytes,
-	}
-	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath), entry, sizeBytes)
+	c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
 	c.refreshUsage()
+	c.layoutMu.Lock()
+	c.layouts[folderPath] = cloneSegmentIndexLayout(layout)
+	c.layoutMu.Unlock()
 }
 
 func (c *segmentIndexCache) RemoveByPath(folderPath string) {
@@ -647,6 +576,12 @@ func (c *segmentIndexCache) RemoveLayoutByPath(folderPath string) {
 	if c == nil {
 		return
 	}
+	if folderPath == "" {
+		return
+	}
+	c.layoutMu.Lock()
+	delete(c.layouts, folderPath)
+	c.layoutMu.Unlock()
 	c.shared.Remove(sharedCacheNamespaceSegmentIndex, segmentIndexLayoutCacheKey(folderPath))
 	c.refreshUsage()
 }

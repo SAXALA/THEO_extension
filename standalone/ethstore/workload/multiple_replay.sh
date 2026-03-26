@@ -21,10 +21,10 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 # Fill these arrays with candidate values (MiB / count).
-CACHE_SIZE_CANDIDATES=(16) # 64 256
+CACHE_SIZE_CANDIDATES=(24) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
-BACKEND_CANDIDATES=(pebble) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache) # cache nocache_snap
+BACKEND_CANDIDATES=(ethstore) # pebble ethstore
+TRACE_FILE_CANDIDATES=(nocache_snap) # cache nocache_snap
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
@@ -215,13 +215,9 @@ for trace_file in "${SELECTED_TRACES[@]}"; do
 				echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
 				exit 1
 			fi
-			if (( cache_size_mib % 16 != 0 )); then
-				echo "CACHE_SIZE candidate must be a multiple of 16, got: $cache_size_mib"
-				exit 1
-			fi
 
 			backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
-			if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]] || [ "$backend_cache_mib" -lt 0 ]; then
+			if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
 				echo "Invalid derived backend cache for $backend: $backend_cache_mib"
 				exit 1
 			fi

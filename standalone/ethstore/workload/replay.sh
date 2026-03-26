@@ -830,16 +830,10 @@ main() {
     if [ "$BACKEND" = "all" ]; then
         for b in ethstore chainkv pebble; do
             echo "==== ${ACTION} ${b} ===="
-            if [ "$ACTION" = "load" ] || [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
-                drop_caches
-            fi
             run_action "$b"
         done
     else
         echo "==== ${ACTION} ${BACKEND} ===="
-        if [ "$ACTION" = "load" ] || [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
-            drop_caches
-        fi
         run_action "$BACKEND"
     fi
 }
