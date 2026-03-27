@@ -105,7 +105,8 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 	}
 
 	logger := log.New("database", file)
-	logger.Info("Allocated cache and file handles", "cache", common.StorageSize(cache*1024*1024), "handles", handles)
+	fmt.Printf("[Pebble] Allocated cache and file handles: cache=%s handles=%d\n",
+		common.StorageSize(cache*1024*1024), handles)
 
 	maxMemTableSize := (1<<31)<<(^uint(0)>>63) - 1
 	memTableLimit := 2
@@ -129,8 +130,8 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 			return runtime.NumCPU() / 2
 		},
 		L0CompactionThreshold:       4,
-		L0StopWritesThreshold:       1000,
-		L0CompactionFileThreshold:   1000,
+		L0StopWritesThreshold:       12,
+		// L0CompactionFileThreshold:   1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
 		BytesPerSync:                512 << 10, // 512 KB
 		DisableWAL:                  false,
@@ -155,28 +156,14 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 	opt.Experimental.ReadSamplingMultiplier = -1 // disable seek compaction as in Geth
 
 	// Log all options values at startup
-	logger.Info("Pebble options configured",
-		"Cache", common.StorageSize(cache*1024*1024),
-		"MaxOpenFiles", opt.MaxOpenFiles,
-		"MemTableSize", common.StorageSize(opt.MemTableSize),
-		"MemTableStopWritesThreshold", opt.MemTableStopWritesThreshold,
-		"L0CompactionThreshold", opt.L0CompactionThreshold,
-		"L0StopWritesThreshold", opt.L0StopWritesThreshold,
-		"L0CompactionFileThreshold", opt.L0CompactionFileThreshold,
-		"LBaseMaxBytes", common.StorageSize(opt.LBaseMaxBytes),
-		"BytesPerSync", common.StorageSize(opt.BytesPerSync),
-		"DisableWAL", opt.DisableWAL,
-		"ReadOnly", opt.ReadOnly,
-		"Levels", len(opt.Levels),
-		"ReadSamplingMultiplier", opt.Experimental.ReadSamplingMultiplier,
-	)
+	fmt.Printf("[Pebble] options configured: Cache=%s MaxOpenFiles=%d MemTableSize=%s MemTableStopWritesThreshold=%d L0CompactionThreshold=%d L0StopWritesThreshold=%d L0CompactionFileThreshold=%d LBaseMaxBytes=%s BytesPerSync=%s DisableWAL=%v ReadOnly=%v Levels=%d ReadSamplingMultiplier=%d\n",
+		common.StorageSize(cache*1024*1024), opt.MaxOpenFiles, common.StorageSize(opt.MemTableSize),
+		opt.MemTableStopWritesThreshold, opt.L0CompactionThreshold, opt.L0StopWritesThreshold,
+		opt.L0CompactionFileThreshold, common.StorageSize(opt.LBaseMaxBytes), common.StorageSize(opt.BytesPerSync),
+		opt.DisableWAL, opt.ReadOnly, len(opt.Levels), opt.Experimental.ReadSamplingMultiplier)
 	for i, level := range opt.Levels {
-		logger.Info("Pebble level options",
-			"level", i,
-			"TargetFileSize", common.StorageSize(level.TargetFileSize),
-			"FilterPolicy", fmt.Sprintf("%T", level.FilterPolicy),
-			"Compression", level.Compression,
-		)
+		fmt.Printf("[Pebble] level %d options: TargetFileSize=%s FilterPolicy=%T Compression=%v\n",
+			i, common.StorageSize(level.TargetFileSize), level.FilterPolicy, level.Compression)
 	}
 
 	var err error
@@ -194,100 +181,62 @@ func (d *PebbleStore) Close() error {
 
 	// Log metrics before closing
 	metrics := d.db.Metrics()
-	d.log.Info("Pebble metrics on close",
-		"diskSpaceUsage", common.StorageSize(metrics.DiskSpaceUsage()),
-		"uptime", metrics.Uptime,
-		"numVirtual", metrics.NumVirtual(),
-		"readAmp", metrics.ReadAmp(),
-	)
+	fmt.Printf("[Pebble] metrics on close: diskSpaceUsage=%s uptime=%s numVirtual=%d readAmp=%d\n",
+		common.StorageSize(metrics.DiskSpaceUsage()), metrics.Uptime, metrics.NumVirtual(), metrics.ReadAmp())
 
 	// Log keys metrics
-	d.log.Info("Pebble keys metrics on close",
-		"rangeKeySetsCount", metrics.Keys.RangeKeySetsCount,
-		"tombstoneCount", metrics.Keys.TombstoneCount,
-		"missizedTombstonesCount", metrics.Keys.MissizedTombstonesCount,
-	)
+	fmt.Printf("[Pebble] keys metrics: rangeKeySetsCount=%d tombstoneCount=%d missizedTombstonesCount=%d\n",
+		metrics.Keys.RangeKeySetsCount, metrics.Keys.TombstoneCount, metrics.Keys.MissizedTombstonesCount)
 
 	// Log memtable metrics
-	d.log.Info("Pebble memtable metrics on close",
-		"size", common.StorageSize(metrics.MemTable.Size),
-		"count", metrics.MemTable.Count,
-		"zombieSize", common.StorageSize(metrics.MemTable.ZombieSize),
-		"zombieCount", metrics.MemTable.ZombieCount,
-	)
+	fmt.Printf("[Pebble] memtable metrics: size=%s count=%d zombieSize=%s zombieCount=%d\n",
+		common.StorageSize(metrics.MemTable.Size), metrics.MemTable.Count,
+		common.StorageSize(metrics.MemTable.ZombieSize), metrics.MemTable.ZombieCount)
 
 	// Log table metrics
-	d.log.Info("Pebble table metrics on close",
-		"obsoleteSize", common.StorageSize(metrics.Table.ObsoleteSize),
-		"obsoleteCount", metrics.Table.ObsoleteCount,
-		"zombieSize", common.StorageSize(metrics.Table.ZombieSize),
-		"zombieCount", metrics.Table.ZombieCount,
-		"backingTableCount", metrics.Table.BackingTableCount,
-		"backingTableSize", common.StorageSize(metrics.Table.BackingTableSize),
-	)
+	fmt.Printf("[Pebble] table metrics: obsoleteSize=%s obsoleteCount=%d zombieSize=%s zombieCount=%d backingTableCount=%d backingTableSize=%s\n",
+		common.StorageSize(metrics.Table.ObsoleteSize), metrics.Table.ObsoleteCount,
+		common.StorageSize(metrics.Table.ZombieSize), metrics.Table.ZombieCount,
+		metrics.Table.BackingTableCount, common.StorageSize(metrics.Table.BackingTableSize))
 
 	// Log WAL metrics
-	d.log.Info("Pebble WAL metrics on close",
-		"files", metrics.WAL.Files,
-		"obsoleteFiles", metrics.WAL.ObsoleteFiles,
-		"size", common.StorageSize(metrics.WAL.Size),
-		"physicalSize", common.StorageSize(metrics.WAL.PhysicalSize),
-		"bytesIn", common.StorageSize(metrics.WAL.BytesIn),
-		"bytesWritten", common.StorageSize(metrics.WAL.BytesWritten),
-	)
+	fmt.Printf("[Pebble] WAL metrics: files=%d obsoleteFiles=%d size=%s physicalSize=%s bytesIn=%s bytesWritten=%s\n",
+		metrics.WAL.Files, metrics.WAL.ObsoleteFiles,
+		common.StorageSize(metrics.WAL.Size), common.StorageSize(metrics.WAL.PhysicalSize),
+		common.StorageSize(metrics.WAL.BytesIn), common.StorageSize(metrics.WAL.BytesWritten))
 
 	// Log compaction metrics
-	d.log.Info("Pebble compaction metrics on close",
-		"count", metrics.Compact.Count,
-		"defaultCount", metrics.Compact.DefaultCount,
-		"deleteOnlyCount", metrics.Compact.DeleteOnlyCount,
-		"elisionOnlyCount", metrics.Compact.ElisionOnlyCount,
-		"moveCount", metrics.Compact.MoveCount,
-		"readCount", metrics.Compact.ReadCount,
-		"rewriteCount", metrics.Compact.RewriteCount,
-		"multiLevelCount", metrics.Compact.MultiLevelCount,
-		"estimatedDebt", common.StorageSize(metrics.Compact.EstimatedDebt),
-		"inProgressBytes", common.StorageSize(metrics.Compact.InProgressBytes),
-		"numInProgress", metrics.Compact.NumInProgress,
-		"markedFiles", metrics.Compact.MarkedFiles,
-		"duration", metrics.Compact.Duration,
-	)
+	fmt.Printf("[Pebble] compaction metrics: count=%d defaultCount=%d deleteOnlyCount=%d elisionOnlyCount=%d moveCount=%d readCount=%d rewriteCount=%d multiLevelCount=%d estimatedDebt=%s inProgressBytes=%s numInProgress=%d markedFiles=%d duration=%s\n",
+		metrics.Compact.Count, metrics.Compact.DefaultCount, metrics.Compact.DeleteOnlyCount,
+		metrics.Compact.ElisionOnlyCount, metrics.Compact.MoveCount, metrics.Compact.ReadCount,
+		metrics.Compact.RewriteCount, metrics.Compact.MultiLevelCount,
+		common.StorageSize(metrics.Compact.EstimatedDebt), common.StorageSize(metrics.Compact.InProgressBytes),
+		metrics.Compact.NumInProgress, metrics.Compact.MarkedFiles, metrics.Compact.Duration)
 
 	// Log flush metrics
-	d.log.Info("Pebble flush metrics on close",
-		"count", metrics.Flush.Count,
-		"numInProgress", metrics.Flush.NumInProgress,
-		"asIngestCount", metrics.Flush.AsIngestCount,
-		"asIngestTableCount", metrics.Flush.AsIngestTableCount,
-		"asIngestBytes", common.StorageSize(metrics.Flush.AsIngestBytes),
-	)
+	fmt.Printf("[Pebble] flush metrics: count=%d numInProgress=%d asIngestCount=%d asIngestTableCount=%d asIngestBytes=%s\n",
+		metrics.Flush.Count, metrics.Flush.NumInProgress, metrics.Flush.AsIngestCount,
+		metrics.Flush.AsIngestTableCount, common.StorageSize(metrics.Flush.AsIngestBytes))
 
 	// Log ingest metrics
-	d.log.Info("Pebble ingest metrics on close",
-		"count", metrics.Ingest.Count,
-	)
+	fmt.Printf("[Pebble] ingest metrics: count=%d\n", metrics.Ingest.Count)
 
 	// Log snapshot metrics
-	d.log.Info("Pebble snapshot metrics on close",
-		"count", metrics.Snapshots.Count,
-		"earliestSeqNum", metrics.Snapshots.EarliestSeqNum,
-		"pinnedKeys", metrics.Snapshots.PinnedKeys,
-		"pinnedSize", common.StorageSize(metrics.Snapshots.PinnedSize),
-	)
+	fmt.Printf("[Pebble] snapshot metrics: count=%d earliestSeqNum=%d pinnedKeys=%d pinnedSize=%s\n",
+		metrics.Snapshots.Count, metrics.Snapshots.EarliestSeqNum,
+		metrics.Snapshots.PinnedKeys, common.StorageSize(metrics.Snapshots.PinnedSize))
 
 	// Log block cache metrics
-	d.log.Info("Pebble block cache metrics on close",
-		"hits", metrics.BlockCache.Hits,
-		"misses", metrics.BlockCache.Misses,
-		"hitRate", fmt.Sprintf("%.2f%%", float64(metrics.BlockCache.Hits)/float64(metrics.BlockCache.Hits+metrics.BlockCache.Misses+1)*100),
-	)
+	totalBlockCache := metrics.BlockCache.Hits + metrics.BlockCache.Misses + 1
+	fmt.Printf("[Pebble] block cache metrics: hits=%d misses=%d hitRate=%.2f%%\n",
+		metrics.BlockCache.Hits, metrics.BlockCache.Misses,
+		float64(metrics.BlockCache.Hits)/float64(totalBlockCache)*100)
 
 	// Log table cache metrics
-	d.log.Info("Pebble table cache metrics on close",
-		"hits", metrics.TableCache.Hits,
-		"misses", metrics.TableCache.Misses,
-		"hitRate", fmt.Sprintf("%.2f%%", float64(metrics.TableCache.Hits)/float64(metrics.TableCache.Hits+metrics.TableCache.Misses+1)*100),
-	)
+	totalTableCache := metrics.TableCache.Hits + metrics.TableCache.Misses + 1
+	fmt.Printf("[Pebble] table cache metrics: hits=%d misses=%d hitRate=%.2f%%\n",
+		metrics.TableCache.Hits, metrics.TableCache.Misses,
+		float64(metrics.TableCache.Hits)/float64(totalTableCache)*100)
 
 	// Log level-specific metrics
 	for i := 0; i < len(metrics.Levels); i++ {
@@ -295,25 +244,13 @@ func (d *PebbleStore) Close() error {
 		if level.NumFiles == 0 && level.Size == 0 {
 			continue
 		}
-		d.log.Info("Pebble level metrics on close",
-			"level", i,
-			"sublevels", level.Sublevels,
-			"numFiles", level.NumFiles,
-			"numVirtualFiles", level.NumVirtualFiles,
-			"size", common.StorageSize(level.Size),
-			"virtualSize", common.StorageSize(level.VirtualSize),
-			"score", level.Score,
-			"bytesIn", common.StorageSize(level.BytesIn),
-			"bytesIngested", common.StorageSize(level.BytesIngested),
-			"bytesMoved", common.StorageSize(level.BytesMoved),
-			"bytesRead", common.StorageSize(level.BytesRead),
-			"bytesCompacted", common.StorageSize(level.BytesCompacted),
-			"bytesFlushed", common.StorageSize(level.BytesFlushed),
-			"tablesCompacted", level.TablesCompacted,
-			"tablesFlushed", level.TablesFlushed,
-			"tablesIngested", level.TablesIngested,
-			"tablesMoved", level.TablesMoved,
-		)
+		fmt.Printf("[Pebble] level %d metrics: sublevels=%d numFiles=%d numVirtualFiles=%d size=%s virtualSize=%s score=%.2f bytesIn=%s bytesIngested=%s bytesMoved=%s bytesRead=%s bytesCompacted=%s bytesFlushed=%s tablesCompacted=%d tablesFlushed=%d tablesIngested=%d tablesMoved=%d\n",
+			i, level.Sublevels, level.NumFiles, level.NumVirtualFiles,
+			common.StorageSize(level.Size), common.StorageSize(level.VirtualSize), level.Score,
+			common.StorageSize(level.BytesIn), common.StorageSize(level.BytesIngested),
+			common.StorageSize(level.BytesMoved), common.StorageSize(level.BytesRead),
+			common.StorageSize(level.BytesCompacted), common.StorageSize(level.BytesFlushed),
+			level.TablesCompacted, level.TablesFlushed, level.TablesIngested, level.TablesMoved)
 	}
 
 	errc := make(chan error)

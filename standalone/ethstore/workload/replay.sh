@@ -42,7 +42,8 @@ NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-true}"
 # segment index 是否启用 zstd 压缩；默认开启
 SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-true}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
-DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
+# DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)))
+DEFAULT_GC_WORKERS=32
 if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
     DEFAULT_GC_WORKERS=1
 fi
@@ -346,20 +347,30 @@ build_replay_binary() {
         exit 1
     fi
     mkdir -p ./bin
-    if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
-    # if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
+    # if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
+    if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
         echo "构建 replayWorkload 失败，退出。"
         exit 1
     fi
 }
 
 drop_caches() {
+    # Trim the target SSD to minimize the impact of leftover data on performance.
+    echo "Trimming target disk to drop caches..."
+    sudo_run fstrim -v "$DISK_MOUNT_POINT"
+    sleep 5
     echo "Drop caches"
     sudo_run sh -c 'echo 1 > /proc/sys/vm/drop_caches'
     sudo_run sh -c 'echo 2 > /proc/sys/vm/drop_caches'
     sudo_run sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-    # Trim the target SSD to minimize the impact of leftover data on performance.
-    sudo_run fstrim -v "$DISK_MOUNT_POINT"
+    # Check if caches are dropped successfully.
+    local cached_bytes
+    cached_bytes=$(sudo_run cat /proc/meminfo | grep -E '^(Cached|Buffers|SReclaimable):' | awk '{sum += $2} END {print sum}')
+    if [ "$cached_bytes" -gt 1048576 ]; then
+        echo "Warning: Cached memory is still ${cached_bytes} KiB after dropping caches"
+    else
+        echo "Cached memory after dropping caches: ${cached_bytes} KiB"
+    fi
 }
 
 restore_ethstore_db() {
@@ -823,9 +834,7 @@ main() {
 
     validate_inputs
     validate_runtime_requirements
-    if [ "$ACTION" != "restore" ]; then
-        build_replay_binary
-    fi
+    build_replay_binary
 
     if [ "$BACKEND" = "all" ]; then
         for b in ethstore chainkv pebble; do

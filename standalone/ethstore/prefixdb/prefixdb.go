@@ -40,7 +40,7 @@ const (
 	segmentIndexFixedKeyFieldBytes  = 1 + segmentIndexKeyStartMaxBytes
 	segmentIndexFlatEntryBytes      = 4 + segmentIndexFixedKeyFieldBytes
 	segmentChunkStreamReadThreshold = 64 * 1024 * 1024
-	segmentChunkBufferEntryLimit    = 1024
+	segmentChunkBufferEntryLimit    = 16
 	segmentIndexFlatMagic           = 0x464c4958 // 'FLIX'
 	segmentIndexMultiLevelMagic     = 0x4d4c4958 // 'MLIX'
 	segmentIndexFormatVersion       = 3
