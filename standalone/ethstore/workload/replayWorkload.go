@@ -1446,7 +1446,33 @@ func printRuntimeArgsSnapshot(
 	fmt.Println("=============================")
 }
 
+func normalizeLegacyBoolFlagArgs(args []string, boolFlags map[string]struct{}) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(args))
+	normalized = append(normalized, args[0])
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if _, ok := boolFlags[arg]; ok && i+1 < len(args) {
+			if boolValue, err := strconv.ParseBool(args[i+1]); err == nil {
+				normalized = append(normalized, fmt.Sprintf("%s=%t", arg, boolValue))
+				i++
+				continue
+			}
+		}
+		normalized = append(normalized, arg)
+	}
+	return normalized
+}
+
 func main() {
+	os.Args = normalizeLegacyBoolFlagArgs(os.Args, map[string]struct{}{
+		"-ckv-state":                     {},
+		"-node-file-sorted-compression": {},
+		"-segment-index-compression":    {},
+	})
+
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
 	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc/upgrade-index")
 	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
@@ -1776,7 +1802,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 	var acccuntHashKeyPebble *pebblestore.PebbleStore
 	if stage == prefixdbLoadStageAll || stage == prefixdbLoadStageStorage {
 		if len(pebbleDir) == 0 {
-			pebbleDir = "/mnt/ramdisk/accountHash_key_pebble"
+			pebbleDir = "/home/sxl/tar/accountHash_key_pebble"
 		}
 		dbPath := strings.TrimSpace(pebbleDir)
 		if dbPath == "" {

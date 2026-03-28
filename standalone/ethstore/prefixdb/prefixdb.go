@@ -2002,11 +2002,32 @@ func (db *PrefixDB) addDiskWrite(usage diskIOUsage, n int) {
 }
 
 func (db *PrefixDB) readFileWithStats(path string, usage diskIOUsage) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err == nil {
-		db.addDiskRead(usage, len(data))
+	f, err := db.openCachedReadOnlyFile(path)
+	if err != nil {
+		return nil, err
 	}
-	return data, err
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size < 0 {
+		return nil, fmt.Errorf("invalid file size: %s", path)
+	}
+	if size == 0 {
+		db.addDiskRead(usage, 0)
+		return nil, nil
+	}
+	if size > int64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("file too large to read into memory: %s", path)
+	}
+	data := make([]byte, int(size))
+	sr := io.NewSectionReader(f, 0, size)
+	if _, err := io.ReadFull(sr, data); err != nil {
+		return nil, err
+	}
+	db.addDiskRead(usage, len(data))
+	return data, nil
 }
 
 func (db *PrefixDB) writeFileWithStats(path string, data []byte, perm os.FileMode, usage diskIOUsage) error {
@@ -3776,7 +3797,13 @@ func writeFileAtomic(db *PrefixDB, path string, data []byte) error {
 	if db != nil {
 		db.addDiskWrite(diskIOUsageStorageSegmentIndex, len(data))
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if db != nil && db.fileHandleCache != nil {
+		db.fileHandleCache.InvalidatePath(path)
+	}
+	return nil
 }
 
 func fileExists(path string) bool {

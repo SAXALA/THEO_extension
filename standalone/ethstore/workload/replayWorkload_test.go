@@ -137,6 +137,36 @@ func TestResolvePrefixDBLoadAccountKeyNotFoundIsDeferred(t *testing.T) {
 	}
 }
 
+func TestNormalizeLegacyBoolFlagArgs(t *testing.T) {
+	args := []string{
+		"replayWorkload",
+		"-mode", "re",
+		"-node-file-sorted-compression", "false",
+		"-segment-index-compression", "true",
+		"-ckv-state", "false",
+		"-trace-file", "cache",
+	}
+
+	normalized := normalizeLegacyBoolFlagArgs(args, map[string]struct{}{
+		"-ckv-state":                     {},
+		"-node-file-sorted-compression": {},
+		"-segment-index-compression":    {},
+	})
+
+	got := strings.Join(normalized, " ")
+	want := strings.Join([]string{
+		"replayWorkload",
+		"-mode", "re",
+		"-node-file-sorted-compression=false",
+		"-segment-index-compression=true",
+		"-ckv-state=false",
+		"-trace-file", "cache",
+	}, " ")
+	if got != want {
+		t.Fatalf("unexpected normalized args:\n got: %s\nwant: %s", got, want)
+	}
+}
+
 func TestLoadPrefixDBFinalBatchCommitPersistsTailEntries(t *testing.T) {
 	tempDir := t.TempDir()
 	auxDir := filepath.Join(tempDir, "account-hash-pebble")

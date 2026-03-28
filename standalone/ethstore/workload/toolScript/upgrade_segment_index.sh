@@ -10,8 +10,8 @@ TARGET_STATE_DIR="${2:-${TARGET_STATE_DIR:-}}"
 
 usage() {
     echo "Usage: $0 <source-state-db-dir> [target-state-db-dir]"
-    echo "Example: $0 /mnt/ssd2/loaded/ethstore/database_statedb16KB_gced"
-    echo "Example: $0 /mnt/ssd2/loaded/ethstore/database_statedb16KB_gced /mnt/ssd2/loaded/ethstore/database_statedb16KB_gced_upgrade_copy"
+    echo "Example: $0 /data/loaded/ethstore/database_statedb16KB_gced"
+    echo "Example: $0 /data/loaded/ethstore/database_statedb16KB_gced /data/loaded/ethstore/database_statedb16KB_gced_upgrade_copy"
 }
 
 # sudo 密码；留空则使用交互式 sudo

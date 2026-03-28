@@ -78,15 +78,15 @@ RUN_ROUND="${RUN_ROUND:-0}"
 RUN_ROUNDS="${RUN_ROUNDS:-0}"
 
 # 已加载数据根目录（source）与回放运行目录（target）
-LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
-RUNNING_ROOT="${RUNNING_ROOT:-/mnt/ssd2/running}"
+LOADED_ROOT="${LOADED_ROOT:-/data/loaded}"
+RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT="/mnt/ssd2"
 
 # ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb64KB | database_statedb256KB
 calculate_default_ethstore_statedb_dirname() {
     case "$CHUNK_FILE_SIZE_BYTES" in
         4096) echo "database_statedb4KB" ;;
-        8192) echo "database_statedb8KB" ;;
+        8192) echo "database_statedb8KB_0326_compressed" ;;
         16384) echo "database_statedb16KB" ;;
         65536) echo "database_statedb64KB" ;;
         262144) echo "database_statedb256KB" ;;
@@ -96,7 +96,7 @@ calculate_default_ethstore_statedb_dirname() {
 ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethstore_statedb_dirname)}"
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
-GC_STATE_DIR="${GC_STATE_DIR:-/mnt/ssd2/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
+GC_STATE_DIR="${GC_STATE_DIR:-/data/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
 # segment index 升级目录：直接在该 statedb 目录执行，不进行复制
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
 # prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
@@ -635,7 +635,7 @@ run_load() {
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode ld -backend ethstore -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         prefixdb)
             echo "prefixdb backend 已拆分为 load-account / load-storage，请使用新的 action"
@@ -665,7 +665,7 @@ run_load_account() {
                 -mode ld -backend prefixdb -prefixdb-load-stage account \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
             echo "load-account 仅支持 prefixdb backend"
@@ -687,7 +687,7 @@ run_load_storage() {
                 -mode ld -backend prefixdb -prefixdb-load-stage storage -prefixdb-state-dir "$PREFIXDB_ACCOUNT_STATE_DIR" \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
             echo "load-storage 仅支持 prefixdb backend"
@@ -740,7 +740,7 @@ run_replay() {
                 -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -767,7 +767,7 @@ run_gc() {
                 -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
                 -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
             echo "gc 仅支持 ethstore backend"
@@ -790,7 +790,7 @@ run_upgrade_index() {
                 -mode upgrade-index -backend ethstore -upgrade-state-dir "$UPGRADE_STATE_DIR" \
                 -cache-count "$CACHE_COUNT" -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
-                -node-file-sorted-compression "$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression "$SEGMENT_INDEX_COMPRESSION"
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
             echo "upgrade-index 仅支持 ethstore backend"

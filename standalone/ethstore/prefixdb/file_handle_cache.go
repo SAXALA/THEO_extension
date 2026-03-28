@@ -22,7 +22,11 @@ type fileHandleCacheKey struct {
 }
 
 type fileHandleCache struct {
-	cache *lru.Cache
+	cache       *lru.Cache
+	closeCh     chan *os.File
+	closeMu     sync.Mutex
+	closeCond   *sync.Cond
+	closePending int
 }
 
 var (
@@ -80,10 +84,14 @@ func newFileHandleCache(capacity int) (*fileHandleCache, error) {
 	if capacity > maxFileHandleCacheSize {
 		capacity = maxFileHandleCacheSize
 	}
-	fhc := &fileHandleCache{}
+	fhc := &fileHandleCache{
+		closeCh: make(chan *os.File, 1024),
+	}
+	fhc.closeCond = sync.NewCond(&fhc.closeMu)
+	go fhc.closeWorker()
 	cache, err := lru.NewWithEvict(capacity, func(key interface{}, value interface{}) {
 		if f, ok := value.(*os.File); ok && f != nil {
-			_ = f.Close()
+			fhc.enqueueClose(f)
 		}
 	})
 	if err != nil {
@@ -91,6 +99,48 @@ func newFileHandleCache(capacity int) (*fileHandleCache, error) {
 	}
 	fhc.cache = cache
 	return fhc, nil
+}
+
+func (c *fileHandleCache) closeWorker() {
+	for f := range c.closeCh {
+		if f != nil {
+			_ = f.Close()
+		}
+		c.closeMu.Lock()
+		c.closePending--
+		if c.closePending == 0 {
+			c.closeCond.Broadcast()
+		}
+		c.closeMu.Unlock()
+	}
+}
+
+func (c *fileHandleCache) enqueueClose(f *os.File) {
+	if c == nil || f == nil {
+		return
+	}
+	c.closeMu.Lock()
+	c.closePending++
+	c.closeMu.Unlock()
+	select {
+	case c.closeCh <- f:
+	default:
+		// Keep eviction path non-blocking even under close bursts.
+		go func(file *os.File) {
+			c.closeCh <- file
+		}(f)
+	}
+}
+
+func (c *fileHandleCache) waitForPendingCloses() {
+	if c == nil {
+		return
+	}
+	c.closeMu.Lock()
+	for c.closePending > 0 {
+		c.closeCond.Wait()
+	}
+	c.closeMu.Unlock()
 }
 
 func normalizeOpenPath(path string) string {
@@ -146,7 +196,7 @@ func (c *fileHandleCache) InvalidatePath(path string) {
 			continue
 		}
 		if k.path == normalized {
-			// Remove triggers the on-evict callback and closes the file.
+			// Remove triggers on-evict callback and schedules async close.
 			c.cache.Remove(k)
 		}
 	}
@@ -156,6 +206,8 @@ func (c *fileHandleCache) Purge() {
 	if c == nil {
 		return
 	}
-	// Purge triggers the on-evict callback and closes all cached files.
+	// Purge triggers on-evict callback and schedules async close for all files.
 	c.cache.Purge()
+	// Preserve purge semantics: when Purge returns, queued closes are finished.
+	c.waitForPendingCloses()
 }

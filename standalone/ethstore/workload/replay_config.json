@@ -1,12 +1,12 @@
 {
-  "loadDataDir": "/mnt/ssd/ethstore/20500000_key_value_pairs.txt",
+  "loadDataDir": "/mnt/tmp/20500000_key_value_pairs.txt",
   "aolDataFile": "/mnt/ssd/ethstore/database/aol/print_all_output.txt",
   "traceFile": "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000",
   "traceFileNocache": "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000",
   "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot",
-  "ethstoreDir": "/mnt/ssd2/running/ethstore",
-  "pebbleDir": "/mnt/ssd2/running/pebble",
-  "chainKVDir": "/mnt/ssd2/running/chainkv",
-  "accountHashKeyPebbleDir": "/mnt/ramdisk/accountHash_key_pebble",
-  "loadedEthStoreDir": "/mnt/ssd2/loaded/ethstore"
+  "ethstoreDir": "/data/running/ethstore",
+  "pebbleDir": "/data/running/pebble",
+  "chainKVDir": "/data/running/chainkv",
+  "accountHashKeyPebbleDir": "/home/sxl/tar/accountHash_key_pebble",
+  "loadedEthStoreDir": "/data/loaded/ethstore"
 }
