@@ -2308,13 +2308,6 @@ func (db *PrefixDB) Close() error {
 		return fmt.Errorf("failed to close prefix tree: %v", err)
 	}
 
-	if err := db.accountFile.Sync(); err != nil {
-		// Check if file is already closed
-		if !errors.Is(err, os.ErrClosed) {
-			errs = append(errs, fmt.Errorf("failed to sync account file: %v", err))
-		}
-	}
-
 	if err := db.accountFile.Close(); err != nil {
 		if !errors.Is(err, os.ErrClosed) {
 			errs = append(errs, err)
@@ -2325,7 +2318,6 @@ func (db *PrefixDB) Close() error {
 	db.accountBatch = nil
 
 	if db.storageCurFile != nil {
-		_ = db.storageCurFile.Sync()
 		_ = db.storageCurFile.Close()
 		db.storageCurFile = nil
 	}

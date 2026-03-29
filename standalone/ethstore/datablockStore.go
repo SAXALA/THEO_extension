@@ -379,11 +379,6 @@ func (baol *BlockAppendOnlyLog) saveIndexMeta() error {
 		return fmt.Errorf("failed to write index meta: %w", err)
 	}
 	baol.addDiskWrite(baolDiskIOUsageIndexMeta, len(buf))
-	if err := file.Sync(); err != nil {
-		baol.addDiskWrite(baolDiskIOUsageIndexMeta, 0)
-		return fmt.Errorf("failed to sync index meta: %w", err)
-	}
-	baol.addDiskWrite(baolDiskIOUsageIndexMeta, 0)
 
 	baol.log.Debug("Saved index metadata", "minBlockID", baol.minBlockID, "maxBlockID", baol.latestBlockID)
 	return nil
@@ -981,12 +976,6 @@ func (baol *BlockAppendOnlyLog) Delete(key string) error {
 		baol.log.Error("Failed to flush data writer after tombstone", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to flush data writer for tombstone block %d: %w", blockIDForDelete, err)
 	}
-	if err := baol.dataFile.Sync(); err != nil {
-		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
-		baol.log.Error("Failed to sync data file after tombstone", "blockID", blockIDForDelete, "error", err)
-		return fmt.Errorf("failed to sync data file for tombstone block %d: %w", blockIDForDelete, err)
-	}
-	baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	if err := baol.flushIndexBuffer(); err != nil {
 		baol.log.Error("Failed to flush index map buffer after tombstone", "blockID", blockIDForDelete, "error", err)
 		return fmt.Errorf("failed to flush index map buffer for tombstone block %d: %w", blockIDForDelete, err)
@@ -1340,12 +1329,6 @@ func (baol *BlockAppendOnlyLog) AppendToNewBlock(kvs map[string]string) (uint64,
 		baol.log.Error("Failed to flush data writer after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to flush data writer for new block %d: %w", newBlockID, err)
 	}
-	if err := baol.dataFile.Sync(); err != nil {
-		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
-		baol.log.Error("Failed to sync data file after new block", "assignedBlockID", newBlockID, "error", err)
-		return 0, fmt.Errorf("failed to sync data file for new block %d: %w", newBlockID, err)
-	}
-	baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	if err := baol.flushIndexBuffer(); err != nil {
 		baol.log.Error("Failed to flush index map buffer after new block", "assignedBlockID", newBlockID, "error", err)
 		return 0, fmt.Errorf("failed to flush index map buffer for new block %d: %w", newBlockID, err)
@@ -1458,12 +1441,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 	}
 
 	if baol.dataFile != nil {
-		// Sync data file before closing, to ensure all writes are flushed.
-		if err := baol.dataFile.Sync(); err != nil {
-			baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
-			errs = append(errs, fmt.Errorf("failed to sync data file on close: %w", err))
-		}
-		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 		if err := baol.dataFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close data file: %w", err))
 		}
@@ -1471,11 +1448,6 @@ func (baol *BlockAppendOnlyLog) Close() error {
 	}
 
 	if baol.indexMapFile != nil {
-		if err := baol.indexMapFile.Sync(); err != nil {
-			baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
-			errs = append(errs, fmt.Errorf("failed to sync index map file on close: %w", err))
-		}
-		baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
 		if err := baol.indexMapFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close index map file: %w", err))
 		}
@@ -1632,14 +1604,6 @@ func (baol *BlockAppendOnlyLog) flushIndexBufferWithBlockID(minBlockID uint64) e
 		}
 	}
 
-	if err := f.Sync(); err != nil {
-		baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
-		baol.log.Error("Failed to sync index file after buffer flush", "error", err)
-		baol.restoreIndexBuffer(entries)
-		return err
-	}
-	baol.addDiskWrite(baolDiskIOUsageIndexMutation, 0)
-
 	baol.log.Debug("Successfully flushed index buffer", "entries", len(entries))
 	return nil
 }
@@ -1661,13 +1625,6 @@ func (baol *BlockAppendOnlyLog) FlushDataAndIndex() error {
 		if err := baol.dataWriter.Flush(); err != nil {
 			return fmt.Errorf("failed to flush data writer: %w", err)
 		}
-	}
-	if baol.dataFile != nil {
-		if err := baol.dataFile.Sync(); err != nil {
-			baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
-			return fmt.Errorf("failed to sync data file: %w", err)
-		}
-		baol.addDiskWrite(baolDiskIOUsageDataMutation, 0)
 	}
 	if err := baol.flushIndexBufferWithBlockID(baol.minBlockID); err != nil {
 		return fmt.Errorf("failed to flush index buffer: %w", err)

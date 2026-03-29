@@ -1802,7 +1802,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 	var acccuntHashKeyPebble *pebblestore.PebbleStore
 	if stage == prefixdbLoadStageAll || stage == prefixdbLoadStageStorage {
 		if len(pebbleDir) == 0 {
-			pebbleDir = "/home/sxl/tar/accountHash_key_pebble"
+			pebbleDir = "/mnt/ssd/ethstore/index/accountHash_key_pebble"
 		}
 		dbPath := strings.TrimSpace(pebbleDir)
 		if dbPath == "" {

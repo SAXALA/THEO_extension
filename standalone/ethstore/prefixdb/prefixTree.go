@@ -533,10 +533,6 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 			pt.db.addDiskWrite(diskIOUsageNodeFileGC, len(payload))
 		}
 	}
-	if err := tf.Sync(); err != nil {
-		tf.Close()
-		return fmt.Errorf("fsync tmp file failed: %w", err)
-	}
 	if err := tf.Close(); err != nil {
 		return fmt.Errorf("close tmp file failed: %w", err)
 	}
@@ -545,10 +541,6 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 		return fmt.Errorf("rename failed: %w", err)
 	}
 	pt.dropFileHandles(fileID)
-	if dirf, err := os.Open(filepath.Dir(filePath)); err == nil {
-		_ = dirf.Sync()
-		_ = dirf.Close()
-	}
 	if fileID == pt.globalFileID {
 		pt.globalNodeMu.Lock()
 		defer pt.globalNodeMu.Unlock()
@@ -896,20 +888,12 @@ func (pt *PrefixTree) rewriteGlobalNodeFileLocked() error {
 			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(payload))
 		}
 	}
-	if err := tf.Sync(); err != nil {
-		_ = tf.Close()
-		return fmt.Errorf("fsync global node tmp file failed: %w", err)
-	}
 	if err := tf.Close(); err != nil {
 		return fmt.Errorf("close global node tmp file failed: %w", err)
 	}
 	if err := os.Rename(tmp, filePath); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename global node tmp file failed: %w", err)
-	}
-	if dirf, err := os.Open(filepath.Dir(filePath)); err == nil {
-		_ = dirf.Sync()
-		_ = dirf.Close()
 	}
 	if pt.globalFile != nil {
 		_ = pt.globalFile.Close()

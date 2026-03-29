@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,7 +109,7 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 
 	maxMemTableSize := (1<<31)<<(^uint(0)>>63) - 1
 	memTableLimit := 2
-	memTableSize := 4 * 1024 * 1024
+	memTableSize := cache * 1024 * 1024 / 4 
 	if memTableSize >= maxMemTableSize {
 		memTableSize = maxMemTableSize - 1
 	}
@@ -127,7 +126,7 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		MemTableSize: uint64(memTableSize),
 		MemTableStopWritesThreshold: memTableLimit,
 		MaxConcurrentCompactions: func() int {
-			return runtime.NumCPU() / 2
+			return 16 // runtime.NumCPU() / 2
 		},
 		L0CompactionThreshold:       4,
 		L0StopWritesThreshold:       12,
