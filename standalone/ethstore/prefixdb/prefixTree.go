@@ -203,6 +203,14 @@ func cloneNodeInfo(nodeInfo NodeInfo) NodeInfo {
 	return cloned
 }
 
+func tombstoneNodeInfo(key []byte) NodeInfo {
+	return NodeInfo{key: append([]byte(nil), key...)}
+}
+
+func isNodeInfoTombstone(nodeInfo NodeInfo) bool {
+	return nodeInfo.accountOffset == 0 && nodeInfo.accountSize == 0 && nodeInfo.storageFileID == 0 && nodeInfo.storageOffset == 0 && nodeInfo.storageSize == 0
+}
+
 func nodeInfoToTrieNode(nodeInfo NodeInfo) *TrieNode {
 	return &TrieNode{
 		accountOffset: nodeInfo.accountOffset,
@@ -228,6 +236,9 @@ func trieNodeToNodeInfo(key []byte, node *TrieNode) NodeInfo {
 }
 
 func mergeNodeInfoForAppend(previous NodeInfo, next NodeInfo) NodeInfo {
+	if isNodeInfoTombstone(next) {
+		return cloneNodeInfo(next)
+	}
 	merged := cloneNodeInfo(next)
 	if merged.accountSize == 0 && merged.accountOffset == previous.accountOffset {
 		merged.accountSize = previous.accountSize
@@ -428,15 +439,23 @@ func (pt *PrefixTree) buildGCStateFromFile(fileID string) (*gcState, error) {
 	if header.Magic != FileNodeMagic {
 		return nil, fmt.Errorf("invalid filenode magic for %s", fileID)
 	}
-	if header.SortedEntryCount == 0 && header.UnsortedEntryCount == 0 {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat filenode failed: %w", err)
+	}
+	payloadSize := int(info.Size()) - binary.Size(header)
+	if payloadSize <= 0 {
 		return nil, nil
 	}
-	if header.UnsortedEntryCount == 0 {
-		return nil, nil
-	}
-	payloadSize, err := nodeFileStoredPayloadSize(header)
+	unsortedCount, err := nodeFileInferUnsortedEntryCount(header, payloadSize)
 	if err != nil {
 		return nil, err
+	}
+	if header.SortedEntryCount == 0 && unsortedCount == 0 {
+		return nil, nil
+	}
+	if unsortedCount == 0 {
+		return nil, nil
 	}
 	if _, err := f.Seek(int64(binary.Size(header)), io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek filenode failed: %w", err)
@@ -573,13 +592,15 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 }
 
 func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []byte) []NodeInfo {
-	total := header.SortedEntryCount + header.UnsortedEntryCount
+	sortedCount := uint32(len(sortedSlice) / NodeEntrySize)
+	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
+	total := sortedCount + unsortedCount
 	if total == 0 {
 		return nil
 	}
 	m := make(map[string]NodeInfo, total)
 	isNonZero := func(e NodeInfo) bool { return e.storageFileID != 0 || e.storageOffset != 0 }
-	sortedEntries := int(header.SortedEntryCount)
+	sortedEntries := int(sortedCount)
 	for i := 0; i < sortedEntries; i++ {
 		start := i * NodeEntrySize
 		end := start + NodeEntrySize
@@ -587,11 +608,11 @@ func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []
 			break
 		}
 		dec := decodeNodeEntry(sortedSlice[start:end])
-		if len(dec.key) > 0 {
+		if len(dec.key) > 0 && !isNodeInfoTombstone(dec) {
 			m[string(dec.key)] = dec
 		}
 	}
-	unsortedEntries := int(header.UnsortedEntryCount)
+	unsortedEntries := int(unsortedCount)
 	for i := 0; i < unsortedEntries; i++ {
 		start := i * NodeEntrySize
 		end := start + NodeEntrySize
@@ -603,6 +624,10 @@ func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []
 			continue
 		}
 		k := string(dec.key)
+		if isNodeInfoTombstone(dec) {
+			delete(m, k)
+			continue
+		}
 		if old, ok := m[k]; ok && isNonZero(old) && !isNonZero(dec) {
 			dec.storageFileID = old.storageFileID
 			dec.storageOffset = old.storageOffset
@@ -672,11 +697,7 @@ func (pt *PrefixTree) loadGlobalNodeIndex() error {
 			return fmt.Errorf("invalid global node magic")
 		}
 
-		payloadSize, err := nodeFileStoredPayloadSize(header)
-		if err != nil {
-			_ = file.Close()
-			return err
-		}
+		payloadSize := int(stat.Size()) - binary.Size(header)
 		if payloadSize > 0 {
 			payload := make([]byte, payloadSize)
 			if _, err := io.ReadFull(file, payload); err != nil {
@@ -786,11 +807,11 @@ func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
 	if pt.globalFile == nil {
 		return errors.New("global node file is not initialized")
 	}
-	payloadSize, err := nodeFileStoredPayloadSize(pt.globalHeader)
+	info, err := pt.globalFile.Stat()
 	if err != nil {
 		return err
 	}
-	writeOffset := int64(binary.Size(pt.globalHeader)) + int64(payloadSize)
+	writeOffset := info.Size()
 	buf := make([]byte, 0, len(entries)*NodeEntrySize)
 	for _, entry := range entries {
 		buf = append(buf, encodeNodeEntry(entry)...)
@@ -800,16 +821,6 @@ func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
 	}
 	if pt.db != nil {
 		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(buf))
-	}
-	pt.globalHeader.UnsortedEntryCount += uint32(len(entries))
-	if _, err := pt.globalFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek global node header failed: %w", err)
-	}
-	if err := binary.Write(pt.globalFile, binary.BigEndian, &pt.globalHeader); err != nil {
-		return fmt.Errorf("update global node header failed: %w", err)
-	}
-	if pt.db != nil {
-		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(pt.globalHeader))
 	}
 	return nil
 }
@@ -917,13 +928,16 @@ func (pt *PrefixTree) deleteFromGlobalFileNode(key []byte) (bool, error) {
 		return false, nil
 	}
 	pt.globalNodeIndex.Remove(string(key))
+	tombstone := tombstoneNodeInfo(key)
 	if pt.globalCommitDepth > 0 {
-		delete(pt.globalCommitBatch, string(key))
+		if pt.globalCommitBatch == nil {
+			pt.globalCommitBatch = make(map[string]NodeInfo)
+		}
+		pt.globalCommitBatch[string(key)] = tombstone
 		pt.globalCommitDirty = true
-		pt.globalNeedsRewrite = true
 		return true, nil
 	}
-	if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+	if err := pt.appendGlobalNodeEntry(tombstone); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1139,11 +1153,11 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 		}
 	}
 
-	payloadSize, err := nodeFileStoredPayloadSize(header)
+	info, err := file.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat file failed: %w", err)
 	}
-	writeOffset := int64(binary.Size(header)) + int64(payloadSize)
+	writeOffset := info.Size()
 	entryData := encodeNodeEntry(NodeInfo{
 		key:           key,
 		accountOffset: accountOffset,
@@ -1157,16 +1171,6 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	}
 	if pt.db != nil {
 		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(entryData))
-	}
-	header.UnsortedEntryCount++
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek start failed: %w", err)
-	}
-	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
-		return fmt.Errorf("update header failed: %w", err)
-	}
-	if pt.db != nil {
-		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
 	}
 	return nil
 }
@@ -1203,6 +1207,9 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	if err != nil {
 		return false, fmt.Errorf("open node file failed: %w", err)
 	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("reset file pointer failed: %w", err)
+	}
 	var header FileNodeHeader
 	if err := binary.Read(file, binary.BigEndian, &header); err != nil {
 		return false, fmt.Errorf("read file header failed: %w", err)
@@ -1213,10 +1220,11 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	if header.Magic != FileNodeMagic {
 		return false, errors.New("invalid file node magic number")
 	}
-	payloadSize, err := nodeFileStoredPayloadSize(header)
+	info, err := file.Stat()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("stat node file failed: %w", err)
 	}
+	payloadSize := int(info.Size()) - binary.Size(header)
 	payload := make([]byte, payloadSize)
 	n, err := file.ReadAt(payload, int64(binary.Size(header)))
 	if err != nil && err != io.EOF {
@@ -1232,48 +1240,22 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	if err != nil {
 		return false, fmt.Errorf("decode payload failed : %w", err)
 	}
-	total := header.SortedEntryCount + header.UnsortedEntryCount
-	entries := make([]NodeInfo, 0, total)
 	found := false
 	for _, dec := range buildEntriesFromSlices(header, sortedSlice, unsortedSlice) {
-		if !bytes.Equal(dec.key, key) {
-			entries = append(entries, dec)
-		} else {
+		if bytes.Equal(dec.key, key) {
 			found = true
+			break
 		}
 	}
 	if !found {
 		return false, nil
 	}
-
-	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return false, fmt.Errorf("reset file pointer failed: %w", err)
-	}
-	header.SortedEntryCount = uint32(len(entries))
-	header.UnsortedEntryCount = 0
-	payload, err = encodeNodeFilePayload(&header, encodeNodeEntries(entries), nil, pt.db != nil && pt.db.nodeFileSortedCompression)
-	if err != nil {
-		return false, fmt.Errorf("encode payload failed : %w", err)
-	}
-	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
-		return false, fmt.Errorf("write file header failed : %w", err)
+	tombstone := encodeNodeEntry(tombstoneNodeInfo(key))
+	if _, err := file.WriteAt(tombstone, info.Size()); err != nil {
+		return false, fmt.Errorf("write tombstone failed: %w", err)
 	}
 	if pt.db != nil {
-		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
-	}
-	if len(payload) > 0 {
-		if _, err := file.Write(payload); err != nil {
-			return false, fmt.Errorf("failed to write entry: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(payload))
-		}
-	}
-	newSize := int64(binary.Size(header)) + int64(len(payload))
-	if err := file.Truncate(newSize); err != nil {
-		return false, fmt.Errorf("fail to Truncate file : %w", err)
+		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(tombstone))
 	}
 	return true, nil
 }
@@ -1398,10 +1380,25 @@ func (pt *PrefixTree) Close() error {
 		pt.globalNeedsRewrite = false
 		clear(pt.globalCommitBatch)
 	}
-	if pt.globalHeader.UnsortedEntryCount > 0 {
-		if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+	if pt.globalFile != nil {
+		info, err := pt.globalFile.Stat()
+		if err != nil {
 			pt.globalNodeMu.Unlock()
 			return err
+		}
+		payloadSize := int(info.Size()) - binary.Size(pt.globalHeader)
+		if payloadSize > 0 {
+			unsortedCount, inferErr := nodeFileInferUnsortedEntryCount(pt.globalHeader, payloadSize)
+			if inferErr != nil {
+				pt.globalNodeMu.Unlock()
+				return inferErr
+			}
+			if unsortedCount > 0 {
+				if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
+					pt.globalNodeMu.Unlock()
+					return err
+				}
+			}
 		}
 	}
 	if pt.globalFile != nil {
@@ -1480,21 +1477,29 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			pt.setFileNodeCache(fileID, hdrBuf, bigBuf)
 		}
 
-		totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
-		if totalEntries > 0 && bigBuf != nil {
+		sortedCount := uint32(0)
+		unsortedCount := uint32(0)
+		if bigBuf != nil {
 			sortedBytes := int(header.SortedEntryCount) * NodeEntrySize
 			sortedSlice = bigBuf[:sortedBytes]
 			unsortedSlice = bigBuf[sortedBytes:]
-			if pt.shouldScheduleGC(header.SortedEntryCount, header.UnsortedEntryCount) {
+			sortedCount = uint32(len(sortedSlice) / NodeEntrySize)
+			unsortedCount = uint32(len(unsortedSlice) / NodeEntrySize)
+			if sortedCount+unsortedCount > 0 && pt.shouldScheduleGC(sortedCount, unsortedCount) {
 				scheduleJob = true
 				scheduleGC = func() {
-					pt.maybeScheduleGC(fileID, header, sortedSlice, unsortedSlice)
+					headerCopy := header
+					headerCopy.SortedEntryCount = sortedCount
+					headerCopy.UnsortedEntryCount = unsortedCount
+					pt.maybeScheduleGC(fileID, headerCopy, sortedSlice, unsortedSlice)
 				}
 			}
 		}
 	}
 
-	totalEntries := header.SortedEntryCount + header.UnsortedEntryCount
+	sortedCount := uint32(len(sortedSlice) / NodeEntrySize)
+	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
+	totalEntries := sortedCount + unsortedCount
 	if totalEntries == 0 {
 		return NodeInfo{}, false, nil
 	}
@@ -1505,16 +1510,19 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 	var zeroHit *NodeInfo
 
 	// var nodeInfo NodeInfo
-	if header.UnsortedEntryCount > 0 && unsortedSlice != nil {
-		totalSize := int(header.UnsortedEntryCount) * NodeEntrySize
-		for i := uint32(0); i < header.UnsortedEntryCount; i++ {
-			idx := header.UnsortedEntryCount - 1 - i
+	if unsortedCount > 0 && unsortedSlice != nil {
+		totalSize := int(unsortedCount) * NodeEntrySize
+		for i := uint32(0); i < unsortedCount; i++ {
+			idx := unsortedCount - 1 - i
 			offsetInBuf := int64(idx) * NodeEntrySize
 			if offsetInBuf+NodeEntrySize > int64(totalSize) {
 				break
 			}
 			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
 			if bytes.Equal(dec.key, Key) {
+				if isNodeInfoTombstone(dec) {
+					return NodeInfo{}, false, nil
+				}
 				if isNonZero(dec.storageFileID) {
 					if zeroHit == nil {
 						return dec, true, nil
@@ -1538,7 +1546,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 	// 	return zeroHit.accountOffset, zeroHit.storageFileID, zeroHit.storageOffset, zeroHit.storageSize, true, nil
 	// }
 
-	if header.SortedEntryCount > 0 && sortedSlice != nil {
+	if sortedCount > 0 && sortedSlice != nil {
 		getKeyAt := func(idx uint32) []byte {
 			start := int(idx) * NodeEntrySize
 			keyLen := int(sortedSlice[start])
@@ -1548,7 +1556,7 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			return sortedSlice[start+1 : start+1+keyLen]
 		}
 
-		low, high := uint32(0), header.SortedEntryCount-1
+		low, high := uint32(0), sortedCount-1
 		for low <= high {
 			mid := (low + high) / 2
 			k := getKeyAt(mid)
@@ -1556,6 +1564,9 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			if cmp == 0 {
 				start := int(mid) * NodeEntrySize
 				dec := decodeNodeEntry(sortedSlice[start : start+NodeEntrySize])
+				if isNodeInfoTombstone(dec) {
+					return NodeInfo{}, false, nil
+				}
 				if isNonZero(dec.storageFileID) {
 					return dec, true, nil
 				}
@@ -1652,11 +1663,11 @@ func (pt *PrefixTree) readDecodedFileNode(fileID string, file *os.File) (decoded
 		return result, fmt.Errorf("invalid file node magic (got 0x%X, file=%s)", result.header.Magic, fileID)
 	}
 
-	payloadSize, err := nodeFileStoredPayloadSize(result.header)
+	info, err := file.Stat()
 	if err != nil {
-		return result, fmt.Errorf("compute payload size failed: file=%s version=%d sorted=%d unsorted=%d: %w",
-			fileID, result.header.Version, result.header.SortedEntryCount, result.header.UnsortedEntryCount, err)
+		return result, fmt.Errorf("stat node file failed: file=%s: %w", fileID, err)
 	}
+	payloadSize := int(info.Size()) - int(headerSize)
 	if payloadSize == 0 {
 		return result, nil
 	}

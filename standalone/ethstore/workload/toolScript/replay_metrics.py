@@ -6,6 +6,9 @@ auto-detects the paired "*_io_*.log" file and computes:
 - avg CPU usage across all io samples
 - avg RSS_KB across all io samples
 - physical read/write bytes from the last valid sample row
+- block-device read/write byte diffs from the paired ".stat" file
+- NAND write byte diff from the paired ".stat" file
+- write overhead derived from NAND writes minus block writes across the run
 
 From the main replay log, it extracts:
 - replay summary: ops, total time, throughput, logical read/write
@@ -235,6 +238,10 @@ def find_io_log(main_log: Path) -> Path:
     return main_log.with_name(f"{parts[0]}_io_{parts[1]}")
 
 
+def find_stat_log(main_log: Path) -> Path:
+    return Path(f"{find_io_log(main_log)}.stat")
+
+
 def normalize_main_log(path: Path) -> Path:
     base = path.name
     if "_io_" not in base:
@@ -358,7 +365,72 @@ def parse_io_log(path: Path) -> dict[str, Any]:
     return result
 
 
-def item_to_single_row(item: dict[str, Any], io: dict[str, Any]) -> dict[str, Any]:
+def parse_stat_log(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "stat_file": str(path),
+        "block_read_bytes_diff": None,
+        "block_write_bytes_diff": None,
+        "nand_write_bytes_diff": None,
+        "nand_source": None,
+        "write_overhead_bytes": None,
+        "write_overhead_pct": None,
+        "write_amplification": None,
+        "warnings": [],
+    }
+
+    if not path.exists():
+        result["warnings"].append("stat file not found")
+        return result
+
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.DictReader(f)
+        row = next(reader, None)
+
+    if row is None:
+        result["warnings"].append("stat row missing")
+        return result
+
+    block_read_bytes_diff = safe_int(
+        row.get("BLOCK_READ_BYTES_DIFF", row.get("SSD_READ_BYTES_DIFF", ""))
+    )
+    block_write_bytes_diff = safe_int(
+        row.get("BLOCK_WRITE_BYTES_DIFF", row.get("SSD_WRITE_BYTES_DIFF", ""))
+    )
+    nand_write_bytes_diff = safe_int(row.get("NAND_WRITE_BYTES_DIFF", ""))
+    nand_source = (row.get("NAND_SOURCE") or "").strip() or None
+
+    result["block_read_bytes_diff"] = block_read_bytes_diff
+    result["block_write_bytes_diff"] = block_write_bytes_diff
+    result["nand_write_bytes_diff"] = nand_write_bytes_diff
+    result["nand_source"] = nand_source
+
+    if block_write_bytes_diff is None:
+        result["warnings"].append("stat block write bytes diff missing")
+    if nand_write_bytes_diff is None:
+        result["warnings"].append("stat nand write bytes diff missing")
+
+    if (
+        block_write_bytes_diff is not None
+        and nand_write_bytes_diff is not None
+    ):
+        write_overhead_bytes = nand_write_bytes_diff - block_write_bytes_diff
+        result["write_overhead_bytes"] = write_overhead_bytes
+        if block_write_bytes_diff > 0:
+            result["write_overhead_pct"] = (
+                write_overhead_bytes / block_write_bytes_diff
+            ) * 100.0
+            result["write_amplification"] = (
+                nand_write_bytes_diff / block_write_bytes_diff
+            )
+
+    return result
+
+
+def item_to_single_row(
+    item: dict[str, Any],
+    io: dict[str, Any],
+    stat: dict[str, Any],
+) -> dict[str, Any]:
     file_name = Path(item["file"]).name
     round_idx = parse_round_from_name(Path(item["file"]))
     round_group = build_round_group_key(Path(item["file"]))
@@ -380,6 +452,13 @@ def item_to_single_row(item: dict[str, Any], io: dict[str, Any]) -> dict[str, An
         "io_avg_rss_kb": io["io_avg_rss_kb"],
         "physical_read_bytes": io["physical_read_bytes"],
         "physical_write_bytes": io["physical_write_bytes"],
+        "block_read_bytes_diff": stat["block_read_bytes_diff"],
+        "block_write_bytes_diff": stat["block_write_bytes_diff"],
+        "nand_write_bytes_diff": stat["nand_write_bytes_diff"],
+        "nand_source": stat["nand_source"],
+        "write_overhead_bytes": stat["write_overhead_bytes"],
+        "write_overhead_pct": stat["write_overhead_pct"],
+        "write_amplification": stat["write_amplification"],
     }
 
     groups = ["BlockData", "OtherData", "StateData", "Global"]
@@ -402,6 +481,7 @@ def item_to_single_row(item: dict[str, Any], io: dict[str, Any]) -> dict[str, An
     warnings = []
     warnings.extend(item["warnings"])
     warnings.extend(io["warnings"])
+    warnings.extend(stat["warnings"])
     row["warnings"] = " | ".join(warnings)
     return row
 
@@ -552,7 +632,8 @@ def main(argv: list[str]) -> int:
     rows: list[dict[str, Any]] = []
     for item, p in zip(items, main_logs):
         io_metrics = parse_io_log(find_io_log(p))
-        rows.append(item_to_single_row(item, io_metrics))
+        stat_metrics = parse_stat_log(find_stat_log(p))
+        rows.append(item_to_single_row(item, io_metrics, stat_metrics))
 
     write_csv(rows, out_path)
 

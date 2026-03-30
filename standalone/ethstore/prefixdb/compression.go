@@ -3,6 +3,7 @@ package prefixdb
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -134,10 +135,36 @@ func (h *FileNodeHeader) setSortedCompression(compressed bool, compressedSize in
 	}
 }
 
-func nodeFileStoredPayloadSize(header FileNodeHeader) (int, error) {
+func nodeFileStoredSortedPayloadSize(header FileNodeHeader) (int, error) {
 	sortedStored := header.sortedCompressedSize()
+	if sortedStored < 0 {
+		return 0, fmt.Errorf("negative sorted node file payload size")
+	}
+	return sortedStored, nil
+}
+
+func nodeFileInferUnsortedEntryCount(header FileNodeHeader, payloadSize int) (uint32, error) {
+	sortedStored, err := nodeFileStoredSortedPayloadSize(header)
+	if err != nil {
+		return 0, err
+	}
+	if payloadSize < sortedStored {
+		return 0, fmt.Errorf("node file payload smaller than sorted portion: payload=%d sorted=%d", payloadSize, sortedStored)
+	}
+	unsortedStored := payloadSize - sortedStored
+	if unsortedStored%NodeEntrySize != 0 {
+		return 0, fmt.Errorf("node file unsorted payload size %d is not aligned to entry size %d", unsortedStored, NodeEntrySize)
+	}
+	return uint32(unsortedStored / NodeEntrySize), nil
+}
+
+func nodeFileStoredPayloadSize(header FileNodeHeader) (int, error) {
+	sortedStored, err := nodeFileStoredSortedPayloadSize(header)
+	if err != nil {
+		return 0, err
+	}
 	unsortedStored := int(header.UnsortedEntryCount) * NodeEntrySize
-	if sortedStored < 0 || unsortedStored < 0 {
+	if unsortedStored < 0 {
 		return 0, fmt.Errorf("negative node file payload size")
 	}
 	return sortedStored + unsortedStored, nil
@@ -169,27 +196,34 @@ func encodeNodeFilePayload(header *FileNodeHeader, sortedSlice, unsortedSlice []
 
 func decodeNodeFilePayload(header FileNodeHeader, payload []byte) ([]byte, []byte, []byte, error) {
 	expectedSorted := int(header.SortedEntryCount) * NodeEntrySize
-	expectedUnsorted := int(header.UnsortedEntryCount) * NodeEntrySize
 	if !header.sortedCompressed() {
-		if len(payload) != expectedSorted+expectedUnsorted {
-			return nil, nil, nil, fmt.Errorf("unexpected node file payload size: got %d want %d", len(payload), expectedSorted+expectedUnsorted)
+		if len(payload) < expectedSorted {
+			return nil, nil, nil, fmt.Errorf("unexpected node file payload size: got %d want at least %d", len(payload), expectedSorted)
+		}
+		unsortedStored := len(payload) - expectedSorted
+		if unsortedStored%NodeEntrySize != 0 {
+			return nil, nil, nil, fmt.Errorf("unexpected unsorted payload size: got %d not aligned to %d", unsortedStored, NodeEntrySize)
 		}
 		sortedSlice := payload[:expectedSorted]
 		unsortedSlice := payload[expectedSorted:]
 		return payload, sortedSlice, unsortedSlice, nil
 	}
-	sortedStored := header.sortedCompressedSize()
-	if sortedStored < 0 || sortedStored > len(payload) {
-		return nil, nil, nil, fmt.Errorf("invalid compressed sorted payload size %d", sortedStored)
+	sortedStored, err := nodeFileStoredSortedPayloadSize(header)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if len(payload)-sortedStored != expectedUnsorted {
-		return nil, nil, nil, fmt.Errorf("unexpected unsorted payload size: got %d want %d", len(payload)-sortedStored, expectedUnsorted)
+	if sortedStored > len(payload) {
+		return nil, nil, nil, fmt.Errorf("short read got %d want at least %d: %w", len(payload), sortedStored, io.ErrUnexpectedEOF)
+	}
+	unsortedStored := len(payload) - sortedStored
+	if unsortedStored%NodeEntrySize != 0 {
+		return nil, nil, nil, fmt.Errorf("unexpected unsorted payload size: got %d not aligned to %d", unsortedStored, NodeEntrySize)
 	}
 	sortedSlice, err := decompressMetadataZstd(payload[:sortedStored], expectedSorted)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	combined := make([]byte, 0, len(sortedSlice)+expectedUnsorted)
+	combined := make([]byte, 0, len(sortedSlice)+unsortedStored)
 	combined = append(combined, sortedSlice...)
 	combined = append(combined, payload[sortedStored:]...)
 	return combined, combined[:len(sortedSlice)], combined[len(sortedSlice):], nil
