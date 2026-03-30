@@ -79,7 +79,7 @@ RUN_ROUNDS="${RUN_ROUNDS:-0}"
 # 已加载数据根目录（source）与回放运行目录（target）
 LOADED_ROOT="${LOADED_ROOT:-/data/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
-DISK_MOUNT_POINT="/mnt/ssd2"
+DISK_MOUNT_POINT="/data"
 
 # ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb64KB | database_statedb256KB
 calculate_default_ethstore_statedb_dirname() {
@@ -614,7 +614,7 @@ run_and_monitor() {
     (
         trap - ERR INT TERM EXIT
         set +e
-        sudo_run ./monitor.sh "$CURRENT_REPLAY_PID" 1 "$io_file"
+        sudo_run ./monitor.sh "$CURRENT_REPLAY_PID" 1 "$io_file" "$DISK_MOUNT_POINT"
     ) &
     CURRENT_MONITOR_PID=$!
 
