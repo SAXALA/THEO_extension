@@ -619,6 +619,14 @@ run_and_monitor() {
     CURRENT_MONITOR_PID=$!
 
     wait "$CURRENT_REPLAY_PID"
+    CURRENT_REPLAY_PID=""
+
+    # Let monitor.sh observe process exit and flush SSD stats to *.stat.
+    if [ -n "$CURRENT_MONITOR_PID" ]; then
+        wait "$CURRENT_MONITOR_PID" 2>/dev/null || true
+        CURRENT_MONITOR_PID=""
+    fi
+
     cleanup_running_processes
 }
 

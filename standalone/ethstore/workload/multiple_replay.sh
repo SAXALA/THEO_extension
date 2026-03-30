@@ -24,7 +24,7 @@ BACKEND_SELECTOR="${2:-}"
 CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
 BACKEND_CANDIDATES=(ethstore pebble) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache nocache_snap nocache) # cache nocache_snap nocache
+TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap nocache
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"

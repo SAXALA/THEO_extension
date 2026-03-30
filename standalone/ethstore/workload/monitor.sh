@@ -70,6 +70,98 @@ read_disk_bytes() {
     echo "$((sectors_read * 512)) $((sectors_write * 512))"
 }
 
+resolve_smart_device_path() {
+    local dev_name="$1"
+    local dev_path="/dev/${dev_name}"
+    local parent
+
+    parent=$(lsblk -ndo PKNAME "$dev_path" 2>/dev/null | head -n1)
+    if [ -n "$parent" ]; then
+        echo "/dev/${parent}"
+        return 0
+    fi
+
+    echo "$dev_path"
+}
+
+extract_last_integer() {
+    sed -nE 's/.*([0-9][0-9,]*).*/\1/p' | tr -d ','
+}
+
+human_size_to_bytes() {
+    local human="$1"
+    local value unit
+
+    value=$(echo "$human" | sed -nE 's/^([0-9]+(\.[0-9]+)?).*/\1/p')
+    unit=$(echo "$human" | sed -nE 's/^[0-9]+(\.[0-9]+)?[[:space:]]*([[:alpha:]]+).*$/\2/p' | tr '[:lower:]' '[:upper:]')
+
+    if [ -z "$value" ] || [ -z "$unit" ]; then
+        return 1
+    fi
+
+    awk -v v="$value" -v u="$unit" 'BEGIN {
+        mul = 1
+        if (u == "B") mul = 1
+        else if (u == "KB" || u == "KIB") mul = 1024
+        else if (u == "MB" || u == "MIB") mul = 1024 * 1024
+        else if (u == "GB" || u == "GIB") mul = 1024 * 1024 * 1024
+        else if (u == "TB" || u == "TIB") mul = 1024 * 1024 * 1024 * 1024
+        else if (u == "PB" || u == "PIB") mul = 1024 * 1024 * 1024 * 1024 * 1024
+        else exit 1
+        printf "%.0f", v * mul
+    }'
+}
+
+read_nand_write_bytes() {
+    local dev_path="$1"
+    local smart_out line bracket_val raw_value bytes
+
+    if ! command -v smartctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    smart_out=$(smartctl -a "$dev_path" 2>/dev/null || true)
+    if [ -z "$smart_out" ]; then
+        return 1
+    fi
+
+    # Some NVMe drives expose physical media writes with a human-readable size in brackets.
+    line=$(echo "$smart_out" | grep -iE 'Physical media units written|NAND bytes written|NAND writes|Flash writes' | head -n1)
+    if [ -n "$line" ]; then
+        bracket_val=$(echo "$line" | sed -nE 's/.*\[([0-9]+(\.[0-9]+)?[[:space:]]*[KMGTPE]?I?B)\].*/\1/p')
+        if [ -n "$bracket_val" ]; then
+            bytes=$(human_size_to_bytes "$bracket_val" 2>/dev/null || true)
+            if [ -n "$bytes" ]; then
+                echo "$bytes bracket-size"
+                return 0
+            fi
+        fi
+    fi
+
+    # Common SATA SMART vendor attributes that directly report NAND writes in GiB.
+    line=$(echo "$smart_out" | awk '/Total_NAND_Writes_GiB|NAND_Writes_1GiB|NAND_Writes_GiB|Flash_Writes_GiB/ {print; exit}')
+    if [ -n "$line" ]; then
+        raw_value=$(echo "$line" | extract_last_integer)
+        if [ -n "$raw_value" ]; then
+            bytes=$((raw_value * 1024 * 1024 * 1024))
+            echo "$bytes smart-attr-gib"
+            return 0
+        fi
+    fi
+
+    # Some drives expose a direct NAND bytes counter.
+    line=$(echo "$smart_out" | awk -F: '/NAND[[:space:]_]*Bytes[[:space:]_]*Written/ {print $2; exit}')
+    if [ -n "$line" ]; then
+        raw_value=$(echo "$line" | extract_last_integer)
+        if [ -n "$raw_value" ]; then
+            echo "$raw_value smart-attr-bytes"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 BLOCK_DEVICE=$(resolve_block_device "$SSD_TARGET")
 if [ -z "$BLOCK_DEVICE" ]; then
     echo "错误: 无法从 '$SSD_TARGET' 解析块设备，请传入有效挂载点或块设备路径（如 /mnt/ssd2 或 /dev/nvme0n1p1）。"
@@ -84,7 +176,7 @@ if [ ! -f "$LOGFILE" ]; then
 fi
 
 if [ ! -f "$STATFILE" ]; then
-    echo "START_TIMESTAMP,END_TIMESTAMP,DEVICE,SSD_READ_BYTES_DIFF,SSD_WRITE_BYTES_DIFF,SSD_READ_BYTES_START,SSD_WRITE_BYTES_START,SSD_READ_BYTES_END,SSD_WRITE_BYTES_END" > "$STATFILE"
+    echo "START_TIMESTAMP,END_TIMESTAMP,DEVICE,BLOCK_READ_BYTES_DIFF,BLOCK_WRITE_BYTES_DIFF,BLOCK_READ_BYTES_START,BLOCK_WRITE_BYTES_START,BLOCK_READ_BYTES_END,BLOCK_WRITE_BYTES_END,NAND_WRITE_BYTES_DIFF,NAND_WRITE_BYTES_START,NAND_WRITE_BYTES_END,NAND_SOURCE" > "$STATFILE"
 fi
 
 # 获取系统时钟频率 HZ
@@ -95,6 +187,17 @@ START_TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 START_DISK_BYTES=($(read_disk_bytes "$BLOCK_DEVICE"))
 SSD_START_READ=${START_DISK_BYTES[0]}
 SSD_START_WRITE=${START_DISK_BYTES[1]}
+SMART_DEVICE_PATH=$(resolve_smart_device_path "$BLOCK_DEVICE")
+NAND_SOURCE="unavailable"
+NAND_START_WRITE=""
+
+NAND_START_INFO=$(read_nand_write_bytes "$SMART_DEVICE_PATH" || true)
+if [ -n "$NAND_START_INFO" ]; then
+    NAND_START_WRITE=$(echo "$NAND_START_INFO" | awk '{print $1}')
+    NAND_SOURCE=$(echo "$NAND_START_INFO" | awk '{print $2}')
+else
+    echo "警告: 无法从 ${SMART_DEVICE_PATH} 读取 NAND 物理写入计数（smartctl 字段可能不支持该盘）。" >&2
+fi
 
 # --- 2. 循环监控 ---
 while [ -d "/proc/$MAIN_PID" ]; do
@@ -158,7 +261,17 @@ SSD_END_WRITE=${END_DISK_BYTES[1]}
 SSD_READ_DIFF=$((SSD_END_READ - SSD_START_READ))
 SSD_WRITE_DIFF=$((SSD_END_WRITE - SSD_START_WRITE))
 
-STAT_LINE="$START_TIMESTAMP,$END_TIMESTAMP,$BLOCK_DEVICE,$SSD_READ_DIFF,$SSD_WRITE_DIFF,$SSD_START_READ,$SSD_START_WRITE,$SSD_END_READ,$SSD_END_WRITE"
+NAND_END_WRITE=""
+NAND_WRITE_DIFF=""
+NAND_END_INFO=$(read_nand_write_bytes "$SMART_DEVICE_PATH" || true)
+if [ -n "$NAND_END_INFO" ]; then
+    NAND_END_WRITE=$(echo "$NAND_END_INFO" | awk '{print $1}')
+    if [ -n "$NAND_START_WRITE" ]; then
+        NAND_WRITE_DIFF=$((NAND_END_WRITE - NAND_START_WRITE))
+    fi
+fi
+
+STAT_LINE="$START_TIMESTAMP,$END_TIMESTAMP,$BLOCK_DEVICE,$SSD_READ_DIFF,$SSD_WRITE_DIFF,$SSD_START_READ,$SSD_START_WRITE,$SSD_END_READ,$SSD_END_WRITE,$NAND_WRITE_DIFF,$NAND_START_WRITE,$NAND_END_WRITE,$NAND_SOURCE"
 echo "$STAT_LINE" >> "$STATFILE"
 
 echo -e "\n进程已结束。监控日志已保存至: $LOGFILE 和 $STATFILE"
