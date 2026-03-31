@@ -7,8 +7,8 @@ auto-detects the paired "*_io_*.log" file and computes:
 - avg RSS_KB across all io samples
 - physical read/write bytes from the last valid sample row
 - block-device read/write byte diffs from the paired ".stat" file
-- NAND write byte diff from the paired ".stat" file
-- write overhead derived from NAND writes minus block writes across the run
+- NAND total/io/gc write diffs from the paired ".stat" file
+- write overhead derived from byte-based NAND writes minus block writes across the run
 
 From the main replay log, it extracts:
 - replay summary: ops, total time, throughput, logical read/write
@@ -370,7 +370,20 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
         "stat_file": str(path),
         "block_read_bytes_diff": None,
         "block_write_bytes_diff": None,
+        "nand_total_write_start": None,
+        "nand_total_write_end": None,
+        "nand_total_write_diff": None,
+        "nand_io_write_start": None,
+        "nand_io_write_end": None,
+        "nand_io_write_diff": None,
+        "nand_gc_write_start": None,
+        "nand_gc_write_end": None,
+        "nand_gc_write_diff": None,
+        "nand_counter_source": None,
+        "nand_write_bytes_start": None,
+        "nand_write_bytes_end": None,
         "nand_write_bytes_diff": None,
+        "nand_bytes_source": None,
         "nand_source": None,
         "write_overhead_bytes": None,
         "write_overhead_pct": None,
@@ -396,18 +409,50 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
     block_write_bytes_diff = safe_int(
         row.get("BLOCK_WRITE_BYTES_DIFF", row.get("SSD_WRITE_BYTES_DIFF", ""))
     )
+    nand_total_write_start = safe_int(
+        row.get("NAND_TOTAL_WRITE_START", row.get("NAND_WRITE_BYTES_START", ""))
+    )
+    nand_total_write_end = safe_int(
+        row.get("NAND_TOTAL_WRITE_END", row.get("NAND_WRITE_BYTES_END", ""))
+    )
+    nand_total_write_diff = safe_int(
+        row.get("NAND_TOTAL_WRITE_DIFF", row.get("NAND_WRITE_BYTES_DIFF", ""))
+    )
+    nand_io_write_start = safe_int(row.get("NAND_IO_WRITE_START", ""))
+    nand_io_write_end = safe_int(row.get("NAND_IO_WRITE_END", ""))
+    nand_io_write_diff = safe_int(row.get("NAND_IO_WRITE_DIFF", ""))
+    nand_gc_write_start = safe_int(row.get("NAND_GC_WRITE_START", ""))
+    nand_gc_write_end = safe_int(row.get("NAND_GC_WRITE_END", ""))
+    nand_gc_write_diff = safe_int(row.get("NAND_GC_WRITE_DIFF", ""))
+    nand_counter_source = (row.get("NAND_COUNTER_SOURCE") or "").strip() or None
+    nand_write_bytes_start = safe_int(row.get("NAND_WRITE_BYTES_START", ""))
+    nand_write_bytes_end = safe_int(row.get("NAND_WRITE_BYTES_END", ""))
     nand_write_bytes_diff = safe_int(row.get("NAND_WRITE_BYTES_DIFF", ""))
-    nand_source = (row.get("NAND_SOURCE") or "").strip() or None
+    nand_bytes_source = (row.get("NAND_BYTES_SOURCE") or "").strip() or None
+    nand_source = nand_counter_source or nand_bytes_source or (row.get("NAND_SOURCE") or "").strip() or None
 
     result["block_read_bytes_diff"] = block_read_bytes_diff
     result["block_write_bytes_diff"] = block_write_bytes_diff
+    result["nand_total_write_start"] = nand_total_write_start
+    result["nand_total_write_end"] = nand_total_write_end
+    result["nand_total_write_diff"] = nand_total_write_diff
+    result["nand_io_write_start"] = nand_io_write_start
+    result["nand_io_write_end"] = nand_io_write_end
+    result["nand_io_write_diff"] = nand_io_write_diff
+    result["nand_gc_write_start"] = nand_gc_write_start
+    result["nand_gc_write_end"] = nand_gc_write_end
+    result["nand_gc_write_diff"] = nand_gc_write_diff
+    result["nand_counter_source"] = nand_counter_source
+    result["nand_write_bytes_start"] = nand_write_bytes_start
+    result["nand_write_bytes_end"] = nand_write_bytes_end
     result["nand_write_bytes_diff"] = nand_write_bytes_diff
+    result["nand_bytes_source"] = nand_bytes_source
     result["nand_source"] = nand_source
 
     if block_write_bytes_diff is None:
         result["warnings"].append("stat block write bytes diff missing")
-    if nand_write_bytes_diff is None:
-        result["warnings"].append("stat nand write bytes diff missing")
+    if nand_total_write_diff is None and nand_write_bytes_diff is None:
+        result["warnings"].append("stat nand total write diff missing")
 
     if (
         block_write_bytes_diff is not None
@@ -454,7 +499,20 @@ def item_to_single_row(
         "physical_write_bytes": io["physical_write_bytes"],
         "block_read_bytes_diff": stat["block_read_bytes_diff"],
         "block_write_bytes_diff": stat["block_write_bytes_diff"],
+        "nand_total_write_start": stat["nand_total_write_start"],
+        "nand_total_write_end": stat["nand_total_write_end"],
+        "nand_total_write_diff": stat["nand_total_write_diff"],
+        "nand_io_write_start": stat["nand_io_write_start"],
+        "nand_io_write_end": stat["nand_io_write_end"],
+        "nand_io_write_diff": stat["nand_io_write_diff"],
+        "nand_gc_write_start": stat["nand_gc_write_start"],
+        "nand_gc_write_end": stat["nand_gc_write_end"],
+        "nand_gc_write_diff": stat["nand_gc_write_diff"],
+        "nand_counter_source": stat["nand_counter_source"],
+        "nand_write_bytes_start": stat["nand_write_bytes_start"],
+        "nand_write_bytes_end": stat["nand_write_bytes_end"],
         "nand_write_bytes_diff": stat["nand_write_bytes_diff"],
+        "nand_bytes_source": stat["nand_bytes_source"],
         "nand_source": stat["nand_source"],
         "write_overhead_bytes": stat["write_overhead_bytes"],
         "write_overhead_pct": stat["write_overhead_pct"],

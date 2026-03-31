@@ -2460,6 +2460,77 @@ func TestAccountNamedSegmentedUpdateSplitRefreshesChunkBufferAndIndex(t *testing
 	}
 }
 
+func TestAccountNamedSegmentedRewriteRemovesStaleChunksAndInvalidatesOldChunkBuffers(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+	db.segmentedChunkHardLimit = 64
+
+	accountKey := makeTestAccountKey(0x2c)
+	initial := []kvPair{
+		{key: []byte{0x01}, val: bytes.Repeat([]byte("a"), 20)},
+		{key: []byte{0x03}, val: bytes.Repeat([]byte("b"), 20)},
+		{key: []byte{0x05}, val: bytes.Repeat([]byte("c"), 20)},
+	}
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorage(accountKey, initial); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorage initial failed: %v", err)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	before, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath before rewrite failed: %v", err)
+	}
+	if len(before) < 2 {
+		t.Fatalf("expected initial rewrite to create multiple chunks, got %d", len(before))
+	}
+	staleMeta := before[len(before)-1]
+	if _, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{0x05}); err != nil || failure != nil {
+		t.Fatalf("warm stale chunk cache failed: err=%v failure=%+v", err, failure)
+	}
+	if !db.isSegmentChunkCached(folderPath, staleMeta.FileName) {
+		t.Fatal("expected tail chunk to be cached before rewrite")
+	}
+
+	rewritten := []kvPair{{key: []byte{0x01}, val: bytes.Repeat([]byte("z"), 10)}}
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorage(accountKey, rewritten); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorage rewrite failed: %v", err)
+	}
+
+	after, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath after rewrite failed: %v", err)
+	}
+	keep := make(map[string]struct{}, len(after))
+	for _, meta := range after {
+		keep[meta.FileName] = struct{}{}
+	}
+	if _, ok := keep[staleMeta.FileName]; ok {
+		t.Fatalf("expected rewritten index to drop stale chunk %s", staleMeta.FileName)
+	}
+	if fileExists(filepath.Join(folderPath, staleMeta.FileName)) {
+		t.Fatalf("expected stale chunk file %s to be removed from disk", staleMeta.FileName)
+	}
+	if db.isSegmentChunkCached(folderPath, staleMeta.FileName) {
+		t.Fatal("expected stale chunk cache entry to be removed after rewrite")
+	}
+
+	db.removeStorageCacheValue(accountKey, []byte{0x01})
+	value, failure, err := db.readSegmentedChunkToCacheByPath(folderPath, accountKey, []byte{0x01})
+	if err != nil {
+		t.Fatalf("read rewritten value failed: %v", err)
+	}
+	if failure != nil || !bytes.Equal(value, bytes.Repeat([]byte("z"), 10)) {
+		t.Fatalf("unexpected rewritten value: value=%q failure=%+v", value, failure)
+	}
+	if db.isSegmentChunkCached(folderPath, staleMeta.FileName) {
+		t.Fatal("expected stale chunk cache entry to stay removed after read")
+	}
+}
+
 func TestAccountNamedSegmentedAppendDoesNotReadDiskToRefreshChunkBuffer(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 0)

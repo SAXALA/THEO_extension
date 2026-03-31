@@ -2757,7 +2757,10 @@ func (db *PrefixDB) rewriteAccountNamedSegmentedStorageWithLockHeld(accountKey [
 }
 
 func (db *PrefixDB) rewriteAccountNamedSegmentedStorageWithFolderLockHeld(folderPath string, accountKey []byte, kvs []kvPair, entry *segmentIndexFolderLock) (uint32, uint64, uint64, error) {
-	if err := os.RemoveAll(folderPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	var oldMetas []segmentChunkMeta
+	if metas, err := db.readSegmentIndexNoCacheByPathLocked(folderPath); err == nil {
+		oldMetas = cloneSegmentChunkMetas(metas)
+	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errSegmentIndexEntryNotFound) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return 0, 0, 0, err
 	}
 	if err := os.MkdirAll(folderPath, 0o755); err != nil {
@@ -2769,6 +2772,21 @@ func (db *PrefixDB) rewriteAccountNamedSegmentedStorageWithFolderLockHeld(folder
 	}
 	if err := db.writeSegmentIndexLocked(folderPath, chunkMetas, entry); err != nil {
 		return 0, 0, 0, err
+	}
+	keep := make(map[string]struct{}, len(chunkMetas))
+	for _, meta := range chunkMetas {
+		keep[meta.FileName] = struct{}{}
+	}
+	if err := removeStaleSegmentChunkFiles(folderPath, keep); err != nil {
+		return 0, 0, 0, err
+	}
+	for _, meta := range oldMetas {
+		if _, ok := keep[meta.FileName]; ok {
+			// Existing file names may be overwritten with new payloads; drop stale cached data.
+			db.removeCachedSegmentChunkEntries(folderPath, meta.FileName)
+			continue
+		}
+		db.removeCachedSegmentChunkEntries(folderPath, meta.FileName)
 	}
 	db.markAccountStorageFolder(accountKey)
 	db.invalidateSegmentIndexLayoutForPath(folderPath)
@@ -4024,6 +4042,35 @@ func removeStaleLevel2IndexFiles(folderPath string, oldEntries []segmentIndexL1E
 		toDelete = append(toDelete, entry.MetaID)
 	}
 	return removeLevel2IndexFilesByIDs(folderPath, toDelete)
+}
+
+func removeStaleSegmentChunkFiles(folderPath string, keep map[string]struct{}) error {
+	entries, err := os.ReadDir(folderPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if parseChunkOrdinal(name) < 0 {
+			continue
+		}
+		if keep != nil {
+			if _, ok := keep[name]; ok {
+				continue
+			}
+		}
+		full := filepath.Join(folderPath, name)
+		if err := os.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func removeLevel2IndexFiles(folderPath string, keep map[uint32]struct{}) error {

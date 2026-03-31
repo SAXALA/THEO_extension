@@ -255,6 +255,64 @@ func mergeNodeInfoForAppend(previous NodeInfo, next NodeInfo) NodeInfo {
 	return merged
 }
 
+func encodeFileNodeHeader(header FileNodeHeader) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, &header); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func nodeFileContainsKey(sortedSlice, unsortedSlice, key []byte) bool {
+	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
+	if unsortedCount > 0 {
+		totalSize := int(unsortedCount) * NodeEntrySize
+		for i := uint32(0); i < unsortedCount; i++ {
+			idx := unsortedCount - 1 - i
+			offsetInBuf := int64(idx) * NodeEntrySize
+			if offsetInBuf+NodeEntrySize > int64(totalSize) {
+				break
+			}
+			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
+			if bytes.Equal(dec.key, key) {
+				return !isNodeInfoTombstone(dec)
+			}
+		}
+	}
+
+	sortedCount := uint32(len(sortedSlice) / NodeEntrySize)
+	if sortedCount == 0 {
+		return false
+	}
+	getKeyAt := func(idx uint32) []byte {
+		start := int(idx) * NodeEntrySize
+		keyLen := int(sortedSlice[start])
+		if keyLen > MaxKeySize {
+			keyLen = MaxKeySize
+		}
+		return sortedSlice[start+1 : start+1+keyLen]
+	}
+	low, high := uint32(0), sortedCount-1
+	for low <= high {
+		mid := (low + high) / 2
+		cmp := bytes.Compare(getKeyAt(mid), key)
+		if cmp == 0 {
+			start := int(mid) * NodeEntrySize
+			dec := decodeNodeEntry(sortedSlice[start : start+NodeEntrySize])
+			return !isNodeInfoTombstone(dec)
+		}
+		if cmp < 0 {
+			low = mid + 1
+		} else {
+			if mid == 0 {
+				break
+			}
+			high = mid - 1
+		}
+	}
+	return false
+}
+
 // PrefixTree
 type PrefixTree struct {
 	lock        sync.RWMutex
@@ -280,7 +338,6 @@ type PrefixTree struct {
 	globalCommitDepth  int
 	globalCommitDirty  bool
 	globalCommitBatch  map[string]NodeInfo
-	globalNeedsRewrite bool
 
 	// node file access stats (read path)
 	fileNodeCacheHits     uint64
@@ -772,15 +829,8 @@ func (pt *PrefixTree) endGlobalCommit() error {
 	}
 	defer func() {
 		pt.globalCommitDirty = false
-		pt.globalNeedsRewrite = false
 		clear(pt.globalCommitBatch)
 	}()
-	if pt.globalNeedsRewrite {
-		prefixdbDebugf("PrefixTree endGlobalCommit: rewrite start entries=%d", len(pt.globalCommitBatch))
-		err := pt.rewriteGlobalNodeFileLocked()
-		prefixdbDebugf("PrefixTree endGlobalCommit: rewrite done elapsed=%s err=%v", time.Since(commitStart), err)
-		return err
-	}
 	if len(pt.globalCommitBatch) == 0 {
 		prefixdbDebugf("PrefixTree endGlobalCommit: empty batch elapsed=%s", time.Since(commitStart))
 		return nil
@@ -1113,49 +1163,41 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	// invalidate cache if it matches
 	pt.invalidateFileNodeCache(fileID)
 
-	filePath := filepath.Join(pt.fileNodeDir, fileID)
 	var file *os.File
-	var header FileNodeHeader
 	var err error
-
-	if _, err = os.Stat(filePath); os.IsNotExist(err) {
+	file, err = pt.getOrCreateFileHandle(fileID, os.O_RDWR)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("open file failed: %w", err)
+		}
 		file, err = pt.getOrCreateFileHandle(fileID, os.O_RDWR|os.O_CREATE)
 		if err != nil {
 			return fmt.Errorf("create file failed: %w", err)
-		}
-		header = FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
-		if err := binary.Write(file, binary.BigEndian, &header); err != nil {
-			file.Close()
-			return fmt.Errorf("write header failed: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
-		}
-	} else {
-		file, err = pt.getOrCreateFileHandle(fileID, os.O_RDWR)
-		if err != nil {
-			return fmt.Errorf("open file failed: %w", err)
-		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			file.Close()
-			return fmt.Errorf("seek failed: %w", err)
-		}
-		if err := binary.Read(file, binary.BigEndian, &header); err != nil {
-			file.Close()
-			return fmt.Errorf("read header failed: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskRead(diskIOUsageNodeFileMutation, binary.Size(header))
-		}
-		if header.Magic != FileNodeMagic {
-			file.Close()
-			return errors.New("invalid file node magic")
 		}
 	}
 
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat file failed: %w", err)
+	}
+	if info.Size() == 0 {
+		header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
+		headerBytes, err := encodeFileNodeHeader(header)
+		if err != nil {
+			return fmt.Errorf("encode header failed: %w", err)
+		}
+		if _, err := file.WriteAt(headerBytes, 0); err != nil {
+			return fmt.Errorf("write header failed: %w", err)
+		}
+		if pt.db != nil {
+			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(headerBytes))
+		}
+		info, err = file.Stat()
+		if err != nil {
+			return fmt.Errorf("stat file after header write failed: %w", err)
+		}
+	} else if info.Size() < int64(binary.Size(FileNodeHeader{})) {
+		return fmt.Errorf("invalid file node size %d", info.Size())
 	}
 	writeOffset := info.Size()
 	entryData := encodeNodeEntry(NodeInfo{
@@ -1240,14 +1282,7 @@ func (pt *PrefixTree) deleteFromFileNode(fileID string, key []byte) (bool, error
 	if err != nil {
 		return false, fmt.Errorf("decode payload failed : %w", err)
 	}
-	found := false
-	for _, dec := range buildEntriesFromSlices(header, sortedSlice, unsortedSlice) {
-		if bytes.Equal(dec.key, key) {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !nodeFileContainsKey(sortedSlice, unsortedSlice, key) {
 		return false, nil
 	}
 	tombstone := encodeNodeEntry(tombstoneNodeInfo(key))
@@ -1360,12 +1395,7 @@ func (pt *PrefixTree) Close() error {
 	}
 	pt.globalNodeMu.Lock()
 	if pt.globalCommitDirty {
-		if pt.globalNeedsRewrite {
-			if err := pt.rewriteGlobalNodeFileLocked(); err != nil {
-				pt.globalNodeMu.Unlock()
-				return err
-			}
-		} else if len(pt.globalCommitBatch) > 0 {
+		if len(pt.globalCommitBatch) > 0 {
 			entries := make([]NodeInfo, 0, len(pt.globalCommitBatch))
 			for _, entry := range pt.globalCommitBatch {
 				entries = append(entries, cloneNodeInfo(entry))
@@ -1377,7 +1407,6 @@ func (pt *PrefixTree) Close() error {
 			}
 		}
 		pt.globalCommitDirty = false
-		pt.globalNeedsRewrite = false
 		clear(pt.globalCommitBatch)
 	}
 	if pt.globalFile != nil {

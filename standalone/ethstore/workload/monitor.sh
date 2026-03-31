@@ -12,6 +12,17 @@ if [ -z "$TARGET" ]; then
     exit 1
 fi
 
+# sudo 密码；留空则使用交互式 sudo
+SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
+
+sudo_run() {
+    if [ -n "${SUDO_PASSWD}" ]; then
+        echo "${SUDO_PASSWD}" | sudo -S "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # 支持传入 PID 或进程名
 if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
     MAIN_PID="$TARGET"
@@ -84,6 +95,31 @@ resolve_smart_device_path() {
     echo "$dev_path"
 }
 
+resolve_hioadm_device_name() {
+    local dev_name="$1"
+    local candidate="$dev_name"
+    local next
+
+    if [ ! -e "/dev/${candidate}" ]; then
+        return 1
+    fi
+
+    while true; do
+        next=$(lsblk -ndo PKNAME "/dev/${candidate}" 2>/dev/null | head -n1)
+        if [ -z "$next" ]; then
+            break
+        fi
+        candidate="$next"
+    done
+
+    if [[ "$candidate" =~ ^nvme[0-9]+$ ]] || [[ "$candidate" =~ ^nvme[0-9]+n[0-9]+$ ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
 extract_last_integer() {
     sed -nE 's/.*([0-9][0-9,]*).*/\1/p' | tr -d ','
 }
@@ -112,6 +148,62 @@ human_size_to_bytes() {
     }'
 }
 
+normalize_counter_value() {
+    local raw
+
+    raw=$(echo "$1" | tr -d '[:space:]')
+    if [ -z "$raw" ]; then
+        return 1
+    fi
+
+    if [[ ! "$raw" =~ ^(0[xX][0-9A-Fa-f]+|[0-9]+)$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$((raw))"
+}
+
+run_hioadm_extend_smart() {
+    local dev_name="$1"
+    local output
+
+    if ! command -v hioadm >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        output=$(hioadm info -d "$dev_name" -e 2>/dev/null || true)
+    else
+        output=$(sudo_run hioadm info -d "$dev_name" -e 2>/dev/null || true)
+    fi
+
+    if [ -z "$output" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$output"
+}
+
+read_hioadm_nand_write_counters() {
+    local dev_name="$1"
+    local ext_out total_raw io_raw gc_raw total io_write gc_write
+
+    ext_out=$(run_hioadm_extend_smart "$dev_name") || return 1
+    total_raw=$(printf '%s\n' "$ext_out" | awk -F: '/^[[:space:]]*write_count[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+    io_raw=$(printf '%s\n' "$ext_out" | awk -F: '/^[[:space:]]*IO_write_cnt[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+    gc_raw=$(printf '%s\n' "$ext_out" | awk -F: '/^[[:space:]]*GC_write_cnt[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+
+    total=$(normalize_counter_value "$total_raw" 2>/dev/null || true)
+    io_write=$(normalize_counter_value "$io_raw" 2>/dev/null || true)
+    gc_write=$(normalize_counter_value "$gc_raw" 2>/dev/null || true)
+
+    if [ -z "$total" ] && [ -z "$io_write" ] && [ -z "$gc_write" ]; then
+        return 1
+    fi
+
+    printf '%s|%s|%s|%s\n' "$total" "$io_write" "$gc_write" "hioadm-extend-smart-counts"
+}
+
 read_nand_write_bytes() {
     local dev_path="$1"
     local smart_out line bracket_val raw_value bytes
@@ -132,7 +224,7 @@ read_nand_write_bytes() {
         if [ -n "$bracket_val" ]; then
             bytes=$(human_size_to_bytes "$bracket_val" 2>/dev/null || true)
             if [ -n "$bytes" ]; then
-                echo "$bytes bracket-size"
+                printf '%s|%s\n' "$bytes" "bracket-size"
                 return 0
             fi
         fi
@@ -144,7 +236,7 @@ read_nand_write_bytes() {
         raw_value=$(echo "$line" | extract_last_integer)
         if [ -n "$raw_value" ]; then
             bytes=$((raw_value * 1024 * 1024 * 1024))
-            echo "$bytes smart-attr-gib"
+            printf '%s|%s\n' "$bytes" "smart-attr-gib"
             return 0
         fi
     fi
@@ -154,7 +246,7 @@ read_nand_write_bytes() {
     if [ -n "$line" ]; then
         raw_value=$(echo "$line" | extract_last_integer)
         if [ -n "$raw_value" ]; then
-            echo "$raw_value smart-attr-bytes"
+            printf '%s|%s\n' "$raw_value" "smart-attr-bytes"
             return 0
         fi
     fi
@@ -176,7 +268,7 @@ if [ ! -f "$LOGFILE" ]; then
 fi
 
 if [ ! -f "$STATFILE" ]; then
-    echo "START_TIMESTAMP,END_TIMESTAMP,DEVICE,BLOCK_READ_BYTES_DIFF,BLOCK_WRITE_BYTES_DIFF,BLOCK_READ_BYTES_START,BLOCK_WRITE_BYTES_START,BLOCK_READ_BYTES_END,BLOCK_WRITE_BYTES_END,NAND_WRITE_BYTES_DIFF,NAND_WRITE_BYTES_START,NAND_WRITE_BYTES_END,NAND_SOURCE" > "$STATFILE"
+    echo "START_TIMESTAMP,END_TIMESTAMP,DEVICE,BLOCK_READ_BYTES_DIFF,BLOCK_WRITE_BYTES_DIFF,BLOCK_READ_BYTES_START,BLOCK_WRITE_BYTES_START,BLOCK_READ_BYTES_END,BLOCK_WRITE_BYTES_END,NAND_TOTAL_WRITE_DIFF,NAND_TOTAL_WRITE_START,NAND_TOTAL_WRITE_END,NAND_IO_WRITE_DIFF,NAND_IO_WRITE_START,NAND_IO_WRITE_END,NAND_GC_WRITE_DIFF,NAND_GC_WRITE_START,NAND_GC_WRITE_END,NAND_COUNTER_SOURCE,NAND_WRITE_BYTES_DIFF,NAND_WRITE_BYTES_START,NAND_WRITE_BYTES_END,NAND_BYTES_SOURCE" > "$STATFILE"
 fi
 
 # 获取系统时钟频率 HZ
@@ -188,15 +280,29 @@ START_DISK_BYTES=($(read_disk_bytes "$BLOCK_DEVICE"))
 SSD_START_READ=${START_DISK_BYTES[0]}
 SSD_START_WRITE=${START_DISK_BYTES[1]}
 SMART_DEVICE_PATH=$(resolve_smart_device_path "$BLOCK_DEVICE")
-NAND_SOURCE="unavailable"
-NAND_START_WRITE=""
+HIOADM_DEVICE=$(resolve_hioadm_device_name "$BLOCK_DEVICE" || true)
+NAND_COUNTER_SOURCE="unavailable"
+NAND_TOTAL_START_WRITE=""
+NAND_IO_START_WRITE=""
+NAND_GC_START_WRITE=""
+NAND_BYTES_SOURCE="unavailable"
+NAND_START_WRITE_BYTES=""
+
+NAND_COUNTER_START_INFO=""
+if [ -n "$HIOADM_DEVICE" ]; then
+    NAND_COUNTER_START_INFO=$(read_hioadm_nand_write_counters "$HIOADM_DEVICE" || true)
+fi
+if [ -n "$NAND_COUNTER_START_INFO" ]; then
+    IFS='|' read -r NAND_TOTAL_START_WRITE NAND_IO_START_WRITE NAND_GC_START_WRITE NAND_COUNTER_SOURCE <<< "$NAND_COUNTER_START_INFO"
+elif command -v hioadm >/dev/null 2>&1; then
+    echo "警告: 无法通过 hioadm 读取 ${HIOADM_DEVICE:-$BLOCK_DEVICE} 的 NAND total/io/gc 写计数；请检查 SUDO_PASSWD 是否可用，或先执行 sudo -v 再启动 monitor.sh。" >&2
+fi
 
 NAND_START_INFO=$(read_nand_write_bytes "$SMART_DEVICE_PATH" || true)
 if [ -n "$NAND_START_INFO" ]; then
-    NAND_START_WRITE=$(echo "$NAND_START_INFO" | awk '{print $1}')
-    NAND_SOURCE=$(echo "$NAND_START_INFO" | awk '{print $2}')
+    IFS='|' read -r NAND_START_WRITE_BYTES NAND_BYTES_SOURCE <<< "$NAND_START_INFO"
 else
-    echo "警告: 无法从 ${SMART_DEVICE_PATH} 读取 NAND 物理写入计数（smartctl 字段可能不支持该盘）。" >&2
+    echo "警告: 无法从 ${SMART_DEVICE_PATH} 读取 smartctl NAND 总写字节计数。" >&2
 fi
 
 # --- 2. 循环监控 ---
@@ -261,17 +367,40 @@ SSD_END_WRITE=${END_DISK_BYTES[1]}
 SSD_READ_DIFF=$((SSD_END_READ - SSD_START_READ))
 SSD_WRITE_DIFF=$((SSD_END_WRITE - SSD_START_WRITE))
 
-NAND_END_WRITE=""
-NAND_WRITE_DIFF=""
-NAND_END_INFO=$(read_nand_write_bytes "$SMART_DEVICE_PATH" || true)
-if [ -n "$NAND_END_INFO" ]; then
-    NAND_END_WRITE=$(echo "$NAND_END_INFO" | awk '{print $1}')
-    if [ -n "$NAND_START_WRITE" ]; then
-        NAND_WRITE_DIFF=$((NAND_END_WRITE - NAND_START_WRITE))
+NAND_TOTAL_END_WRITE=""
+NAND_TOTAL_WRITE_DIFF=""
+NAND_IO_END_WRITE=""
+NAND_IO_WRITE_DIFF=""
+NAND_GC_END_WRITE=""
+NAND_GC_WRITE_DIFF=""
+NAND_COUNTER_END_INFO=""
+if [ -n "$HIOADM_DEVICE" ]; then
+    NAND_COUNTER_END_INFO=$(read_hioadm_nand_write_counters "$HIOADM_DEVICE" || true)
+fi
+if [ -n "$NAND_COUNTER_END_INFO" ]; then
+    IFS='|' read -r NAND_TOTAL_END_WRITE NAND_IO_END_WRITE NAND_GC_END_WRITE _ <<< "$NAND_COUNTER_END_INFO"
+    if [ -n "$NAND_TOTAL_START_WRITE" ] && [ -n "$NAND_TOTAL_END_WRITE" ]; then
+        NAND_TOTAL_WRITE_DIFF=$((NAND_TOTAL_END_WRITE - NAND_TOTAL_START_WRITE))
+    fi
+    if [ -n "$NAND_IO_START_WRITE" ] && [ -n "$NAND_IO_END_WRITE" ]; then
+        NAND_IO_WRITE_DIFF=$((NAND_IO_END_WRITE - NAND_IO_START_WRITE))
+    fi
+    if [ -n "$NAND_GC_START_WRITE" ] && [ -n "$NAND_GC_END_WRITE" ]; then
+        NAND_GC_WRITE_DIFF=$((NAND_GC_END_WRITE - NAND_GC_START_WRITE))
     fi
 fi
 
-STAT_LINE="$START_TIMESTAMP,$END_TIMESTAMP,$BLOCK_DEVICE,$SSD_READ_DIFF,$SSD_WRITE_DIFF,$SSD_START_READ,$SSD_START_WRITE,$SSD_END_READ,$SSD_END_WRITE,$NAND_WRITE_DIFF,$NAND_START_WRITE,$NAND_END_WRITE,$NAND_SOURCE"
+NAND_END_WRITE_BYTES=""
+NAND_WRITE_BYTES_DIFF=""
+NAND_END_INFO=$(read_nand_write_bytes "$SMART_DEVICE_PATH" || true)
+if [ -n "$NAND_END_INFO" ]; then
+    IFS='|' read -r NAND_END_WRITE_BYTES _ <<< "$NAND_END_INFO"
+    if [ -n "$NAND_START_WRITE_BYTES" ]; then
+        NAND_WRITE_BYTES_DIFF=$((NAND_END_WRITE_BYTES - NAND_START_WRITE_BYTES))
+    fi
+fi
+
+STAT_LINE="$START_TIMESTAMP,$END_TIMESTAMP,$BLOCK_DEVICE,$SSD_READ_DIFF,$SSD_WRITE_DIFF,$SSD_START_READ,$SSD_START_WRITE,$SSD_END_READ,$SSD_END_WRITE,$NAND_TOTAL_WRITE_DIFF,$NAND_TOTAL_START_WRITE,$NAND_TOTAL_END_WRITE,$NAND_IO_WRITE_DIFF,$NAND_IO_START_WRITE,$NAND_IO_END_WRITE,$NAND_GC_WRITE_DIFF,$NAND_GC_START_WRITE,$NAND_GC_END_WRITE,$NAND_COUNTER_SOURCE,$NAND_WRITE_BYTES_DIFF,$NAND_START_WRITE_BYTES,$NAND_END_WRITE_BYTES,$NAND_BYTES_SOURCE"
 echo "$STAT_LINE" >> "$STATFILE"
 
 echo -e "\n进程已结束。监控日志已保存至: $LOGFILE 和 $STATFILE"
