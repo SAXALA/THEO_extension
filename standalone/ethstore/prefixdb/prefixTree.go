@@ -263,6 +263,20 @@ func encodeFileNodeHeader(header FileNodeHeader) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func encodeFileNodeAndPayload(header FileNodeHeader, payload []byte) ([]byte, error) {
+	headerBytes, err := encodeFileNodeHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		return headerBytes, nil
+	}
+	fileData := make([]byte, 0, len(headerBytes)+len(payload))
+	fileData = append(fileData, headerBytes...)
+	fileData = append(fileData, payload...)
+	return fileData, nil
+}
+
 func nodeFileContainsKey(sortedSlice, unsortedSlice, key []byte) bool {
 	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
 	if unsortedCount > 0 {
@@ -589,25 +603,20 @@ func (pt *PrefixTree) compactFileFromState(fileID string, state *gcState) error 
 	if err != nil {
 		return fmt.Errorf("encode compacted node payload failed: %w", err)
 	}
+	fileData, err := encodeFileNodeAndPayload(newHdr, payload)
+	if err != nil {
+		return fmt.Errorf("encode compacted node file failed: %w", err)
+	}
 	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("create tmp file failed: %w", err)
 	}
-	if err := binary.Write(tf, binary.BigEndian, &newHdr); err != nil {
+	if _, err := tf.Write(fileData); err != nil {
 		tf.Close()
-		return fmt.Errorf("write tmp header failed: %w", err)
+		return fmt.Errorf("write tmp file failed: %w", err)
 	}
 	if pt.db != nil {
-		pt.db.addDiskWrite(diskIOUsageNodeFileGC, binary.Size(newHdr))
-	}
-	if len(payload) > 0 {
-		if _, err := tf.Write(payload); err != nil {
-			tf.Close()
-			return fmt.Errorf("write tmp entry failed: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskWrite(diskIOUsageNodeFileGC, len(payload))
-		}
+		pt.db.addDiskWrite(diskIOUsageNodeFileGC, len(fileData))
 	}
 	if err := tf.Close(); err != nil {
 		return fmt.Errorf("close tmp file failed: %w", err)
@@ -929,25 +938,20 @@ func (pt *PrefixTree) rewriteGlobalNodeFileLocked() error {
 	if err != nil {
 		return fmt.Errorf("encode global node payload failed: %w", err)
 	}
+	fileData, err := encodeFileNodeAndPayload(header, payload)
+	if err != nil {
+		return fmt.Errorf("encode global node file failed: %w", err)
+	}
 	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("create global node tmp file failed: %w", err)
 	}
-	if err := binary.Write(tf, binary.BigEndian, &header); err != nil {
+	if _, err := tf.Write(fileData); err != nil {
 		_ = tf.Close()
-		return fmt.Errorf("write global node tmp header failed: %w", err)
+		return fmt.Errorf("write global node tmp file failed: %w", err)
 	}
 	if pt.db != nil {
-		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, binary.Size(header))
-	}
-	if len(payload) > 0 {
-		if _, err := tf.Write(payload); err != nil {
-			_ = tf.Close()
-			return fmt.Errorf("write global node tmp entry failed: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(payload))
-		}
+		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(fileData))
 	}
 	if err := tf.Close(); err != nil {
 		return fmt.Errorf("close global node tmp file failed: %w", err)
@@ -1180,26 +1184,6 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	if err != nil {
 		return fmt.Errorf("stat file failed: %w", err)
 	}
-	if info.Size() == 0 {
-		header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
-		headerBytes, err := encodeFileNodeHeader(header)
-		if err != nil {
-			return fmt.Errorf("encode header failed: %w", err)
-		}
-		if _, err := file.WriteAt(headerBytes, 0); err != nil {
-			return fmt.Errorf("write header failed: %w", err)
-		}
-		if pt.db != nil {
-			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(headerBytes))
-		}
-		info, err = file.Stat()
-		if err != nil {
-			return fmt.Errorf("stat file after header write failed: %w", err)
-		}
-	} else if info.Size() < int64(binary.Size(FileNodeHeader{})) {
-		return fmt.Errorf("invalid file node size %d", info.Size())
-	}
-	writeOffset := info.Size()
 	entryData := encodeNodeEntry(NodeInfo{
 		key:           key,
 		accountOffset: accountOffset,
@@ -1208,6 +1192,23 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 		storageOffset: storageOffset,
 		storageSize:   storageSize,
 	})
+	if info.Size() == 0 {
+		header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
+		fileData, err := encodeFileNodeAndPayload(header, entryData)
+		if err != nil {
+			return fmt.Errorf("encode initial file content failed: %w", err)
+		}
+		if _, err := file.WriteAt(fileData, 0); err != nil {
+			return fmt.Errorf("write initial file content failed: %w", err)
+		}
+		if pt.db != nil {
+			pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(fileData))
+		}
+		return nil
+	} else if info.Size() < int64(binary.Size(FileNodeHeader{})) {
+		return fmt.Errorf("invalid file node size %d", info.Size())
+	}
+	writeOffset := info.Size()
 	if _, err := file.WriteAt(entryData, writeOffset); err != nil {
 		return fmt.Errorf("write entry failed: %w", err)
 	}

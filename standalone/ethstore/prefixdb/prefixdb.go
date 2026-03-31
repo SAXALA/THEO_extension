@@ -2015,7 +2015,6 @@ func (db *PrefixDB) readFileWithStats(path string, usage diskIOUsage) ([]byte, e
 		return nil, fmt.Errorf("invalid file size: %s", path)
 	}
 	if size == 0 {
-		db.addDiskRead(usage, 0)
 		return nil, nil
 	}
 	if size > int64(int(^uint(0)>>1)) {

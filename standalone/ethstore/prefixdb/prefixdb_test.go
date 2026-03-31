@@ -1389,6 +1389,33 @@ func TestGetAccountFallsBackToLegacyReadsWhenAccountSizeUnknown(t *testing.T) {
 	}
 }
 
+func TestReadFileWithStatsEmptyFileDoesNotIncrementReadOps(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	emptyPath := filepath.Join(baseDir, "empty.bin")
+	if err := os.WriteFile(emptyPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	data, err := db.readFileWithStats(emptyPath, diskIOUsageStorageSegmentIndex)
+	if err != nil {
+		t.Fatalf("readFileWithStats failed: %v", err)
+	}
+	if data != nil {
+		t.Fatalf("expected nil data for empty file, got %v", data)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageSegmentIndex].readOps)
+	if after != before {
+		t.Fatalf("expected empty-file read to avoid incrementing readOps, before=%d after=%d", before, after)
+	}
+}
+
 func TestCloneSegmentChunkMetasCopiesBackingData(t *testing.T) {
 	original := []segmentChunkMeta{{
 		FileName: strings.Repeat("chunk", 8),
@@ -3147,6 +3174,28 @@ func TestGetFromFileNodeReadsLegacyCompressedBucketFormat(t *testing.T) {
 	}
 	if state.header.SortedEntryCount != 1 || state.header.UnsortedEntryCount != 1 {
 		t.Fatalf("unexpected GC state for legacy bucket file: %+v", state.header)
+	}
+}
+
+func TestPutIntoEmptyBucketCountsSingleWriteOp(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	key := bytes.Repeat([]byte{0xab}, 32)
+	fileID := pt.fileIDForKey(key)
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	if err := pt.putIntoFileNode(fileID, key, 1, 10, 2, 3, 4); err != nil {
+		t.Fatalf("putIntoFileNode failed: %v", err)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected empty bucket initial write to use exactly one writeOp, got %d", got)
 	}
 }
 

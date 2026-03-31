@@ -5,6 +5,7 @@ Output is CSV only, one row per main replay log. For each main log, this script
 auto-detects the paired "*_io_*.log" file and computes:
 - avg CPU usage across all io samples
 - avg RSS_KB across all io samples
+- filesystem-level read/write op counts from /proc/PID/io syscr/syscw
 - physical read/write bytes from the last valid sample row
 - block-device read/write byte diffs from the paired ".stat" file
 - NAND total/io/gc write diffs from the paired ".stat" file
@@ -299,6 +300,8 @@ def parse_io_log(path: Path) -> dict[str, Any]:
         "io_sample_count": 0,
         "io_avg_cpu_usage": None,
         "io_avg_rss_kb": None,
+        "fs_total_read_ops": None,
+        "fs_total_write_ops": None,
         "physical_read_bytes": None,
         "physical_write_bytes": None,
         "warnings": [],
@@ -312,28 +315,28 @@ def parse_io_log(path: Path) -> dict[str, Any]:
     cpu_n = 0
     rss_sum = 0.0
     rss_n = 0
+    last_total_syscr: int | None = None
+    last_total_syscw: int | None = None
     last_rchar: int | None = None
     last_wchar: int | None = None
 
     with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
-        reader = csv.reader(f, skipinitialspace=True)
-        header_seen = False
+        reader = csv.DictReader(f, skipinitialspace=True)
         for row in reader:
             if not row:
                 continue
-            if not header_seen:
-                # Header starts with TIMESTAMP,CPU_USAGE,...
-                if row[0].strip().upper() == "TIMESTAMP":
-                    header_seen = True
-                continue
 
-            if len(row) < 9:
-                continue
+            cpu = safe_float(row.get("CPU_USAGE", ""))
+            rss = safe_float(row.get("RSS_KB", ""))
+            total_syscr = safe_int(row.get("TOTAL_SYSCR", ""))
+            total_syscw = safe_int(row.get("TOTAL_SYSCW", ""))
+            rchar = safe_int(row.get("TOTAL_RCHAR", ""))
+            wchar = safe_int(row.get("TOTAL_WCHAR", ""))
 
-            cpu = safe_float(row[1])
-            rss = safe_float(row[2])
-            rchar = safe_int(row[7])
-            wchar = safe_int(row[8])
+            if rchar is None:
+                rchar = safe_int(row.get("TOTAL_READ_BYTES", ""))
+            if wchar is None:
+                wchar = safe_int(row.get("TOTAL_WRITE_BYTES", ""))
 
             if cpu is not None:
                 cpu_sum += cpu
@@ -341,6 +344,10 @@ def parse_io_log(path: Path) -> dict[str, Any]:
             if rss is not None:
                 rss_sum += rss
                 rss_n += 1
+            if total_syscr is not None:
+                last_total_syscr = total_syscr
+            if total_syscw is not None:
+                last_total_syscw = total_syscw
 
             # Keep the last row with valid total read/write bytes.
             if rchar is not None and wchar is not None:
@@ -352,6 +359,8 @@ def parse_io_log(path: Path) -> dict[str, Any]:
         result["io_avg_cpu_usage"] = cpu_sum / cpu_n
     if rss_n > 0:
         result["io_avg_rss_kb"] = rss_sum / rss_n
+    result["fs_total_read_ops"] = last_total_syscr
+    result["fs_total_write_ops"] = last_total_syscw
     result["physical_read_bytes"] = last_rchar
     result["physical_write_bytes"] = last_wchar
 
@@ -359,6 +368,8 @@ def parse_io_log(path: Path) -> dict[str, Any]:
         result["warnings"].append("io cpu samples missing")
     if rss_n == 0:
         result["warnings"].append("io rss samples missing")
+    if last_total_syscr is None or last_total_syscw is None:
+        result["warnings"].append("io filesystem op counts missing")
     if last_rchar is None or last_wchar is None:
         result["warnings"].append("io physical bytes missing")
 
@@ -370,6 +381,12 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
         "stat_file": str(path),
         "block_read_bytes_diff": None,
         "block_write_bytes_diff": None,
+        "fs_read_ops_start": None,
+        "fs_read_ops_end": None,
+        "fs_read_ops_diff": None,
+        "fs_write_ops_start": None,
+        "fs_write_ops_end": None,
+        "fs_write_ops_diff": None,
         "nand_total_write_start": None,
         "nand_total_write_end": None,
         "nand_total_write_diff": None,
@@ -409,6 +426,12 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
     block_write_bytes_diff = safe_int(
         row.get("BLOCK_WRITE_BYTES_DIFF", row.get("SSD_WRITE_BYTES_DIFF", ""))
     )
+    fs_read_ops_start = safe_int(row.get("FS_READ_OPS_START", ""))
+    fs_read_ops_end = safe_int(row.get("FS_READ_OPS_END", ""))
+    fs_read_ops_diff = safe_int(row.get("FS_READ_OPS_DIFF", ""))
+    fs_write_ops_start = safe_int(row.get("FS_WRITE_OPS_START", ""))
+    fs_write_ops_end = safe_int(row.get("FS_WRITE_OPS_END", ""))
+    fs_write_ops_diff = safe_int(row.get("FS_WRITE_OPS_DIFF", ""))
     nand_total_write_start = safe_int(
         row.get("NAND_TOTAL_WRITE_START", row.get("NAND_WRITE_BYTES_START", ""))
     )
@@ -433,6 +456,12 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
 
     result["block_read_bytes_diff"] = block_read_bytes_diff
     result["block_write_bytes_diff"] = block_write_bytes_diff
+    result["fs_read_ops_start"] = fs_read_ops_start
+    result["fs_read_ops_end"] = fs_read_ops_end
+    result["fs_read_ops_diff"] = fs_read_ops_diff
+    result["fs_write_ops_start"] = fs_write_ops_start
+    result["fs_write_ops_end"] = fs_write_ops_end
+    result["fs_write_ops_diff"] = fs_write_ops_diff
     result["nand_total_write_start"] = nand_total_write_start
     result["nand_total_write_end"] = nand_total_write_end
     result["nand_total_write_diff"] = nand_total_write_diff
@@ -495,10 +524,18 @@ def item_to_single_row(
         "io_sample_count": io["io_sample_count"],
         "io_avg_cpu_usage": io["io_avg_cpu_usage"],
         "io_avg_rss_kb": io["io_avg_rss_kb"],
+        "fs_total_read_ops": io["fs_total_read_ops"],
+        "fs_total_write_ops": io["fs_total_write_ops"],
         "physical_read_bytes": io["physical_read_bytes"],
         "physical_write_bytes": io["physical_write_bytes"],
         "block_read_bytes_diff": stat["block_read_bytes_diff"],
         "block_write_bytes_diff": stat["block_write_bytes_diff"],
+        "fs_read_ops_start": stat["fs_read_ops_start"],
+        "fs_read_ops_end": stat["fs_read_ops_end"],
+        "fs_read_ops_diff": stat["fs_read_ops_diff"],
+        "fs_write_ops_start": stat["fs_write_ops_start"],
+        "fs_write_ops_end": stat["fs_write_ops_end"],
+        "fs_write_ops_diff": stat["fs_write_ops_diff"],
         "nand_total_write_start": stat["nand_total_write_start"],
         "nand_total_write_end": stat["nand_total_write_end"],
         "nand_total_write_diff": stat["nand_total_write_diff"],

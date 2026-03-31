@@ -1120,21 +1120,16 @@ func (baol *BlockAppendOnlyLog) writeLogEntry(w io.Writer, blockID uint64, key, 
 	keyLen := uint32(len(keyBytes))
 	valueLen := uint32(len(valueBytes))
 
-	buf := make([]byte, blockIDSize+keyLenSize+valueLenSize)
+	buf := make([]byte, blockIDSize+keyLenSize+valueLenSize+len(keyBytes)+len(valueBytes))
 	binary.BigEndian.PutUint64(buf[0:blockIDSize], blockID)
 	binary.BigEndian.PutUint32(buf[blockIDSize:blockIDSize+keyLenSize], keyLen)
 	binary.BigEndian.PutUint32(buf[blockIDSize+keyLenSize:], valueLen)
-
-	if _, err := w.Write(buf); err != nil {
-		return err
-	}
-	if _, err := w.Write(keyBytes); err != nil {
-		return err
-	}
-	if _, err := w.Write(valueBytes); err != nil {
-		return err
-	}
-	return nil
+	offset := blockIDSize + keyLenSize + valueLenSize
+	copy(buf[offset:], keyBytes)
+	offset += len(keyBytes)
+	copy(buf[offset:], valueBytes)
+	_, err := w.Write(buf)
+	return err
 }
 
 // writeLogEntriess serializes some log entries to the writer.
