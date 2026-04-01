@@ -6,10 +6,9 @@ auto-detects the paired "*_io_*.log" file and computes:
 - avg CPU usage across all io samples
 - avg RSS_KB across all io samples
 - filesystem-level read/write op counts from /proc/PID/io syscr/syscw
-- physical read/write bytes from the last valid sample row
-- block-device read/write byte diffs from the paired ".stat" file
-- NAND total/io/gc write diffs from the paired ".stat" file
-- write overhead derived from byte-based NAND writes minus block writes across the run
+- filesystem-level read/write bytes derived from TOTAL_RCHAR/TOTAL_WCHAR deltas
+- NAND flash total read/write counts from the paired ".stat" file
+- NAND flash total read/write sizes derived from 4 KiB pages
 
 From the main replay log, it extracts:
 - replay summary: ops, total time, throughput, logical read/write
@@ -30,6 +29,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+NAND_PAGE_BYTES = 4096
 
 REPLAY_FINISHED_RE = re.compile(
     r"Replay finished\.\s+ops=(\d+)\s+time=([0-9]*\.?[0-9]+)s\s+"
@@ -300,10 +301,12 @@ def parse_io_log(path: Path) -> dict[str, Any]:
         "io_sample_count": 0,
         "io_avg_cpu_usage": None,
         "io_avg_rss_kb": None,
-        "fs_total_read_ops": None,
-        "fs_total_write_ops": None,
-        "physical_read_bytes": None,
-        "physical_write_bytes": None,
+        "fs_read_bytes_start": None,
+        "fs_read_bytes_end": None,
+        "fs_read_bytes_diff": None,
+        "fs_write_bytes_start": None,
+        "fs_write_bytes_end": None,
+        "fs_write_bytes_diff": None,
         "warnings": [],
     }
 
@@ -315,8 +318,8 @@ def parse_io_log(path: Path) -> dict[str, Any]:
     cpu_n = 0
     rss_sum = 0.0
     rss_n = 0
-    last_total_syscr: int | None = None
-    last_total_syscw: int | None = None
+    first_rchar: int | None = None
+    first_wchar: int | None = None
     last_rchar: int | None = None
     last_wchar: int | None = None
 
@@ -328,8 +331,6 @@ def parse_io_log(path: Path) -> dict[str, Any]:
 
             cpu = safe_float(row.get("CPU_USAGE", ""))
             rss = safe_float(row.get("RSS_KB", ""))
-            total_syscr = safe_int(row.get("TOTAL_SYSCR", ""))
-            total_syscw = safe_int(row.get("TOTAL_SYSCW", ""))
             rchar = safe_int(row.get("TOTAL_RCHAR", ""))
             wchar = safe_int(row.get("TOTAL_WCHAR", ""))
 
@@ -344,13 +345,13 @@ def parse_io_log(path: Path) -> dict[str, Any]:
             if rss is not None:
                 rss_sum += rss
                 rss_n += 1
-            if total_syscr is not None:
-                last_total_syscr = total_syscr
-            if total_syscw is not None:
-                last_total_syscw = total_syscw
 
             # Keep the last row with valid total read/write bytes.
             if rchar is not None and wchar is not None:
+                if first_rchar is None:
+                    first_rchar = rchar
+                if first_wchar is None:
+                    first_wchar = wchar
                 last_rchar = rchar
                 last_wchar = wchar
 
@@ -359,17 +360,19 @@ def parse_io_log(path: Path) -> dict[str, Any]:
         result["io_avg_cpu_usage"] = cpu_sum / cpu_n
     if rss_n > 0:
         result["io_avg_rss_kb"] = rss_sum / rss_n
-    result["fs_total_read_ops"] = last_total_syscr
-    result["fs_total_write_ops"] = last_total_syscw
-    result["physical_read_bytes"] = last_rchar
-    result["physical_write_bytes"] = last_wchar
+    result["fs_read_bytes_start"] = first_rchar
+    result["fs_read_bytes_end"] = last_rchar
+    result["fs_write_bytes_start"] = first_wchar
+    result["fs_write_bytes_end"] = last_wchar
+    if first_rchar is not None and last_rchar is not None:
+        result["fs_read_bytes_diff"] = last_rchar - first_rchar
+    if first_wchar is not None and last_wchar is not None:
+        result["fs_write_bytes_diff"] = last_wchar - first_wchar
 
     if cpu_n == 0:
         result["warnings"].append("io cpu samples missing")
     if rss_n == 0:
         result["warnings"].append("io rss samples missing")
-    if last_total_syscr is None or last_total_syscw is None:
-        result["warnings"].append("io filesystem op counts missing")
     if last_rchar is None or last_wchar is None:
         result["warnings"].append("io physical bytes missing")
 
@@ -379,32 +382,17 @@ def parse_io_log(path: Path) -> dict[str, Any]:
 def parse_stat_log(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {
         "stat_file": str(path),
-        "block_read_bytes_diff": None,
-        "block_write_bytes_diff": None,
         "fs_read_ops_start": None,
         "fs_read_ops_end": None,
         "fs_read_ops_diff": None,
         "fs_write_ops_start": None,
         "fs_write_ops_end": None,
         "fs_write_ops_diff": None,
-        "nand_total_write_start": None,
-        "nand_total_write_end": None,
+        "nand_total_read_diff": None,
         "nand_total_write_diff": None,
-        "nand_io_write_start": None,
-        "nand_io_write_end": None,
-        "nand_io_write_diff": None,
-        "nand_gc_write_start": None,
-        "nand_gc_write_end": None,
-        "nand_gc_write_diff": None,
+        "nand_read_bytes": None,
+        "nand_write_bytes": None,
         "nand_counter_source": None,
-        "nand_write_bytes_start": None,
-        "nand_write_bytes_end": None,
-        "nand_write_bytes_diff": None,
-        "nand_bytes_source": None,
-        "nand_source": None,
-        "write_overhead_bytes": None,
-        "write_overhead_pct": None,
-        "write_amplification": None,
         "warnings": [],
     }
 
@@ -420,82 +408,37 @@ def parse_stat_log(path: Path) -> dict[str, Any]:
         result["warnings"].append("stat row missing")
         return result
 
-    block_read_bytes_diff = safe_int(
-        row.get("BLOCK_READ_BYTES_DIFF", row.get("SSD_READ_BYTES_DIFF", ""))
-    )
-    block_write_bytes_diff = safe_int(
-        row.get("BLOCK_WRITE_BYTES_DIFF", row.get("SSD_WRITE_BYTES_DIFF", ""))
-    )
     fs_read_ops_start = safe_int(row.get("FS_READ_OPS_START", ""))
     fs_read_ops_end = safe_int(row.get("FS_READ_OPS_END", ""))
     fs_read_ops_diff = safe_int(row.get("FS_READ_OPS_DIFF", ""))
     fs_write_ops_start = safe_int(row.get("FS_WRITE_OPS_START", ""))
     fs_write_ops_end = safe_int(row.get("FS_WRITE_OPS_END", ""))
     fs_write_ops_diff = safe_int(row.get("FS_WRITE_OPS_DIFF", ""))
-    nand_total_write_start = safe_int(
-        row.get("NAND_TOTAL_WRITE_START", row.get("NAND_WRITE_BYTES_START", ""))
-    )
-    nand_total_write_end = safe_int(
-        row.get("NAND_TOTAL_WRITE_END", row.get("NAND_WRITE_BYTES_END", ""))
-    )
+    nand_total_read_diff = safe_int(row.get("NAND_TOTAL_READ_DIFF", ""))
     nand_total_write_diff = safe_int(
         row.get("NAND_TOTAL_WRITE_DIFF", row.get("NAND_WRITE_BYTES_DIFF", ""))
     )
-    nand_io_write_start = safe_int(row.get("NAND_IO_WRITE_START", ""))
-    nand_io_write_end = safe_int(row.get("NAND_IO_WRITE_END", ""))
-    nand_io_write_diff = safe_int(row.get("NAND_IO_WRITE_DIFF", ""))
-    nand_gc_write_start = safe_int(row.get("NAND_GC_WRITE_START", ""))
-    nand_gc_write_end = safe_int(row.get("NAND_GC_WRITE_END", ""))
-    nand_gc_write_diff = safe_int(row.get("NAND_GC_WRITE_DIFF", ""))
     nand_counter_source = (row.get("NAND_COUNTER_SOURCE") or "").strip() or None
-    nand_write_bytes_start = safe_int(row.get("NAND_WRITE_BYTES_START", ""))
-    nand_write_bytes_end = safe_int(row.get("NAND_WRITE_BYTES_END", ""))
-    nand_write_bytes_diff = safe_int(row.get("NAND_WRITE_BYTES_DIFF", ""))
-    nand_bytes_source = (row.get("NAND_BYTES_SOURCE") or "").strip() or None
-    nand_source = nand_counter_source or nand_bytes_source or (row.get("NAND_SOURCE") or "").strip() or None
 
-    result["block_read_bytes_diff"] = block_read_bytes_diff
-    result["block_write_bytes_diff"] = block_write_bytes_diff
     result["fs_read_ops_start"] = fs_read_ops_start
     result["fs_read_ops_end"] = fs_read_ops_end
     result["fs_read_ops_diff"] = fs_read_ops_diff
     result["fs_write_ops_start"] = fs_write_ops_start
     result["fs_write_ops_end"] = fs_write_ops_end
     result["fs_write_ops_diff"] = fs_write_ops_diff
-    result["nand_total_write_start"] = nand_total_write_start
-    result["nand_total_write_end"] = nand_total_write_end
+    result["nand_total_read_diff"] = nand_total_read_diff
     result["nand_total_write_diff"] = nand_total_write_diff
-    result["nand_io_write_start"] = nand_io_write_start
-    result["nand_io_write_end"] = nand_io_write_end
-    result["nand_io_write_diff"] = nand_io_write_diff
-    result["nand_gc_write_start"] = nand_gc_write_start
-    result["nand_gc_write_end"] = nand_gc_write_end
-    result["nand_gc_write_diff"] = nand_gc_write_diff
+    if nand_total_read_diff is not None:
+        result["nand_read_bytes"] = nand_total_read_diff * NAND_PAGE_BYTES
+    if nand_total_write_diff is not None:
+        result["nand_write_bytes"] = nand_total_write_diff * NAND_PAGE_BYTES
     result["nand_counter_source"] = nand_counter_source
-    result["nand_write_bytes_start"] = nand_write_bytes_start
-    result["nand_write_bytes_end"] = nand_write_bytes_end
-    result["nand_write_bytes_diff"] = nand_write_bytes_diff
-    result["nand_bytes_source"] = nand_bytes_source
-    result["nand_source"] = nand_source
-
-    if block_write_bytes_diff is None:
-        result["warnings"].append("stat block write bytes diff missing")
-    if nand_total_write_diff is None and nand_write_bytes_diff is None:
+    if fs_read_ops_diff is None or fs_write_ops_diff is None:
+        result["warnings"].append("stat filesystem op counts missing")
+    if nand_total_read_diff is None:
+        result["warnings"].append("stat nand total read diff missing")
+    if nand_total_write_diff is None:
         result["warnings"].append("stat nand total write diff missing")
-
-    if (
-        block_write_bytes_diff is not None
-        and nand_write_bytes_diff is not None
-    ):
-        write_overhead_bytes = nand_write_bytes_diff - block_write_bytes_diff
-        result["write_overhead_bytes"] = write_overhead_bytes
-        if block_write_bytes_diff > 0:
-            result["write_overhead_pct"] = (
-                write_overhead_bytes / block_write_bytes_diff
-            ) * 100.0
-            result["write_amplification"] = (
-                nand_write_bytes_diff / block_write_bytes_diff
-            )
 
     return result
 
@@ -524,36 +467,14 @@ def item_to_single_row(
         "io_sample_count": io["io_sample_count"],
         "io_avg_cpu_usage": io["io_avg_cpu_usage"],
         "io_avg_rss_kb": io["io_avg_rss_kb"],
-        "fs_total_read_ops": io["fs_total_read_ops"],
-        "fs_total_write_ops": io["fs_total_write_ops"],
-        "physical_read_bytes": io["physical_read_bytes"],
-        "physical_write_bytes": io["physical_write_bytes"],
-        "block_read_bytes_diff": stat["block_read_bytes_diff"],
-        "block_write_bytes_diff": stat["block_write_bytes_diff"],
-        "fs_read_ops_start": stat["fs_read_ops_start"],
-        "fs_read_ops_end": stat["fs_read_ops_end"],
-        "fs_read_ops_diff": stat["fs_read_ops_diff"],
-        "fs_write_ops_start": stat["fs_write_ops_start"],
-        "fs_write_ops_end": stat["fs_write_ops_end"],
-        "fs_write_ops_diff": stat["fs_write_ops_diff"],
-        "nand_total_write_start": stat["nand_total_write_start"],
-        "nand_total_write_end": stat["nand_total_write_end"],
-        "nand_total_write_diff": stat["nand_total_write_diff"],
-        "nand_io_write_start": stat["nand_io_write_start"],
-        "nand_io_write_end": stat["nand_io_write_end"],
-        "nand_io_write_diff": stat["nand_io_write_diff"],
-        "nand_gc_write_start": stat["nand_gc_write_start"],
-        "nand_gc_write_end": stat["nand_gc_write_end"],
-        "nand_gc_write_diff": stat["nand_gc_write_diff"],
-        "nand_counter_source": stat["nand_counter_source"],
-        "nand_write_bytes_start": stat["nand_write_bytes_start"],
-        "nand_write_bytes_end": stat["nand_write_bytes_end"],
-        "nand_write_bytes_diff": stat["nand_write_bytes_diff"],
-        "nand_bytes_source": stat["nand_bytes_source"],
-        "nand_source": stat["nand_source"],
-        "write_overhead_bytes": stat["write_overhead_bytes"],
-        "write_overhead_pct": stat["write_overhead_pct"],
-        "write_amplification": stat["write_amplification"],
+        "fs_read_ops": stat["fs_read_ops_diff"],
+        "fs_write_ops": stat["fs_write_ops_diff"],
+        "fs_read_bytes": io["fs_read_bytes_diff"],
+        "fs_write_bytes": io["fs_write_bytes_diff"],
+        "nand_read_ops": stat["nand_total_read_diff"],
+        "nand_read_bytes": stat["nand_read_bytes"],
+        "nand_write_ops": stat["nand_total_write_diff"],
+        "nand_write_bytes": stat["nand_write_bytes"],
     }
 
     groups = ["BlockData", "OtherData", "StateData", "Global"]

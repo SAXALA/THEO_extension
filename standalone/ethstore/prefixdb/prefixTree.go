@@ -361,6 +361,8 @@ type PrefixTree struct {
 	nodeFileDiskLoads     uint64 // times we had to read from a node file due to fileNodeCache miss
 	nodeFileReadOps       uint64 // number of os.File.ReadAt calls
 	nodeFileReadBytes     uint64
+	fileNodeUnsortedHits  uint64
+	fileNodeUnsortedSum   uint64
 
 	bufPool sync.Pool
 
@@ -1380,7 +1382,12 @@ func (pt *PrefixTree) Close() error {
 	pt.mergeWait.Wait()
 
 	if analysisStatsEnabled {
-		fmt.Printf("PrefixTree nodefile stats: fileNodeCache hits=%d misses=%d handleCache hits=%d misses=%d diskLoads=%d readOps=%d readBytes=%d\n",
+		unsortedHits := atomic.LoadUint64(&pt.fileNodeUnsortedHits)
+		avgUnsortedCount := float64(0)
+		if unsortedHits > 0 {
+			avgUnsortedCount = float64(atomic.LoadUint64(&pt.fileNodeUnsortedSum)) / float64(unsortedHits)
+		}
+		fmt.Printf("PrefixTree nodefile stats: fileNodeCache hits=%d misses=%d handleCache hits=%d misses=%d diskLoads=%d readOps=%d readBytes=%d unsortedHits=%d avgUnsortedCount=%.2f\n",
 			atomic.LoadUint64(&pt.fileNodeCacheHits),
 			atomic.LoadUint64(&pt.fileNodeCacheMisses),
 			atomic.LoadUint64(&pt.fileHandleCacheHits),
@@ -1388,6 +1395,8 @@ func (pt *PrefixTree) Close() error {
 			atomic.LoadUint64(&pt.nodeFileDiskLoads),
 			atomic.LoadUint64(&pt.nodeFileReadOps),
 			atomic.LoadUint64(&pt.nodeFileReadBytes),
+			unsortedHits,
+			avgUnsortedCount,
 		)
 	}
 
@@ -1550,6 +1559,8 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			}
 			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
 			if bytes.Equal(dec.key, Key) {
+				addUint64Stat(&pt.fileNodeUnsortedHits, 1)
+				addUint64Stat(&pt.fileNodeUnsortedSum, uint64(unsortedCount))
 				if isNodeInfoTombstone(dec) {
 					return NodeInfo{}, false, nil
 				}

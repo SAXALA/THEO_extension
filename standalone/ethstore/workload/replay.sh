@@ -76,8 +76,9 @@ CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
 RUN_ROUND="${RUN_ROUND:-0}"
 RUN_ROUNDS="${RUN_ROUNDS:-0}"
 
-# 已加载数据根目录（source）与回放运行目录（target）
-LOADED_ROOT="${LOADED_ROOT:-/data/loaded}"
+# 已加载数据根目录（source）与回放运行目录（target）。
+# 默认把 loaded 放到另一块 SSD，给 /data 上的 running 目录腾出更多可用空间。
+LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT="/data"
 
@@ -95,7 +96,7 @@ calculate_default_ethstore_statedb_dirname() {
 ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethstore_statedb_dirname)}"
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
-GC_STATE_DIR="${GC_STATE_DIR:-/data/loaded/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
+GC_STATE_DIR="${GC_STATE_DIR:-${LOADED_ROOT}/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
 # segment index 升级目录：直接在该 statedb 目录执行，不进行复制
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
 # prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
@@ -116,6 +117,12 @@ CURRENT_MONITOR_PID=""
 SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
 # rsync 3.2.x 默认可能受 1GB max-alloc 限制影响；0 表示不额外限制。
 RSYNC_MAX_ALLOC="${RSYNC_MAX_ALLOC:-0}"
+# replay 前清理后的空闲观察配置。
+IDLE_OBSERVE_ENABLED="${IDLE_OBSERVE_ENABLED:-true}"
+IDLE_OBSERVE_INTERVAL_SECONDS="${IDLE_OBSERVE_INTERVAL_SECONDS:-5}"
+IDLE_OBSERVE_MAX_SECONDS="${IDLE_OBSERVE_MAX_SECONDS:-120}"
+IDLE_OBSERVE_STABLE_WINDOWS="${IDLE_OBSERVE_STABLE_WINDOWS:-3}"
+IDLE_OBSERVE_MAX_DIRTY_KB="${IDLE_OBSERVE_MAX_DIRTY_KB:-1024}"
 
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then
@@ -240,6 +247,8 @@ Common env vars:
     GC_STATE_DIR
     UPGRADE_STATE_DIR
     ETHSTORE_PREFIXDB_DIR SUDO_PASSWD
+    IDLE_OBSERVE_ENABLED IDLE_OBSERVE_INTERVAL_SECONDS IDLE_OBSERVE_MAX_SECONDS
+    IDLE_OBSERVE_STABLE_WINDOWS IDLE_OBSERVE_MAX_DIRTY_KB
 
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
@@ -356,6 +365,7 @@ build_replay_binary() {
 drop_caches() {
     # Trim the target SSD to minimize the impact of leftover data on performance.
     echo "Trimming target disk to drop caches..."
+    sync
     sudo_run fstrim -v "$DISK_MOUNT_POINT"
     sleep 5
     echo "Drop caches"
@@ -370,6 +380,116 @@ drop_caches() {
     else
         echo "Cached memory after dropping caches: ${cached_bytes} KiB"
     fi
+}
+
+resolve_mount_device() {
+    local mount_device
+    mount_device=$(findmnt -n -o SOURCE --target "$DISK_MOUNT_POINT" 2>/dev/null || true)
+    if [ -z "$mount_device" ]; then
+        mount_device=$(df --output=source "$DISK_MOUNT_POINT" 2>/dev/null | tail -n 1 | tr -d ' ')
+    fi
+    printf "%s" "$mount_device"
+}
+
+read_diskstats_snapshot() {
+    local device_name="$1"
+    awk -v dev="$device_name" '$3 == dev {printf "%s %s %s %s %s %s", $4, $6, $8, $10, $12, $13; exit}' /proc/diskstats
+}
+
+read_dirty_writeback_kb() {
+    awk '
+        /^Dirty:/ {dirty = $2}
+        /^Writeback:/ {writeback = $2}
+        END {printf "%s", dirty + writeback}
+    ' /proc/meminfo
+}
+
+observe_disk_idle() {
+    if [ "$IDLE_OBSERVE_ENABLED" != "true" ]; then
+        echo "Skip idle observation because IDLE_OBSERVE_ENABLED=${IDLE_OBSERVE_ENABLED}"
+        return 0
+    fi
+
+    if ! [[ "$IDLE_OBSERVE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || [ "$IDLE_OBSERVE_INTERVAL_SECONDS" -le 0 ]; then
+        echo "Invalid IDLE_OBSERVE_INTERVAL_SECONDS=${IDLE_OBSERVE_INTERVAL_SECONDS}, skip idle observation" >&2
+        return 0
+    fi
+    if ! [[ "$IDLE_OBSERVE_MAX_SECONDS" =~ ^[0-9]+$ ]] || [ "$IDLE_OBSERVE_MAX_SECONDS" -le 0 ]; then
+        echo "Invalid IDLE_OBSERVE_MAX_SECONDS=${IDLE_OBSERVE_MAX_SECONDS}, skip idle observation" >&2
+        return 0
+    fi
+    if ! [[ "$IDLE_OBSERVE_STABLE_WINDOWS" =~ ^[0-9]+$ ]] || [ "$IDLE_OBSERVE_STABLE_WINDOWS" -le 0 ]; then
+        echo "Invalid IDLE_OBSERVE_STABLE_WINDOWS=${IDLE_OBSERVE_STABLE_WINDOWS}, skip idle observation" >&2
+        return 0
+    fi
+    if ! [[ "$IDLE_OBSERVE_MAX_DIRTY_KB" =~ ^[0-9]+$ ]] || [ "$IDLE_OBSERVE_MAX_DIRTY_KB" -lt 0 ]; then
+        echo "Invalid IDLE_OBSERVE_MAX_DIRTY_KB=${IDLE_OBSERVE_MAX_DIRTY_KB}, skip idle observation" >&2
+        return 0
+    fi
+
+    local mount_device device_name baseline_snapshot max_windows stable_windows observed_windows max_observed_windows
+    mount_device=$(resolve_mount_device)
+    if [ -z "$mount_device" ]; then
+        echo "Cannot resolve block device for $DISK_MOUNT_POINT, skip idle observation" >&2
+        return 0
+    fi
+    device_name=$(basename "$mount_device")
+    baseline_snapshot=$(read_diskstats_snapshot "$device_name")
+    if [ -z "$baseline_snapshot" ]; then
+        echo "Cannot read /proc/diskstats for device ${device_name}, skip idle observation" >&2
+        return 0
+    fi
+
+    max_windows=$((IDLE_OBSERVE_MAX_SECONDS / IDLE_OBSERVE_INTERVAL_SECONDS))
+    if [ "$max_windows" -lt 1 ]; then
+        max_windows=1
+    fi
+
+    stable_windows=0
+    observed_windows=0
+    max_observed_windows=$max_windows
+
+    echo "Observe idle on ${mount_device}: interval=${IDLE_OBSERVE_INTERVAL_SECONDS}s max=${IDLE_OBSERVE_MAX_SECONDS}s stable_windows=${IDLE_OBSERVE_STABLE_WINDOWS} dirty_limit=${IDLE_OBSERVE_MAX_DIRTY_KB}KiB"
+
+    while [ "$observed_windows" -lt "$max_observed_windows" ]; do
+        sleep "$IDLE_OBSERVE_INTERVAL_SECONDS"
+        observed_windows=$((observed_windows + 1))
+
+        local current_snapshot prev_reads prev_read_sectors prev_writes prev_write_sectors prev_inflight prev_io_ms
+        local cur_reads cur_read_sectors cur_writes cur_write_sectors cur_inflight cur_io_ms
+        local delta_reads delta_read_sectors delta_writes delta_write_sectors delta_io_ms dirty_kb
+        current_snapshot=$(read_diskstats_snapshot "$device_name")
+        if [ -z "$current_snapshot" ]; then
+            echo "Lost /proc/diskstats entry for ${device_name}, stop idle observation" >&2
+            return 0
+        fi
+
+        read -r prev_reads prev_read_sectors prev_writes prev_write_sectors prev_inflight prev_io_ms <<< "$baseline_snapshot"
+        read -r cur_reads cur_read_sectors cur_writes cur_write_sectors cur_inflight cur_io_ms <<< "$current_snapshot"
+
+        delta_reads=$((cur_reads - prev_reads))
+        delta_read_sectors=$((cur_read_sectors - prev_read_sectors))
+        delta_writes=$((cur_writes - prev_writes))
+        delta_write_sectors=$((cur_write_sectors - prev_write_sectors))
+        delta_io_ms=$((cur_io_ms - prev_io_ms))
+        dirty_kb=$(read_dirty_writeback_kb)
+
+        echo "Idle observe [${observed_windows}/${max_observed_windows}] ${device_name}: readOpsDelta=${delta_reads} writeOpsDelta=${delta_writes} readBytesDelta=$((delta_read_sectors * 512)) writeBytesDelta=$((delta_write_sectors * 512)) ioBusyMsDelta=${delta_io_ms} inflight=${cur_inflight} dirtyWritebackKB=${dirty_kb}"
+
+        if [ "$delta_reads" -eq 0 ] && [ "$delta_writes" -eq 0 ] && [ "$delta_io_ms" -eq 0 ] && [ "$cur_inflight" -eq 0 ] && [ "$dirty_kb" -le "$IDLE_OBSERVE_MAX_DIRTY_KB" ]; then
+            stable_windows=$((stable_windows + 1))
+            if [ "$stable_windows" -ge "$IDLE_OBSERVE_STABLE_WINDOWS" ]; then
+                echo "Idle observation converged after $((observed_windows * IDLE_OBSERVE_INTERVAL_SECONDS))s on ${mount_device}"
+                return 0
+            fi
+        else
+            stable_windows=0
+        fi
+
+        baseline_snapshot="$current_snapshot"
+    done
+
+    echo "Idle observation reached max wait ${IDLE_OBSERVE_MAX_SECONDS}s; continue with latest device state" >&2
 }
 
 restore_ethstore_db() {
@@ -547,6 +667,11 @@ print_param_snapshot() {
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
     printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
     printf 'PREFIXDB_ACCOUNT_STATE_DIR=%s\n' "$PREFIXDB_ACCOUNT_STATE_DIR"
+    printf 'IDLE_OBSERVE_ENABLED=%s\n' "$IDLE_OBSERVE_ENABLED"
+    printf 'IDLE_OBSERVE_INTERVAL_SECONDS=%s\n' "$IDLE_OBSERVE_INTERVAL_SECONDS"
+    printf 'IDLE_OBSERVE_MAX_SECONDS=%s\n' "$IDLE_OBSERVE_MAX_SECONDS"
+    printf 'IDLE_OBSERVE_STABLE_WINDOWS=%s\n' "$IDLE_OBSERVE_STABLE_WINDOWS"
+    printf 'IDLE_OBSERVE_MAX_DIRTY_KB=%s\n' "$IDLE_OBSERVE_MAX_DIRTY_KB"
 
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
@@ -734,6 +859,7 @@ run_replay() {
     sync_loaded_to_running_for_backend "$backend"
     # Ensure cache drop happens after loaded DB is synced.
     drop_caches
+    observe_disk_idle
 
     local run_tag
     run_tag=$(build_run_tag "replay" "$backend")

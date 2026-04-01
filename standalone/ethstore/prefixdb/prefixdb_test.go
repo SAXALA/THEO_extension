@@ -3430,6 +3430,90 @@ func TestGetFromFileNodeFindsSortedEntryInSortedPart(t *testing.T) {
 	}
 }
 
+func TestGetFromFileNodeTracksUnsortedHitAndCacheStats(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	key := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x20}
+	fileID := pt.getBucketID(key)
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	sortedEntries := []NodeInfo{{
+		key:           []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x10},
+		accountOffset: 100,
+		storageFileID: 1,
+		storageOffset: 200,
+		storageSize:   300,
+	}, {
+		key:           []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x11},
+		accountOffset: 101,
+		storageFileID: 3,
+		storageOffset: 201,
+		storageSize:   301,
+	}}
+	unsortedEntries := []NodeInfo{{
+		key:           append([]byte(nil), key...),
+		accountOffset: 200,
+		storageFileID: 2,
+		storageOffset: 300,
+		storageSize:   400,
+	}}
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: uint32(len(sortedEntries)), UnsortedEntryCount: uint32(len(unsortedEntries))}
+	payload, err := encodeNodeFilePayload(&header, encodeNodeEntries(sortedEntries), encodeNodeEntries(unsortedEntries), true)
+	if err != nil {
+		t.Fatalf("encodeNodeFilePayload failed: %v", err)
+	}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+		_ = file.Close()
+		t.Fatalf("write header failed: %v", err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		t.Fatalf("write payload failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file failed: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		node, found, err := pt.getFromFileNode(fileID, key)
+		if err != nil {
+			t.Fatalf("getFromFileNode failed: %v", err)
+		}
+		if !found {
+			t.Fatal("expected unsorted entry to be found")
+		}
+		if node.accountOffset != 200 || node.storageFileID != 2 || node.storageOffset != 300 || node.storageSize != 400 {
+			t.Fatalf("unexpected unsorted lookup result: %+v", node)
+		}
+	}
+
+	if got := atomic.LoadUint64(&pt.fileNodeCacheMisses); got != 1 {
+		t.Fatalf("expected one fileNodeCache miss, got %d", got)
+	}
+	if got := atomic.LoadUint64(&pt.fileNodeCacheHits); got != 1 {
+		t.Fatalf("expected one fileNodeCache hit, got %d", got)
+	}
+	if got := atomic.LoadUint64(&pt.fileNodeUnsortedHits); got != 2 {
+		t.Fatalf("expected two unsorted hits, got %d", got)
+	}
+	if got := atomic.LoadUint64(&pt.fileNodeUnsortedSum); got != 2 {
+		t.Fatalf("expected unsorted count sum of 2, got %d", got)
+	}
+}
+
 func TestGetFromFileNodeCompressedPayloadShortReadReturnsExplicitError(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 16*1024, 8, 16, 0, 0, 0, true, false, 0)
