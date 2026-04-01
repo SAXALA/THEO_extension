@@ -96,6 +96,9 @@ func (nc *NodeCache) StoreMetadata(key string, accountOffset uint64, accountSize
 	if raw, ok := nc.shared.Get(sharedCacheNamespaceNode, key); ok {
 		current := raw.(*nodeCacheRecord)
 		rec.value = cloneBytes(current.value)
+		if rec.accountSize == 0 && rec.accountOffset == current.accountOffset {
+			rec.accountSize = current.accountSize
+		}
 	}
 	nc.shared.Add(sharedCacheNamespaceNode, key, rec, estimateNodeCacheRecordSize(key, rec))
 }

@@ -1389,6 +1389,99 @@ func TestGetAccountFallsBackToLegacyReadsWhenAccountSizeUnknown(t *testing.T) {
 	}
 }
 
+func TestApplyStorageCommitPlansPreservesAccountSizeForSingleRead(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := []byte("A12345")
+	accountValue := []byte("account-value")
+	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
+	entrySize := uint32(4 + len(accountKey) + len(accountValue))
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: uint64(offset), accountSize: entrySize}); err != nil {
+		t.Fatalf("storeNode failed: %v", err)
+	}
+	plan, err := db.buildStorageCommitPlan(string(accountKey), map[string][]byte{string([]byte{0x01}): []byte("small-value")})
+	if err != nil {
+		t.Fatalf("buildStorageCommitPlan failed: %v", err)
+	}
+	if err := db.applyStorageCommitPlans([]storageCommitPlan{plan}, nil, false); err != nil {
+		t.Fatalf("applyStorageCommitPlans failed: %v", err)
+	}
+
+	db.nodeCache.Delete(string(accountKey))
+	node, err := db.getAccountNode(accountKey)
+	if err != nil {
+		t.Fatalf("getAccountNode failed: %v", err)
+	}
+	if node == nil || node.accountSize == 0 {
+		t.Fatalf("expected accountSize to be preserved after storage commit plan, node=%+v", node)
+	}
+
+	db.nodeCache.Delete(string(accountKey))
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, accountValue) {
+		t.Fatalf("unexpected account value after storage commit plan: found=%t value=%q", found, value)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected single account read op after storage commit plan, got %d", got)
+	}
+}
+
+func TestCommitStorageForAccountAndGCPreserveAccountSizeForSingleRead(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := []byte("A67890")
+	accountValue := []byte("account-value-after-gc")
+	offset := writeAccountRecordForTest(t, db.accountFile, accountKey, accountValue)
+	entrySize := uint32(4 + len(accountKey) + len(accountValue))
+	if err := db.storeNode(accountKey, &TrieNode{accountOffset: uint64(offset), accountSize: entrySize}); err != nil {
+		t.Fatalf("storeNode failed: %v", err)
+	}
+	if err := db.commitStorageForAccount(string(accountKey), []kvPair{{key: []byte{0x01}, val: []byte("small-value")}}); err != nil {
+		t.Fatalf("commitStorageForAccount failed: %v", err)
+	}
+	if err := db.GCPrefixTree(); err != nil {
+		t.Fatalf("GCPrefixTree failed: %v", err)
+	}
+
+	db.nodeCache.Delete(string(accountKey))
+	node, err := db.getAccountNode(accountKey)
+	if err != nil {
+		t.Fatalf("getAccountNode after GC failed: %v", err)
+	}
+	if node == nil || node.accountSize == 0 {
+		t.Fatalf("expected accountSize to survive GC, node=%+v", node)
+	}
+
+	db.nodeCache.Delete(string(accountKey))
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	value, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get after GC failed: %v", err)
+	}
+	if !found || !bytes.Equal(value, accountValue) {
+		t.Fatalf("unexpected account value after GC: found=%t value=%q", found, value)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageAccountData].readOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected single account read op after GC, got %d", got)
+	}
+}
+
 func TestReadFileWithStatsEmptyFileDoesNotIncrementReadOps(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 16*1024, 8, 16)
@@ -3511,6 +3604,104 @@ func TestGetFromFileNodeTracksUnsortedHitAndCacheStats(t *testing.T) {
 	}
 	if got := atomic.LoadUint64(&pt.fileNodeUnsortedSum); got != 2 {
 		t.Fatalf("expected unsorted count sum of 2, got %d", got)
+	}
+}
+
+func TestGetFromFileNodeUsesSingleDiskReadOnCacheMiss(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	key := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0x20}
+	fileID := pt.getBucketID(key)
+	filePath := filepath.Join(pt.fileNodeDir, fileID)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase, SortedEntryCount: 1}
+	payload, err := encodeNodeFilePayload(&header, encodeNodeEntries([]NodeInfo{{
+		key:           key,
+		accountOffset: 10,
+		accountSize:   20,
+		storageFileID: 1,
+		storageOffset: 11,
+		storageSize:   12,
+	}}), nil, true)
+	if err != nil {
+		t.Fatalf("encodeNodeFilePayload failed: %v", err)
+	}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := binary.Write(file, binary.BigEndian, &header); err != nil {
+		_ = file.Close()
+		t.Fatalf("write header failed: %v", err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		t.Fatalf("write payload failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close file failed: %v", err)
+	}
+
+	beforeDisk := atomic.LoadUint64(&db.diskIOStats[diskIOUsageNodeFileLookup].readOps)
+	beforeNode := atomic.LoadUint64(&pt.nodeFileReadOps)
+	node, found, err := pt.getFromFileNode(fileID, key)
+	if err != nil {
+		t.Fatalf("getFromFileNode failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected node to be found")
+	}
+	if node.accountOffset != 10 || node.accountSize != 20 {
+		t.Fatalf("unexpected node info: %+v", node)
+	}
+	afterDisk := atomic.LoadUint64(&db.diskIOStats[diskIOUsageNodeFileLookup].readOps)
+	afterNode := atomic.LoadUint64(&pt.nodeFileReadOps)
+	if got := afterDisk - beforeDisk; got != 1 {
+		t.Fatalf("expected single nodefile lookup disk read on cache miss, got %d", got)
+	}
+	if got := afterNode - beforeNode; got != 1 {
+		t.Fatalf("expected single PrefixTree nodefile read op on cache miss, got %d", got)
+	}
+}
+
+func TestBuildGCStateFromFileUsesSingleDiskRead(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	pt := db.prefixTree
+	key := bytes.Repeat([]byte{0x02}, 32)
+	fileID := pt.fileIDForKey(key)
+	if err := pt.putIntoFileNode(fileID, key, 1, 10, 2, 3, 4); err != nil {
+		t.Fatalf("first putIntoFileNode failed: %v", err)
+	}
+	if err := pt.putIntoFileNode(fileID, key, 5, 50, 6, 7, 8); err != nil {
+		t.Fatalf("second putIntoFileNode failed: %v", err)
+	}
+
+	before := atomic.LoadUint64(&db.diskIOStats[diskIOUsageNodeFileGC].readOps)
+	state, err := pt.buildGCStateFromFile(fileID)
+	if err != nil {
+		t.Fatalf("buildGCStateFromFile failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected non-nil GC state")
+	}
+	after := atomic.LoadUint64(&db.diskIOStats[diskIOUsageNodeFileGC].readOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected single nodefile GC disk read, got %d", got)
 	}
 }
 

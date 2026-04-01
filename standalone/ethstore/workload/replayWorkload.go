@@ -889,11 +889,7 @@ func (b *ethstoreReplayBackend) ensurePebbleBatch() (ethdb.Batch, error) {
 
 func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
 	if ethstore.AolHandledDataTypes[dataType] {
-		err := b.store.BatchPutToAOL(key, value, dataType)
-		if err == nil {
-			b.prefixdbDirty = true
-		}
-		return err
+		return b.store.BatchPutToAOL(key, value, dataType)
 	}
 	if ethstore.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchPutToPrefixDB(key, value, dataType)
@@ -911,11 +907,7 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 
 func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
 	if ethstore.AolHandledDataTypes[dataType] {
-		err := b.store.BatchDeleteFromAOL(key, dataType)
-		if err == nil {
-			b.prefixdbDirty = true
-		}
-		return err
+		return b.store.BatchDeleteFromAOL(key, dataType)
 	}
 	if ethstore.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchDeleteFromPrefixDB(key, dataType)

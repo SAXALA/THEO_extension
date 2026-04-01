@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -117,6 +118,43 @@ func TestGetWithPebbleBatchOverlay_FallbackToStoreWhenBatchMiss(t *testing.T) {
 	}
 	if store.getCall != 1 {
 		t.Fatalf("expected store.Get call once, got %d", store.getCall)
+	}
+}
+
+func makeAOLTestKey(block uint64) []byte {
+	key := make([]byte, 9)
+	key[0] = 'h'
+	binary.BigEndian.PutUint64(key[1:], block)
+	return key
+}
+
+func TestEthstoreReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) {
+	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), ethstore.HeaderDataType); err != nil {
+		t.Fatalf("StagePut failed: %v", err)
+	}
+	if backend.prefixdbDirty {
+		t.Fatal("expected AOL-only StagePut to avoid marking PrefixDB dirty")
+	}
+}
+
+func TestEthstoreReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.T) {
+	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	if err := backend.StageDelete(makeAOLTestKey(1), ethstore.HeaderDataType); err != nil {
+		t.Fatalf("StageDelete failed: %v", err)
+	}
+	if backend.prefixdbDirty {
+		t.Fatal("expected AOL-only StageDelete to avoid marking PrefixDB dirty")
 	}
 }
 

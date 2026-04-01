@@ -1602,6 +1602,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	}
 	var (
 		accOff         uint64
+		accSize        uint32
 		existingFileID uint32
 		existingOffset uint64
 		existingSize   uint64
@@ -1613,6 +1614,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	}
 	if node != nil {
 		accOff = node.accountOffset
+		accSize = node.accountSize
 		existingFileID = node.storageFileID
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
@@ -1620,7 +1622,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	if len(buf.storagekvs) == 0 {
 		fmt.Printf("flushStorageBuffer: empty buffer for account - accountKey=%s\n",
 			buf.accountKey)
-		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, 0, 0, 0); err != nil {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, accSize, 0, 0, 0); err != nil {
 			return err
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{})
@@ -1636,7 +1638,7 @@ func (db *PrefixDB) flushStorageBuffer() error {
 	}
 	skipAccountPointerUpdate := shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, off, sz)
 	if !skipAccountPointerUpdate {
-		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, 0, fileID, off, sz); err != nil {
+		if err := db.prefixTree.Put([]byte(buf.accountKey), accOff, accSize, fileID, off, sz); err != nil {
 			return err
 		}
 		db.nodeCache.UpdateStoragePointer(buf.accountKey, StorageInfo{
