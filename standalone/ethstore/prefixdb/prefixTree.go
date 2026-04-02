@@ -1104,20 +1104,99 @@ func (pt *PrefixTree) Put(key []byte, accountOffset uint64, accountSize uint32, 
 	if len(key) == 0 {
 		return errors.New("key cannot be empty")
 	}
-
-	fileID := pt.fileIDForKey(key)
-	return pt.putIntoFileNode(fileID, key, accountOffset, accountSize, storageFileID, storageOffset, storageSize)
+	return pt.putNodeInfosLocked([]NodeInfo{{
+		key:           append([]byte(nil), key...),
+		accountOffset: accountOffset,
+		accountSize:   accountSize,
+		storageFileID: storageFileID,
+		storageOffset: storageOffset,
+		storageSize:   storageSize,
+	}})
 
 }
 
 func (pt *PrefixTree) PutNode(key []byte, node *TrieNode) error {
-	entry := trieNodeToNodeInfo(key, node)
-	return pt.Put(entry.key, entry.accountOffset, entry.accountSize, entry.storageFileID, entry.storageOffset, entry.storageSize)
+	return pt.PutNodeInfos([]NodeInfo{trieNodeToNodeInfo(key, node)})
 }
 
-func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset uint64, accountSize uint32, storageFileID uint32, storageOffset uint64, storageSize uint64) error {
-	if fileID == pt.globalFileID {
-		return pt.putIntoGlobalFileNode(key, accountOffset, accountSize, storageFileID, storageOffset, storageSize)
+func (pt *PrefixTree) PutNodeInfos(entries []NodeInfo) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	pt.lock.Lock()
+	defer pt.lock.Unlock()
+	return pt.putNodeInfosLocked(entries)
+}
+
+func (pt *PrefixTree) putNodeInfosLocked(entries []NodeInfo) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	perFile := make(map[string][]NodeInfo)
+	fileOrder := make([]string, 0, len(entries))
+	globalEntries := make([]NodeInfo, 0)
+	for _, entry := range entries {
+		if len(entry.key) == 0 {
+			return errors.New("key cannot be empty")
+		}
+		cloned := cloneNodeInfo(entry)
+		fileID := pt.fileIDForKey(cloned.key)
+		if fileID == pt.globalFileID {
+			globalEntries = append(globalEntries, cloned)
+			continue
+		}
+		if _, ok := perFile[fileID]; !ok {
+			fileOrder = append(fileOrder, fileID)
+		}
+		perFile[fileID] = append(perFile[fileID], cloned)
+	}
+	if len(globalEntries) > 0 {
+		if err := pt.putGlobalNodeInfos(globalEntries); err != nil {
+			return err
+		}
+	}
+	sort.Strings(fileOrder)
+	for _, fileID := range fileOrder {
+		if err := pt.appendFileNodeEntries(fileID, perFile[fileID]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (pt *PrefixTree) putGlobalNodeInfos(entries []NodeInfo) error {
+	pt.globalNodeMu.Lock()
+	defer pt.globalNodeMu.Unlock()
+	if pt.globalNodeIndex == nil {
+		pt.globalNodeIndex = skiplist.New(skiplist.String)
+	}
+	appendEntries := make([]NodeInfo, 0, len(entries))
+	for _, entry := range entries {
+		next := cloneNodeInfo(entry)
+		if elem := pt.globalNodeIndex.Get(string(entry.key)); elem != nil {
+			if previous, ok := elem.Value.(NodeInfo); ok {
+				next = mergeNodeInfoForAppend(previous, next)
+			}
+		}
+		pt.globalNodeIndex.Set(string(entry.key), cloneNodeInfo(next))
+		appendEntries = append(appendEntries, next)
+		if pt.globalCommitDepth > 0 {
+			if pt.globalCommitBatch == nil {
+				pt.globalCommitBatch = make(map[string]NodeInfo)
+			}
+			pt.globalCommitBatch[string(entry.key)] = cloneNodeInfo(next)
+			pt.globalCommitDirty = true
+		}
+	}
+	if pt.globalCommitDepth > 0 {
+		return nil
+	}
+	return pt.appendGlobalNodeEntries(appendEntries)
+}
+
+func (pt *PrefixTree) appendFileNodeEntries(fileID string, entries []NodeInfo) error {
+	if len(entries) == 0 {
+		return nil
 	}
 	release := pt.beginFileMutation(fileID)
 	defer release()
@@ -1126,12 +1205,9 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	fl.Lock()
 	defer fl.Unlock()
 
-	// invalidate cache if it matches
 	pt.invalidateFileNodeCache(fileID)
 
-	var file *os.File
-	var err error
-	file, err = pt.getOrCreateFileHandle(fileID, os.O_RDWR)
+	file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("open file failed: %w", err)
@@ -1146,14 +1222,7 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	if err != nil {
 		return fmt.Errorf("stat file failed: %w", err)
 	}
-	entryData := encodeNodeEntry(NodeInfo{
-		key:           key,
-		accountOffset: accountOffset,
-		accountSize:   accountSize,
-		storageFileID: storageFileID,
-		storageOffset: storageOffset,
-		storageSize:   storageSize,
-	})
+	entryData := encodeNodeEntries(entries)
 	if info.Size() == 0 {
 		header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
 		fileData, err := encodeFileNodeAndPayload(header, entryData)
@@ -1178,6 +1247,20 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 		pt.db.addDiskWrite(diskIOUsageNodeFileMutation, len(entryData))
 	}
 	return nil
+}
+
+func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset uint64, accountSize uint32, storageFileID uint32, storageOffset uint64, storageSize uint64) error {
+	if fileID == pt.globalFileID {
+		return pt.putIntoGlobalFileNode(key, accountOffset, accountSize, storageFileID, storageOffset, storageSize)
+	}
+	return pt.appendFileNodeEntries(fileID, []NodeInfo{{
+		key:           append([]byte(nil), key...),
+		accountOffset: accountOffset,
+		accountSize:   accountSize,
+		storageFileID: storageFileID,
+		storageOffset: storageOffset,
+		storageSize:   storageSize,
+	}})
 }
 
 // Delete deletes a key from the prefix tree

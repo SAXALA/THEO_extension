@@ -1337,6 +1337,8 @@ func (db *PrefixDB) BatchCommit() (err error) {
 		}
 
 		naEntry := make([]byte, 0, prepared.totalSize)
+		nodeEntries := make([]NodeInfo, 0, len(prepared.order))
+		cacheUpdates := make([]pendingNodeCacheUpdate, 0, len(prepared.order))
 		stageStart = time.Now()
 		processedAccounts := 0
 		for _, key := range prepared.order {
@@ -1346,12 +1348,8 @@ func (db *PrefixDB) BatchCommit() (err error) {
 				continue
 			}
 			if op.value == nil {
-				if db.nodeCache != nil {
-					db.nodeCache.Delete(key)
-				}
-				if err := db.storeNode(keyBytes, &TrieNode{accountOffset: 0, accountSize: 0, storageFileID: 0, storageOffset: 0, storageSize: 0}); err != nil {
-					return err
-				}
+				nodeEntries = append(nodeEntries, trieNodeToNodeInfo(keyBytes, &TrieNode{}))
+				cacheUpdates = append(cacheUpdates, pendingNodeCacheUpdate{key: key, delete: true})
 				continue
 			}
 
@@ -1366,23 +1364,25 @@ func (db *PrefixDB) BatchCommit() (err error) {
 				accountOffset: uint64(offset),
 				accountSize:   uint32(len(entry)),
 			}
-			if err := db.storeNode(keyBytes, node); err != nil {
-				return err
-			}
-			if db.nodeCache != nil {
-				db.nodeCache.StoreMetadata(key, uint64(offset), uint32(len(entry)), StorageInfo{
+			nodeEntries = append(nodeEntries, trieNodeToNodeInfo(keyBytes, node))
+			cacheUpdates = append(cacheUpdates, pendingNodeCacheUpdate{
+				key:           key,
+				accountOffset: uint64(offset),
+				accountSize:   uint32(len(entry)),
+				storageInfo: StorageInfo{
 					storageFileID: op.storageFileID,
 					storageOffset: op.storageOffset,
 					storageSize:   op.storageSize,
-				})
-			}
+				},
+			})
 			processedAccounts++
 			if processedAccounts%10000 == 0 {
-				prefixdbDebugf("BatchCommit: account node writes progress=%d/%d elapsed=%s",
+				prefixdbDebugf("BatchCommit: account node staging progress=%d/%d elapsed=%s",
 					processedAccounts, len(prepared.order), time.Since(stageStart))
 			}
 		}
-		prefixdbDebugf("BatchCommit: account node writes done count=%d elapsed=%s", processedAccounts, time.Since(stageStart))
+		prefixdbDebugf("BatchCommit: account node staging done count=%d totalEntries=%d elapsed=%s",
+			processedAccounts, len(nodeEntries), time.Since(stageStart))
 
 		if len(naEntry) > 0 {
 			stageStart = time.Now()
@@ -1392,6 +1392,14 @@ func (db *PrefixDB) BatchCommit() (err error) {
 			}
 			db.addDiskWrite(diskIOUsageAccountData, len(naEntry))
 			prefixdbDebugf("BatchCommit: account file append bytes=%d elapsed=%s", len(naEntry), time.Since(stageStart))
+		}
+
+		if len(nodeEntries) > 0 {
+			stageStart = time.Now()
+			if err := db.applyNodeBatch(nodeEntries, cacheUpdates); err != nil {
+				return err
+			}
+			prefixdbDebugf("BatchCommit: account node writes done count=%d elapsed=%s", len(nodeEntries), time.Since(stageStart))
 		}
 
 		if len(storagePlans) > 0 {
@@ -2372,6 +2380,36 @@ func (db *PrefixDB) normalizeStorageKey(rawKey []byte) ([]byte, error) {
 
 func (db *PrefixDB) storeNode(key []byte, node *TrieNode) error {
 	return db.prefixTree.PutNode(key, node)
+}
+
+type pendingNodeCacheUpdate struct {
+	key           string
+	delete        bool
+	accountOffset uint64
+	accountSize   uint32
+	storageInfo   StorageInfo
+}
+
+func (db *PrefixDB) applyNodeBatch(entries []NodeInfo, cacheUpdates []pendingNodeCacheUpdate) error {
+	if len(entries) > 0 {
+		if db.prefixTree == nil {
+			return errors.New("prefix tree not initialized")
+		}
+		if err := db.prefixTree.PutNodeInfos(entries); err != nil {
+			return err
+		}
+	}
+	if db.nodeCache == nil {
+		return nil
+	}
+	for _, update := range cacheUpdates {
+		if update.delete {
+			db.nodeCache.Delete(update.key)
+			continue
+		}
+		db.nodeCache.StoreMetadata(update.key, update.accountOffset, update.accountSize, update.storageInfo)
+	}
+	return nil
 }
 
 func (db *PrefixDB) shouldBypassNodeCache(key []byte) bool {

@@ -124,6 +124,16 @@ IDLE_OBSERVE_MAX_SECONDS="${IDLE_OBSERVE_MAX_SECONDS:-120}"
 IDLE_OBSERVE_STABLE_WINDOWS="${IDLE_OBSERVE_STABLE_WINDOWS:-3}"
 IDLE_OBSERVE_MAX_DIRTY_KB="${IDLE_OBSERVE_MAX_DIRTY_KB:-1024}"
 
+# replay 进程可选 cgroup v2 IO 限速；默认关闭。
+REPLAY_CGROUP_IO_LIMIT_ENABLED="${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
+REPLAY_CGROUP_NAME_PREFIX="${REPLAY_CGROUP_NAME_PREFIX:-theo-replay}"
+REPLAY_CGROUP_READ_IOPS_LIMIT="${REPLAY_CGROUP_READ_IOPS_LIMIT:-850000}"
+REPLAY_CGROUP_WRITE_IOPS_LIMIT="${REPLAY_CGROUP_WRITE_IOPS_LIMIT:-110000}"
+REPLAY_CGROUP_READ_MBPS_LIMIT="${REPLAY_CGROUP_READ_MBPS_LIMIT:-3700}"
+REPLAY_CGROUP_WRITE_MBPS_LIMIT="${REPLAY_CGROUP_WRITE_MBPS_LIMIT:-2400}"
+REPLAY_CGROUP_READ_BPS_LIMIT="${REPLAY_CGROUP_READ_BPS_LIMIT:-$((REPLAY_CGROUP_READ_MBPS_LIMIT * 1000 * 1000))}"
+REPLAY_CGROUP_WRITE_BPS_LIMIT="${REPLAY_CGROUP_WRITE_BPS_LIMIT:-$((REPLAY_CGROUP_WRITE_MBPS_LIMIT * 1000 * 1000))}"
+
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then
         echo "${SUDO_PASSWD}" | sudo -S "$@"
@@ -140,6 +150,9 @@ report_error() {
 }
 
 trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+ACTIVE_REPLAY_CGROUP_PATH=""
+ACTIVE_REPLAY_CGROUP_MAJMIN=""
 
 sudo_rsync_run() {
     local args=()
@@ -209,6 +222,8 @@ cleanup_running_processes() {
 
     CURRENT_MONITOR_PID=""
     CURRENT_REPLAY_PID=""
+
+    cleanup_replay_cgroup
 }
 
 handle_interrupt() {
@@ -249,6 +264,11 @@ Common env vars:
     ETHSTORE_PREFIXDB_DIR SUDO_PASSWD
     IDLE_OBSERVE_ENABLED IDLE_OBSERVE_INTERVAL_SECONDS IDLE_OBSERVE_MAX_SECONDS
     IDLE_OBSERVE_STABLE_WINDOWS IDLE_OBSERVE_MAX_DIRTY_KB
+    REPLAY_CGROUP_IO_LIMIT_ENABLED(true|false)
+    REPLAY_CGROUP_NAME_PREFIX
+    REPLAY_CGROUP_READ_IOPS_LIMIT REPLAY_CGROUP_WRITE_IOPS_LIMIT
+    REPLAY_CGROUP_READ_MBPS_LIMIT REPLAY_CGROUP_WRITE_MBPS_LIMIT
+    REPLAY_CGROUP_READ_BPS_LIMIT REPLAY_CGROUP_WRITE_BPS_LIMIT
 
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
@@ -347,6 +367,21 @@ validate_runtime_requirements() {
             exit 1
         fi
     fi
+
+    if [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" = "true" ]; then
+        local numeric_value numeric_name
+        for numeric_name in \
+            REPLAY_CGROUP_READ_IOPS_LIMIT \
+            REPLAY_CGROUP_WRITE_IOPS_LIMIT \
+            REPLAY_CGROUP_READ_BPS_LIMIT \
+            REPLAY_CGROUP_WRITE_BPS_LIMIT; do
+            numeric_value="${!numeric_name}"
+            if ! [[ "$numeric_value" =~ ^[0-9]+$ ]] || [ "$numeric_value" -le 0 ]; then
+                echo "${numeric_name} 必须是正整数，当前值=${numeric_value}"
+                exit 1
+            fi
+        done
+    fi
 }
 
 build_replay_binary() {
@@ -389,6 +424,88 @@ resolve_mount_device() {
         mount_device=$(df --output=source "$DISK_MOUNT_POINT" 2>/dev/null | tail -n 1 | tr -d ' ')
     fi
     printf "%s" "$mount_device"
+}
+
+resolve_mount_majmin() {
+    local majmin
+    majmin=$(findmnt -n -o MAJ:MIN --target "$DISK_MOUNT_POINT" 2>/dev/null || true)
+    if [ -n "$majmin" ]; then
+        printf "%s" "$majmin"
+        return 0
+    fi
+
+    local mount_device sys_stat_path
+    mount_device=$(resolve_mount_device)
+    if [ -z "$mount_device" ]; then
+        return 1
+    fi
+    sys_stat_path="/sys/class/block/$(basename "$mount_device")/dev"
+    if [ -r "$sys_stat_path" ]; then
+        tr -d '[:space:]' < "$sys_stat_path"
+        return 0
+    fi
+    return 1
+}
+
+cleanup_replay_cgroup() {
+    if [ -z "$ACTIVE_REPLAY_CGROUP_PATH" ]; then
+        return 0
+    fi
+
+    sudo_run sh -c "rmdir '$ACTIVE_REPLAY_CGROUP_PATH' 2>/dev/null || true"
+    ACTIVE_REPLAY_CGROUP_PATH=""
+    ACTIVE_REPLAY_CGROUP_MAJMIN=""
+}
+
+setup_replay_cgroup() {
+    if [ "$ACTION" != "replay" ] || [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" != "true" ]; then
+        return 1
+    fi
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "Skip replay cgroup IO limit: host is not using cgroup v2" >&2
+        return 1
+    fi
+
+    local majmin cgroup_name cgroup_path uid gid
+    majmin=$(resolve_mount_majmin)
+    if [ -z "$majmin" ]; then
+        echo "Skip replay cgroup IO limit: cannot resolve MAJ:MIN for ${DISK_MOUNT_POINT}" >&2
+        return 1
+    fi
+
+    uid=$(id -u)
+    gid=$(id -g)
+    cgroup_name="${REPLAY_CGROUP_NAME_PREFIX}_$(date +%s)_$$"
+    cgroup_path="/sys/fs/cgroup/${cgroup_name}"
+
+    sudo_run mkdir "$cgroup_path"
+    sudo_run sh -c "printf '%s riops=%s wiops=%s rbps=%s wbps=%s\n' '$majmin' '$REPLAY_CGROUP_READ_IOPS_LIMIT' '$REPLAY_CGROUP_WRITE_IOPS_LIMIT' '$REPLAY_CGROUP_READ_BPS_LIMIT' '$REPLAY_CGROUP_WRITE_BPS_LIMIT' > '$cgroup_path/io.max'"
+    sudo_run sh -c "chown '$uid:$gid' '$cgroup_path' '$cgroup_path/cgroup.procs' '$cgroup_path/cgroup.threads' 2>/dev/null || true"
+
+    ACTIVE_REPLAY_CGROUP_PATH="$cgroup_path"
+    ACTIVE_REPLAY_CGROUP_MAJMIN="$majmin"
+    return 0
+}
+
+launch_replay_process() {
+    local log_file="$1"
+    shift
+
+    if setup_replay_cgroup; then
+        echo "Replay cgroup IO limit enabled: path=${ACTIVE_REPLAY_CGROUP_PATH} device=${ACTIVE_REPLAY_CGROUP_MAJMIN} riops=${REPLAY_CGROUP_READ_IOPS_LIMIT} wiops=${REPLAY_CGROUP_WRITE_IOPS_LIMIT} rbps=${REPLAY_CGROUP_READ_BPS_LIMIT} wbps=${REPLAY_CGROUP_WRITE_BPS_LIMIT}"
+        (
+            if ! echo "$BASHPID" > "$ACTIVE_REPLAY_CGROUP_PATH/cgroup.procs"; then
+                echo "Failed to join replay cgroup: ${ACTIVE_REPLAY_CGROUP_PATH}" >&2
+                exit 1
+            fi
+            exec ./bin/replayWorkload "$@"
+        ) >> "$log_file" 2>&1 &
+        CURRENT_REPLAY_PID=$!
+        return 0
+    fi
+
+    ./bin/replayWorkload "$@" >> "$log_file" 2>&1 &
+    CURRENT_REPLAY_PID=$!
 }
 
 read_diskstats_snapshot() {
@@ -631,19 +748,24 @@ build_run_tag() {
         round_tag="_r_${RUN_ROUND}"
     fi
 
+    local cgroup_tag=""
+    if [ "$action" = "replay" ] && [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" = "true" ]; then
+        cgroup_tag="_cg_1"
+    fi
+
     if [ "$backend" = "chainkv" ]; then
         local ckv_state_tag ckv_prefix_tag
         ckv_state_tag=$(sanitize_tag_value "$CHAINKV_STATE")
         ckv_prefix_tag=$(sanitize_tag_value "$CHAINKV_STATE_KEY_PREFIXES")
-        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}"
+        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "pebble" ]; then
-        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}"
+        printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "prefixdb" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "ethstore" ]; then
-        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}"
+        printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}${cgroup_tag}"
     else
-        printf "%s" "${base_tag}${round_tag}"
+        printf "%s" "${base_tag}${round_tag}${cgroup_tag}"
     fi
 }
 
@@ -672,6 +794,14 @@ print_param_snapshot() {
     printf 'IDLE_OBSERVE_MAX_SECONDS=%s\n' "$IDLE_OBSERVE_MAX_SECONDS"
     printf 'IDLE_OBSERVE_STABLE_WINDOWS=%s\n' "$IDLE_OBSERVE_STABLE_WINDOWS"
     printf 'IDLE_OBSERVE_MAX_DIRTY_KB=%s\n' "$IDLE_OBSERVE_MAX_DIRTY_KB"
+    printf 'REPLAY_CGROUP_IO_LIMIT_ENABLED=%s\n' "$REPLAY_CGROUP_IO_LIMIT_ENABLED"
+    printf 'REPLAY_CGROUP_NAME_PREFIX=%s\n' "$REPLAY_CGROUP_NAME_PREFIX"
+    printf 'REPLAY_CGROUP_READ_IOPS_LIMIT=%s\n' "$REPLAY_CGROUP_READ_IOPS_LIMIT"
+    printf 'REPLAY_CGROUP_WRITE_IOPS_LIMIT=%s\n' "$REPLAY_CGROUP_WRITE_IOPS_LIMIT"
+    printf 'REPLAY_CGROUP_READ_MBPS_LIMIT=%s\n' "$REPLAY_CGROUP_READ_MBPS_LIMIT"
+    printf 'REPLAY_CGROUP_WRITE_MBPS_LIMIT=%s\n' "$REPLAY_CGROUP_WRITE_MBPS_LIMIT"
+    printf 'REPLAY_CGROUP_READ_BPS_LIMIT=%s\n' "$REPLAY_CGROUP_READ_BPS_LIMIT"
+    printf 'REPLAY_CGROUP_WRITE_BPS_LIMIT=%s\n' "$REPLAY_CGROUP_WRITE_BPS_LIMIT"
 
     if [ "$snapshot_backend" = "ethstore" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
@@ -733,8 +863,7 @@ run_and_monitor() {
         printf "\n"
     } >> "$log_file"
 
-    ./bin/replayWorkload "$@" >> "$log_file" 2>&1 &
-    CURRENT_REPLAY_PID=$!
+    launch_replay_process "$log_file" "$@"
     echo "${backend} monitor target PID: ${CURRENT_REPLAY_PID}"
     (
         trap - ERR INT TERM EXIT
@@ -752,6 +881,7 @@ run_and_monitor() {
         CURRENT_MONITOR_PID=""
     fi
 
+    cleanup_replay_cgroup
     cleanup_running_processes
 }
 

@@ -440,6 +440,8 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 }
 
 func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOps map[string]WriteOperation, updateAccountBatch bool) error {
+	nodeEntries := make([]NodeInfo, 0, len(plans))
+	cacheUpdates := make([]pendingNodeCacheUpdate, 0, len(plans))
 	for _, plan := range plans {
 		if accountOps != nil {
 			if op, ok := accountOps[plan.accountKey]; ok {
@@ -452,18 +454,25 @@ func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOp
 		if plan.skipNodeWrite {
 			continue
 		}
-		accountKeyBytes := []byte(plan.accountKey)
-		if err := db.prefixTree.Put(accountKeyBytes, plan.accountOffset, plan.accountSize, plan.storageInfo.storageFileID, plan.storageInfo.storageOffset, plan.storageInfo.storageSize); err != nil {
-			return err
-		}
-		if db.nodeCache != nil {
-			db.nodeCache.StoreMetadata(plan.accountKey, plan.accountOffset, plan.accountSize, plan.storageInfo)
-		}
+		nodeEntries = append(nodeEntries, NodeInfo{
+			key:           []byte(plan.accountKey),
+			accountOffset: plan.accountOffset,
+			accountSize:   plan.accountSize,
+			storageFileID: plan.storageInfo.storageFileID,
+			storageOffset: plan.storageInfo.storageOffset,
+			storageSize:   plan.storageInfo.storageSize,
+		})
+		cacheUpdates = append(cacheUpdates, pendingNodeCacheUpdate{
+			key:           plan.accountKey,
+			accountOffset: plan.accountOffset,
+			accountSize:   plan.accountSize,
+			storageInfo:   plan.storageInfo,
+		})
 		if updateAccountBatch && db.accountBatch != nil {
 			_ = db.accountBatch.updateStoragePointer(plan.accountKey, plan.storageInfo)
 		}
 	}
-	return nil
+	return db.applyNodeBatch(nodeEntries, cacheUpdates)
 }
 
 func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) error {

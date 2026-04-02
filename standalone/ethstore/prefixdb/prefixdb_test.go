@@ -756,6 +756,59 @@ func TestBatchCommitPlansInlineStoragePointerBeforeAccountNodeWrite(t *testing.T
 	}
 }
 
+func TestBatchCommitBatchesNodeWritesByFileID(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	firstKey := makeTestAccountKey(0x31)
+	secondKey := append([]byte(nil), firstKey...)
+	secondKey[10] ^= 0x5a
+	thirdKey := makeTestAccountKey(0x52)
+
+	firstFileID := db.prefixTree.fileIDForKey(firstKey)
+	secondFileID := db.prefixTree.fileIDForKey(secondKey)
+	thirdFileID := db.prefixTree.fileIDForKey(thirdKey)
+	if firstFileID != secondFileID {
+		t.Fatalf("expected first two keys to share node file, got %q and %q", firstFileID, secondFileID)
+	}
+	if firstFileID == thirdFileID {
+		t.Fatalf("expected third key to use a different node file, got %q", thirdFileID)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	for idx, key := range [][]byte{firstKey, secondKey, thirdKey} {
+		if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, key, []byte(fmt.Sprintf("account-%d", idx)), nil); err != nil {
+			t.Fatalf("BatchPut account %d failed: %v", idx, err)
+		}
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageNodeFileMutation].writeOps)
+	if got := after - before; got != 2 {
+		t.Fatalf("expected one nodefile write per touched fileID, got %d writeOps", got)
+	}
+
+	headerSize := int64(binary.Size(FileNodeHeader{}))
+	firstStat, err := os.Stat(filepath.Join(db.prefixTree.fileNodeDir, firstFileID))
+	if err != nil {
+		t.Fatalf("Stat first bucket failed: %v", err)
+	}
+	if got := firstStat.Size(); got != headerSize+2*NodeEntrySize {
+		t.Fatalf("expected shared bucket to contain two entries, got size=%d want=%d", got, headerSize+2*NodeEntrySize)
+	}
+	thirdStat, err := os.Stat(filepath.Join(db.prefixTree.fileNodeDir, thirdFileID))
+	if err != nil {
+		t.Fatalf("Stat third bucket failed: %v", err)
+	}
+	if got := thirdStat.Size(); got != headerSize+NodeEntrySize {
+		t.Fatalf("expected separate bucket to contain one entry, got size=%d want=%d", got, headerSize+NodeEntrySize)
+	}
+}
+
 func TestBatchCommitPlansSegmentedStoragePointerBeforeAccountNodeWrite(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 16)

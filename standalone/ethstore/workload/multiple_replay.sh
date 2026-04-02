@@ -15,7 +15,7 @@ cd "$script_dir" || exit 1
 #   ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh replay all all
 #   ./multiple_replay.sh load-account prefixdb
-#   PREFIXDB_ACCOUNT_STATE_DIR=/data/loaded/ethstore/database_statedb8KB ./multiple_replay.sh load-storage prefixdb
+#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB ./multiple_replay.sh load-storage prefixdb
 
 ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
@@ -23,8 +23,8 @@ BACKEND_SELECTOR="${2:-}"
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
-BACKEND_CANDIDATES=(ethstore) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache nocache_snap nocache) # cache nocache_snap nocache
+BACKEND_CANDIDATES=(ethstore pebble) # pebble ethstore
+TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap nocache
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
