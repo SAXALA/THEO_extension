@@ -86,8 +86,15 @@ read_fs_io_counters() {
     local syscr
     local syscw
 
-    syscr=$(awk '/syscr/ {print $2}' "/proc/${pid}/io")
-    syscw=$(awk '/syscw/ {print $2}' "/proc/${pid}/io")
+    if [ ! -r "/proc/${pid}/io" ]; then
+        return 1
+    fi
+
+    syscr=$(awk '/syscr/ {print $2}' "/proc/${pid}/io" 2>/dev/null || true)
+    syscw=$(awk '/syscw/ {print $2}' "/proc/${pid}/io" 2>/dev/null || true)
+    if [ -z "$syscr" ] || [ -z "$syscw" ]; then
+        return 1
+    fi
     echo "$syscr $syscw"
 }
 
@@ -204,7 +211,7 @@ START_TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 START_DISK_BYTES=($(read_disk_bytes "$BLOCK_DEVICE"))
 SSD_START_READ=${START_DISK_BYTES[0]}
 SSD_START_WRITE=${START_DISK_BYTES[1]}
-START_FS_IO=($(read_fs_io_counters "$MAIN_PID"))
+START_FS_IO=($(read_fs_io_counters "$MAIN_PID" 2>/dev/null || echo "0 0"))
 FS_START_READ_OPS=${START_FS_IO[0]}
 FS_START_WRITE_OPS=${START_FS_IO[1]}
 HIOADM_DEVICE=$(resolve_hioadm_device_name "$BLOCK_DEVICE" || true)
@@ -232,6 +239,10 @@ fi
 
 # --- 2. 循环监控 ---
 while [ -d "/proc/$MAIN_PID" ]; do
+    if [ ! -r "/proc/$MAIN_PID/stat" ] || [ ! -r "/proc/$MAIN_PID/io" ] || [ ! -r "/proc/$MAIN_PID/status" ]; then
+        break
+    fi
+
     # 记录采样开始前的数据
     # 使用 /proc/$PID/stat 时，我们要提取的是第 14 和 15 个字段 (utime, stime)
     CPU_TOTAL_BEFORE=$(grep '^cpu ' /proc/stat | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
@@ -239,9 +250,9 @@ while [ -d "/proc/$MAIN_PID" ]; do
     UTIME_BEFORE=${PROC_STAT_BEFORE[13]}
     STIME_BEFORE=${PROC_STAT_BEFORE[14]}
     
-    IO_BEFORE_READ=$(awk '/rchar/ {print $2}' /proc/$MAIN_PID/io)
-    IO_BEFORE_WRITE=$(awk '/wchar/ {print $2}' /proc/$MAIN_PID/io)
-    FS_IO_BEFORE=($(read_fs_io_counters "$MAIN_PID"))
+    IO_BEFORE_READ=$(awk '/rchar/ {print $2}' /proc/$MAIN_PID/io 2>/dev/null || echo 0)
+    IO_BEFORE_WRITE=$(awk '/wchar/ {print $2}' /proc/$MAIN_PID/io 2>/dev/null || echo 0)
+    FS_IO_BEFORE=($(read_fs_io_counters "$MAIN_PID" 2>/dev/null || echo "0 0"))
     SYSCR_BEFORE=${FS_IO_BEFORE[0]}
     SYSCW_BEFORE=${FS_IO_BEFORE[1]}
 
@@ -249,6 +260,7 @@ while [ -d "/proc/$MAIN_PID" ]; do
 
     # 检查进程在 sleep 期间是否退出
     if [ ! -d "/proc/$MAIN_PID" ]; then break; fi
+    if [ ! -r "/proc/$MAIN_PID/stat" ] || [ ! -r "/proc/$MAIN_PID/io" ] || [ ! -r "/proc/$MAIN_PID/status" ]; then break; fi
 
     # 记录采样结束后的数据
     TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
@@ -257,12 +269,12 @@ while [ -d "/proc/$MAIN_PID" ]; do
     UTIME_AFTER=${PROC_STAT_AFTER[13]}
     STIME_AFTER=${PROC_STAT_AFTER[14]}
     
-    IO_AFTER_READ=$(awk '/rchar/ {print $2}' /proc/$MAIN_PID/io)
-    IO_AFTER_WRITE=$(awk '/wchar/ {print $2}' /proc/$MAIN_PID/io)
-    FS_IO_AFTER=($(read_fs_io_counters "$MAIN_PID"))
+    IO_AFTER_READ=$(awk '/rchar/ {print $2}' /proc/$MAIN_PID/io 2>/dev/null || echo "$IO_BEFORE_READ")
+    IO_AFTER_WRITE=$(awk '/wchar/ {print $2}' /proc/$MAIN_PID/io 2>/dev/null || echo "$IO_BEFORE_WRITE")
+    FS_IO_AFTER=($(read_fs_io_counters "$MAIN_PID" 2>/dev/null || echo "$SYSCR_BEFORE $SYSCW_BEFORE"))
     SYSCR_AFTER=${FS_IO_AFTER[0]}
     SYSCW_AFTER=${FS_IO_AFTER[1]}
-    RSS=$(awk '/VmRSS/ {print $2}' /proc/$MAIN_PID/status)
+    RSS=$(awk '/VmRSS/ {print $2}' /proc/$MAIN_PID/status 2>/dev/null || echo 0)
 
     # --- 3. 数据计算 ---
     # CPU 使用率计算

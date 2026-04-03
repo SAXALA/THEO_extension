@@ -23,9 +23,11 @@ type storageCommitPlan struct {
 	accountKey    string
 	accountOffset uint64
 	accountSize   uint32
+	existingInfo  StorageInfo
 	storageInfo   StorageInfo
 	skipNodeWrite bool
 	cacheEntries  []kvPair
+	inlineSegment []byte
 }
 
 type preparedAccountCommit struct {
@@ -197,6 +199,9 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	err = func() error {
 		plans, err = db.prepareStorageCommitPlans(batch, unresolved, nil)
 		if err != nil {
+			return err
+		}
+		if err := db.appendPreparedInlineStorageSegments(plans); err != nil {
 			return err
 		}
 		if len(plans) > 0 {
@@ -414,6 +419,11 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 		existingFileID = node.storageFileID
 		existingOffset = node.storageOffset
 		existingSize = node.storageSize
+		plan.existingInfo = StorageInfo{
+			storageFileID: existingFileID,
+			storageOffset: existingOffset,
+			storageSize:   existingSize,
+		}
 	}
 	if len(perAccount) == 0 {
 		fmt.Printf("buildStorageCommitPlan: no storage entries to write for account - accountKey=%s\n",
@@ -426,16 +436,15 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 	}
 	sortKVPairs(kvs)
 	plan.cacheEntries = kvs
-	fileID, offset, size, err := db.persistStorageEntries(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
+	info, inlineSegment, err := db.prepareStorageEntriesForCommit(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
 	if err != nil {
 		return plan, err
 	}
-	plan.storageInfo = StorageInfo{
-		storageFileID: fileID,
-		storageOffset: offset,
-		storageSize:   size,
+	plan.storageInfo = info
+	plan.inlineSegment = inlineSegment
+	if len(inlineSegment) == 0 {
+		plan.skipNodeWrite = shouldSkipAccountEntryPointerUpdate(existingFileID, info.storageFileID, info.storageOffset, info.storageSize)
 	}
-	plan.skipNodeWrite = shouldSkipAccountEntryPointerUpdate(existingFileID, fileID, offset, size)
 	return plan, nil
 }
 

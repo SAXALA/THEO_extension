@@ -14,6 +14,7 @@ cd "$script_dir" || exit 1
 # Examples:
 #   ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh replay all all
+#   TEST_RUN_ROUNDS=3 ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh load-account prefixdb
 #   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB ./multiple_replay.sh load-storage prefixdb
 
@@ -25,11 +26,13 @@ CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
 BACKEND_CANDIDATES=(ethstore pebble) # pebble ethstore
 TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap nocache
+REPLAY_CGROUP_CASE_CANDIDATES=(true false)
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-3}"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -99,6 +102,9 @@ Edit arrays in this file:
 	BACKEND_CANDIDATES=(...)
 	TRACE_FILE_CANDIDATES=(...)
 
+Environment flags:
+	TEST_RUN_ROUNDS=1            # each parameter combination runs this many rounds
+
 CHAINKV_CACHE_MB and PEBBLE_CACHE_MB are derived automatically as CACHE_SIZE.
 For ethstore:
 	TOTAL_CACHE_SIZE_MIB = CACHE_SIZE
@@ -126,6 +132,11 @@ fi
 
 if [ "${#TRACE_FILE_CANDIDATES[@]}" -eq 0 ]; then
 	echo "TRACE_FILE_CANDIDATES is empty"
+	exit 1
+fi
+
+if ! [[ "$TEST_RUN_ROUNDS" =~ ^[0-9]+$ ]] || [ "$TEST_RUN_ROUNDS" -le 0 ]; then
+	echo "Invalid TEST_RUN_ROUNDS: $TEST_RUN_ROUNDS"
 	exit 1
 fi
 
@@ -197,71 +208,118 @@ resolve_cache_count_candidates() {
 	esac
 }
 
+resolve_replay_cgroup_cases() {
+	if [ "$ACTION" = "replay" ]; then
+		printf '%s\n' "${REPLAY_CGROUP_CASE_CANDIDATES[@]}"
+		return 0
+	fi
+	printf '%s\n' "${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
+}
+
+count_total_runs() {
+	local total=0
+	local backend trace_file cache_size_mib cache_count replay_cgroup_enabled round_idx
+	local backend_cache_mib
+	local -a cache_count_values
+
+	for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
+		for trace_file in "${SELECTED_TRACES[@]}"; do
+			for backend in "${SELECTED_BACKENDS[@]}"; do
+				mapfile -t cache_count_values < <(resolve_cache_count_candidates "$backend")
+				for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
+					backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
+					if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
+						echo "Invalid derived backend cache for $backend: $backend_cache_mib" >&2
+						exit 1
+					fi
+					for cache_count in "${cache_count_values[@]}"; do
+						for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+							total=$((total + 1))
+						done
+					done
+				done
+			done
+		done
+	done
+
+	printf '%s\n' "$total"
+}
+
 mapfile -t SELECTED_BACKENDS < <(resolve_backends)
 mapfile -t SELECTED_TRACES < <(resolve_traces)
+mapfile -t REPLAY_CGROUP_CASES < <(resolve_replay_cgroup_cases)
 
 run_idx=0
-total_runs=0
-for backend in "${SELECTED_BACKENDS[@]}"; do
-	mapfile -t cache_count_candidates < <(resolve_cache_count_candidates "$backend")
-	total_runs=$((total_runs + ${#CACHE_SIZE_CANDIDATES[@]} * ${#cache_count_candidates[@]} * ${#SELECTED_TRACES[@]}))
-done
+total_runs="$(count_total_runs)"
 
-for trace_file in "${SELECTED_TRACES[@]}"; do
-	for backend in "${SELECTED_BACKENDS[@]}"; do
-		mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
-		for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
-			if ! [[ "$cache_size_mib" =~ ^[0-9]+$ ]] || [ "$cache_size_mib" -le 0 ]; then
-				echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
-				exit 1
-			fi
-
-			backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
-			if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
-				echo "Invalid derived backend cache for $backend: $backend_cache_mib"
-				exit 1
-			fi
-
-			for cache_count in "${CACHE_COUNT_VALUES[@]}"; do
-				if ! [[ "$cache_count" =~ ^[0-9]+$ ]]; then
-					echo "Invalid CACHE_COUNT candidate: $cache_count"
+for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
+	for trace_file in "${SELECTED_TRACES[@]}"; do
+		for backend in "${SELECTED_BACKENDS[@]}"; do
+			mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
+			for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
+				if ! [[ "$cache_size_mib" =~ ^[0-9]+$ ]] || [ "$cache_size_mib" -le 0 ]; then
+					echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
 					exit 1
 				fi
 
-				run_idx=$((run_idx + 1))
-				if [ "$backend" = "ethstore" ]; then
-					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count}"
-					TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
-					CACHE_COUNT="$cache_count" \
-					TRACE_FILE="$trace_file" \
-					DB_TYPE="$DB_TYPE" \
-					WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-					CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-					./replay.sh "$ACTION" "$backend" &
-				else
-					echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB"
-					if [ "$backend" = "chainkv" ]; then
-						CHAINKV_CACHE_MB="$backend_cache_mib" \
-						TRACE_FILE="$trace_file" \
-						DB_TYPE="$DB_TYPE" \
-						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-						CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-						./replay.sh "$ACTION" "$backend" &
-					else
-						PEBBLE_CACHE_MB="$backend_cache_mib" \
-						TRACE_FILE="$trace_file" \
-						DB_TYPE="$DB_TYPE" \
-						WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-						CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-						./replay.sh "$ACTION" "$backend" &
-					fi
+				backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
+				if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
+					echo "Invalid derived backend cache for $backend: $backend_cache_mib"
+					exit 1
 				fi
-				CURRENT_REPLAY_SH_PID=$!
-				wait "$CURRENT_REPLAY_SH_PID"
-				CURRENT_REPLAY_SH_PID=""
 
-				echo "[$run_idx/$total_runs] done"
-				echo
+				for cache_count in "${CACHE_COUNT_VALUES[@]}"; do
+					if ! [[ "$cache_count" =~ ^[0-9]+$ ]]; then
+						echo "Invalid CACHE_COUNT candidate: $cache_count"
+						exit 1
+					fi
+
+					for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+						run_idx=$((run_idx + 1))
+						if [ "$backend" = "ethstore" ]; then
+							echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+							TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
+							CACHE_COUNT="$cache_count" \
+							TRACE_FILE="$trace_file" \
+							DB_TYPE="$DB_TYPE" \
+							WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+							CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
+							REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+							RUN_ROUND="$round_idx" \
+							RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+							./replay.sh "$ACTION" "$backend" &
+						else
+							echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+							if [ "$backend" = "chainkv" ]; then
+								CHAINKV_CACHE_MB="$backend_cache_mib" \
+								TRACE_FILE="$trace_file" \
+								DB_TYPE="$DB_TYPE" \
+								WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+								CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
+								REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+								RUN_ROUND="$round_idx" \
+								RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+								./replay.sh "$ACTION" "$backend" &
+							else
+								PEBBLE_CACHE_MB="$backend_cache_mib" \
+								TRACE_FILE="$trace_file" \
+								DB_TYPE="$DB_TYPE" \
+								WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+								CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
+								REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+								RUN_ROUND="$round_idx" \
+								RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+								./replay.sh "$ACTION" "$backend" &
+							fi
+						fi
+						CURRENT_REPLAY_SH_PID=$!
+						wait "$CURRENT_REPLAY_SH_PID"
+						CURRENT_REPLAY_SH_PID=""
+
+						echo "[$run_idx/$total_runs] done"
+						echo
+					done
+				done
 			done
 		done
 	done

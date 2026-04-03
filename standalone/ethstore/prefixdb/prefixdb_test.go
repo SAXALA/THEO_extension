@@ -892,6 +892,206 @@ func TestBatchCommitPlansSegmentedStoragePointerBeforeAccountNodeWrite(t *testin
 	}
 }
 
+func TestBatchCommitBatchesCommonStorageFileWrites(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+
+	accountA := []byte{0x61, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	accountB := []byte{0x62, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountA, []byte("account-a"), nil); err != nil {
+		t.Fatalf("BatchPut accountA failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountB, []byte("account-b"), nil); err != nil {
+		t.Fatalf("BatchPut accountB failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKeyWithSuffix(0x01), []byte("value-a"), accountA); err != nil {
+		t.Fatalf("BatchPut storageA failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, makeTestStorageRawKeyWithSuffix(0x01), []byte("value-b"), accountB); err != nil {
+		t.Fatalf("BatchPut storageB failed: %v", err)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected common storage file to be written once, got %d writeOps", got)
+	}
+
+	nodeA, err := db.getNode(accountA)
+	if err != nil {
+		t.Fatalf("getNode accountA failed: %v", err)
+	}
+	nodeB, err := db.getNode(accountB)
+	if err != nil {
+		t.Fatalf("getNode accountB failed: %v", err)
+	}
+	if nodeA == nil || nodeB == nil {
+		t.Fatalf("expected both account nodes to exist, got A=%+v B=%+v", nodeA, nodeB)
+	}
+	if nodeA.storageFileID == 0 || nodeB.storageFileID == 0 || isSegmentedStorage(nodeA.storageFileID) || isSegmentedStorage(nodeB.storageFileID) {
+		t.Fatalf("expected inline storage pointers, got A=%+v B=%+v", nodeA, nodeB)
+	}
+	if nodeA.storageFileID != nodeB.storageFileID {
+		t.Fatalf("expected both nodes to point to the same common log file, got %d and %d", nodeA.storageFileID, nodeB.storageFileID)
+	}
+	if nodeA.storageSize == 0 || nodeB.storageSize == 0 || nodeA.storageOffset == nodeB.storageOffset {
+		t.Fatalf("expected distinct non-zero inline storage ranges, got A=%+v B=%+v", nodeA, nodeB)
+	}
+
+	for _, tc := range []struct {
+		accountKey []byte
+		storageKey []byte
+		want       []byte
+	}{
+		{accountKey: accountA, storageKey: makeTestStorageRawKeyWithSuffix(0x01), want: []byte("value-a")},
+		{accountKey: accountB, storageKey: makeTestStorageRawKeyWithSuffix(0x01), want: []byte("value-b")},
+	} {
+		got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, tc.storageKey, tc.accountKey)
+		if err != nil {
+			t.Fatalf("Get storage failed for %x: %v", tc.accountKey, err)
+		}
+		if !found || !bytes.Equal(got, tc.want) {
+			t.Fatalf("unexpected storage value for %x: found=%t got=%q want=%q", tc.accountKey, found, got, tc.want)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	reopened, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	reopenedNodeA, err := reopened.getNode(accountA)
+	if err != nil {
+		t.Fatalf("reopened getNode accountA failed: %v", err)
+	}
+	reopenedNodeB, err := reopened.getNode(accountB)
+	if err != nil {
+		t.Fatalf("reopened getNode accountB failed: %v", err)
+	}
+	if reopenedNodeA == nil || reopenedNodeB == nil {
+		t.Fatalf("expected reopened nodes to exist, got A=%+v B=%+v", reopenedNodeA, reopenedNodeB)
+	}
+	if reopenedNodeA.storageFileID != nodeA.storageFileID || reopenedNodeA.storageOffset != nodeA.storageOffset || reopenedNodeA.storageSize != nodeA.storageSize {
+		t.Fatalf("unexpected reopened nodeA storage info: got=%+v want=%+v", reopenedNodeA, nodeA)
+	}
+	if reopenedNodeB.storageFileID != nodeB.storageFileID || reopenedNodeB.storageOffset != nodeB.storageOffset || reopenedNodeB.storageSize != nodeB.storageSize {
+		t.Fatalf("unexpected reopened nodeB storage info: got=%+v want=%+v", reopenedNodeB, nodeB)
+	}
+}
+
+func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+
+	accountA := []byte{0x63, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	accountB := []byte{0x64, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountA, []byte("account-a"), nil); err != nil {
+		t.Fatalf("BatchPut accountA failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountB, []byte("account-b"), nil); err != nil {
+		t.Fatalf("BatchPut accountB failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("initial BatchCommit failed: %v", err)
+	}
+
+	storageKeyA := makeTestStorageRawKeyWithSuffix(0x01)
+	storageKeyB := makeTestStorageRawKeyWithSuffix(0x01)
+	if err := db.StorageBatchPut(storageKeyA, []byte("value-a"), accountA); err != nil {
+		t.Fatalf("StorageBatchPut accountA failed: %v", err)
+	}
+	if err := db.StorageBatchPut(storageKeyB, []byte("value-b"), accountB); err != nil {
+		t.Fatalf("StorageBatchPut accountB failed: %v", err)
+	}
+
+	before := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit failed: %v", err)
+	}
+	after := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	if got := after - before; got != 1 {
+		t.Fatalf("expected storage batch to append common log once, got %d writeOps", got)
+	}
+
+	nodeA, err := db.getNode(accountA)
+	if err != nil {
+		t.Fatalf("getNode accountA failed: %v", err)
+	}
+	nodeB, err := db.getNode(accountB)
+	if err != nil {
+		t.Fatalf("getNode accountB failed: %v", err)
+	}
+	if nodeA == nil || nodeB == nil {
+		t.Fatalf("expected account nodes after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
+	}
+	if nodeA.storageFileID == 0 || nodeB.storageFileID == 0 || isSegmentedStorage(nodeA.storageFileID) || isSegmentedStorage(nodeB.storageFileID) {
+		t.Fatalf("expected inline storage pointers after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
+	}
+	if nodeA.storageFileID != nodeB.storageFileID {
+		t.Fatalf("expected storage-only batch to reuse the same common log file, got %d and %d", nodeA.storageFileID, nodeB.storageFileID)
+	}
+	if nodeA.storageOffset == nodeB.storageOffset || nodeA.storageSize == 0 || nodeB.storageSize == 0 {
+		t.Fatalf("expected distinct storage ranges after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	reopened, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	reopenedNodeA, err := reopened.getNode(accountA)
+	if err != nil {
+		t.Fatalf("reopened getNode accountA failed: %v", err)
+	}
+	reopenedNodeB, err := reopened.getNode(accountB)
+	if err != nil {
+		t.Fatalf("reopened getNode accountB failed: %v", err)
+	}
+	if reopenedNodeA == nil || reopenedNodeB == nil {
+		t.Fatalf("expected reopened nodes after storage batch commit, got A=%+v B=%+v", reopenedNodeA, reopenedNodeB)
+	}
+	if reopenedNodeA.storageFileID != nodeA.storageFileID || reopenedNodeA.storageOffset != nodeA.storageOffset || reopenedNodeA.storageSize != nodeA.storageSize {
+		t.Fatalf("unexpected reopened nodeA storage info: got=%+v want=%+v", reopenedNodeA, nodeA)
+	}
+	if reopenedNodeB.storageFileID != nodeB.storageFileID || reopenedNodeB.storageOffset != nodeB.storageOffset || reopenedNodeB.storageSize != nodeB.storageSize {
+		t.Fatalf("unexpected reopened nodeB storage info: got=%+v want=%+v", reopenedNodeB, nodeB)
+	}
+
+	for _, tc := range []struct {
+		accountKey []byte
+		storageKey []byte
+		want       []byte
+	}{
+		{accountKey: accountA, storageKey: storageKeyA, want: []byte("value-a")},
+		{accountKey: accountB, storageKey: storageKeyB, want: []byte("value-b")},
+	} {
+		got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, tc.storageKey, tc.accountKey)
+		if err != nil {
+			t.Fatalf("reopened Get storage failed for %x: %v", tc.accountKey, err)
+		}
+		if !found || !bytes.Equal(got, tc.want) {
+			t.Fatalf("unexpected reopened storage value for %x: found=%t got=%q want=%q", tc.accountKey, found, got, tc.want)
+		}
+	}
+}
+
 func TestGCPrefixTreePreservesInlineStoragePointer(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)

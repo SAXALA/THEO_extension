@@ -483,6 +483,14 @@ func (c *segmentIndexCache) GetLayoutByPath(folderPath string) (segmentIndexLayo
 }
 
 func (c *segmentIndexCache) AddByPath(folderPath string, metas []segmentChunkMeta) {
+	c.addByPath(folderPath, metas, true)
+}
+
+func (c *segmentIndexCache) AddByPathNoClone(folderPath string, metas []segmentChunkMeta) {
+	c.addByPath(folderPath, metas, false)
+}
+
+func (c *segmentIndexCache) addByPath(folderPath string, metas []segmentChunkMeta, cloneMetas bool) {
 	if c == nil {
 		return
 	}
@@ -492,11 +500,11 @@ func (c *segmentIndexCache) AddByPath(folderPath string, metas []segmentChunkMet
 		c.refreshUsage()
 		return
 	}
-	entry := &segmentIndexCacheEntry{
-		folderKey: folderPath,
-		metas:     cloneSegmentChunkMetas(metas),
-		sizeBytes: sizeBytes,
+	stored := metas
+	if cloneMetas {
+		stored = cloneSegmentChunkMetas(metas)
 	}
+	entry := &segmentIndexCacheEntry{folderKey: folderPath, metas: stored, sizeBytes: sizeBytes}
 	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexCacheKey(folderPath), entry, sizeBytes)
 	c.refreshUsage()
 }
@@ -506,6 +514,14 @@ func (c *segmentIndexCache) Add(folderID uint32, metas []segmentChunkMeta) {
 }
 
 func (c *segmentIndexCache) AddLevel2ByPath(folderPath string, metaID uint32, generation uint64, metas []segmentChunkMeta) {
+	c.addLevel2ByPath(folderPath, metaID, generation, metas, true)
+}
+
+func (c *segmentIndexCache) AddLevel2ByPathNoClone(folderPath string, metaID uint32, generation uint64, metas []segmentChunkMeta) {
+	c.addLevel2ByPath(folderPath, metaID, generation, metas, false)
+}
+
+func (c *segmentIndexCache) addLevel2ByPath(folderPath string, metaID uint32, generation uint64, metas []segmentChunkMeta, cloneMetas bool) {
 	if c == nil {
 		return
 	}
@@ -515,11 +531,11 @@ func (c *segmentIndexCache) AddLevel2ByPath(folderPath string, metaID uint32, ge
 		c.refreshUsage()
 		return
 	}
-	entry := &segmentIndexCacheEntry{
-		folderKey: folderPath,
-		metas:     cloneSegmentChunkMetas(metas),
-		sizeBytes: sizeBytes,
+	stored := metas
+	if cloneMetas {
+		stored = cloneSegmentChunkMetas(metas)
 	}
+	entry := &segmentIndexCacheEntry{folderKey: folderPath, metas: stored, sizeBytes: sizeBytes}
 	c.shared.Add(sharedCacheNamespaceSegmentIndex, segmentIndexLevel2CacheKey(folderPath, metaID, generation), entry, sizeBytes)
 	c.refreshUsage()
 }

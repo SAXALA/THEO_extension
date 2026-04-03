@@ -493,14 +493,17 @@ launch_replay_process() {
 
     if setup_replay_cgroup; then
         echo "Replay cgroup IO limit enabled: path=${ACTIVE_REPLAY_CGROUP_PATH} device=${ACTIVE_REPLAY_CGROUP_MAJMIN} riops=${REPLAY_CGROUP_READ_IOPS_LIMIT} wiops=${REPLAY_CGROUP_WRITE_IOPS_LIMIT} rbps=${REPLAY_CGROUP_READ_BPS_LIMIT} wbps=${REPLAY_CGROUP_WRITE_BPS_LIMIT}"
-        (
-            if ! echo "$BASHPID" > "$ACTIVE_REPLAY_CGROUP_PATH/cgroup.procs"; then
-                echo "Failed to join replay cgroup: ${ACTIVE_REPLAY_CGROUP_PATH}" >&2
-                exit 1
-            fi
-            exec ./bin/replayWorkload "$@"
-        ) >> "$log_file" 2>&1 &
+        ./bin/replayWorkload "$@" >> "$log_file" 2>&1 &
         CURRENT_REPLAY_PID=$!
+
+        if ! sudo_run sh -c "echo '${CURRENT_REPLAY_PID}' > '${ACTIVE_REPLAY_CGROUP_PATH}/cgroup.procs'"; then
+            echo "Failed to move replay PID ${CURRENT_REPLAY_PID} into cgroup: ${ACTIVE_REPLAY_CGROUP_PATH}" >&2
+            terminate_pid_tree "$CURRENT_REPLAY_PID"
+            wait "$CURRENT_REPLAY_PID" 2>/dev/null || true
+            CURRENT_REPLAY_PID=""
+            cleanup_replay_cgroup
+            return 1
+        fi
         return 0
     fi
 
@@ -749,8 +752,12 @@ build_run_tag() {
     fi
 
     local cgroup_tag=""
-    if [ "$action" = "replay" ] && [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" = "true" ]; then
-        cgroup_tag="_cg_1"
+    if [ "$action" = "replay" ]; then
+        if [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" = "true" ]; then
+            cgroup_tag="_cg_1"
+        else
+            cgroup_tag="_cg_0"
+        fi
     fi
 
     if [ "$backend" = "chainkv" ]; then
@@ -872,7 +879,11 @@ run_and_monitor() {
     ) &
     CURRENT_MONITOR_PID=$!
 
+    local replay_rc
+    set +e
     wait "$CURRENT_REPLAY_PID"
+    replay_rc=$?
+    set -e
     CURRENT_REPLAY_PID=""
 
     # Let monitor.sh observe process exit and flush SSD stats to *.stat.
@@ -883,6 +894,8 @@ run_and_monitor() {
 
     cleanup_replay_cgroup
     cleanup_running_processes
+
+    return "$replay_rc"
 }
 
 run_load() {
