@@ -46,6 +46,26 @@ fi
 echo "开始监控进程: $PROCESS_DESC"
 echo "采样间隔: ${INTERVAL}s | 日志保存至: $LOGFILE"
 
+resolve_root_block_device() {
+    local dev_name="$1"
+    local candidate="$dev_name"
+    local next
+
+    if [ ! -e "/dev/${candidate}" ]; then
+        return 1
+    fi
+
+    while true; do
+        next=$(lsblk -ndo PKNAME "/dev/${candidate}" 2>/dev/null | head -n1)
+        if [ -z "$next" ]; then
+            break
+        fi
+        candidate="$next"
+    done
+
+    echo "$candidate"
+}
+
 resolve_block_device() {
     local target="$1"
     local dev
@@ -68,6 +88,38 @@ resolve_block_device() {
     fi
 
     return 1
+}
+
+read_device_model() {
+    local dev_name="$1"
+    local root_dev
+    local model_file
+
+    root_dev=$(resolve_root_block_device "$dev_name" 2>/dev/null || true)
+    if [ -z "$root_dev" ]; then
+        root_dev="$dev_name"
+    fi
+
+    model_file="/sys/class/block/${root_dev}/device/model"
+    if [ ! -r "$model_file" ]; then
+        return 1
+    fi
+
+    tr -d '[:space:]' < "$model_file"
+}
+
+is_huawei_ssd_model() {
+    local model_upper
+
+    model_upper=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    [[ "$model_upper" == *HUAWEI* ]]
+}
+
+is_intel_p4510_model() {
+    local model_upper
+
+    model_upper=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    [[ "$model_upper" == *INTEL* && ( "$model_upper" == *P4510* || "$model_upper" == *SSDPE2KX* ) ]]
 }
 
 read_disk_bytes() {
@@ -100,22 +152,36 @@ read_fs_io_counters() {
 
 resolve_hioadm_device_name() {
     local dev_name="$1"
-    local candidate="$dev_name"
-    local next
+    local candidate
 
-    if [ ! -e "/dev/${candidate}" ]; then
+    candidate=$(resolve_root_block_device "$dev_name" 2>/dev/null || true)
+    if [ -z "$candidate" ]; then
         return 1
     fi
 
-    while true; do
-        next=$(lsblk -ndo PKNAME "/dev/${candidate}" 2>/dev/null | head -n1)
-        if [ -z "$next" ]; then
-            break
-        fi
-        candidate="$next"
-    done
-
     if [[ "$candidate" =~ ^nvme[0-9]+$ ]] || [[ "$candidate" =~ ^nvme[0-9]+n[0-9]+$ ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_nvme_controller_name() {
+    local dev_name="$1"
+    local candidate
+
+    candidate=$(resolve_root_block_device "$dev_name" 2>/dev/null || true)
+    if [ -z "$candidate" ]; then
+        return 1
+    fi
+
+    if [[ "$candidate" =~ ^(nvme[0-9]+)n[0-9]+$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$candidate" =~ ^nvme[0-9]+$ ]]; then
         echo "$candidate"
         return 0
     fi
@@ -183,7 +249,148 @@ read_hioadm_nand_rw_counters() {
         return 1
     fi
 
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$total_read" "$io_read" "$gc_read" "$total_write" "$io_write" "$gc_write" "hioadm-extend-smart-counts"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$total_read" "$io_read" "$gc_read" "$total_write" "$io_write" "$gc_write" "hioadm"
+}
+
+run_nvme_intel_smart_log_add() {
+    local dev_name="$1"
+    local output
+
+    if ! command -v nvme >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        output=$(nvme intel smart-log-add "/dev/${dev_name}" 2>/dev/null || true)
+    else
+        output=$(sudo_run nvme intel smart-log-add "/dev/${dev_name}" 2>/dev/null || true)
+    fi
+
+    if [ -z "$output" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$output"
+}
+
+run_nvme_intel_smart_log_add_json() {
+    local dev_name="$1"
+    local output
+
+    if ! command -v nvme >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        output=$(nvme intel smart-log-add -j "/dev/${dev_name}" 2>/dev/null || true)
+    else
+        output=$(sudo_run nvme intel smart-log-add -j "/dev/${dev_name}" 2>/dev/null || true)
+    fi
+
+    if [ -z "$output" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$output"
+}
+
+extract_nvme_intel_json_raw_counter() {
+    local text="$1"
+    local key="$2"
+
+    printf '%s\n' "$text" | awk -v wanted="$key" '
+        BEGIN {
+            in_target = 0
+        }
+        $0 ~ "\"" wanted "\"[[:space:]]*:[[:space:]]*\\{" {
+            in_target = 1
+            next
+        }
+        in_target && $0 ~ /"raw"[[:space:]]*:/ {
+            line = $0
+            gsub(/,/, "", line)
+            if (match(line, /"raw"[[:space:]]*:[[:space:]]*"?([0-9]+(\.[0-9]+)?)"?/, m)) {
+                print m[1]
+                exit
+            }
+        }
+        in_target && $0 ~ /}/ {
+            in_target = 0
+        }
+    '
+}
+
+extract_nvme_intel_counter() {
+    local text="$1"
+    local key="$2"
+
+    printf '%s\n' "$text" | awk -v wanted="$key" '
+        {
+            line=tolower($0)
+            gsub(/,/, "", line)
+        }
+        line ~ "^[[:space:]]*" wanted "[[:space:]]*:" {
+            if (match(line, /(sectors|sector|units|unit|bytes|byte|count|raw):[[:space:]]*([0-9]+)/, m)) {
+                print m[2]
+                exit
+            }
+
+            count=split(line, parts, /[^0-9]+/)
+            for (i=count; i>=1; i--) {
+                if (parts[i] != "") {
+                    print parts[i]
+                    exit
+                }
+            }
+        }
+    '
+}
+
+read_intel_p4510_nand_rw_counters() {
+    local dev_name="$1"
+    local ext_out json_out total_read_raw total_write_raw total_read total_write
+
+    json_out=$(run_nvme_intel_smart_log_add_json "$dev_name" || true)
+    if [ -n "$json_out" ]; then
+        total_read_raw=$(extract_nvme_intel_json_raw_counter "$json_out" "media_bytes_read")
+        total_write_raw=$(extract_nvme_intel_json_raw_counter "$json_out" "nand_bytes_written")
+    fi
+
+    if [ -z "$total_read_raw" ] || [ -z "$total_write_raw" ]; then
+        ext_out=$(run_nvme_intel_smart_log_add "$dev_name" || true)
+        if [ -z "$total_read_raw" ]; then
+            total_read_raw=$(extract_nvme_intel_counter "$ext_out" "media_bytes_read")
+        fi
+        if [ -z "$total_write_raw" ]; then
+            total_write_raw=$(extract_nvme_intel_counter "$ext_out" "nand_bytes_written")
+        fi
+    fi
+
+    total_read=$(normalize_counter_value "$total_read_raw" 2>/dev/null || true)
+    total_write=$(normalize_counter_value "$total_write_raw" 2>/dev/null || true)
+
+    if [ -z "$total_read" ] && [ -z "$total_write" ]; then
+        return 1
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$total_read" "" "" "$total_write" "" "" "nvme-cli"
+}
+
+read_nand_rw_counters() {
+    local method="$1"
+    local dev_name="$2"
+
+    case "$method" in
+        huawei-hioadm)
+            read_hioadm_nand_rw_counters "$dev_name"
+            ;;
+        intel-p4510-nvme)
+            read_intel_p4510_nand_rw_counters "$dev_name"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 BLOCK_DEVICE=$(resolve_block_device "$SSD_TARGET")
@@ -192,7 +399,19 @@ if [ -z "$BLOCK_DEVICE" ]; then
     exit 1
 fi
 
-echo "SSD 统计目标: $SSD_TARGET (device: $BLOCK_DEVICE) | 统计日志: $STATFILE"
+SSD_MODEL=$(read_device_model "$BLOCK_DEVICE" 2>/dev/null || true)
+NAND_READ_METHOD=""
+NAND_DEVICE_NAME=""
+
+if [ -n "$SSD_MODEL" ] && is_huawei_ssd_model "$SSD_MODEL"; then
+    NAND_READ_METHOD="huawei-hioadm"
+    NAND_DEVICE_NAME=$(resolve_hioadm_device_name "$BLOCK_DEVICE" || true)
+elif [ -n "$SSD_MODEL" ] && is_intel_p4510_model "$SSD_MODEL"; then
+    NAND_READ_METHOD="intel-p4510-nvme"
+    NAND_DEVICE_NAME=$(resolve_nvme_controller_name "$BLOCK_DEVICE" || true)
+fi
+
+echo "SSD 统计目标: $SSD_TARGET (device: $BLOCK_DEVICE, model: ${SSD_MODEL:-unknown}) | 统计日志: $STATFILE"
 
 # 写入 CSV 表头以便后续分析
 if [ ! -f "$LOGFILE" ]; then
@@ -214,7 +433,6 @@ SSD_START_WRITE=${START_DISK_BYTES[1]}
 START_FS_IO=($(read_fs_io_counters "$MAIN_PID" 2>/dev/null || echo "0 0"))
 FS_START_READ_OPS=${START_FS_IO[0]}
 FS_START_WRITE_OPS=${START_FS_IO[1]}
-HIOADM_DEVICE=$(resolve_hioadm_device_name "$BLOCK_DEVICE" || true)
 NAND_COUNTER_SOURCE="unavailable"
 NAND_TOTAL_START_READ=""
 NAND_IO_START_READ=""
@@ -222,19 +440,23 @@ NAND_GC_START_READ=""
 NAND_TOTAL_START_WRITE=""
 NAND_IO_START_WRITE=""
 NAND_GC_START_WRITE=""
-HIOADM_START_OK=0
+NAND_START_OK=0
 
 NAND_COUNTER_START_INFO=""
-if [ -n "$HIOADM_DEVICE" ]; then
-    NAND_COUNTER_START_INFO=$(read_hioadm_nand_rw_counters "$HIOADM_DEVICE" || true)
+if [ -n "$NAND_READ_METHOD" ] && [ -n "$NAND_DEVICE_NAME" ]; then
+    NAND_COUNTER_START_INFO=$(read_nand_rw_counters "$NAND_READ_METHOD" "$NAND_DEVICE_NAME" || true)
 fi
 if [ -n "$NAND_COUNTER_START_INFO" ]; then
     IFS='|' read -r NAND_TOTAL_START_READ NAND_IO_START_READ NAND_GC_START_READ NAND_TOTAL_START_WRITE NAND_IO_START_WRITE NAND_GC_START_WRITE NAND_COUNTER_SOURCE <<< "$NAND_COUNTER_START_INFO"
-    HIOADM_START_OK=1
+    NAND_START_OK=1
 fi
 
-if [ "$HIOADM_START_OK" -eq 0 ]; then
-    echo "警告: 无法通过 hioadm 读取 /dev/${HIOADM_DEVICE:-$BLOCK_DEVICE} 的 NAND 读写统计；请检查 SUDO_PASSWD 是否可用、是否已执行 sudo -v，或确认设备是否暴露相应厂商字段。" >&2
+if [ "$NAND_START_OK" -eq 0 ]; then
+    if [ -z "$NAND_READ_METHOD" ]; then
+        echo "警告: 设备 ${SSD_MODEL:-unknown} 未匹配到支持的 NAND 统计采集方式；当前仅支持华为 SSD (hioadm) 和 Intel P4510 (nvme intel smart-log-add)。" >&2
+    else
+        echo "警告: 无法通过 ${NAND_READ_METHOD} 读取 /dev/${NAND_DEVICE_NAME:-$BLOCK_DEVICE} 的 NAND 读写统计；请检查 sudo 权限、工具是否已安装，或确认设备是否暴露相应厂商字段。" >&2
+    fi
 fi
 
 # --- 2. 循环监控 ---
@@ -334,8 +556,8 @@ NAND_IO_READ_DIFF=""
 NAND_GC_END_READ=""
 NAND_GC_READ_DIFF=""
 NAND_COUNTER_END_INFO=""
-if [ -n "$HIOADM_DEVICE" ]; then
-    NAND_COUNTER_END_INFO=$(read_hioadm_nand_rw_counters "$HIOADM_DEVICE" || true)
+if [ -n "$NAND_READ_METHOD" ] && [ -n "$NAND_DEVICE_NAME" ]; then
+    NAND_COUNTER_END_INFO=$(read_nand_rw_counters "$NAND_READ_METHOD" "$NAND_DEVICE_NAME" || true)
 fi
 if [ -n "$NAND_COUNTER_END_INFO" ]; then
     IFS='|' read -r NAND_TOTAL_END_READ NAND_IO_END_READ NAND_GC_END_READ NAND_TOTAL_END_WRITE NAND_IO_END_WRITE NAND_GC_END_WRITE _ <<< "$NAND_COUNTER_END_INFO"

@@ -24,15 +24,16 @@ BACKEND_SELECTOR="${2:-}"
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
-BACKEND_CANDIDATES=(ethstore pebble) # pebble ethstore
+COMMIT_BLOCK_INTERVAL_CANDIDATES=(10 100 1000)
+BACKEND_CANDIDATES=(pebble ethstore) # pebble ethstore
 TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap nocache
-REPLAY_CGROUP_CASE_CANDIDATES=(true false)
+REPLAY_CGROUP_CASE_CANDIDATES=(false)
 CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-3}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-1}"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -99,6 +100,7 @@ trace-file: cache | nocache | nocache_snap | all         (default: all for repla
 Edit arrays in this file:
 	CACHE_SIZE_CANDIDATES=(...)  # values must be multiples of 16
   CACHE_COUNT_CANDIDATES=(...)
+	COMMIT_BLOCK_INTERVAL_CANDIDATES=(...)
 	BACKEND_CANDIDATES=(...)
 	TRACE_FILE_CANDIDATES=(...)
 
@@ -122,6 +124,11 @@ if [ "${#CACHE_SIZE_CANDIDATES[@]}" -eq 0 ]; then
 fi
 if [ "${#CACHE_COUNT_CANDIDATES[@]}" -eq 0 ]; then
 	echo "CACHE_COUNT_CANDIDATES is empty"
+	exit 1
+fi
+
+if [ "${#COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}" -eq 0 ]; then
+	echo "COMMIT_BLOCK_INTERVAL_CANDIDATES is empty"
 	exit 1
 fi
 
@@ -218,7 +225,7 @@ resolve_replay_cgroup_cases() {
 
 count_total_runs() {
 	local total=0
-	local backend trace_file cache_size_mib cache_count replay_cgroup_enabled round_idx
+	local backend trace_file cache_size_mib cache_count commit_block_interval replay_cgroup_enabled round_idx
 	local backend_cache_mib
 	local -a cache_count_values
 
@@ -233,8 +240,10 @@ count_total_runs() {
 						exit 1
 					fi
 					for cache_count in "${cache_count_values[@]}"; do
-						for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
-							total=$((total + 1))
+						for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
+							for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+								total=$((total + 1))
+							done
 						done
 					done
 				done
@@ -274,24 +283,19 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 						exit 1
 					fi
 
-					for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
-						run_idx=$((run_idx + 1))
-						if [ "$backend" = "ethstore" ]; then
-							echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
-							TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
-							CACHE_COUNT="$cache_count" \
-							TRACE_FILE="$trace_file" \
-							DB_TYPE="$DB_TYPE" \
-							WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-							CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-							REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
-							RUN_ROUND="$round_idx" \
-							RUN_ROUNDS="$TEST_RUN_ROUNDS" \
-							./replay.sh "$ACTION" "$backend" &
-						else
-							echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
-							if [ "$backend" = "chainkv" ]; then
-								CHAINKV_CACHE_MB="$backend_cache_mib" \
+					for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
+						if ! [[ "$commit_block_interval" =~ ^[0-9]+$ ]] || [ "$commit_block_interval" -le 0 ]; then
+							echo "Invalid COMMIT_BLOCK_INTERVAL candidate: $commit_block_interval"
+							exit 1
+						fi
+
+						for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+							run_idx=$((run_idx + 1))
+							if [ "$backend" = "ethstore" ]; then
+								echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+								TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
+								CACHE_COUNT="$cache_count" \
+								COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
 								TRACE_FILE="$trace_file" \
 								DB_TYPE="$DB_TYPE" \
 								WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
@@ -301,23 +305,38 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 								RUN_ROUNDS="$TEST_RUN_ROUNDS" \
 								./replay.sh "$ACTION" "$backend" &
 							else
-								PEBBLE_CACHE_MB="$backend_cache_mib" \
-								TRACE_FILE="$trace_file" \
-								DB_TYPE="$DB_TYPE" \
-								WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-								CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-								REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
-								RUN_ROUND="$round_idx" \
-								RUN_ROUNDS="$TEST_RUN_ROUNDS" \
-								./replay.sh "$ACTION" "$backend" &
+								echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+								if [ "$backend" = "chainkv" ]; then
+									CHAINKV_CACHE_MB="$backend_cache_mib" \
+									COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
+									TRACE_FILE="$trace_file" \
+									DB_TYPE="$DB_TYPE" \
+									WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+									CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
+									REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+									RUN_ROUND="$round_idx" \
+									RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+									./replay.sh "$ACTION" "$backend" &
+								else
+									PEBBLE_CACHE_MB="$backend_cache_mib" \
+									COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
+									TRACE_FILE="$trace_file" \
+									DB_TYPE="$DB_TYPE" \
+									WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+									CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
+									REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+									RUN_ROUND="$round_idx" \
+									RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+									./replay.sh "$ACTION" "$backend" &
+								fi
 							fi
-						fi
-						CURRENT_REPLAY_SH_PID=$!
-						wait "$CURRENT_REPLAY_SH_PID"
-						CURRENT_REPLAY_SH_PID=""
+							CURRENT_REPLAY_SH_PID=$!
+							wait "$CURRENT_REPLAY_SH_PID"
+							CURRENT_REPLAY_SH_PID=""
 
-						echo "[$run_idx/$total_runs] done"
-						echo
+							echo "[$run_idx/$total_runs] done"
+							echo
+						done
 					done
 				done
 			done

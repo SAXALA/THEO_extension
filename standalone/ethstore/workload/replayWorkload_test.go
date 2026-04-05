@@ -186,7 +186,7 @@ func TestNormalizeLegacyBoolFlagArgs(t *testing.T) {
 	}
 
 	normalized := normalizeLegacyBoolFlagArgs(args, map[string]struct{}{
-		"-ckv-state":                     {},
+		"-ckv-state":                    {},
 		"-node-file-sorted-compression": {},
 		"-segment-index-compression":    {},
 	})
@@ -460,7 +460,7 @@ func TestReplayTrace_StartBlockSkipsEarlierBlocks(t *testing.T) {
 		"Processing block (end), ID: 101",
 	)
 
-	replayTrace(backend, traceFile, 0, allDBTypes, 101, 0)
+	replayTrace(backend, traceFile, 0, allDBTypes, 101, 0, 1)
 
 	if len(backend.puts) != 1 {
 		t.Fatalf("expected 1 put after start block filter, got %d", len(backend.puts))
@@ -484,7 +484,7 @@ func TestReplayTrace_EndBlockStopsAfterCommit(t *testing.T) {
 		"Processing block (end), ID: 201",
 	)
 
-	replayTrace(backend, traceFile, 0, allDBTypes, 0, 200)
+	replayTrace(backend, traceFile, 0, allDBTypes, 0, 200, 1)
 
 	if len(backend.puts) != 1 {
 		t.Fatalf("expected replay to stop after end block, got %d puts", len(backend.puts))
@@ -511,7 +511,7 @@ func TestReplayTrace_StartAndEndOnSameBlock(t *testing.T) {
 		"Processing block (end), ID: 301",
 	)
 
-	replayTrace(backend, traceFile, 0, allDBTypes, 300, 300)
+	replayTrace(backend, traceFile, 0, allDBTypes, 300, 300, 1)
 
 	if len(backend.puts) != 1 {
 		t.Fatalf("expected exactly one block to replay, got %d puts", len(backend.puts))
@@ -521,5 +521,29 @@ func TestReplayTrace_StartAndEndOnSameBlock(t *testing.T) {
 	}
 	if backend.commits != 1 {
 		t.Fatalf("expected exactly one commit for start=end block, got %d", backend.commits)
+	}
+}
+
+func TestReplayTrace_CommitBlockInterval(t *testing.T) {
+	backend := &fakeReplayBackend{}
+	traceFile := writeTraceFile(t,
+		"Processing block (start), ID: 400",
+		"OPType: Put, key: 0a, size: 1, value: aa, size: 1",
+		"Processing block (end), ID: 400",
+		"Processing block (start), ID: 401",
+		"OPType: Put, key: 0b, size: 1, value: bb, size: 1",
+		"Processing block (end), ID: 401",
+		"Processing block (start), ID: 402",
+		"OPType: Put, key: 0c, size: 1, value: cc, size: 1",
+		"Processing block (end), ID: 402",
+	)
+
+	replayTrace(backend, traceFile, 0, allDBTypes, 0, 0, 2)
+
+	if backend.commits != 2 {
+		t.Fatalf("expected 2 commits for interval=2 across 3 blocks, got %d", backend.commits)
+	}
+	if len(backend.puts) != 3 {
+		t.Fatalf("expected 3 puts to replay, got %d", len(backend.puts))
 	}
 }

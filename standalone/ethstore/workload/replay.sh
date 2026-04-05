@@ -27,6 +27,8 @@ WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
 END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
+# 每累计处理多少个 block 才 commit 一次；默认每 1 个 block commit 一次
+COMMIT_BLOCK_INTERVAL="${COMMIT_BLOCK_INTERVAL:-1}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
 # 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
@@ -125,12 +127,13 @@ IDLE_OBSERVE_STABLE_WINDOWS="${IDLE_OBSERVE_STABLE_WINDOWS:-3}"
 IDLE_OBSERVE_MAX_DIRTY_KB="${IDLE_OBSERVE_MAX_DIRTY_KB:-1024}"
 
 # replay 进程可选 cgroup v2 IO 限速；默认关闭。
+# https://www.samsung.com.cn/memory-storage/nvme-ssd/870-evo-4tb-sata-3-2-5-ssd-mz-77e4t0bw/
 REPLAY_CGROUP_IO_LIMIT_ENABLED="${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
 REPLAY_CGROUP_NAME_PREFIX="${REPLAY_CGROUP_NAME_PREFIX:-theo-replay}"
-REPLAY_CGROUP_READ_IOPS_LIMIT="${REPLAY_CGROUP_READ_IOPS_LIMIT:-850000}"
-REPLAY_CGROUP_WRITE_IOPS_LIMIT="${REPLAY_CGROUP_WRITE_IOPS_LIMIT:-110000}"
-REPLAY_CGROUP_READ_MBPS_LIMIT="${REPLAY_CGROUP_READ_MBPS_LIMIT:-3700}"
-REPLAY_CGROUP_WRITE_MBPS_LIMIT="${REPLAY_CGROUP_WRITE_MBPS_LIMIT:-2400}"
+REPLAY_CGROUP_READ_IOPS_LIMIT="${REPLAY_CGROUP_READ_IOPS_LIMIT:-98000}" # NVME 850K, SATA 98K
+REPLAY_CGROUP_WRITE_IOPS_LIMIT="${REPLAY_CGROUP_WRITE_IOPS_LIMIT:-88000}" # NVME 110K, SATA 88K
+REPLAY_CGROUP_READ_MBPS_LIMIT="${REPLAY_CGROUP_READ_MBPS_LIMIT:-560}" # NVME 3700MB/s, SATA 560MB/s
+REPLAY_CGROUP_WRITE_MBPS_LIMIT="${REPLAY_CGROUP_WRITE_MBPS_LIMIT:-530}" # NVME 2400MB/s, SATA 530MB/s
 REPLAY_CGROUP_READ_BPS_LIMIT="${REPLAY_CGROUP_READ_BPS_LIMIT:-$((REPLAY_CGROUP_READ_MBPS_LIMIT * 1000 * 1000))}"
 REPLAY_CGROUP_WRITE_BPS_LIMIT="${REPLAY_CGROUP_WRITE_BPS_LIMIT:-$((REPLAY_CGROUP_WRITE_MBPS_LIMIT * 1000 * 1000))}"
 
@@ -744,7 +747,7 @@ build_run_tag() {
     running_root_tag=$(sanitize_tag_value "$RUNNING_ROOT")
 
     local base_tag
-    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_block_${START_BLOCK_ID}-${END_BLOCK_ID}"
+    base_tag="act_${action}_be_${backend}_max_${WORKLOAD_MAX_OPS}_trace_${trace_tag}_db_${dbtype_tag}_block_${START_BLOCK_ID}-${END_BLOCK_ID}_cbi_${COMMIT_BLOCK_INTERVAL}"
 
     local round_tag=""
     if [[ "$RUN_ROUND" =~ ^[0-9]+$ ]] && [ "$RUN_ROUND" -gt 0 ]; then
@@ -785,6 +788,7 @@ print_param_snapshot() {
     printf 'WORKLOAD_MAX_OPS=%s\n' "$WORKLOAD_MAX_OPS"
     printf 'START_BLOCK_ID=%s\n' "$START_BLOCK_ID"
     printf 'END_BLOCK_ID=%s\n' "$END_BLOCK_ID"
+    printf 'COMMIT_BLOCK_INTERVAL=%s\n' "$COMMIT_BLOCK_INTERVAL"
     printf 'TRACE_FILE=%s\n' "$TRACE_FILE"
     printf 'DB_TYPE=%s\n' "$DB_TYPE"
     printf 'RUN_ROUND=%s\n' "$RUN_ROUND"
@@ -1013,18 +1017,18 @@ run_replay() {
             ensure_ethstore_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
                 -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
-                -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" \
+                -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES"
+                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES"
+                -mode re -backend pebble -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES"
             ;;
     esac
 }

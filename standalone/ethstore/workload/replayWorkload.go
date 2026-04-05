@@ -1072,8 +1072,11 @@ func (b *chainKVReplayBackend) PrintCommitStats() {
 
 // replayTrace replays a workload trace file against the given backend.
 // dbType controls which key types are replayed across all backends.
-func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType, startBlockID int64, endBlockID int64) {
+func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType DBType, startBlockID int64, endBlockID int64, commitBlockInterval int64) {
 	fmt.Printf("[%s] Replaying trace from %s\n", backend.Name(), traceFile)
+	if commitBlockInterval <= 0 {
+		log.Fatalf("replayTrace: invalid commit block interval %d", commitBlockInterval)
+	}
 	file, err := os.Open(traceFile)
 	if err != nil {
 		log.Fatalf("replayTrace: failed to open trace file: %v", err)
@@ -1090,6 +1093,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		stopAtNextBlockEnd bool
 		committedAtExit    bool
 		replayStarted      bool
+		pendingBlocks      int64
 		lastIterDataType   ethstore.DataType = ethstore.DataType(-1)
 	)
 	if startBlockID <= 0 {
@@ -1155,19 +1159,23 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 						backend.Name(), markerID, lineCounter)
 				}
 				if markerType == "end" && replayStarted {
-					if commitErr := backend.CommitBlock(); commitErr != nil {
-						fmt.Printf("[%s] block commit failed at line %d: %v\n",
-							backend.Name(), lineCounter, commitErr)
-						break
+					pendingBlocks++
+					if pendingBlocks >= commitBlockInterval {
+						if commitErr := backend.CommitBlock(); commitErr != nil {
+							fmt.Printf("[%s] block commit failed at line %d: %v\n",
+								backend.Name(), lineCounter, commitErr)
+							break
+						}
+						pendingBlocks = 0
 					}
 					if endBlockID > 0 && markerID == endBlockID {
-						committedAtExit = true
+						committedAtExit = pendingBlocks == 0
 						fmt.Printf("[%s] Replay window ended at block ID %d (line %d).\n",
 							backend.Name(), markerID, lineCounter)
 						break
 					}
 					if stopAtNextBlockEnd {
-						committedAtExit = true
+						committedAtExit = pendingBlocks == 0
 						fmt.Printf("[%s] Reached max ops %d; stopping at block boundary (line %d).\n",
 							backend.Name(), maxOps, lineCounter)
 						break
@@ -1339,7 +1347,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 	}
 
-	if !committedAtExit {
+	if !committedAtExit || pendingBlocks > 0 {
 		if commitErr := backend.CommitBlock(); commitErr != nil {
 			fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
 		}
@@ -1362,6 +1370,7 @@ func printRuntimeArgsSnapshot(
 	maxOps int64,
 	startBlockID int64,
 	endBlockID int64,
+	commitBlockInterval int64,
 	dbTypeStr string,
 	traceFileSelector string,
 	resolvedTraceFile string,
@@ -1392,6 +1401,7 @@ func printRuntimeArgsSnapshot(
 	fmt.Printf("max_ops=%d\n", maxOps)
 	fmt.Printf("start_block_id=%d\n", startBlockID)
 	fmt.Printf("end_block_id=%d\n", endBlockID)
+	fmt.Printf("commit_block_interval=%d\n", commitBlockInterval)
 	fmt.Printf("db_type=%s\n", dbTypeStr)
 	fmt.Printf("trace_file_selector=%s\n", traceFileSelector)
 	fmt.Printf("trace_file_resolved=%s\n", resolvedTraceFile)
@@ -1460,7 +1470,7 @@ func normalizeLegacyBoolFlagArgs(args []string, boolFlags map[string]struct{}) [
 
 func main() {
 	os.Args = normalizeLegacyBoolFlagArgs(os.Args, map[string]struct{}{
-		"-ckv-state":                     {},
+		"-ckv-state":                    {},
 		"-node-file-sorted-compression": {},
 		"-segment-index-compression":    {},
 	})
@@ -1471,6 +1481,7 @@ func main() {
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
 	endBlockID := flag.Int64("end-block-id", 0, "Replay end block ID (0 means no early stop by block ID)")
+	commitBlockInterval := flag.Int64("commit-block-interval", 1, "Commit staged writes every N completed blocks during replay")
 	contractChunkFileSizeBytes := flag.Int("contract-chunk-file-size-bytes", 0, "Chunk file size for ld mode in bytes (0 means use default)")
 	totalCacheSizeMiB := flag.Int("total-cache-size-mib", 0, "Total shared PrefixDB cache size for ld/re/gc in MiB (0 means use default)")
 	prefixdbHandles := flag.Int("prefixdb-handles", 0, "PrefixDB number of cached file handles (0 means use default)")
@@ -1504,6 +1515,9 @@ func main() {
 	}
 	if *startBlockID > 0 && *endBlockID > 0 && *endBlockID < *startBlockID {
 		log.Fatalf("invalid block window: -end-block-id (%d) must be >= -start-block-id (%d)", *endBlockID, *startBlockID)
+	}
+	if *commitBlockInterval <= 0 {
+		log.Fatalf("invalid -commit-block-interval %d (must be >= 1)", *commitBlockInterval)
 	}
 
 	cfg, err := loadReplayConfig(*configPath)
@@ -1548,6 +1562,7 @@ func main() {
 		*maxOps,
 		*startBlockID,
 		*endBlockID,
+		*commitBlockInterval,
 		*DBTypeStr,
 		*replayTraceFile,
 		traceFile,
@@ -1587,7 +1602,7 @@ func main() {
 	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 	// }
 	// defer ethBackend.Close()
-	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 	// return
 
 	switch *mode {
@@ -1602,21 +1617,21 @@ func main() {
 				log.Fatalf("re: failed to open chainkv backend: %v", ckvErr)
 			}
 			defer ckvBackend.Close()
-			replayTrace(ckvBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+			replayTrace(ckvBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		} else if strings.EqualFold(*backend, "pebble") {
 			pbBackend, pbErr := newPebbleBaselineReplayBackend(cfg.PebbleDBDir, *pebbleCache, *pebbleHandles)
 			if pbErr != nil {
 				log.Fatalf("rb: failed to open pebble baseline backend: %v", pbErr)
 			}
 			defer pbBackend.Close()
-			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		} else {
 			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
 			if ethErr != nil {
 				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 			}
 			defer ethBackend.Close()
-			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID)
+			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		}
 	case "gc":
 		if err := runGC(*backend, *contractCachePrefetchCount, *gcStateDir, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression); err != nil {
