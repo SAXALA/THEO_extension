@@ -112,7 +112,7 @@ is_huawei_ssd_model() {
     local model_upper
 
     model_upper=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
-    [[ "$model_upper" == *HUAWEI* ]]
+    [[ "$model_upper" == *HUAWEI* || "$model_upper" == HWE* ]]
 }
 
 is_intel_p4510_model() {

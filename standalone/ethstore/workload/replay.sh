@@ -78,11 +78,36 @@ CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
 RUN_ROUND="${RUN_ROUND:-0}"
 RUN_ROUNDS="${RUN_ROUNDS:-0}"
 
+resolve_mount_point_from_path() {
+    local path="$1"
+    local candidate="$path"
+    local mount_point=""
+
+    if [ -z "$candidate" ]; then
+        return 1
+    fi
+
+    while [ ! -e "$candidate" ] && [ "$candidate" != "/" ]; do
+        candidate=$(dirname "$candidate")
+    done
+
+    mount_point=$(findmnt -n -o TARGET --target "$candidate" 2>/dev/null || true)
+    if [ -z "$mount_point" ]; then
+        mount_point=$(df --output=target "$candidate" 2>/dev/null | tail -n 1 | awk '{$1=$1; print}')
+    fi
+
+    if [ -z "$mount_point" ]; then
+        return 1
+    fi
+
+    printf "%s" "$mount_point"
+}
+
 # 已加载数据根目录（source）与回放运行目录（target）。
 # 默认把 loaded 放到另一块 SSD，给 /data 上的 running 目录腾出更多可用空间。
 LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
-RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
-DISK_MOUNT_POINT="/data"
+RUNNING_ROOT="${RUNNING_ROOT:-/mnt/gen3/running}"
+DISK_MOUNT_POINT=$(resolve_mount_point_from_path "$RUNNING_ROOT")
 
 # ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb64KB | database_statedb256KB
 calculate_default_ethstore_statedb_dirname() {
@@ -128,7 +153,7 @@ IDLE_OBSERVE_MAX_DIRTY_KB="${IDLE_OBSERVE_MAX_DIRTY_KB:-1024}"
 
 # replay 进程可选 cgroup v2 IO 限速；默认关闭。
 # https://www.samsung.com.cn/memory-storage/nvme-ssd/870-evo-4tb-sata-3-2-5-ssd-mz-77e4t0bw/
-REPLAY_CGROUP_IO_LIMIT_ENABLED="${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
+REPLAY_CGROUP_IO_LIMIT_ENABLED="${REPLAY_CGROUP_IO_LIMIT_ENABLED:-false}"
 REPLAY_CGROUP_NAME_PREFIX="${REPLAY_CGROUP_NAME_PREFIX:-theo-replay}"
 REPLAY_CGROUP_READ_IOPS_LIMIT="${REPLAY_CGROUP_READ_IOPS_LIMIT:-98000}" # NVME 850K, SATA 98K
 REPLAY_CGROUP_WRITE_IOPS_LIMIT="${REPLAY_CGROUP_WRITE_IOPS_LIMIT:-88000}" # NVME 110K, SATA 88K
@@ -298,6 +323,11 @@ validate_inputs() {
 
 validate_runtime_requirements() {
     local needs_ethstore_prefixdb="false"
+
+    if [ -z "$DISK_MOUNT_POINT" ]; then
+        echo "无法根据 RUNNING_ROOT 推导挂载点: ${RUNNING_ROOT}"
+        exit 1
+    fi
 
     if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ]; then
         if [ "$BACKEND" = "ethstore" ] || [ "$BACKEND" = "all" ]; then
@@ -796,6 +826,7 @@ print_param_snapshot() {
     printf 'ETHSTORE_PREFIXDB_DIR=%s\n' "$ETHSTORE_PREFIXDB_DIR"
     printf 'LOADED_ROOT=%s\n' "$LOADED_ROOT"
     printf 'RUNNING_ROOT=%s\n' "$RUNNING_ROOT"
+    printf 'DISK_MOUNT_POINT=%s\n' "$DISK_MOUNT_POINT"
     printf 'ETHSTORE_STATEDB_DIRNAME=%s\n' "$ETHSTORE_STATEDB_DIRNAME"
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
     printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
