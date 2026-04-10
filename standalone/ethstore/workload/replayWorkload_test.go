@@ -413,6 +413,72 @@ func TestLoadPrefixDBAccountStopsAfterLeavingAccountPrefixRange(t *testing.T) {
 	}
 }
 
+func TestLoadPebbleLoadsOnlyNonAOLAndNonPrefixDBEntries(t *testing.T) {
+	tempDir := t.TempDir()
+	pebbleDir := filepath.Join(tempDir, "runtime-pebble")
+	auxDir := filepath.Join(tempDir, "account-hash-pebble")
+	dataFile := filepath.Join(tempDir, "load-pebble.txt")
+	aolKey := []byte{'h', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
+	accountKey := []byte{'A', 0x01, 0x02, 0x03}
+	nonPrefixKey := []byte{'m', 0xaa, 0xbb, 0xcc}
+	auxKey := []byte{0xde, 0xad, 0xbe, 0xef}
+	auxValue := []byte("account-hash-index")
+	content := fmt.Sprintf(
+		"Key: %x, Value : %x\nKey: %x, Value : %x\nKey: %x, Value : %x\n",
+		aolKey, []byte("aol-value"),
+		accountKey, []byte("account-value"),
+		nonPrefixKey, []byte("pebble-value"),
+	)
+	if err := os.WriteFile(dataFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	auxStore, err := pebblestore.NewPebbleStore(auxDir, 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("NewPebbleStore aux failed: %v", err)
+	}
+	if err := auxStore.Put(auxKey, auxValue); err != nil {
+		auxStore.Close()
+		t.Fatalf("auxStore.Put failed: %v", err)
+	}
+	if err := auxStore.Close(); err != nil {
+		t.Fatalf("auxStore.Close failed: %v", err)
+	}
+
+	if err := loadPebble(pebbleDir, dataFile, auxDir, 0, 0); err != nil {
+		t.Fatalf("loadPebble failed: %v", err)
+	}
+
+	store, err := pebblestore.NewPebbleStore(pebbleDir, 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("NewPebbleStore reopen failed: %v", err)
+	}
+	defer store.Close()
+
+	got, err := store.Get(nonPrefixKey)
+	if err != nil {
+		t.Fatalf("expected non-prefix entry in pebble store: %v", err)
+	}
+	if !bytes.Equal(got, []byte("pebble-value")) {
+		t.Fatalf("unexpected non-prefix value: got %q want %q", got, []byte("pebble-value"))
+	}
+
+	gotAux, err := store.Get(auxKey)
+	if err != nil {
+		t.Fatalf("expected account hash index entry in runtime pebble: %v", err)
+	}
+	if !bytes.Equal(gotAux, auxValue) {
+		t.Fatalf("unexpected account hash index value: got %q want %q", gotAux, auxValue)
+	}
+
+	if _, err := store.Get(aolKey); !errors.Is(err, pebblestore.ErrNotFound) {
+		t.Fatalf("expected AOL entry to be skipped by loadPebble, got: %v", err)
+	}
+	if _, err := store.Get(accountKey); !errors.Is(err, pebblestore.ErrNotFound) {
+		t.Fatalf("expected PrefixDB entry to be skipped by loadPebble, got: %v", err)
+	}
+}
+
 func TestGetWithPebbleBatchOverlay_BatchPutAndDeletePrecedence(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "pebble-overlay-workload-test")

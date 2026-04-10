@@ -26,7 +26,7 @@ fi
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 # 回放 block 窗口；0 代表不限制（起点从头/终点不限）
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
-END_BLOCK_ID="${END_BLOCK_ID:-20510000}"
+END_BLOCK_ID="${END_BLOCK_ID:-20550000}"
 # 每累计处理多少个 block 才 commit 一次；默认每 1 个 block commit 一次
 COMMIT_BLOCK_INTERVAL="${COMMIT_BLOCK_INTERVAL:-1}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap

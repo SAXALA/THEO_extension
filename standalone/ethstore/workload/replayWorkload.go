@@ -420,6 +420,14 @@ func formatPrefixDBStateDirName(chunkFileSize int) string {
 	return "database_statedb" + strconv.Itoa(chunkFileSize/1024) + "KB"
 }
 
+func formatEthstoreRuntimeStateDir(databaseDir string) string {
+	return strings.TrimSpace(databaseDir) + "_state"
+}
+
+func formatEthstoreRuntimePebbleDir(databaseDir string) string {
+	return strings.TrimSpace(databaseDir) + "_pebble"
+}
+
 func resolvePrefixDBStateDir(databaseDir string, explicitStateDir string, chunkFileSize int, stage prefixdbLoadStage) (string, error) {
 	if stateDir := strings.TrimSpace(explicitStateDir); stateDir != "" {
 		return stateDir, nil
@@ -590,10 +598,13 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 		if err := loadBlockStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
 		}
-		// load contract account and storage
-		if err := loadPrefixdbAndPebble(cfg.EthStoreDir, cfg.LoadDataDir, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, pebbleCache, pebbleHandles, 32, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
-			return fmt.Errorf("ethstore account load failed: %w", err)
+		if err := loadPrefixDB(cfg.EthStoreDir, formatEthstoreRuntimeStateDir(cfg.EthStoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbLoadStageAll, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+			return fmt.Errorf("ethstore prefixdb load failed: %w", err)
 		}
+		if err := loadPebble(formatEthstoreRuntimePebbleDir(cfg.EthStoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles); err != nil {
+			return fmt.Errorf("ethstore pebble load failed: %w", err)
+		}
+		return nil
 	case strings.EqualFold(backend, "prefixdb"):
 		if strings.TrimSpace(cfg.LoadedEthstoreDir) == "" {
 			return fmt.Errorf("ld with prefixdb backend requires loadedEthStoreDir in config")
@@ -608,7 +619,6 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 	default:
 		return fmt.Errorf("unknown backend: %s", backend)
 	}
-	return nil
 }
 
 func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
@@ -1716,84 +1726,6 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 	return nil
 }
 
-// load all data from the key-value file into EthStore
-func loadPrefixdbAndPebble(dataBaseDir string, loadDataDir string, contractChunkFileSizeBytes int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
-	store, err := ethstore.NewWithPrefixGCAndStoreSettings(dataBaseDir, 6000, "put_test", false, contractChunkFileSizeBytes, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
-	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
-	}
-	defer store.Close()
-
-	// Read key-value pairs from the test file
-	file, err := os.Open(loadDataDir)
-	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
-	}
-	defer file.Close()
-
-	var totalTime time.Duration
-	counter := 0
-	reader := bufio.NewReader(file)
-
-	for {
-
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
-		}
-
-		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
-
-		parts := strings.Split(line, ", Value :")
-		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
-			continue
-		}
-		keyPart := strings.TrimPrefix(parts[0], "Key: ")
-		valuePart := strings.TrimSpace(parts[1])
-
-		// Convert key and value to byte slices
-		keyBytes := []byte(keyPart)
-
-		valueBytes := []byte(valuePart)
-
-		if !ethstore.PrefixDBHandledDataTypes[ethstore.GetDataTypeFromKey(keyBytes)] {
-			continue
-		}
-
-		keyBytes, err = hex.DecodeString(string(keyBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
-		}
-
-		valueBytes, err = hex.DecodeString(string(valueBytes))
-		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
-		}
-
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
-		if ethstore.AolHandledDataTypes[dataType] {
-			continue
-		}
-
-		start := time.Now()
-		err = store.PutWithDataType(keyBytes, valueBytes, dataType)
-		end := time.Now()
-
-		totalTime += end.Sub(start)
-		counter++
-		if counter%100000 == 0 {
-			logPutProgressSeconds(counter, totalTime)
-		}
-	}
-	if err := store.RunPostLoadGC(); err != nil {
-		log.Fatalf("Failed to run post-load GC: %v", err)
-	}
-	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
-	return nil
-}
-
 func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, pebbleDir string, stage prefixdbLoadStage, chunkFileSize int, cacheSize int, prefixdbHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
 	dir, err := resolvePrefixDBStateDir(databaseDir, explicitStateDir, chunkFileSize, stage)
 	if err != nil {
@@ -2060,69 +1992,42 @@ func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, tota
 	return nil
 }
 
-func insertAccountHashindexTopebble(sourcePebblePath string, targetPebbleDir string) error {
-	// insert all kvs in hashKeyPebble into memCache
-	fmt.Println("Building memcache from pebble store...")
-	pebblePath := strings.TrimSpace(sourcePebblePath)
-	if pebblePath == "" {
-		return fmt.Errorf("account hash index source dir is required")
-	}
-
-	accountHashKeyPebble, err := pebblestore.NewPebbleStore(pebblePath, 0, 0, "", false)
+func copyPebbleStoreEntries(source *pebblestore.PebbleStore, target *pebblestore.PebbleStore) (int, error) {
+	iter, err := source.GetIterator()
 	if err != nil {
-		return fmt.Errorf("failed to open pebble store: %v", err)
-	}
-	defer accountHashKeyPebble.Close()
-
-	dir := strings.TrimSpace(targetPebbleDir)
-	if dir == "" {
-		return fmt.Errorf("account hash index target dir is required")
-	}
-	db, err := pebblestore.NewPebbleStore(dir, 0, 0, "", false)
-	if err != nil {
-		return fmt.Errorf("failed to create pebble store: %v", err)
-	}
-	defer db.Close()
-
-	iter, err := accountHashKeyPebble.GetIterator()
-	if err != nil {
-		return fmt.Errorf("failed to get iterator from pebble store: %v", err)
+		return 0, fmt.Errorf("failed to get iterator from source pebble store: %w", err)
 	}
 	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		value := iter.Value()
-		_, err := db.Get(key)
-		if err != nil {
-			return fmt.Errorf("failed to check key existence in pebble store: %v", err)
-		}
-		err = db.Put(key, value)
-		if err != nil {
-			return fmt.Errorf("failed to put item into pebble store: %v", err)
-		}
-	}
-	fmt.Println("Finished inserting account hash key values.")
 
-	return nil
+	count := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		value := append([]byte(nil), iter.Value()...)
+		if err := target.Put(key, value); err != nil {
+			return count, fmt.Errorf("failed to copy item into target pebble store: %w", err)
+		}
+		count++
+	}
+	return count, nil
 }
 
-func loadPebble(dirPath string, testFilePath string) {
+func loadPebble(dirPath string, testFilePath string, accountHashIndexDir string, pebbleCache int, pebbleHandles int) error {
 	dirPath = strings.TrimSpace(dirPath)
 	testFilePath = strings.TrimSpace(testFilePath)
 	if dirPath == "" || testFilePath == "" {
-		log.Fatalf("loadPebble requires non-empty dirPath and testFilePath")
+		return fmt.Errorf("loadPebble requires non-empty dirPath and testFilePath")
 	}
 	fmt.Println("Start load pebble...")
-	pdb, err := pebblestore.NewPebbleStore(dirPath, 0, 0, "pebble_load", false)
+	pdb, err := pebblestore.NewPebbleStore(dirPath, pebbleCache, pebbleHandles, "pebble_load", false)
 	if err != nil {
-		log.Fatalf("Failed to create EthStore instance: %v", err)
+		return fmt.Errorf("failed to create PebbleStore instance: %w", err)
 	}
 	defer pdb.Close()
 
 	// Read key-value pairs from the test file
 	file, err := os.Open(testFilePath)
 	if err != nil {
-		log.Fatalf("Failed to open test file: %v", err)
+		return fmt.Errorf("failed to open test file: %w", err)
 	}
 	defer file.Close()
 
@@ -2134,16 +2039,31 @@ func loadPebble(dirPath string, testFilePath string) {
 	for {
 
 		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break // End of file reached
+		if err != nil {
+			if err == io.EOF {
+				if len(line) == 0 {
+					break
+				}
+			} else {
+				return fmt.Errorf("failed to read load data line: %w", err)
+			}
 		}
 
 		// line format: "key: xxxxxx, value: yyyy"
-		line = line[:len(line)-1] // Remove the newline character
+		line = strings.TrimRight(line, "\r\n")
+		if len(line) == 0 {
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
 			log.Printf("无法解析行: %s", line)
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
@@ -2156,14 +2076,14 @@ func loadPebble(dirPath string, testFilePath string) {
 
 		keyBytes, err = hex.DecodeString(string(keyBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode key: %v", err)
+			return fmt.Errorf("failed to decode key: %w", err)
 		}
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
-			log.Fatalf("Failed to decode value: %v", err)
+			return fmt.Errorf("failed to decode value: %w", err)
 		}
-		DataType := ethstore.GetDataTypeFromKey(keyBytes)
-		if !ethstore.AolHandledDataTypes[DataType] && !ethstore.PrefixDBHandledDataTypes[DataType] {
+		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		if !ethstore.AolHandledDataTypes[dataType] && !ethstore.PrefixDBHandledDataTypes[dataType] {
 			// Perform the Put operation
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)
@@ -2171,15 +2091,35 @@ func loadPebble(dirPath string, testFilePath string) {
 			totalTime += endTime.Sub(startTime)
 			counter++
 			if err != nil {
-				log.Fatalf("Put operation failed for key %s: %v", keyPart, err)
+				return fmt.Errorf("put operation failed for key %s: %w", keyPart, err)
 			}
 			if counter%100000 == 0 {
 				logPutProgressSeconds(counter, totalTime)
 			}
 		}
+		if err == io.EOF {
+			break
+		}
 
 	}
 	fmt.Printf("\nTotal Put operations: %d, Total time: %f s\n", counter, totalTime.Seconds())
+
+	if sourceDir := strings.TrimSpace(accountHashIndexDir); sourceDir != "" {
+		fmt.Println("Start load accountHash_key_pebble into runtime pebble...")
+		sourceStore, err := pebblestore.NewPebbleStore(sourceDir, 0, 0, "", false)
+		if err != nil {
+			return fmt.Errorf("failed to open accountHash_key_pebble source store: %w", err)
+		}
+		defer sourceStore.Close()
+
+		copiedCount, err := copyPebbleStoreEntries(sourceStore, pdb)
+		if err != nil {
+			return fmt.Errorf("failed to copy accountHash_key_pebble entries: %w", err)
+		}
+		fmt.Printf("Copied %d account hash index entries into runtime pebble\n", copiedCount)
+	}
+
+	return nil
 }
 
 const TrieNodeAccountPrefix = "41"

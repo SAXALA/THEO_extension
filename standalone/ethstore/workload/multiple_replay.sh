@@ -27,6 +27,17 @@ DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-2}"
 
+# Fill these arrays with candidate values (MiB / count).
+CACHE_SIZE_CANDIDATES=(16)      # e.g. 64 256
+CACHE_COUNT_CANDIDATES=(0)      # e.g. 64
+COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
+BACKEND_CANDIDATES=(pebble ethstore chainkv)   # pebble ethstore
+TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)        # cache nocache_snap nocache
+REPLAY_CGROUP_CASE_CANDIDATES=(false)
+
+# Chunk file size in bytes (used by ethstore/prefixdb).
+CHUNK_FILE_SIZE_BYTES=8192
+
 # Optional 4th argument: path to a config script that defines the candidate arrays.
 # Defaults to the bundled replay_experiment_config.sh.
 CONFIG_SCRIPT="${4:-${script_dir}/replay_experiment_config.sh}"
