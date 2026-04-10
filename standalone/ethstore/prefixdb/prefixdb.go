@@ -48,7 +48,7 @@ const (
 	segmentIndexFlatVersion         = 3
 )
 
-var segmentIndexLevel2Size = 8 * 1024
+const defaultSegmentIndexLevel2Size = 8 * 1024
 
 const segmentIndexLevel2Pattern = "index.meta.l2.%08d"
 
@@ -785,6 +785,7 @@ type PrefixDB struct {
 	stroageCacheSizeLimit     uint64
 	storageChunkSize          int
 	segmentedChunkHardLimit   int // hard cap for individual chunk files
+	segmentIndexLevel2Size    int // target byte budget per L2 index shard; defaults to storageChunkSize
 
 	// storageBatcher enables BatchPut/BatchCommit for storage-only kvs.
 	storageBatch *storageBatcher
@@ -963,6 +964,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		storageGetCacheCount:             storageGetCacheCount,
 		storageChunkSize:                 storageChunkFileSize,
 		segmentedChunkHardLimit:          computeSegmentedChunkHardLimit(storageChunkFileSize, resolvedStorageGCThreshold),
+		segmentIndexLevel2Size:           resolveSegmentIndexLevel2Size(storageChunkFileSize),
 		nodeFileGCUnsortedRatioThreshold: cfg.NodeFileGCUnsortedRatioThreshold,
 		gcWorkers:                        cfg.GCWorkers,
 		nodeFileSortedCompression:        resolvedNodeFileSortedCompression,
@@ -3698,6 +3700,17 @@ func computeSegmentedChunkHardLimit(storageChunkFileSize int, threshold float64)
 	return int(math.Ceil(float64(storageChunkFileSize) * sanitizeStorageGCThreshold(threshold)))
 }
 
+// resolveSegmentIndexLevel2Size returns the L2 index shard byte budget.
+// It defaults to storageChunkFileSize so that the segment index page size
+// scales together with the chunk file size configured via CLI.
+// Falls back to defaultSegmentIndexLevel2Size when storageChunkFileSize <= 0.
+func resolveSegmentIndexLevel2Size(storageChunkFileSize int) int {
+	if storageChunkFileSize > 0 {
+		return storageChunkFileSize
+	}
+	return defaultSegmentIndexLevel2Size
+}
+
 func storageGCQueueCapacity(workers int) int {
 	return sanitizePrefixTreeGCWorkerCount(workers) * storageGCQueueMultiplier
 }
@@ -4399,22 +4412,23 @@ func removeLevel2IndexFiles(folderPath string, keep map[uint32]struct{}) error {
 	return nil
 }
 
-func splitSegmentMetas(metas []segmentChunkMeta) [][]segmentChunkMeta {
+func (db *PrefixDB) splitSegmentMetas(metas []segmentChunkMeta) [][]segmentChunkMeta {
 	if len(metas) == 0 {
 		return nil
 	}
 	groups := make([][]segmentChunkMeta, 0, len(metas)/16+1)
 	groupStart := 0
 	groupSize := 4
+	level2Size := db.segmentIndexLevel2Size
 	for i, meta := range metas {
 		entrySize := estimateSegmentEntrySize(meta)
-		if groupSize+entrySize > segmentIndexLevel2Size && i > groupStart {
+		if groupSize+entrySize > level2Size && i > groupStart {
 			groups = append(groups, metas[groupStart:i])
 			groupStart = i
 			groupSize = 4
 		}
 		groupSize += entrySize
-		if groupSize >= segmentIndexLevel2Size {
+		if groupSize >= level2Size {
 			groups = append(groups, metas[groupStart:i+1])
 			groupStart = i + 1
 			groupSize = 4
@@ -4762,7 +4776,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 		}
 	}
 	if len(groups) == 0 {
-		groups = splitSegmentMetas(metas)
+		groups = db.splitSegmentMetas(metas)
 		if len(groups) == 0 {
 			groups = [][]segmentChunkMeta{metas}
 		}

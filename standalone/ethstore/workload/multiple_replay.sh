@@ -10,30 +10,35 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$script_dir" || exit 1
 
 # Usage:
-#   ./multiple_replay.sh [action] [backend|all] [trace-file|all]
+#   ./multiple_replay.sh [action] [backend|all] [trace-file|all] [config-script]
 # Examples:
 #   ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh replay all all
 #   TEST_RUN_ROUNDS=3 ./multiple_replay.sh replay ethstore nocache_snap
-#   ./multiple_replay.sh load-account prefixdb
-#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB ./multiple_replay.sh load-storage prefixdb
+#   ./multiple_replay.sh load-account prefixdb all ./my_experiment.sh
+#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB \
+#     ./multiple_replay.sh load-storage prefixdb all ./my_experiment.sh
 
 ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
-
-# Fill these arrays with candidate values (MiB / count).
-CACHE_SIZE_CANDIDATES=(16) # 64 256
-CACHE_COUNT_CANDIDATES=(0) #64
-COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
-BACKEND_CANDIDATES=(pebble ethstore) # pebble ethstore
-TRACE_FILE_CANDIDATES=(nocache) # cache nocache_snap nocache
-REPLAY_CGROUP_CASE_CANDIDATES=(false)
-CHUNK_FILE_SIZE_BYTES=8192
 
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-2}"
+
+# Optional 4th argument: path to a config script that defines the candidate arrays.
+# Defaults to the bundled replay_experiment_config.sh.
+CONFIG_SCRIPT="${4:-${script_dir}/replay_experiment_config.sh}"
+
+if [ ! -f "$CONFIG_SCRIPT" ]; then
+	echo "Config script not found: $CONFIG_SCRIPT" >&2
+	exit 1
+fi
+
+# Source the config to get CACHE_SIZE_CANDIDATES, BACKEND_CANDIDATES, etc.
+# shellcheck source=/dev/null
+source "$CONFIG_SCRIPT"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -91,25 +96,25 @@ trap 'cleanup_running_processes' EXIT
 
 usage() {
 	cat <<EOF
-Usage: $0 [action] [backend|all] [trace-file|all]
+Usage: $0 [action] [backend|all] [trace-file|all] [config-script]
 
-action:     load | load-account | load-storage | restore | replay | gc  (default: replay)
-backend:    ethstore | chainkv | pebble | all            (default: all when omitted)
-trace-file: cache | nocache | nocache_snap | all         (default: all for replay when omitted)
+action:       load | load-account | load-storage | restore | replay | gc  (default: replay)
+backend:      ethstore | chainkv | pebble | all            (default: all when omitted)
+trace-file:   cache | nocache | nocache_snap | all         (default: all for replay)
+config-script path to a bash script that defines experiment arrays
+              (default: ${script_dir}/replay_experiment_config.sh)
 
-Edit arrays in this file:
-	CACHE_SIZE_CANDIDATES=(...)  # values must be multiples of 16
+The config script must define these arrays:
+  CACHE_SIZE_CANDIDATES=(...)          # values in MiB
   CACHE_COUNT_CANDIDATES=(...)
-	COMMIT_BLOCK_INTERVAL_CANDIDATES=(...)
-	BACKEND_CANDIDATES=(...)
-	TRACE_FILE_CANDIDATES=(...)
+  COMMIT_BLOCK_INTERVAL_CANDIDATES=(...)
+  BACKEND_CANDIDATES=(...)
+  TRACE_FILE_CANDIDATES=(...)
+  REPLAY_CGROUP_CASE_CANDIDATES=(...)
+  CHUNK_FILE_SIZE_BYTES=<bytes>
 
 Environment flags:
-	TEST_RUN_ROUNDS=1            # each parameter combination runs this many rounds
-
-CHAINKV_CACHE_MB and PEBBLE_CACHE_MB are derived automatically as CACHE_SIZE.
-For ethstore:
-	TOTAL_CACHE_SIZE_MIB = CACHE_SIZE
+  TEST_RUN_ROUNDS=1    # each parameter combination runs this many rounds
 EOF
 }
 
@@ -118,29 +123,16 @@ if [ "$ACTION" = "-h" ] || [ "$ACTION" = "--help" ]; then
 	exit 0
 fi
 
-if [ "${#CACHE_SIZE_CANDIDATES[@]}" -eq 0 ]; then
-	echo "CACHE_SIZE_CANDIDATES is empty"
-	exit 1
-fi
-if [ "${#CACHE_COUNT_CANDIDATES[@]}" -eq 0 ]; then
-	echo "CACHE_COUNT_CANDIDATES is empty"
-	exit 1
-fi
-
-if [ "${#COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}" -eq 0 ]; then
-	echo "COMMIT_BLOCK_INTERVAL_CANDIDATES is empty"
-	exit 1
-fi
-
-if [ "${#BACKEND_CANDIDATES[@]}" -eq 0 ]; then
-	echo "BACKEND_CANDIDATES is empty"
-	exit 1
-fi
-
-if [ "${#TRACE_FILE_CANDIDATES[@]}" -eq 0 ]; then
-	echo "TRACE_FILE_CANDIDATES is empty"
-	exit 1
-fi
+# Validate sourced arrays exist and are non-empty.
+for required_arr in CACHE_SIZE_CANDIDATES CACHE_COUNT_CANDIDATES \
+		COMMIT_BLOCK_INTERVAL_CANDIDATES BACKEND_CANDIDATES \
+		TRACE_FILE_CANDIDATES REPLAY_CGROUP_CASE_CANDIDATES; do
+	eval "arr_len=\${#${required_arr}[@]}"
+	if [ "$arr_len" -eq 0 ]; then
+		echo "${required_arr} is empty (defined in ${CONFIG_SCRIPT})" >&2
+		exit 1
+	fi
+done
 
 if ! [[ "$TEST_RUN_ROUNDS" =~ ^[0-9]+$ ]] || [ "$TEST_RUN_ROUNDS" -le 0 ]; then
 	echo "Invalid TEST_RUN_ROUNDS: $TEST_RUN_ROUNDS"

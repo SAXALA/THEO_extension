@@ -6673,12 +6673,6 @@ type segmentIndexQueryBenchmarkFixture struct {
 func newSegmentIndexQueryBenchmarkFixture(b *testing.B, level2Size int) *segmentIndexQueryBenchmarkFixture {
 	b.Helper()
 
-	prevLevel2Size := segmentIndexLevel2Size
-	segmentIndexLevel2Size = level2Size
-	b.Cleanup(func() {
-		segmentIndexLevel2Size = prevLevel2Size
-	})
-
 	baseDir := b.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 64, 0)
 	if err != nil {
@@ -6687,6 +6681,8 @@ func newSegmentIndexQueryBenchmarkFixture(b *testing.B, level2Size int) *segment
 	b.Cleanup(func() {
 		_ = db.Close()
 	})
+	// Override the L2 index shard size for this benchmark run.
+	db.segmentIndexLevel2Size = level2Size
 
 	accountKey := makeTestAccountKey(byte(level2Size >> 10))
 	folderPath := db.segmentedFolderPathForAccount(accountKey)
