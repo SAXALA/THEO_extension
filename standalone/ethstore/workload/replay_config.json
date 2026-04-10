@@ -4,9 +4,9 @@
   "traceFile": "/mnt/tmp/geth-trace-withcache-merged-block-20500000-21500000",
   "traceFileNocache": "/mnt/tmp/geth-trace-without-cache-merged-block-20500000-21500000",
   "traceFileNoCacheWithSnapshot": "/mnt/tmp/geth-trace-no-cache-enable-snapshot",
-  "ethstoreDir": "/mnt/gen3/running/ethstore",
-  "pebbleDir": "/mnt/gen3/running/pebble",
-  "chainKVDir": "/mnt/gen3/running/chainkv",
+  "ethstoreDir": "/data/running/ethstore",
+  "pebbleDir": "/data/running/pebble",
+  "chainKVDir": "/data/running/chainkv",
   "accountHashKeyPebbleDir": "/mnt/ssd2/ethstore/index/accountHash_key_pebble",
   "loadedEthStoreDir": "/mnt/ssd2/loaded/ethstore"
 }

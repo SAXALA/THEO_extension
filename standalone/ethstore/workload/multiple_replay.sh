@@ -26,7 +26,7 @@ CACHE_SIZE_CANDIDATES=(16) # 64 256
 CACHE_COUNT_CANDIDATES=(0) #64
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
 BACKEND_CANDIDATES=(pebble ethstore) # pebble ethstore
-TRACE_FILE_CANDIDATES=(cache nocache_snap) # cache nocache_snap nocache
+TRACE_FILE_CANDIDATES=(nocache) # cache nocache_snap nocache
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 CHUNK_FILE_SIZE_BYTES=8192
 

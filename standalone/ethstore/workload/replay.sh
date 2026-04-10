@@ -106,7 +106,7 @@ resolve_mount_point_from_path() {
 # 已加载数据根目录（source）与回放运行目录（target）。
 # 默认把 loaded 放到另一块 SSD，给 /data 上的 running 目录腾出更多可用空间。
 LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
-RUNNING_ROOT="${RUNNING_ROOT:-/mnt/gen3/running}"
+RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT=$(resolve_mount_point_from_path "$RUNNING_ROOT")
 
 # ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb64KB | database_statedb256KB
