@@ -70,8 +70,6 @@ PREFIXDB_HANDLES="${PREFIXDB_HANDLES:-32768}"
 CHAINKV_HANDLES="${CHAINKV_HANDLES:-32768}"
 # chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
-# chainkv 参数: 逗号分隔 key 前缀列表；空字符串表示不过滤
-CHAINKV_STATE_KEY_PREFIXES="${CHAINKV_STATE_KEY_PREFIXES:-}"
 # chainkv load 限制条数；0 代表不限制
 CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
 # 多轮回放参数（由 multiple_replay.sh 注入）
@@ -285,7 +283,7 @@ Common env vars:
     NODE_FILE_SORTED_COMPRESSION SEGMENT_INDEX_COMPRESSION
     CHUNK_FILE_SIZE_BYTES(bytes), TOTAL_CACHE_SIZE_MIB(MiB)
     CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES, PREFIXDB_HANDLES
-    CHAINKV_STATE(true|false), CHAINKV_STATE_KEY_PREFIXES(csv), CHAINKV_LOAD_LIMIT(0=unlimited)
+    CHAINKV_STATE(true|false), CHAINKV_LOAD_LIMIT(0=unlimited)
     LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
     GC_STATE_DIR
     UPGRADE_STATE_DIR
@@ -794,10 +792,9 @@ build_run_tag() {
     fi
 
     if [ "$backend" = "chainkv" ]; then
-        local ckv_state_tag ckv_prefix_tag
+        local ckv_state_tag
         ckv_state_tag=$(sanitize_tag_value "$CHAINKV_STATE")
-        ckv_prefix_tag=$(sanitize_tag_value "$CHAINKV_STATE_KEY_PREFIXES")
-        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvp_${ckv_prefix_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}${cgroup_tag}"
+        printf "%s" "${base_tag}_ckvc_${CHAINKV_CACHE_MB}_ckvh_${CHAINKV_HANDLES}_ckvs_${ckv_state_tag}_ckvl_${CHAINKV_LOAD_LIMIT}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "pebble" ]; then
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "prefixdb" ]; then
@@ -870,7 +867,6 @@ print_param_snapshot() {
         printf 'CHAINKV_CACHE_MB=%s\n' "$CHAINKV_CACHE_MB"
         printf 'CHAINKV_HANDLES=%s\n' "$CHAINKV_HANDLES"
         printf 'CHAINKV_STATE=%s\n' "$CHAINKV_STATE"
-        printf 'CHAINKV_STATE_KEY_PREFIXES=%s\n' "$CHAINKV_STATE_KEY_PREFIXES"
         printf 'CHAINKV_LOAD_LIMIT=%s\n' "$CHAINKV_LOAD_LIMIT"
     elif [ "$snapshot_backend" = "pebble" ]; then
         printf 'PEBBLE_CACHE_MB=%s\n' "$PEBBLE_CACHE_MB"
@@ -953,7 +949,7 @@ run_load() {
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES" -ckv-limit "$CHAINKV_LOAD_LIMIT"
+                -mode ld -backend chainkv -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-limit "$CHAINKV_LOAD_LIMIT"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \
@@ -1055,7 +1051,7 @@ run_replay() {
             ;;
         chainkv)
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE" -ckv-state-key-prefixes "$CHAINKV_STATE_KEY_PREFIXES"
+                -mode re -backend chainkv -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" -ckv-cache "$CHAINKV_CACHE_MB" -ckv-handles "$CHAINKV_HANDLES" -ckv-state "$CHAINKV_STATE"
             ;;
         pebble)
             run_and_monitor "$backend" "$log_file" "$io_file" \

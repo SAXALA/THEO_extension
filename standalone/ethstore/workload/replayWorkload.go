@@ -458,9 +458,8 @@ func loadReplayConfig(path string) (replayConfig, error) {
 }
 
 type chainKVLDB struct {
-	db            *chainkvdb.LDBDatabase
-	useState      bool
-	statePrefixes [][]byte
+	db       *chainkvdb.LDBDatabase
+	useState bool
 }
 
 func NewChainKVLDB(path string, cache int, handles int, useState bool) (*chainKVLDB, error) {

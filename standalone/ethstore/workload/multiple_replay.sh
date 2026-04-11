@@ -25,7 +25,7 @@ BACKEND_SELECTOR="${2:-}"
 TRACE_SELECTOR="${3:-all}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-2}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-1}"
 
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16)      # e.g. 64 256
@@ -37,19 +37,6 @@ REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
 # Chunk file size in bytes (used by ethstore/prefixdb).
 CHUNK_FILE_SIZE_BYTES=8192
-
-# Optional 4th argument: path to a config script that defines the candidate arrays.
-# Defaults to the bundled replay_experiment_config.sh.
-CONFIG_SCRIPT="${4:-${script_dir}/replay_experiment_config.sh}"
-
-if [ ! -f "$CONFIG_SCRIPT" ]; then
-	echo "Config script not found: $CONFIG_SCRIPT" >&2
-	exit 1
-fi
-
-# Source the config to get CACHE_SIZE_CANDIDATES, BACKEND_CANDIDATES, etc.
-# shellcheck source=/dev/null
-source "$CONFIG_SCRIPT"
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -140,7 +127,7 @@ for required_arr in CACHE_SIZE_CANDIDATES CACHE_COUNT_CANDIDATES \
 		TRACE_FILE_CANDIDATES REPLAY_CGROUP_CASE_CANDIDATES; do
 	eval "arr_len=\${#${required_arr}[@]}"
 	if [ "$arr_len" -eq 0 ]; then
-		echo "${required_arr} is empty (defined in ${CONFIG_SCRIPT})" >&2
+		echo "${required_arr} is empty" >&2
 		exit 1
 	fi
 done
