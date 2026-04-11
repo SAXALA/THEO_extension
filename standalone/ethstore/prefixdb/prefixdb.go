@@ -35,7 +35,6 @@ const (
 )
 
 const (
-	segmentIndexMultiLevelThreshold = 16 * 1024
 	segmentIndexCompressionMinSize  = 4 * 1024
 	segmentIndexKeyStartMaxBytes    = 32
 	segmentIndexFixedKeyFieldBytes  = 1 + segmentIndexKeyStartMaxBytes
@@ -786,6 +785,7 @@ type PrefixDB struct {
 	storageChunkSize          int
 	segmentedChunkHardLimit   int // hard cap for individual chunk files
 	segmentIndexLevel2Size    int // target byte budget per L2 index shard; defaults to storageChunkSize
+	segmentIndexMultiLevelThreshold int // serialized index bytes threshold for switching to multi-level layout
 
 	// storageBatcher enables BatchPut/BatchCommit for storage-only kvs.
 	storageBatch *storageBatcher
@@ -954,6 +954,8 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		return nil, errors.New("failed to open normal account file")
 	}
 
+	resolvedSegmentIndexLevel2Size := resolveSegmentIndexLevel2Size(storageChunkFileSize)
+
 	db := &PrefixDB{
 		accountFile:                      accountFile,
 		writeMutex:                       sync.Mutex{},
@@ -964,7 +966,8 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		storageGetCacheCount:             storageGetCacheCount,
 		storageChunkSize:                 storageChunkFileSize,
 		segmentedChunkHardLimit:          computeSegmentedChunkHardLimit(storageChunkFileSize, resolvedStorageGCThreshold),
-		segmentIndexLevel2Size:           resolveSegmentIndexLevel2Size(storageChunkFileSize),
+		segmentIndexLevel2Size:           resolvedSegmentIndexLevel2Size,
+		segmentIndexMultiLevelThreshold:  resolveSegmentIndexMultiLevelThreshold(resolvedSegmentIndexLevel2Size),
 		nodeFileGCUnsortedRatioThreshold: cfg.NodeFileGCUnsortedRatioThreshold,
 		gcWorkers:                        cfg.GCWorkers,
 		nodeFileSortedCompression:        resolvedNodeFileSortedCompression,
@@ -3711,6 +3714,14 @@ func resolveSegmentIndexLevel2Size(storageChunkFileSize int) int {
 	return defaultSegmentIndexLevel2Size
 }
 
+func resolveSegmentIndexMultiLevelThreshold(level2Size int) int {
+	resolvedLevel2Size := level2Size
+	if resolvedLevel2Size <= 0 {
+		resolvedLevel2Size = defaultSegmentIndexLevel2Size
+	}
+	return resolvedLevel2Size * 2
+}
+
 func storageGCQueueCapacity(workers int) int {
 	return sanitizePrefixTreeGCWorkerCount(workers) * storageGCQueueMultiplier
 }
@@ -4725,7 +4736,7 @@ func (db *PrefixDB) writeSegmentIndexLocked(folderPath string, metas []segmentCh
 		return removeLevel2IndexFiles(folderPath, nil)
 	}
 	serializedSize := estimateSegmentIndexSize(metas)
-	if serializedSize <= segmentIndexMultiLevelThreshold {
+	if serializedSize <= db.segmentIndexMultiLevelThreshold {
 		buf, err := encodeSegmentChunkMetas(metas)
 		if err != nil {
 			return err

@@ -40,6 +40,18 @@ func TestSortStrategyThreshold(t *testing.T) {
 	}
 }
 
+func TestResolveSegmentIndexMultiLevelThreshold(t *testing.T) {
+	if got := resolveSegmentIndexMultiLevelThreshold(4 * 1024); got != 8*1024 {
+		t.Fatalf("unexpected threshold for 4KiB L2 size: got %d want %d", got, 8*1024)
+	}
+	if got := resolveSegmentIndexMultiLevelThreshold(16 * 1024); got != 32*1024 {
+		t.Fatalf("unexpected threshold for 16KiB L2 size: got %d want %d", got, 32*1024)
+	}
+	if got := resolveSegmentIndexMultiLevelThreshold(0); got != 2*defaultSegmentIndexLevel2Size {
+		t.Fatalf("unexpected default threshold: got %d want %d", got, 2*defaultSegmentIndexLevel2Size)
+	}
+}
+
 func measureSortDuration(entries []kvPair, runs int, sorter func([]kvPair)) time.Duration {
 	if len(entries) == 0 {
 		return 0
@@ -6683,6 +6695,7 @@ func newSegmentIndexQueryBenchmarkFixture(b *testing.B, level2Size int) *segment
 	})
 	// Override the L2 index shard size for this benchmark run.
 	db.segmentIndexLevel2Size = level2Size
+	db.segmentIndexMultiLevelThreshold = resolveSegmentIndexMultiLevelThreshold(level2Size)
 
 	accountKey := makeTestAccountKey(byte(level2Size >> 10))
 	folderPath := db.segmentedFolderPathForAccount(accountKey)

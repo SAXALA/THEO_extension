@@ -1740,7 +1740,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 	var acccuntHashKeyPebble *pebblestore.PebbleStore
 	if stage == prefixdbLoadStageAll || stage == prefixdbLoadStageStorage {
 		if len(pebbleDir) == 0 {
-			pebbleDir = "/mnt/ssd/ethstore/index/accountHash_key_pebble"
+			pebbleDir = "/mnt/ssd2/loaded/ethstore/accountHash_key_pebble"
 		}
 		dbPath := strings.TrimSpace(pebbleDir)
 		if dbPath == "" {
@@ -2083,6 +2083,7 @@ func loadPebble(dirPath string, testFilePath string, accountHashIndexDir string,
 		}
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		if !ethstore.AolHandledDataTypes[dataType] && !ethstore.PrefixDBHandledDataTypes[dataType] {
+
 			// Perform the Put operation
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)

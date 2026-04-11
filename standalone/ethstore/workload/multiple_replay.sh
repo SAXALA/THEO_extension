@@ -31,7 +31,7 @@ TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-1}"
 CACHE_SIZE_CANDIDATES=(16)      # e.g. 64 256
 CACHE_COUNT_CANDIDATES=(0)      # e.g. 64
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
-BACKEND_CANDIDATES=(pebble ethstore chainkv)   # pebble ethstore
+BACKEND_CANDIDATES=(chainkv)   # pebble ethstore chainkv
 TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)        # cache nocache_snap nocache
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
