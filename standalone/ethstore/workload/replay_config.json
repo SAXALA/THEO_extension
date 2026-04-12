@@ -8,5 +8,7 @@
   "pebbleDir": "/data/running/pebble",
   "chainKVDir": "/data/running/chainkv",
   "accountHashKeyPebbleDir": "/mnt/ssd2/loaded/ethstore/accountHash_key_pebble",
-  "loadedEthStoreDir": "/mnt/ssd2/loaded/ethstore"
+  "loadedEthStoreDir": "/mnt/ssd2/loaded/ethstore",
+  "loadedPebbleDir": "/mnt/ssd2/loaded/pebble",
+  "loadedChainKVDir": "/mnt/ssd2/loaded/chainkv"
 }

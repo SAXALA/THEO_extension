@@ -445,7 +445,7 @@ func TestLoadPebbleLoadsOnlyNonAOLAndNonPrefixDBEntries(t *testing.T) {
 		t.Fatalf("auxStore.Close failed: %v", err)
 	}
 
-	if err := loadPebble(pebbleDir, dataFile, auxDir, 0, 0); err != nil {
+	if err := loadEthStorePebble(pebbleDir, dataFile, auxDir, 0, 0, false); err != nil {
 		t.Fatalf("loadPebble failed: %v", err)
 	}
 

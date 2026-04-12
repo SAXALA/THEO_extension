@@ -393,6 +393,8 @@ type replayConfig struct {
 	ChainKVDir                   string `json:"chainKVDir"`
 	AccountHashKeyPebbleDir      string `json:"accountHashKeyPebbleDir"`
 	LoadedEthstoreDir            string `json:"loadedEthStoreDir"`
+	LoadedPebbleDir              string `json:"loadedPebbleDir"`
+	LoadedChainKVDir             string `json:"loadedChainKVDir"`
 }
 
 type prefixdbLoadStage string
@@ -426,6 +428,10 @@ func formatEthstoreRuntimeStateDir(databaseDir string) string {
 
 func formatEthstoreRuntimePebbleDir(databaseDir string) string {
 	return strings.TrimSpace(databaseDir) + "_pebble"
+}
+
+func formatWithoutSnapshotDBDir(baseDir string) string {
+	return strings.TrimSpace(baseDir) + "_without"
 }
 
 func resolvePrefixDBStateDir(databaseDir string, explicitStateDir string, chunkFileSize int, stage prefixdbLoadStage) (string, error) {
@@ -483,7 +489,7 @@ func (c *chainKVLDB) Close() {
 	}
 }
 
-func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
+func chainKVLoadData(db *chainKVLDB, dataFile string, limit int, skipSnapshot bool) error {
 	file, err := os.Open(dataFile)
 	if err != nil {
 		return fmt.Errorf("failed to open data file: %w", err)
@@ -531,6 +537,12 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 			return fmt.Errorf("failed to decode value: %w", err)
 		}
 
+		if skipSnapshot {
+			if keyBytes[0] == 'o' || keyBytes[0] == 'a' {
+				continue
+			}
+		}
+
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		if db.useStateForDataType(dataType) {
 			err = db.db.Put_s(keyBytes, valueBytes)
@@ -561,46 +573,82 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int) error {
 func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes int, totalCacheSizeMiB int, prefixdbHandles int, ckvCache int, ckvHandles int, pebbleCache int, pebbleHandles int, ckvUseState bool, ckvLoadLimit int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbStage prefixdbLoadStage, prefixdbStateDir string) error {
 	switch {
 	case strings.EqualFold(backend, "chainkv"):
-		ckv, openErr := NewChainKVLDB(cfg.ChainKVDir, ckvCache, ckvHandles, ckvUseState)
+		if strings.TrimSpace(cfg.LoadDataDir) == "" {
+			return fmt.Errorf("ld with chainkv backend requires loadDataDir in config")
+		}
+		if strings.TrimSpace(cfg.LoadedChainKVDir) == "" {
+			return fmt.Errorf("ld with chainkv backend requires loadedChainKVDir in config")
+		}
+		ckv, openErr := NewChainKVLDB(cfg.LoadedChainKVDir, ckvCache, ckvHandles, ckvUseState)
 		if openErr != nil {
 			return fmt.Errorf("failed to open chainkv database: %w", openErr)
 		}
 		defer ckv.Close()
-		if loadErr := chainKVLoadData(ckv, cfg.ChainKVDir, ckvLoadLimit); loadErr != nil {
+		if loadErr := chainKVLoadData(ckv, cfg.LoadDataDir, ckvLoadLimit, false); loadErr != nil {
+			return fmt.Errorf("chainkv load failed: %w", loadErr)
+		}
+		return nil
+	case strings.EqualFold(backend, "chainkvWithoutSnapshots"):
+		if strings.TrimSpace(cfg.LoadDataDir) == "" {
+			return fmt.Errorf("ld with chainkvWithoutSnapshots backend requires loadDataDir in config")
+		}
+		if strings.TrimSpace(cfg.LoadedChainKVDir) == "" {
+			return fmt.Errorf("ld with chainkvWithoutSnapshots backend requires loadedChainKVDir in config")
+		}
+		withoutSnapshotChainKVDir := formatWithoutSnapshotDBDir(cfg.LoadedChainKVDir)
+		ckv, openErr := NewChainKVLDB(withoutSnapshotChainKVDir, ckvCache, ckvHandles, ckvUseState)
+		if openErr != nil {
+			return fmt.Errorf("failed to open chainkv database: %w", openErr)
+		}
+		defer ckv.Close()
+		if loadErr := chainKVLoadData(ckv, cfg.LoadDataDir, ckvLoadLimit, true); loadErr != nil {
 			return fmt.Errorf("chainkv load failed: %w", loadErr)
 		}
 		return nil
 	case strings.EqualFold(backend, "pebble"):
-		if cfg.PebbleDBDir == "" {
-			return fmt.Errorf("ld with pebble backend requires pebbleDir in config")
+		if strings.TrimSpace(cfg.LoadedPebbleDir) == "" {
+			return fmt.Errorf("ld with pebble backend requires loadedPebbleDir in config")
 		}
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with pebble backend requires loadDataDir in config")
 		}
-		if err := pebbleDBLoadData(cfg.PebbleDBDir, cfg.LoadDataDir, pebbleCache, pebbleHandles); err != nil {
+		if err := pebbleDBLoadData(cfg.LoadedPebbleDir, cfg.LoadDataDir, pebbleCache, pebbleHandles, false); err != nil {
+			return fmt.Errorf("pebble load failed: %w", err)
+		}
+		return nil
+	case strings.EqualFold(backend, "pebbleWithoutSnapshots"):
+		if strings.TrimSpace(cfg.LoadedPebbleDir) == "" {
+			return fmt.Errorf("ld with pebbleWithoutSnapshots backend requires loadedPebbleDir in config")
+		}
+		if cfg.LoadDataDir == "" {
+			return fmt.Errorf("ld with pebbleWithoutSnapshots backend requires loadDataDir in config")
+		}
+		withoutSnapshotPebbleDir := formatWithoutSnapshotDBDir(cfg.LoadedPebbleDir)
+		if err := pebbleDBLoadData(withoutSnapshotPebbleDir, cfg.LoadDataDir, pebbleCache, pebbleHandles, true); err != nil {
 			return fmt.Errorf("pebble load failed: %w", err)
 		}
 		return nil
 	case strings.EqualFold(backend, "ethstore"):
-		if cfg.EthStoreDir == "" {
-			return fmt.Errorf("ld with ethstore backend requires databaseDir in config")
+		if cfg.LoadedEthstoreDir == "" {
+			return fmt.Errorf("ld with ethstore backend requires loadedEthStoreDir in config")
 		}
 		if cfg.LoadDataDir == "" {
 			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
 		}
 
-		// laod block store
+		//load  block store
 		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
 		if aolDataFile == "" {
 			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
 		}
-		if err := loadBlockStore(cfg.EthStoreDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+		if err := loadBlockStore(cfg.LoadedEthstoreDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("ethstore aol load failed: %w", err)
 		}
-		if err := loadPrefixDB(cfg.EthStoreDir, formatEthstoreRuntimeStateDir(cfg.EthStoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbLoadStageAll, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+		if err := loadPrefixDB(cfg.LoadedEthstoreDir, formatEthstoreRuntimeStateDir(cfg.LoadedEthstoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbLoadStageAll, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("ethstore prefixdb load failed: %w", err)
 		}
-		if err := loadPebble(formatEthstoreRuntimePebbleDir(cfg.EthStoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles); err != nil {
+
+		if err := loadEthStorePebble(formatEthstoreRuntimePebbleDir(cfg.LoadedEthstoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, false); err != nil {
 			return fmt.Errorf("ethstore pebble load failed: %w", err)
 		}
 		return nil
@@ -613,6 +661,18 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 		}
 		if err := loadPrefixDB(cfg.LoadedEthstoreDir, prefixdbStateDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbStage, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("prefixdb load failed: %w", err)
+		}
+		return nil
+	case strings.EqualFold(backend, "ethstorePebbleWithoutSnapshots"):
+		if cfg.LoadedEthstoreDir == "" {
+			return fmt.Errorf("ld with ethstorePebbleWithoutSnapshots backend requires loadedEthStoreDir in config")
+		}
+		if cfg.LoadDataDir == "" {
+			return fmt.Errorf("ld with ethstorePebbleWithoutSnapshots backend requires loadDataDir in config")
+		}
+		withoutSnapshotEthstorePebbleDir := formatWithoutSnapshotDBDir(formatEthstoreRuntimePebbleDir(cfg.LoadedEthstoreDir))
+		if err := loadEthStorePebble(withoutSnapshotEthstorePebbleDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, true); err != nil {
+			return fmt.Errorf("ethstore pebble load failed: %w", err)
 		}
 		return nil
 	default:
@@ -1655,7 +1715,7 @@ func main() {
 	}
 }
 
-func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebbleHandles int) error {
+func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebbleHandles int, withoutSnapShot bool) error {
 	tempDir := pebbleDir
 	store, err := pebblestore.NewPebbleStore(tempDir, pebbleCache, pebbleHandles, "", false)
 	if err != nil {
@@ -1706,6 +1766,10 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 		valueBytes, err = hex.DecodeString(string(valueBytes))
 		if err != nil {
 			return fmt.Errorf("failed to decode value: %w", err)
+		}
+
+		if withoutSnapShot && (keyBytes[0] == 'o' || keyBytes[0] == 'a') {
+			continue
 		}
 
 		// Perform the Put operation
@@ -2010,11 +2074,11 @@ func copyPebbleStoreEntries(source *pebblestore.PebbleStore, target *pebblestore
 	return count, nil
 }
 
-func loadPebble(dirPath string, testFilePath string, accountHashIndexDir string, pebbleCache int, pebbleHandles int) error {
+func loadEthStorePebble(dirPath string, testFilePath string, accountHashIndexDir string, pebbleCache int, pebbleHandles int, skipSnapShot bool) error {
 	dirPath = strings.TrimSpace(dirPath)
 	testFilePath = strings.TrimSpace(testFilePath)
 	if dirPath == "" || testFilePath == "" {
-		return fmt.Errorf("loadPebble requires non-empty dirPath and testFilePath")
+		return fmt.Errorf("loadEthStorePebble requires non-empty dirPath and testFilePath")
 	}
 	fmt.Println("Start load pebble...")
 	pdb, err := pebblestore.NewPebbleStore(dirPath, pebbleCache, pebbleHandles, "pebble_load", false)
@@ -2081,9 +2145,15 @@ func loadPebble(dirPath string, testFilePath string, accountHashIndexDir string,
 		if err != nil {
 			return fmt.Errorf("failed to decode value: %w", err)
 		}
+
+		//skip snapShot data
+
+		if skipSnapShot && (keyBytes[0] == 'o' || keyBytes[0] == 'a') {
+			continue
+		}
+
 		dataType := ethstore.GetDataTypeFromKey(keyBytes)
 		if !ethstore.AolHandledDataTypes[dataType] && !ethstore.PrefixDBHandledDataTypes[dataType] {
-
 			// Perform the Put operation
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)
