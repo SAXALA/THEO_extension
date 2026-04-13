@@ -647,12 +647,18 @@ restore_ethstore_db() {
     echo "Restore ethstore database..."
     local src_root="${LOADED_ROOT}/ethstore"
     local dst_prefix="${RUNNING_ROOT}/ethstore"
-    sudo_rsync_run -avP --delete "${src_root}/database_aol/" "${dst_prefix}_aol/"
-    sudo_run chmod -R 777 "${dst_prefix}_aol/"
-    sudo_rsync_run -avP --delete "${src_root}/database_pebble/" "${dst_prefix}_pebble/"
-    sudo_run chmod -R 777 "${dst_prefix}_pebble/"
-    sudo_rsync_run -avP --delete "${src_root}/${ETHSTORE_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
-    sudo_run chmod -R 777 "${dst_prefix}_state/"
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "aol" ]; then
+        sudo_rsync_run -avP --delete "${src_root}/database_aol/" "${dst_prefix}_aol/"
+        sudo_run chmod -R 777 "${dst_prefix}_aol/"
+    fi
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "pebble" ]; then
+        sudo_rsync_run -avP --delete "${src_root}/database_pebble/" "${dst_prefix}_pebble/"
+        sudo_run chmod -R 777 "${dst_prefix}_pebble/"
+    fi
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]; then
+        sudo_rsync_run -avP --delete "${src_root}/${ETHSTORE_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
+        sudo_run chmod -R 777 "${dst_prefix}_state/"
+    fi
 }
 
 restore_chainkv_db() {
@@ -692,17 +698,53 @@ sync_ethstore_loaded_to_running() {
     local src_pebble="${src_root}/database_pebble"
     local src_state="${src_root}/${ETHSTORE_STATEDB_DIRNAME}"
 
-    if [ ! -d "${src_aol}" ] || [ ! -d "${src_pebble}" ] || [ ! -d "${src_state}" ]; then
-        echo "ethstore source directories missing under ${src_root}. Required: database_aol, database_pebble, ${ETHSTORE_STATEDB_DIRNAME}"
-        exit 1
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "aol" ]; then
+        if [ ! -d "${src_aol}" ]; then
+            echo "ethstore source directory missing under ${src_root}: database_aol"
+            exit 1
+        fi
+    fi
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "pebble" ]; then
+        if [ ! -d "${src_pebble}" ]; then
+            echo "ethstore source directory missing under ${src_root}: database_pebble"
+            exit 1
+        fi
+    fi
+    if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]; then
+        if [ ! -d "${src_state}" ]; then
+            echo "ethstore source directory missing under ${src_root}: ${ETHSTORE_STATEDB_DIRNAME}"
+            exit 1
+        fi
     fi
 
-    echo "Sync ethstore data: ${src_root} -> ${dst_prefix}{_aol,_pebble,_state}"
-    sudo_run mkdir -p "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
-    sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
-    sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
-    sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
-    sudo_run chmod -R 777 "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
+    case "$DB_TYPE" in
+        prefixdb)
+            echo "Sync ethstore state data: ${src_state} -> ${dst_prefix}_state"
+            sudo_run mkdir -p "${dst_prefix}_state"
+            sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
+            sudo_run chmod -R 777 "${dst_prefix}_state"
+            ;;
+        aol)
+            echo "Sync ethstore block data: ${src_aol} -> ${dst_prefix}_aol"
+            sudo_run mkdir -p "${dst_prefix}_aol"
+            sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
+            sudo_run chmod -R 777 "${dst_prefix}_aol"
+            ;;
+        pebble)
+            echo "Sync ethstore pebble data: ${src_pebble} -> ${dst_prefix}_pebble"
+            sudo_run mkdir -p "${dst_prefix}_pebble"
+            sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
+            sudo_run chmod -R 777 "${dst_prefix}_pebble"
+            ;;
+        *)
+            echo "Sync ethstore data: ${src_root} -> ${dst_prefix}{_aol,_pebble,_state}"
+            sudo_run mkdir -p "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
+            sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
+            sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
+            sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
+            sudo_run chmod -R 777 "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
+            ;;
+    esac
 }
 
 sync_chainkv_loaded_to_running() {
