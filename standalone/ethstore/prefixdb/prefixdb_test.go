@@ -1104,6 +1104,28 @@ func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
 	}
 }
 
+func TestStorageBatchCommitFailsOnUnresolvedStorageEntries(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	rawStorageKey := makeTestStorageRawKeyWithSuffix(0x44)
+	if err := db.StorageBatchPut(rawStorageKey, []byte("pending-value"), nil); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+
+	err = db.StorageBatchCommit()
+	if err == nil {
+		t.Fatal("expected StorageBatchCommit to fail for unresolved storage entries")
+	}
+	if !strings.Contains(err.Error(), "unresolved storage entries cannot be resolved") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestGCPrefixTreePreservesInlineStoragePointer(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)

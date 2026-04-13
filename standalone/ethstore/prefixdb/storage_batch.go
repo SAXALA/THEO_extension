@@ -367,6 +367,7 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 		return nil
 	}
 	unresolvedCount := 0
+	unresolvedSamples := make([]string, 0, 3)
 	for origKeyStr, v := range unresolved {
 		origKeyBytes := []byte(origKeyStr)
 		var accountKey []byte
@@ -375,6 +376,9 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 		}
 		if accountKey == nil {
 			unresolvedCount++
+			if len(unresolvedSamples) < cap(unresolvedSamples) {
+				unresolvedSamples = append(unresolvedSamples, fmt.Sprintf("%x", origKeyBytes))
+			}
 			prefixdbDebugf("prepareStorageCommitPlans: unresolved storage entry will be dropped - storageKey=%x valueLen=%d reason=ParentKeyResolver returned nil\n",
 				origKeyBytes, len(v))
 			continue
@@ -392,8 +396,8 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 		perAcc[string(storageKey)] = v
 	}
 	if unresolvedCount > 0 {
-		fmt.Printf("prepareStorageCommitPlans: dropped unresolved storage entries - droppedCount=%d totalUnresolved=%d\n",
-			unresolvedCount, len(unresolved))
+		return fmt.Errorf("prepareStorageCommitPlans: unresolved storage entries cannot be resolved: unresolved=%d total=%d sampleStorageKeys=%v (check ParentKeyResolver/account-hash index readiness)",
+			unresolvedCount, len(unresolved), unresolvedSamples)
 	}
 	return nil
 }
