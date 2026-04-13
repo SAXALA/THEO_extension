@@ -23,6 +23,7 @@ ACTION="${1:-replay}"
 BACKEND_SELECTOR="${2:-}"
 
 TRACE_SELECTOR="${3:-all}"
+CONFIG_SCRIPT="${4:-}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-1}"
@@ -35,8 +36,20 @@ BACKEND_CANDIDATES=(chainkv)   # pebble ethstore chainkv
 TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)        # cache nocache_snap nocache
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
-# Chunk file size in bytes (used by ethstore/prefixdb).
-CHUNK_FILE_SIZE_BYTES=8192
+# Chunk file size candidates in bytes (used by ethstore/prefixdb).
+CHUNK_FILE_SIZE_BYTES_CANDIDATES=(8192)
+
+# Replay block windows in start:end form.
+BLOCK_RANGE_CANDIDATES=("20500000:20550000")
+
+if [ -n "$CONFIG_SCRIPT" ]; then
+	if [ ! -f "$CONFIG_SCRIPT" ]; then
+		echo "Config script not found: $CONFIG_SCRIPT" >&2
+		exit 1
+	fi
+	# shellcheck disable=SC1090
+	source "$CONFIG_SCRIPT"
+fi
 
 if [ -z "$BACKEND_SELECTOR" ]; then
 	BACKEND_SELECTOR="all"
@@ -100,7 +113,7 @@ action:       load | load-account | load-storage | restore | replay | gc  (defau
 backend:      ethstore | chainkv | pebble | all            (default: all when omitted)
 trace-file:   cache | nocache | nocache_snap | all         (default: all for replay)
 config-script path to a bash script that defines experiment arrays
-              (default: ${script_dir}/replay_experiment_config.sh)
+		      (optional; when omitted, built-in defaults are used)
 
 The config script must define these arrays:
   CACHE_SIZE_CANDIDATES=(...)          # values in MiB
@@ -109,7 +122,12 @@ The config script must define these arrays:
   BACKEND_CANDIDATES=(...)
   TRACE_FILE_CANDIDATES=(...)
   REPLAY_CGROUP_CASE_CANDIDATES=(...)
-  CHUNK_FILE_SIZE_BYTES=<bytes>
+	CHUNK_FILE_SIZE_BYTES_CANDIDATES=(...)  # e.g. 4096 8192 16384
+	BLOCK_RANGE_CANDIDATES=("start:end" ...)
+
+Optional config script overrides:
+	DB_TYPE=prefixdb
+	WORKLOAD_MAX_OPS=0
 
 Environment flags:
   TEST_RUN_ROUNDS=1    # each parameter combination runs this many rounds
@@ -124,7 +142,8 @@ fi
 # Validate sourced arrays exist and are non-empty.
 for required_arr in CACHE_SIZE_CANDIDATES CACHE_COUNT_CANDIDATES \
 		COMMIT_BLOCK_INTERVAL_CANDIDATES BACKEND_CANDIDATES \
-		TRACE_FILE_CANDIDATES REPLAY_CGROUP_CASE_CANDIDATES; do
+		TRACE_FILE_CANDIDATES REPLAY_CGROUP_CASE_CANDIDATES \
+		CHUNK_FILE_SIZE_BYTES_CANDIDATES BLOCK_RANGE_CANDIDATES; do
 	eval "arr_len=\${#${required_arr}[@]}"
 	if [ "$arr_len" -eq 0 ]; then
 		echo "${required_arr} is empty" >&2
@@ -213,9 +232,26 @@ resolve_replay_cgroup_cases() {
 	printf '%s\n' "${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
 }
 
+parse_block_range() {
+	local range="$1"
+	local start_block end_block
+
+	IFS=':' read -r start_block end_block <<< "$range"
+	if ! [[ "$start_block" =~ ^[0-9]+$ ]] || ! [[ "$end_block" =~ ^[0-9]+$ ]]; then
+		echo "Invalid BLOCK_RANGE candidate: $range (expected start:end)" >&2
+		exit 1
+	fi
+	if [ "$end_block" -ne 0 ] && [ "$start_block" -ne 0 ] && [ "$end_block" -lt "$start_block" ]; then
+		echo "Invalid BLOCK_RANGE candidate: $range (end < start)" >&2
+		exit 1
+	fi
+	printf '%s %s\n' "$start_block" "$end_block"
+}
+
 count_total_runs() {
 	local total=0
 	local backend trace_file cache_size_mib cache_count commit_block_interval replay_cgroup_enabled round_idx
+	local chunk_file_size_bytes block_range start_block_id end_block_id
 	local backend_cache_mib
 	local -a cache_count_values
 
@@ -223,16 +259,25 @@ count_total_runs() {
 		for trace_file in "${SELECTED_TRACES[@]}"; do
 			for backend in "${SELECTED_BACKENDS[@]}"; do
 				mapfile -t cache_count_values < <(resolve_cache_count_candidates "$backend")
-				for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
-					backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
-					if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
-						echo "Invalid derived backend cache for $backend: $backend_cache_mib" >&2
+				for chunk_file_size_bytes in "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"; do
+					if ! [[ "$chunk_file_size_bytes" =~ ^[0-9]+$ ]] || [ "$chunk_file_size_bytes" -le 0 ]; then
+						echo "Invalid CHUNK_FILE_SIZE_BYTES candidate: $chunk_file_size_bytes" >&2
 						exit 1
 					fi
-					for cache_count in "${cache_count_values[@]}"; do
-						for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
-							for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
-								total=$((total + 1))
+					for block_range in "${BLOCK_RANGE_CANDIDATES[@]}"; do
+						read -r start_block_id end_block_id < <(parse_block_range "$block_range")
+						for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
+							backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
+							if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
+								echo "Invalid derived backend cache for $backend: $backend_cache_mib" >&2
+								exit 1
+							fi
+							for cache_count in "${cache_count_values[@]}"; do
+								for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
+									for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+										total=$((total + 1))
+									done
+								done
 							done
 						done
 					done
@@ -255,77 +300,93 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 	for trace_file in "${SELECTED_TRACES[@]}"; do
 		for backend in "${SELECTED_BACKENDS[@]}"; do
 			mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
-			for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
-				if ! [[ "$cache_size_mib" =~ ^[0-9]+$ ]] || [ "$cache_size_mib" -le 0 ]; then
-					echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
+			for chunk_file_size_bytes in "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"; do
+				if ! [[ "$chunk_file_size_bytes" =~ ^[0-9]+$ ]] || [ "$chunk_file_size_bytes" -le 0 ]; then
+					echo "Invalid CHUNK_FILE_SIZE_BYTES candidate: $chunk_file_size_bytes"
 					exit 1
 				fi
 
-				backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
-				if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
-					echo "Invalid derived backend cache for $backend: $backend_cache_mib"
-					exit 1
-				fi
-
-				for cache_count in "${CACHE_COUNT_VALUES[@]}"; do
-					if ! [[ "$cache_count" =~ ^[0-9]+$ ]]; then
-						echo "Invalid CACHE_COUNT candidate: $cache_count"
-						exit 1
-					fi
-
-					for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
-						if ! [[ "$commit_block_interval" =~ ^[0-9]+$ ]] || [ "$commit_block_interval" -le 0 ]; then
-							echo "Invalid COMMIT_BLOCK_INTERVAL candidate: $commit_block_interval"
+				for block_range in "${BLOCK_RANGE_CANDIDATES[@]}"; do
+					read -r start_block_id end_block_id < <(parse_block_range "$block_range")
+					for cache_size_mib in "${CACHE_SIZE_CANDIDATES[@]}"; do
+						if ! [[ "$cache_size_mib" =~ ^[0-9]+$ ]] || [ "$cache_size_mib" -le 0 ]; then
+							echo "Invalid CACHE_SIZE candidate: $cache_size_mib"
 							exit 1
 						fi
 
-						for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
-							run_idx=$((run_idx + 1))
-							if [ "$backend" = "ethstore" ]; then
-								echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
-								TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
-								CACHE_COUNT="$cache_count" \
-								COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
-								TRACE_FILE="$trace_file" \
-								DB_TYPE="$DB_TYPE" \
-								WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-								CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-								REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
-								RUN_ROUND="$round_idx" \
-								RUN_ROUNDS="$TEST_RUN_ROUNDS" \
-								./replay.sh "$ACTION" "$backend" &
-							else
-								echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
-								if [ "$backend" = "chainkv" ]; then
-									CHAINKV_CACHE_MB="$backend_cache_mib" \
-									COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
-									TRACE_FILE="$trace_file" \
-									DB_TYPE="$DB_TYPE" \
-									WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-									CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-									REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
-									RUN_ROUND="$round_idx" \
-									RUN_ROUNDS="$TEST_RUN_ROUNDS" \
-									./replay.sh "$ACTION" "$backend" &
-								else
-									PEBBLE_CACHE_MB="$backend_cache_mib" \
-									COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
-									TRACE_FILE="$trace_file" \
-									DB_TYPE="$DB_TYPE" \
-									WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
-									CHUNK_FILE_SIZE_BYTES="$CHUNK_FILE_SIZE_BYTES" \
-									REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
-									RUN_ROUND="$round_idx" \
-									RUN_ROUNDS="$TEST_RUN_ROUNDS" \
-									./replay.sh "$ACTION" "$backend" &
-								fi
-							fi
-							CURRENT_REPLAY_SH_PID=$!
-							wait "$CURRENT_REPLAY_SH_PID"
-							CURRENT_REPLAY_SH_PID=""
+						backend_cache_mib="$(resolve_backend_cache_mib "$backend" "$cache_size_mib")"
+						if ! [[ "$backend_cache_mib" =~ ^[0-9]+$ ]]; then
+							echo "Invalid derived backend cache for $backend: $backend_cache_mib"
+							exit 1
+						fi
 
-							echo "[$run_idx/$total_runs] done"
-							echo
+						for cache_count in "${CACHE_COUNT_VALUES[@]}"; do
+							if ! [[ "$cache_count" =~ ^[0-9]+$ ]]; then
+								echo "Invalid CACHE_COUNT candidate: $cache_count"
+								exit 1
+							fi
+
+							for commit_block_interval in "${COMMIT_BLOCK_INTERVAL_CANDIDATES[@]}"; do
+								if ! [[ "$commit_block_interval" =~ ^[0-9]+$ ]] || [ "$commit_block_interval" -le 0 ]; then
+									echo "Invalid COMMIT_BLOCK_INTERVAL candidate: $commit_block_interval"
+									exit 1
+								fi
+
+								for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
+									run_idx=$((run_idx + 1))
+									if [ "$backend" = "ethstore" ]; then
+										echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file BLOCK_RANGE=${start_block_id}-${end_block_id} CHUNK_FILE_SIZE_BYTES=${chunk_file_size_bytes} TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+										TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
+										CACHE_COUNT="$cache_count" \
+										COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
+										TRACE_FILE="$trace_file" \
+										DB_TYPE="$DB_TYPE" \
+										WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+										CHUNK_FILE_SIZE_BYTES="$chunk_file_size_bytes" \
+										START_BLOCK_ID="$start_block_id" \
+										END_BLOCK_ID="$end_block_id" \
+										REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+										RUN_ROUND="$round_idx" \
+										RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+										./replay.sh "$ACTION" "$backend" &
+									else
+										echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file BLOCK_RANGE=${start_block_id}-${end_block_id} CHUNK_FILE_SIZE_BYTES=${chunk_file_size_bytes} CACHE_SIZE=${cache_size_mib}MiB BACKEND_CACHE=${backend_cache_mib}MiB COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+										if [ "$backend" = "chainkv" ]; then
+											CHAINKV_CACHE_MB="$backend_cache_mib" \
+											COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
+											TRACE_FILE="$trace_file" \
+											DB_TYPE="$DB_TYPE" \
+											WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+											CHUNK_FILE_SIZE_BYTES="$chunk_file_size_bytes" \
+											START_BLOCK_ID="$start_block_id" \
+											END_BLOCK_ID="$end_block_id" \
+											REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+											RUN_ROUND="$round_idx" \
+											RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+											./replay.sh "$ACTION" "$backend" &
+										else
+											PEBBLE_CACHE_MB="$backend_cache_mib" \
+											COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
+											TRACE_FILE="$trace_file" \
+											DB_TYPE="$DB_TYPE" \
+											WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
+											CHUNK_FILE_SIZE_BYTES="$chunk_file_size_bytes" \
+											START_BLOCK_ID="$start_block_id" \
+											END_BLOCK_ID="$end_block_id" \
+											REPLAY_CGROUP_IO_LIMIT_ENABLED="$replay_cgroup_enabled" \
+											RUN_ROUND="$round_idx" \
+											RUN_ROUNDS="$TEST_RUN_ROUNDS" \
+											./replay.sh "$ACTION" "$backend" &
+										fi
+									fi
+									CURRENT_REPLAY_SH_PID=$!
+									wait "$CURRENT_REPLAY_SH_PID"
+									CURRENT_REPLAY_SH_PID=""
+
+									echo "[$run_idx/$total_runs] done"
+									echo
+								done
+							done
 						done
 					done
 				done

@@ -129,7 +129,7 @@ func makeAOLTestKey(block uint64) []byte {
 }
 
 func TestEthstoreReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) {
-	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestEthstoreReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) 
 }
 
 func TestEthstoreReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.T) {
-	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
 	}

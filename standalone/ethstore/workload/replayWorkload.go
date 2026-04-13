@@ -910,6 +910,8 @@ func (b *pebbleBaselineReplayBackend) PrintCommitStats() {
 
 type ethstoreReplayBackend struct {
 	store              *ethstore.Database
+	replayDBType       DBType
+	aolDirty           bool
 	pebbleBatch        ethdb.Batch
 	prefixdbDirty      bool
 	blockdbCommitHist  *latencyHistogram
@@ -918,13 +920,14 @@ type ethstoreReplayBackend struct {
 	blockTotalHist     *latencyHistogram
 }
 
-func newEthstoreReplayBackend(dir string, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*ethstoreReplayBackend, error) {
+func newEthstoreReplayBackend(dir string, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*ethstoreReplayBackend, error) {
 	store, err := ethstore.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	if err != nil {
 		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
 	}
 	return &ethstoreReplayBackend{
 		store:              store,
+		replayDBType:       replayDBType,
 		prefixdbCommitHist: newLatencyHistogram(),
 		pebbleCommitHist:   newLatencyHistogram(),
 		blockdbCommitHist:  newLatencyHistogram(),
@@ -958,7 +961,11 @@ func (b *ethstoreReplayBackend) ensurePebbleBatch() (ethdb.Batch, error) {
 
 func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
 	if ethstore.AolHandledDataTypes[dataType] {
-		return b.store.BatchPutToAOL(key, value, dataType)
+		err := b.store.BatchPutToAOL(key, value, dataType)
+		if err == nil {
+			b.aolDirty = true
+		}
+		return err
 	}
 	if ethstore.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchPutToPrefixDB(key, value, dataType)
@@ -976,7 +983,11 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 
 func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
 	if ethstore.AolHandledDataTypes[dataType] {
-		return b.store.BatchDeleteFromAOL(key, dataType)
+		err := b.store.BatchDeleteFromAOL(key, dataType)
+		if err == nil {
+			b.aolDirty = true
+		}
+		return err
 	}
 	if ethstore.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchDeleteFromPrefixDB(key, dataType)
@@ -994,11 +1005,16 @@ func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataTy
 
 func (b *ethstoreReplayBackend) CommitBlock() error {
 	blockStart := time.Now()
-	start := time.Now()
-	err := b.store.CommitAOLBatch()
-	b.blockdbCommitHist.observe(time.Since(start))
-	if err != nil {
-		return err
+	committedAny := false
+	if b.aolDirty {
+		start := time.Now()
+		err := b.store.CommitAOLBatch()
+		b.blockdbCommitHist.observe(time.Since(start))
+		if err != nil {
+			return err
+		}
+		b.aolDirty = false
+		committedAny = true
 	}
 	if b.prefixdbDirty {
 		start := time.Now()
@@ -1007,6 +1023,7 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 		}
 		b.prefixdbCommitHist.observe(time.Since(start))
 		b.prefixdbDirty = false
+		committedAny = true
 	}
 	if b.pebbleBatch != nil {
 		start := time.Now()
@@ -1015,8 +1032,11 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 		}
 		b.pebbleCommitHist.observe(time.Since(start))
 		b.pebbleBatch = nil
+		committedAny = true
 	}
-	b.blockTotalHist.observe(time.Since(blockStart))
+	if committedAny {
+		b.blockTotalHist.observe(time.Since(blockStart))
+	}
 	return nil
 }
 
@@ -1025,9 +1045,18 @@ func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
 }
 
 func (b *ethstoreReplayBackend) PrintCommitStats() {
-	reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
-	reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
-	reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+	switch b.replayDBType {
+	case AOL:
+		reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
+	case PrefixDB:
+		reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
+	case Pebble:
+		reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+	default:
+		reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
+		reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
+		reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+	}
 	reportHistogramSummary("ethstore commit (Total)", b.blockTotalHist)
 }
 
@@ -1666,7 +1695,7 @@ func main() {
 	}()
 
 	// For quick debugging
-	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
 	// if ethErr != nil {
 	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 	// }
@@ -1695,7 +1724,7 @@ func main() {
 			defer pbBackend.Close()
 			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		} else {
-			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
 			if ethErr != nil {
 				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
 			}
