@@ -266,9 +266,54 @@ func NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir string, chunkFileSi
 	db := &Database{
 		fn:                  stateDir,
 		log:                 logger,
+		quitChan:            make(chan chan error, 1),
 		statepdb:            statePrefixdb,
 		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
 	}
+	statePrefixdb.ParentKeyResolver = func(storageKey []byte) []byte {
+		if len(storageKey) < 33 {
+			return nil
+		}
+		return db.GetParentAccountKey(storageKey[1:33])
+	}
+	return db, nil
+}
+
+// NewStateWithPebbleGCAndStoreSettings opens PrefixDB plus the sibling Pebble
+// store needed for account-hash -> account-key resolution, while skipping AOL.
+func NewStateWithPebbleGCAndStoreSettings(dirPath string, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
+	logger := log.New("database", dirPath)
+
+	dirPathState := dirPath + "_state"
+	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+	}
+
+	db := &Database{
+		fn:                  dirPath,
+		log:                 logger,
+		quitChan:            make(chan chan error, 1),
+		statepdb:            statePrefixdb,
+		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
+	}
+	statePrefixdb.ParentKeyResolver = func(storageKey []byte) []byte {
+		if len(storageKey) < 33 {
+			return nil
+		}
+		return db.GetParentAccountKey(storageKey[1:33])
+	}
+
+	pebblePath := dirPath + "_pebble"
+	logger.Info("Initializing Pebble store", "path", pebblePath)
+	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, pebbleCache, pebbleHandles, namespace, readonly)
+	if err != nil {
+		db.statepdb.Close()
+		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
+	}
+	db.pebble = pebbleStore
+	db.diskSizeGauge = metrics.GetOrRegisterGauge(namespace+"disk/size", nil)
+
 	return db, nil
 }
 

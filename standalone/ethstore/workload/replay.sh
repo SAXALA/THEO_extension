@@ -126,6 +126,8 @@ GC_STATE_DIR="${GC_STATE_DIR:-${LOADED_ROOT}/ethstore/${ETHSTORE_STATEDB_DIRNAME
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
 # prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
 PREFIXDB_ACCOUNT_STATE_DIR="${PREFIXDB_ACCOUNT_STATE_DIR:-}"
+# ethstore prefixdb replay 可选专用 Pebble 源目录；仅在特定实验需要隔离 accountHash->accountKey 索引时使用
+ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="${ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
 
 # ethstore prefixdb 目录（用于权限预检查）
 ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-${RUNNING_ROOT}/ethstore_state/prefixdb}"
@@ -689,13 +691,67 @@ ensure_ethstore_statedb_dirname() {
     fi
 }
 
+normalize_trace_selector() {
+    printf "%s" "$TRACE_FILE" | tr '[:upper:]' '[:lower:]'
+}
+
+resolve_chainkv_loaded_dir() {
+    case "$(normalize_trace_selector)" in
+        cache|nocache_snap)
+            printf "%s" "${LOADED_ROOT}/chainkv"
+            ;;
+        nocache)
+            printf "%s" "${LOADED_ROOT}/chainkv_without"
+            ;;
+        *)
+            echo "Unsupported TRACE_FILE for chainkv replay sync: ${TRACE_FILE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+resolve_pebble_loaded_dir() {
+    case "$(normalize_trace_selector)" in
+        cache|nocache_snap)
+            printf "%s" "${LOADED_ROOT}/pebble"
+            ;;
+        nocache)
+            printf "%s" "${LOADED_ROOT}/pebble_without"
+            ;;
+        *)
+            echo "Unsupported TRACE_FILE for pebble replay sync: ${TRACE_FILE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+resolve_ethstore_pebble_loaded_dir() {
+    if [ "$DB_TYPE" = "prefixdb" ] && [ -n "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR" ]; then
+        printf "%s" "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR"
+        return 0
+    fi
+    case "$(normalize_trace_selector)" in
+        cache|nocache_snap)
+            printf "%s" "${LOADED_ROOT}/ethstore/database_pebble"
+            ;;
+        nocache)
+            printf "%s" "${LOADED_ROOT}/ethstore/database_pebble_without"
+            ;;
+        *)
+            echo "Unsupported TRACE_FILE for ethstore pebble replay sync: ${TRACE_FILE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 sync_ethstore_loaded_to_running() {
     ensure_ethstore_statedb_dirname
     local src_root="${LOADED_ROOT}/ethstore"
     local dst_prefix="${RUNNING_ROOT}/ethstore"
 
     local src_aol="${src_root}/database_aol"
-    local src_pebble="${src_root}/database_pebble"
+    local src_pebble
+    src_pebble="$(resolve_ethstore_pebble_loaded_dir)"
     local src_state="${src_root}/${ETHSTORE_STATEDB_DIRNAME}"
 
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "aol" ]; then
@@ -715,14 +771,19 @@ sync_ethstore_loaded_to_running() {
             echo "ethstore source directory missing under ${src_root}: ${ETHSTORE_STATEDB_DIRNAME}"
             exit 1
         fi
+        if [ ! -d "${src_pebble}" ]; then
+            echo "ethstore source directory missing under ${src_root}: $(basename "${src_pebble}")"
+            exit 1
+        fi
     fi
 
     case "$DB_TYPE" in
         prefixdb)
-            echo "Sync ethstore state data: ${src_state} -> ${dst_prefix}_state"
-            sudo_run mkdir -p "${dst_prefix}_state"
+            echo "Sync ethstore state+pebble data: ${src_state} -> ${dst_prefix}_state, ${src_pebble} -> ${dst_prefix}_pebble"
+            sudo_run mkdir -p "${dst_prefix}_state" "${dst_prefix}_pebble"
             sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
-            sudo_run chmod -R 777 "${dst_prefix}_state"
+            sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
+            sudo_run chmod -R 777 "${dst_prefix}_state" "${dst_prefix}_pebble"
             ;;
         aol)
             echo "Sync ethstore block data: ${src_aol} -> ${dst_prefix}_aol"
@@ -748,7 +809,8 @@ sync_ethstore_loaded_to_running() {
 }
 
 sync_chainkv_loaded_to_running() {
-    local src="${LOADED_ROOT}/chainkv"
+    local src
+    src="$(resolve_chainkv_loaded_dir)"
     local dst="${RUNNING_ROOT}/chainkv"
     if [ ! -d "${src}" ]; then
         echo "chainkv source directory missing: ${src}"
@@ -761,7 +823,8 @@ sync_chainkv_loaded_to_running() {
 }
 
 sync_pebble_loaded_to_running() {
-    local src="${LOADED_ROOT}/pebble"
+    local src
+    src="$(resolve_pebble_loaded_dir)"
     local dst="${RUNNING_ROOT}/pebble"
     if [ ! -d "${src}" ]; then
         echo "pebble source directory missing: ${src}"
@@ -870,6 +933,7 @@ print_param_snapshot() {
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
     printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
     printf 'PREFIXDB_ACCOUNT_STATE_DIR=%s\n' "$PREFIXDB_ACCOUNT_STATE_DIR"
+    printf 'ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR=%s\n' "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR"
     printf 'IDLE_OBSERVE_ENABLED=%s\n' "$IDLE_OBSERVE_ENABLED"
     printf 'IDLE_OBSERVE_INTERVAL_SECONDS=%s\n' "$IDLE_OBSERVE_INTERVAL_SECONDS"
     printf 'IDLE_OBSERVE_MAX_SECONDS=%s\n' "$IDLE_OBSERVE_MAX_SECONDS"

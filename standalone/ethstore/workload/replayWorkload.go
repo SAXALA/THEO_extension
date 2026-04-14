@@ -675,6 +675,19 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 			return fmt.Errorf("ethstore pebble load failed: %w", err)
 		}
 		return nil
+	case strings.EqualFold(backend, "insertAccountHashKeyPebbleToEthStorePebble"):
+		if cfg.LoadedEthstoreDir == "" {
+			return fmt.Errorf("insertAccountHashKeyPebbleToEthStorePebble with ethstore backend requires loadedEthStoreDir in config")
+		}
+		if cfg.AccountHashKeyPebbleDir == "" {
+			return fmt.Errorf("insertAccountHashKeyPebbleToEthStorePebble with ethstore backend requires accountHashKeyPebbleDir in config")
+		}
+		ethstorePebbleDir := "/mnt/ssd2/loaded/pebble_without"
+		fmt.Println("dir: " + ethstorePebbleDir)
+		if err := insertAccountHashKeyPebbleToEthStorePebble(cfg.AccountHashKeyPebbleDir, ethstorePebbleDir, pebbleCache, pebbleHandles); err != nil {
+			return fmt.Errorf("insert account hash key pebble to ethstore pebble failed: %w", err)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown backend: %s", backend)
 	}
@@ -921,7 +934,15 @@ type ethstoreReplayBackend struct {
 }
 
 func newEthstoreReplayBackend(dir string, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*ethstoreReplayBackend, error) {
-	store, err := ethstore.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	var (
+		store *ethstore.Database
+		err   error
+	)
+	if replayDBType == PrefixDB {
+		store, err = ethstore.NewStateWithPebbleGCAndStoreSettings(dir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	} else {
+		store, err = ethstore.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
 	}
@@ -2491,4 +2512,26 @@ func unpackToNibbles(bytes []byte) []byte {
 		nibbles = append(nibbles, b&0x0F)
 	}
 	return nibbles
+}
+
+func insertAccountHashKeyPebbleToEthStorePebble(accountHashKeyPebbleDir string, ethStorePebbleDir string, pebbleCache int, pebbleHandles int) error {
+	fmt.Println("Start copying account hash key pebble entries into ethstore pebble..." + accountHashKeyPebbleDir + " -> " + ethStorePebbleDir)
+	accountHashKeyPebble, err := pebblestore.NewPebbleStore(accountHashKeyPebbleDir, pebbleCache, pebbleHandles, "accountHash_key_pebble_load", false)
+	if err != nil {
+		return fmt.Errorf("failed to create PebbleStore instance for account hash key pebble: %w", err)
+	}
+	defer accountHashKeyPebble.Close()
+
+	ethStorePebble, err := pebblestore.NewPebbleStore(ethStorePebbleDir, pebbleCache, pebbleHandles, "ethstore_pebble_load", false)
+	if err != nil {
+		return fmt.Errorf("failed to create PebbleStore instance for ethstore pebble: %w", err)
+	}
+	defer ethStorePebble.Close()
+
+	copiedCount, err := copyPebbleStoreEntries(accountHashKeyPebble, ethStorePebble)
+	if err != nil {
+		return fmt.Errorf("failed to copy entries from account hash key pebble to ethstore pebble: %w", err)
+	}
+	fmt.Printf("Copied %d entries from account hash key pebble to ethstore pebble\n", copiedCount)
+	return nil
 }

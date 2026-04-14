@@ -158,6 +158,83 @@ func TestEthstoreReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.
 	}
 }
 
+func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "ethstore")
+	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)
+	if err := os.MkdirAll(brokenAOLDataPath, 0o755); err != nil {
+		t.Fatalf("create broken AOL path failed: %v", err)
+	}
+
+	backend, err := newEthstoreReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("expected prefixdb replay backend to skip AOL init, got %v", err)
+	}
+	defer backend.Close()
+
+	accountKey := append([]byte{'A'}, bytes.Repeat([]byte{0x11}, 32)...)
+	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+		t.Fatalf("StagePut account failed: %v", err)
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock failed: %v", err)
+	}
+	got, err := backend.Get(accountKey, ethstore.TrieNodeAccountDataType)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if string(got) != "account" {
+		t.Fatalf("unexpected account value: %q", string(got))
+	}
+}
+
+func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "ethstore")
+	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)
+	if err := os.MkdirAll(brokenAOLDataPath, 0o755); err != nil {
+		t.Fatalf("create broken AOL path failed: %v", err)
+	}
+
+	accountHash := bytes.Repeat([]byte{0x22}, 32)
+	accountKey := append([]byte{'A'}, bytes.Repeat([]byte{0x33}, 32)...)
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x01, 0x02, 0x03)
+
+	auxStore, err := pebblestore.NewPebbleStore(baseDir+"_pebble", 0, 0, "", false)
+	if err != nil {
+		t.Fatalf("open auxiliary pebble failed: %v", err)
+	}
+	if err := auxStore.Put(accountHash, accountKey); err != nil {
+		auxStore.Close()
+		t.Fatalf("seed account hash mapping failed: %v", err)
+	}
+	if err := auxStore.Close(); err != nil {
+		t.Fatalf("close auxiliary pebble failed: %v", err)
+	}
+
+	backend, err := newEthstoreReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("expected prefixdb replay backend to open with sibling pebble, got %v", err)
+	}
+	defer backend.Close()
+
+	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+		t.Fatalf("StagePut account failed: %v", err)
+	}
+	if err := backend.StagePut(storageKey, []byte("storage"), ethstore.TrieNodeStorageDataType); err != nil {
+		t.Fatalf("StagePut storage failed: %v", err)
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock failed: %v", err)
+	}
+
+	got, err := backend.Get(storageKey, ethstore.TrieNodeStorageDataType)
+	if err != nil {
+		t.Fatalf("Get storage failed: %v", err)
+	}
+	if string(got) != "storage" {
+		t.Fatalf("unexpected storage value: %q", string(got))
+	}
+}
+
 func TestResolvePrefixDBLoadAccountKeyNotFoundIsDeferred(t *testing.T) {
 	accountHash := bytes.Repeat([]byte{0x42}, 32)
 	storageKey := append(append([]byte{'O'}, accountHash...), 0x01, 0x08, 0x0b)

@@ -22,6 +22,7 @@ fi
 # - chunk sizes 4 KiB / 8 KiB / 16 KiB
 
 DB_TYPE="prefixdb"
+ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
 BACKEND_CANDIDATES=(ethstore)
 TRACE_FILE_CANDIDATES=(cache)
 CACHE_SIZE_CANDIDATES=(16)
