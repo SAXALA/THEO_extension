@@ -144,6 +144,8 @@ CURRENT_MONITOR_PID=""
 SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
 # rsync 3.2.x 默认可能受 1GB max-alloc 限制影响；0 表示不额外限制。
 RSYNC_MAX_ALLOC="${RSYNC_MAX_ALLOC:-0}"
+# 默认只关心数据内容，不强制保留 owner/group/perms 等元数据；脚本稍后会统一 chmod。
+RSYNC_PRESERVE_METADATA="${RSYNC_PRESERVE_METADATA:-false}"
 # replay 前清理后的空闲观察配置。
 IDLE_OBSERVE_ENABLED="${IDLE_OBSERVE_ENABLED:-true}"
 IDLE_OBSERVE_INTERVAL_SECONDS="${IDLE_OBSERVE_INTERVAL_SECONDS:-5}"
@@ -195,12 +197,18 @@ sudo_rsync_run() {
     if [ "$has_max_alloc" -eq 0 ] && [ -n "$RSYNC_MAX_ALLOC" ]; then
         args+=("--max-alloc=${RSYNC_MAX_ALLOC}")
     fi
+    if [ "${RSYNC_PRESERVE_METADATA}" != "true" ]; then
+        args+=("--no-perms" "--no-owner" "--no-group" "--omit-dir-times" "--no-devices" "--no-specials")
+    fi
     args+=("$@")
 
     set +e
     sudo_run rsync "${args[@]}"
     local rc=$?
     set -e
+    if [ "$rc" -eq 23 ]; then
+        echo "rsync exited with code 23 (partial transfer). Check earlier rsync output for unreadable or transient files." >&2
+    fi
     if [ "$rc" -eq 24 ]; then
         echo "rsync exited with code 24 (source files vanished during transfer); continuing" >&2
         return 0

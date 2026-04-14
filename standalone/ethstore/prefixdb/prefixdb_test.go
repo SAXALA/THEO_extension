@@ -1104,7 +1104,7 @@ func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
 	}
 }
 
-func TestStorageBatchCommitFailsOnUnresolvedStorageEntries(t *testing.T) {
+func TestBatchCommitDropsUnresolvedStorageAndContinues(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)
 	if err != nil {
@@ -1112,17 +1112,56 @@ func TestStorageBatchCommitFailsOnUnresolvedStorageEntries(t *testing.T) {
 	}
 	defer db.Close()
 
-	rawStorageKey := makeTestStorageRawKeyWithSuffix(0x44)
-	if err := db.StorageBatchPut(rawStorageKey, []byte("pending-value"), nil); err != nil {
-		t.Fatalf("StorageBatchPut failed: %v", err)
+	accountKey := makeTestAccountKey(0x44)
+	resolvedStorageKey := makeTestStorageRawKey(accountKey, 0x01)
+	deferredStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+
+	db.ParentKeyResolver = func(storageKey []byte) []byte {
+		if bytes.Equal(storageKey, resolvedStorageKey) {
+			return accountKey
+		}
+		return nil
 	}
 
-	err = db.StorageBatchCommit()
-	if err == nil {
-		t.Fatal("expected StorageBatchCommit to fail for unresolved storage entries")
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-value"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unresolved storage entries cannot be resolved") {
-		t.Fatalf("unexpected error: %v", err)
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, resolvedStorageKey, []byte("resolved-value"), nil); err != nil {
+		t.Fatalf("BatchPut resolved storage failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, deferredStorageKey, []byte("deferred-value"), nil); err != nil {
+		t.Fatalf("BatchPut deferred storage failed: %v", err)
+	}
+
+	err = db.BatchCommit()
+	if err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+	if db.storageBatch == nil {
+		t.Fatal("expected storageBatch to remain initialized")
+	}
+	if got := len(db.storageBatch.unresolved); got != 0 {
+		t.Fatalf("expected unresolved storage entries to be dropped after BatchCommit, got %d queued", got)
+	}
+
+	accountValue, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if !found || !bytes.Equal(accountValue, []byte("account-value")) {
+		t.Fatalf("unexpected account value after partial BatchCommit: found=%t got=%q", found, accountValue)
+	}
+	resolvedValue, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, resolvedStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get resolved storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(resolvedValue, []byte("resolved-value")) {
+		t.Fatalf("unexpected resolved storage value: found=%t got=%q", found, resolvedValue)
+	}
+	if deferredValue, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, deferredStorageKey, accountKey); err != nil {
+		t.Fatalf("Get dropped storage failed: %v", err)
+	} else if found {
+		t.Fatalf("expected dropped storage to stay unavailable, found value %q", deferredValue)
 	}
 }
 

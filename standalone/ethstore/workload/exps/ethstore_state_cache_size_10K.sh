@@ -20,7 +20,7 @@ fi
 # - cache trace only
 # - block window 20500000-20510000
 # - chunk sizes 8 KiB
-# - cache sizes 4 MiB / 64 MiB / 256 MiB
+# - cache sizes 4 MiB / 16 MiB / 64 MiB / 256 MiB
 
 DB_TYPE="prefixdb"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
