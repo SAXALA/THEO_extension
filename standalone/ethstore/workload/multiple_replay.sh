@@ -232,6 +232,18 @@ resolve_replay_cgroup_cases() {
 	printf '%s\n' "${REPLAY_CGROUP_IO_LIMIT_ENABLED:-true}"
 }
 
+resolve_chunk_file_size_candidates() {
+	local backend="$1"
+	case "$backend" in
+		ethstore|prefixdb)
+			printf '%s\n' "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"
+			;;
+		*)
+			echo "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[0]}"
+			;;
+	esac
+}
+
 parse_block_range() {
 	local range="$1"
 	local start_block end_block
@@ -253,13 +265,14 @@ count_total_runs() {
 	local backend trace_file cache_size_mib cache_count commit_block_interval replay_cgroup_enabled round_idx
 	local chunk_file_size_bytes block_range start_block_id end_block_id
 	local backend_cache_mib
-	local -a cache_count_values
+	local -a cache_count_values chunk_file_size_values
 
 	for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 		for trace_file in "${SELECTED_TRACES[@]}"; do
 			for backend in "${SELECTED_BACKENDS[@]}"; do
 				mapfile -t cache_count_values < <(resolve_cache_count_candidates "$backend")
-				for chunk_file_size_bytes in "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"; do
+				mapfile -t chunk_file_size_values < <(resolve_chunk_file_size_candidates "$backend")
+				for chunk_file_size_bytes in "${chunk_file_size_values[@]}"; do
 					if ! [[ "$chunk_file_size_bytes" =~ ^[0-9]+$ ]] || [ "$chunk_file_size_bytes" -le 0 ]; then
 						echo "Invalid CHUNK_FILE_SIZE_BYTES candidate: $chunk_file_size_bytes" >&2
 						exit 1
@@ -300,7 +313,8 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 	for trace_file in "${SELECTED_TRACES[@]}"; do
 		for backend in "${SELECTED_BACKENDS[@]}"; do
 			mapfile -t CACHE_COUNT_VALUES < <(resolve_cache_count_candidates "$backend")
-			for chunk_file_size_bytes in "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"; do
+			mapfile -t CHUNK_FILE_SIZE_VALUES < <(resolve_chunk_file_size_candidates "$backend")
+			for chunk_file_size_bytes in "${CHUNK_FILE_SIZE_VALUES[@]}"; do
 				if ! [[ "$chunk_file_size_bytes" =~ ^[0-9]+$ ]] || [ "$chunk_file_size_bytes" -le 0 ]; then
 					echo "Invalid CHUNK_FILE_SIZE_BYTES candidate: $chunk_file_size_bytes"
 					exit 1
