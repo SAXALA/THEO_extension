@@ -6,7 +6,7 @@ fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
-TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-2}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-3}"
 export TEST_RUN_ROUNDS
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

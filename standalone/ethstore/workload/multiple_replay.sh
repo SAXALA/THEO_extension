@@ -341,6 +341,7 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 										COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
 										TRACE_FILE="$trace_file" \
 										DB_TYPE="$DB_TYPE" \
+										ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR" \
 										WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
 										CHUNK_FILE_SIZE_BYTES="$chunk_file_size_bytes" \
 										START_BLOCK_ID="$start_block_id" \
