@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -67,6 +69,33 @@ func writeTraceFile(t *testing.T, lines ...string) string {
 		t.Fatalf("write trace file failed: %v", err)
 	}
 	return tracePath
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	origStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe failed: %v", err)
+	}
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = origStdout
+	}()
+
+	outCh := make(chan string, 1)
+	go func() {
+		buf, readErr := io.ReadAll(reader)
+		if readErr != nil {
+			outCh <- fmt.Sprintf("read stdout failed: %v", readErr)
+			return
+		}
+		outCh <- string(buf)
+	}()
+
+	fn()
+	_ = writer.Close()
+	return <-outCh
 }
 
 type fakeGetterStore struct {
@@ -688,5 +717,46 @@ func TestReplayTrace_CommitBlockInterval(t *testing.T) {
 	}
 	if len(backend.puts) != 3 {
 		t.Fatalf("expected 3 puts to replay, got %d", len(backend.puts))
+	}
+}
+
+func TestReplayTrace_CountsOnlyActuallyReplayedOpsButTracksTraceBytesRead(t *testing.T) {
+	backend := &fakeReplayBackend{}
+	traceFile := writeTraceFile(t,
+		"Processing block (start), ID: 500",
+		"OPType: Put, key: , size: 0, value: aa, size: 1",
+		"OPType: Put, key: 0a, size: 1, value: bb, size: 1",
+		"Processing block (end), ID: 500",
+	)
+
+	traceContent, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatalf("read trace file failed: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		replayTrace(backend, traceFile, 0, allDBTypes, 0, 0, 1)
+	})
+
+	if len(backend.puts) != 1 {
+		t.Fatalf("expected only valid put to be replayed, got %d puts", len(backend.puts))
+	}
+
+	replaySummaryRE := regexp.MustCompile(`Replay finished\. ops=(\d+) `)
+	match := replaySummaryRE.FindStringSubmatch(output)
+	if len(match) != 2 {
+		t.Fatalf("replay summary not found in output: %s", output)
+	}
+	if match[1] != "1" {
+		t.Fatalf("expected replay ops to count only actually replayed ops, got %s; output=%s", match[1], output)
+	}
+
+	traceBytesRE := regexp.MustCompile(`Trace file bytes read: (\d+) bytes`)
+	match = traceBytesRE.FindStringSubmatch(output)
+	if len(match) != 2 {
+		t.Fatalf("trace bytes summary not found in output: %s", output)
+	}
+	if got, want := match[1], fmt.Sprintf("%d", len(traceContent)); got != want {
+		t.Fatalf("expected trace bytes to reflect bytes actually read from trace file, got %s want %s; output=%s", got, want, output)
 	}
 }

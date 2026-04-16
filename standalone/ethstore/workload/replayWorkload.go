@@ -1378,17 +1378,6 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 		kvTypeStr := classifyDataType(dataType)
 
-		counter++
-		if counter%10000 == 0 {
-			fmt.Printf("\r[%s] ops=%d time=%.2fs read=%d write=%d\n",
-				backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
-		}
-		if maxOps > 0 && counter >= maxOps && !stopAtNextBlockEnd {
-			stopAtNextBlockEnd = true
-			fmt.Printf("\n[%s] Reached max ops %d; waiting for next block boundary.\n",
-				backend.Name(), maxOps)
-		}
-
 		//debug
 		// testKeyHex := "4fc01cf44b5fd388621bce9fca946de503c1f9fa5c34765867954352ad3baec0080f01"
 		// testKeyBytes, _ := hex.DecodeString(testKeyHex)
@@ -1453,6 +1442,17 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 		elapsed := time.Since(start)
 		totalTime += elapsed
+		recordOp(kvTypeStr, op, elapsed)
+		counter++
+		if counter%10000 == 0 {
+			fmt.Printf("\r[%s] ops=%d time=%.2fs read=%d write=%d\n",
+				backend.Name(), counter, totalTime.Seconds(), logicReadSize, logicWriteSize)
+		}
+		if maxOps > 0 && counter >= maxOps && !stopAtNextBlockEnd {
+			stopAtNextBlockEnd = true
+			fmt.Printf("\n[%s] Reached max ops %d; waiting for next block boundary.\n",
+				backend.Name(), maxOps)
+		}
 		// comment to disable operation failed output
 		// if opErr != nil {
 		// 	if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
@@ -1460,7 +1460,6 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		// 			backend.Name(), opTypeStr, keyHex, opErr)
 		// 	}
 		// }
-		recordOp(kvTypeStr, op, elapsed)
 		if readErr == io.EOF {
 			break
 		}
