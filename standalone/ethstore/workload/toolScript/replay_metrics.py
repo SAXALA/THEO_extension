@@ -505,7 +505,14 @@ def item_to_single_row(
 def write_csv(rows: list[dict[str, Any]], output: Path | None) -> None:
     if not rows:
         return
+    # Preserve first-row column order, then append any extra keys found later.
     fieldnames = list(rows[0].keys())
+    seen = set(fieldnames)
+    for row in rows[1:]:
+        for k in row.keys():
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
     if output:
         with output.open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
