@@ -1086,6 +1086,10 @@ func decodeNodeEntry(entry []byte) NodeInfo {
 }
 
 func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error) {
+	return pt.GetWithBreakdown(key, nil)
+}
+
+func (pt *PrefixTree) GetWithBreakdown(key []byte, breakdown *trieGetBreakdownStats) (nodeInfo NodeInfo, found bool, err error) {
 	pt.lock.RLock()
 	defer pt.lock.RUnlock()
 	if len(key) == 0 {
@@ -1093,7 +1097,7 @@ func (pt *PrefixTree) Get(key []byte) (nodeInfo NodeInfo, found bool, err error)
 	}
 	fileID := pt.fileIDForKey(key)
 
-	return pt.getFromFileNode(fileID, key)
+	return pt.getFromFileNodeWithBreakdown(fileID, key, breakdown)
 
 }
 
@@ -1493,8 +1497,27 @@ func (pt *PrefixTree) Close() error {
 }
 
 func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeInfo, found bool, err error) {
+	return pt.getFromFileNodeWithBreakdown(fileID, Key, nil)
+}
+
+func (pt *PrefixTree) getFromFileNodeWithBreakdown(fileID string, Key []byte, breakdown *trieGetBreakdownStats) (nodeInfo NodeInfo, found bool, err error) {
 	if fileID == pt.globalFileID {
-		return pt.getFromGlobalNode(Key)
+		locateStart := time.Now()
+		recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+			if breakdown == nil {
+				return nil
+			}
+			return &breakdown.indexLocate
+		}(), true, time.Since(locateStart))
+		searchStart := time.Now()
+		nodeInfo, found, err = pt.getFromGlobalNode(Key)
+		recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+			if breakdown == nil {
+				return nil
+			}
+			return &breakdown.search
+		}(), true, time.Since(searchStart))
+		return nodeInfo, found, err
 	}
 	fl := pt.fileStripeLocks.pick([]byte(fileID))
 	fl.RLock()
@@ -1515,11 +1538,19 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 	var bigBuf []byte
 	var header FileNodeHeader
 	var sortedSlice, unsortedSlice []byte
+	sourceFromCache := true
+	locateStart := time.Now()
 
 	if state := pt.getGCState(fileID); state != nil {
 		header = state.header
 		sortedSlice = state.sorted
 		unsortedSlice = state.unsorted
+		recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+			if breakdown == nil {
+				return nil
+			}
+			return &breakdown.indexLocate
+		}(), true, time.Since(locateStart))
 	} else {
 		if entry, ok := pt.getFileNodeCache(fileID); ok {
 			releaseCacheEntry = entry.Release
@@ -1532,7 +1563,14 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 			if header.Magic != FileNodeMagic {
 				return NodeInfo{}, false, fmt.Errorf("invalid cached file node magic (got 0x%X, file=%s)", header.Magic, fileID)
 			}
+			recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+				if breakdown == nil {
+					return nil
+				}
+				return &breakdown.indexLocate
+			}(), true, time.Since(locateStart))
 		} else {
+			sourceFromCache = false
 			addUint64Stat(&pt.fileNodeCacheMisses, 1)
 			addUint64Stat(&pt.nodeFileDiskLoads, 1)
 			file, err := pt.getOrCreateFileHandle(fileID, os.O_RDWR)
@@ -1542,6 +1580,12 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 				}
 				return NodeInfo{}, false, fmt.Errorf("open file failed: %w", err)
 			}
+			recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+				if breakdown == nil {
+					return nil
+				}
+				return &breakdown.indexLocate
+			}(), false, time.Since(locateStart))
 			decoded, readErr := pt.readDecodedFileNode(fileID, file)
 			if readErr != nil {
 				var retryErr error
@@ -1583,8 +1627,24 @@ func (pt *PrefixTree) getFromFileNode(fileID string, Key []byte) (nodeInfo NodeI
 	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
 	totalEntries := sortedCount + unsortedCount
 	if totalEntries == 0 {
+		recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+			if breakdown == nil {
+				return nil
+			}
+			return &breakdown.search
+		}(), sourceFromCache, 0)
 		return NodeInfo{}, false, nil
 	}
+
+	searchStart := time.Now()
+	defer func() {
+		recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+			if breakdown == nil {
+				return nil
+			}
+			return &breakdown.search
+		}(), sourceFromCache, time.Since(searchStart))
+	}()
 
 	var latestAccountHit *NodeInfo
 	var latestStorageHit *NodeInfo

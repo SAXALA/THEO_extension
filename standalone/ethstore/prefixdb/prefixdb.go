@@ -652,6 +652,12 @@ type trieStorageGetBreakdownStepStats struct {
 	noCacheNanos uint64
 }
 
+type trieGetBreakdownStats struct {
+	indexLocate trieStorageGetBreakdownStepStats
+	ioRead      trieStorageGetBreakdownStepStats
+	search      trieStorageGetBreakdownStepStats
+}
+
 type segmentIndexLookupSource uint8
 
 const (
@@ -813,6 +819,7 @@ type PrefixDB struct {
 	trieStorageLogPairs   uint64
 	trieStorageLogBytes   uint64
 
+	trieAccountGetStats              trieGetBreakdownStats
 	trieStorageAccountEntryStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexLayerStats trieStorageSegmentIndexLayerStats
@@ -1033,8 +1040,12 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 		}
 	}
 
+	cacheLookupStart := time.Now()
 	if useNodeCache {
 		if entry, ok := db.nodeCache.Get(cacheKey); ok && entry.Value != nil {
+			recordTrieStorageGetBreakdownStep(&db.trieAccountGetStats.indexLocate, true, time.Since(cacheLookupStart))
+			recordTrieStorageGetBreakdownStep(&db.trieAccountGetStats.ioRead, true, 0)
+			recordTrieStorageGetBreakdownStep(&db.trieAccountGetStats.search, true, 0)
 			return entry.Value, true, nil
 		}
 	}
@@ -1047,7 +1058,7 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 		}()
 	}
 
-	node, err := db.getAccountNode(key)
+	node, err := db.getAccountNodeWithBreakdown(key, &db.trieAccountGetStats)
 	if err != nil {
 		db.logAccountKVReadFailure(key, 0, 0, "load-account-node", err)
 		return nil, false, err
@@ -1056,7 +1067,9 @@ func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {
 		db.logAccountKVReadFailure(key, 0, 0, "account-not-found", nil)
 		return nil, false, nil
 	}
+	ioReadStart := time.Now()
 	value, err := db.readFromFileWithTracker(node.accountOffset, node.accountSize, missTracker)
+	recordTrieStorageGetBreakdownStep(&db.trieAccountGetStats.ioRead, false, time.Since(ioReadStart))
 	if err != nil {
 		db.logAccountKVReadFailure(key, node.accountOffset, node.accountSize, "read-account-file", err)
 		return nil, false, err
@@ -2228,6 +2241,10 @@ func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, 
 }
 
 func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdownStepStats) {
+	printTrieGetBreakdownStep("TrieNodeStorage", label, stats)
+}
+
+func printTrieGetBreakdownStep(kind string, label string, stats *trieStorageGetBreakdownStepStats) {
 	if !analysisStatsEnabled || stats == nil {
 		return
 	}
@@ -2243,7 +2260,8 @@ func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdo
 	if noCacheCount > 0 {
 		noCacheAvgMicros = float64(noCacheNanos) / float64(noCacheCount) / 1000.0
 	}
-	fmt.Printf("PrefixDB TrieNodeStorage get breakdown [%s]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+	fmt.Printf("PrefixDB %s get breakdown [%s]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+		kind,
 		label,
 		cacheCount,
 		time.Duration(cacheNanos),
@@ -2382,6 +2400,9 @@ func (db *PrefixDB) Close() error {
 			atomic.LoadUint64(&db.trieStorageLogPairs),
 			atomic.LoadUint64(&db.trieStorageLogBytes),
 		)
+		printTrieGetBreakdownStep("TrieNodeAccount", "index-locate", &db.trieAccountGetStats.indexLocate)
+		printTrieGetBreakdownStep("TrieNodeAccount", "io-read", &db.trieAccountGetStats.ioRead)
+		printTrieGetBreakdownStep("TrieNodeAccount", "search", &db.trieAccountGetStats.search)
 		printTrieStorageGetBreakdownStep("account-entry", &db.trieStorageAccountEntryStats)
 		printTrieStorageGetBreakdownStep("segment-index", &db.trieStorageSegmentIndexStats)
 		printTrieStorageSegmentIndexLayerStats(&db.trieStorageSegmentIndexLayerStats)
@@ -2618,6 +2639,10 @@ func (db *PrefixDB) getNodeWithSource(key []byte) (*TrieNode, bool, error) {
 }
 
 func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
+	return db.getAccountNodeWithBreakdown(key, nil)
+}
+
+func (db *PrefixDB) getAccountNodeWithBreakdown(key []byte, breakdown *trieGetBreakdownStats) (*TrieNode, error) {
 	cacheKey := string(key)
 	cacheHit := false
 	useNodeCache := !db.shouldBypassNodeCache(key)
@@ -2627,6 +2652,18 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 			cacheHit = true
 			addUint64Stat(&db.nodeCacheHits, 1)
 			if entry.AccountOffset != 0 || entry.StorageInfo.storageFileID != 0 || entry.Value != nil {
+				recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+					if breakdown == nil {
+						return nil
+					}
+					return &breakdown.indexLocate
+				}(), true, 0)
+				recordTrieStorageGetBreakdownStep(func() *trieStorageGetBreakdownStepStats {
+					if breakdown == nil {
+						return nil
+					}
+					return &breakdown.search
+				}(), true, 0)
 				addUint64Stat(&db.nodeCacheServed, 1)
 				return nodeInfoToTrieNode(NodeInfo{
 					accountOffset: entry.AccountOffset,
@@ -2650,7 +2687,7 @@ func (db *PrefixDB) getAccountNode(key []byte) (*TrieNode, error) {
 		}
 	}
 
-	nodeInfo, found, err := db.prefixTree.Get(key)
+	nodeInfo, found, err := db.prefixTree.GetWithBreakdown(key, breakdown)
 	if err != nil {
 		return nil, err
 	}

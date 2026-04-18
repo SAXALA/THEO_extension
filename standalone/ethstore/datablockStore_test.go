@@ -1,11 +1,13 @@
 package ethstore
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -48,6 +50,14 @@ func cleanupTestDir(t *testing.T, dir string) {
 	if err := os.RemoveAll(dir); err != nil {
 		t.Errorf("Failed to remove temp dir %s: %v", dir, err)
 	}
+}
+
+func makeTestHeaderKey(blockID uint64, suffix byte) string {
+	key := make([]byte, 10)
+	key[0] = 'h'
+	binary.BigEndian.PutUint64(key[1:9], blockID)
+	key[9] = suffix
+	return string(key)
 }
 
 func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
@@ -267,6 +277,74 @@ func TestAppendOnlyLog_DuplicateLatestBlockIDAppendsMultipleKVs(t *testing.T) {
 	expected := map[string]string{"k1": "v1", "k2": "v2", "k3": "v3"}
 	if !reflect.DeepEqual(kvs, expected) {
 		t.Fatalf("block 100 mismatch: got %v want %v", kvs, expected)
+	}
+}
+
+func TestAppendOnlyLogGetBreakdownTracksIndexAndDataPhases(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 1)
+	defer cleanup()
+
+	oldKey := makeTestHeaderKey(1, 0x01)
+	recentKey := makeTestHeaderKey(2, 0x02)
+	if err := aol.Append(1, map[string]string{oldKey: "old-value"}); err != nil {
+		t.Fatalf("append old block failed: %v", err)
+	}
+	if err := aol.Append(2, map[string]string{recentKey: "recent-value"}); err != nil {
+		t.Fatalf("append recent block failed: %v", err)
+	}
+
+	if got, exists, err := aol.Get(recentKey); err != nil {
+		t.Fatalf("Get(recentKey) failed: %v", err)
+	} else if !exists || got != "recent-value" {
+		t.Fatalf("Get(recentKey) mismatch: exists=%v value=%q", exists, got)
+	}
+	if got := atomic.LoadUint64(&aol.getInMemoryIndexStats.cacheCount); got == 0 {
+		t.Fatal("expected in-memory index fetch cacheCount to increase on skiplist hit")
+	}
+	if got := atomic.LoadUint64(&aol.getDiskDataStats.cacheCount); got == 0 {
+		t.Fatal("expected disk data fetch cacheCount to increase on inline value hit")
+	}
+
+	if got, exists, err := aol.Get(oldKey); err != nil {
+		t.Fatalf("Get(oldKey) with cached block index failed: %v", err)
+	} else if !exists || got != "old-value" {
+		t.Fatalf("Get(oldKey) mismatch: exists=%v value=%q", exists, got)
+	}
+	if got := atomic.LoadUint64(&aol.getInMemoryIndexStats.noCacheCount); got == 0 {
+		t.Fatal("expected in-memory index fetch noCacheCount to increase on skiplist miss")
+	}
+	if got := atomic.LoadUint64(&aol.getDiskDataStats.noCacheCount); got == 0 {
+		t.Fatal("expected disk data fetch noCacheCount to increase on disk block scan")
+	}
+
+	entry, ok, err := aol.findBlockIndexEntryOnDisk(1)
+	if err != nil {
+		t.Fatalf("findBlockIndexEntryOnDisk failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected block index entry for block 1 on disk")
+	}
+	aol.blockIndex = map[uint64]blockIndexEntry{1: entry}
+	if got, exists, err := aol.Get(oldKey); err != nil {
+		t.Fatalf("Get(oldKey) with explicit in-memory index failed: %v", err)
+	} else if !exists || got != "old-value" {
+		t.Fatalf("Get(oldKey) with explicit in-memory index mismatch: exists=%v value=%q", exists, got)
+	}
+	if got := atomic.LoadUint64(&aol.getDiskIndexStats.cacheCount); got == 0 {
+		t.Fatal("expected disk index fetch cacheCount to increase when block index is served from memory")
+	}
+
+	aol.blockIndex = nil
+	if got, exists, err := aol.Get(oldKey); err != nil {
+		t.Fatalf("Get(oldKey) with on-disk index failed: %v", err)
+	} else if !exists || got != "old-value" {
+		t.Fatalf("Get(oldKey) after clearing blockIndex mismatch: exists=%v value=%q", exists, got)
+	}
+	if got := atomic.LoadUint64(&aol.getDiskIndexStats.noCacheCount); got == 0 {
+		t.Fatal("expected disk index fetch noCacheCount to increase when index is read from disk")
 	}
 }
 

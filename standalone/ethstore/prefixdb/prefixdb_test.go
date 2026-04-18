@@ -531,6 +531,54 @@ func makeTestStorageRawKeyWithSuffix(suffix ...byte) []byte {
 	return raw
 }
 
+func TestTrieNodeAccountGetBreakdownTracksIndexLocateIOReadAndSearch(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x77)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-value"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit failed: %v", err)
+	}
+
+	if got, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil); err != nil {
+		t.Fatalf("first Get failed: %v", err)
+	} else if !found || string(got) != "account-value" {
+		t.Fatalf("first Get mismatch: found=%v value=%q", found, got)
+	}
+
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.indexLocate.cacheCount) + atomic.LoadUint64(&db.trieAccountGetStats.indexLocate.noCacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount index-locate breakdown to record the first Get")
+	}
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.ioRead.noCacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount io-read noCacheCount to increase on first Get")
+	}
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.search.cacheCount) + atomic.LoadUint64(&db.trieAccountGetStats.search.noCacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount search breakdown to record the first Get")
+	}
+
+	if got, found, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil); err != nil {
+		t.Fatalf("second Get failed: %v", err)
+	} else if !found || string(got) != "account-value" {
+		t.Fatalf("second Get mismatch: found=%v value=%q", found, got)
+	}
+
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.indexLocate.cacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount index-locate cacheCount to increase on cached Get")
+	}
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.ioRead.cacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount io-read cacheCount to increase on cached Get")
+	}
+	if got := atomic.LoadUint64(&db.trieAccountGetStats.search.cacheCount); got == 0 {
+		t.Fatal("expected TrieNodeAccount search cacheCount to increase on cached Get")
+	}
+}
+
 func writeLargeChunkFileForTest(t *testing.T, path string, entryCount int, targetKey []byte, targetValue []byte) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -4587,9 +4635,6 @@ func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T
 	if len(rawIndex) < 4 {
 		t.Fatal("expected segment index bytes after post-load GC")
 	}
-	if got := binary.BigEndian.Uint32(rawIndex[:4]); got != segmentIndexFlatMagic {
-		t.Fatalf("expected flat segment index after post-load GC, got 0x%x", got)
-	}
 
 	updatedMetas, err := db.readSegmentIndexNoCache(folderID)
 	if err != nil {
@@ -4597,6 +4642,13 @@ func TestRunPostLoadGCFullyRewritesStorageSegmentsIgnoringThreshold(t *testing.T
 	}
 	if len(updatedMetas) == 0 {
 		t.Fatal("expected rewritten storage chunk metadata after post-load GC")
+	}
+	expectedMagic := uint32(segmentIndexMultiLevelMagic)
+	if estimateSegmentIndexSize(updatedMetas) <= db.segmentIndexMultiLevelThreshold {
+		expectedMagic = segmentIndexFlatMagic
+	}
+	if got := binary.BigEndian.Uint32(rawIndex[:4]); got != expectedMagic {
+		t.Fatalf("expected segment index magic 0x%x after post-load GC, got 0x%x", expectedMagic, got)
 	}
 
 	allEntries := make([]kvPair, 0)

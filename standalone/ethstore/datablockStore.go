@@ -67,6 +67,13 @@ type baolDiskIOCounters struct {
 	writeBytes uint64
 }
 
+type baolGetBreakdownStepStats struct {
+	cacheCount   uint64
+	cacheNanos   uint64
+	noCacheCount uint64
+	noCacheNanos uint64
+}
+
 // BlockAppendOnlyLog implements the append-only log store with skiplist indexing for recent blocks.
 type BlockAppendOnlyLog struct {
 	dirPath string
@@ -101,6 +108,10 @@ type BlockAppendOnlyLog struct {
 	closed bool
 
 	diskIOStats [baolDiskIOUsageCount]baolDiskIOCounters
+
+	getInMemoryIndexStats baolGetBreakdownStepStats
+	getDiskIndexStats     baolGetBreakdownStepStats
+	getDiskDataStats      baolGetBreakdownStepStats
 
 	// opCount   uint64 // for debugging
 	// failedOps uint64 // for debugging
@@ -440,6 +451,47 @@ func (baol *BlockAppendOnlyLog) printDiskIOStats() {
 	}
 	fmt.Printf("BlockStore disk IO stats [total]: readOps=%d readBytes=%d writeOps=%d writeBytes=%d\n",
 		totalReadOps, totalReadBytes, totalWriteOps, totalWriteBytes,
+	)
+}
+
+func recordBAOLGetBreakdownStep(stats *baolGetBreakdownStepStats, fromCache bool, duration time.Duration) {
+	if !analysisStatsEnabled || stats == nil {
+		return
+	}
+	nanos := uint64(duration)
+	if fromCache {
+		atomic.AddUint64(&stats.cacheCount, 1)
+		atomic.AddUint64(&stats.cacheNanos, nanos)
+		return
+	}
+	atomic.AddUint64(&stats.noCacheCount, 1)
+	atomic.AddUint64(&stats.noCacheNanos, nanos)
+}
+
+func printBAOLGetBreakdownStep(label string, stats *baolGetBreakdownStepStats) {
+	if !analysisStatsEnabled || stats == nil {
+		return
+	}
+	cacheCount := atomic.LoadUint64(&stats.cacheCount)
+	cacheNanos := atomic.LoadUint64(&stats.cacheNanos)
+	noCacheCount := atomic.LoadUint64(&stats.noCacheCount)
+	noCacheNanos := atomic.LoadUint64(&stats.noCacheNanos)
+	cacheAvgMicros := 0.0
+	if cacheCount > 0 {
+		cacheAvgMicros = float64(cacheNanos) / float64(cacheCount) / 1000.0
+	}
+	noCacheAvgMicros := 0.0
+	if noCacheCount > 0 {
+		noCacheAvgMicros = float64(noCacheNanos) / float64(noCacheCount) / 1000.0
+	}
+	fmt.Printf("BlockStore get breakdown [%s]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+		label,
+		cacheCount,
+		time.Duration(cacheNanos),
+		cacheAvgMicros,
+		noCacheCount,
+		time.Duration(noCacheNanos),
+		noCacheAvgMicros,
 	)
 }
 
@@ -855,11 +907,15 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 	// check in buffer first
 
 	// Check if the key is in the skiplist index
+	inMemoryIndexStart := time.Now()
 	element := baol.skiplistIndex.Get(key)
 	if element != nil {
+		recordBAOLGetBreakdownStep(&baol.getInMemoryIndexStats, true, time.Since(inMemoryIndexStart))
 		pointer := element.Value.(*kvPointer)
 
-		valueBytes, err := baol.readValueBytesFromPointer(pointer)
+		diskDataStart := time.Now()
+		valueBytes, dataFromCache, err := baol.readValueBytesFromPointerWithSource(pointer)
+		recordBAOLGetBreakdownStep(&baol.getDiskDataStats, dataFromCache, time.Since(diskDataStart))
 		if err != nil {
 			baol.log.Error("Get: Failed to read entry via pointer", "key", key, "offset", pointer.Offset, "blockID", pointer.BlockID, "error", err)
 			return "", false, fmt.Errorf("failed to read entry for key %s: %w", key, err)
@@ -871,6 +927,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		}
 		return value, true, nil // Key found in skiplist
 	}
+	recordBAOLGetBreakdownStep(&baol.getInMemoryIndexStats, false, time.Since(inMemoryIndexStart))
 
 	// Key not in skiplist - check if we can determine blockID from key
 	dataType := GetDataTypeFromKey([]byte(key))
@@ -891,15 +948,25 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 		}
 
 		// Block not in skiplist - read from disk via index
-		if mainEntry, okMain := baol.getBlockIndexEntry(blockID); okMain {
+		diskIndexStart := time.Now()
+		mainEntry, okMain, indexFromCache, err := baol.getBlockIndexEntryWithSource(blockID)
+		recordBAOLGetBreakdownStep(&baol.getDiskIndexStats, indexFromCache, time.Since(diskIndexStart))
+		if err != nil {
+			return "", false, fmt.Errorf("failed to lookup block index %d: %w", blockID, err)
+		}
+		if okMain {
+			diskDataStart := time.Now()
 			if val, found, err := baol.findKeyInOneBlock(baol.dataFile, mainEntry, key); err != nil {
+				recordBAOLGetBreakdownStep(&baol.getDiskDataStats, false, time.Since(diskDataStart))
 				return "", false, fmt.Errorf("failed to scan block %d from disk: %w", blockID, err)
 			} else if found {
+				recordBAOLGetBreakdownStep(&baol.getDiskDataStats, false, time.Since(diskDataStart))
 				if val == TombstoneMarker {
 					return "", true, nil
 				}
 				return val, true, nil
 			}
+			recordBAOLGetBreakdownStep(&baol.getDiskDataStats, false, time.Since(diskDataStart))
 		}
 		// Block not found in index either
 		return "", false, nil
@@ -1373,8 +1440,13 @@ func (baol *BlockAppendOnlyLog) isLogEmptyInitial() bool {
 // Assumes aol.mu is RLocked by the caller if called during skiplist iteration.
 // Reading from aol.dataFile with ReadAt is safe concurrently.
 func (baol *BlockAppendOnlyLog) readValueBytesFromPointer(pointer *kvPointer) ([]byte, error) {
+	value, _, err := baol.readValueBytesFromPointerWithSource(pointer)
+	return value, err
+}
+
+func (baol *BlockAppendOnlyLog) readValueBytesFromPointerWithSource(pointer *kvPointer) ([]byte, bool, error) {
 	if pointer.HasInlineValue {
-		return pointer.InlineValue, nil
+		return pointer.InlineValue, true, nil
 	}
 
 	// logEntry format on disk: blockID (uint64) | keyLen (uint32) | valueLen (uint32) | key (bytes) | value (bytes)
@@ -1385,15 +1457,15 @@ func (baol *BlockAppendOnlyLog) readValueBytesFromPointer(pointer *kvPointer) ([
 	// The keyLen field is located after the blockID field.
 	f, headerSize, keyLen, valueLen, err := baol.readHeaderAndLocate(pointer)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	valueBytes := make([]byte, valueLen)
 	valueOffset := pointer.Offset + int64(headerSize) + int64(keyLen)
 	if _, err := baol.readAtWithStats(f, valueBytes, valueOffset, baolDiskIOUsageDataQuery); err != nil {
-		return nil, fmt.Errorf("ReadAt for value failed at offset %d (len %d): %w", valueOffset, valueLen, err)
+		return nil, false, fmt.Errorf("ReadAt for value failed at offset %d (len %d): %w", valueOffset, valueLen, err)
 	}
-	return valueBytes, nil
+	return valueBytes, false, nil
 }
 
 // Close flushes buffers and closes open files.
@@ -1450,6 +1522,9 @@ func (baol *BlockAppendOnlyLog) Close() error {
 	}
 
 	baol.printDiskIOStats()
+	printBAOLGetBreakdownStep("in-memory-index-fetch", &baol.getInMemoryIndexStats)
+	printBAOLGetBreakdownStep("disk-index-fetch", &baol.getDiskIndexStats)
+	printBAOLGetBreakdownStep("disk-data-fetch", &baol.getDiskDataStats)
 
 	// Combine errors if any occurred
 	if len(errs) > 0 {
@@ -1632,22 +1707,7 @@ func (baol *BlockAppendOnlyLog) FlushDataAndIndex() error {
 
 // getBlockIndexEntry retrieves the block index entry for a given block ID.
 func (baol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEntry, bool) {
-	if baol.blockIndex != nil {
-		entry, ok := baol.blockIndex[blockID]
-		if ok {
-			return entry, true
-		}
-	}
-	baol.indexBufferMu.Lock()
-	for _, entry := range baol.indexBuffer {
-		if entry.BlockID == blockID {
-			baol.indexBufferMu.Unlock()
-			return entry, true
-		}
-	}
-	baol.indexBufferMu.Unlock()
-
-	entry, ok, err := baol.findBlockIndexEntryOnDisk(blockID)
+	entry, ok, _, err := baol.getBlockIndexEntryWithSource(blockID)
 	if err != nil {
 		baol.log.Error("Failed to lookup block index entry from disk", "blockID", blockID, "error", err)
 		return blockIndexEntry{}, false
@@ -1656,6 +1716,32 @@ func (baol *BlockAppendOnlyLog) getBlockIndexEntry(blockID uint64) (blockIndexEn
 		return entry, true
 	}
 	return blockIndexEntry{}, false
+}
+
+func (baol *BlockAppendOnlyLog) getBlockIndexEntryWithSource(blockID uint64) (blockIndexEntry, bool, bool, error) {
+	if baol.blockIndex != nil {
+		entry, ok := baol.blockIndex[blockID]
+		if ok {
+			return entry, true, true, nil
+		}
+	}
+	baol.indexBufferMu.Lock()
+	for _, entry := range baol.indexBuffer {
+		if entry.BlockID == blockID {
+			baol.indexBufferMu.Unlock()
+			return entry, true, true, nil
+		}
+	}
+	baol.indexBufferMu.Unlock()
+
+	entry, ok, err := baol.findBlockIndexEntryOnDisk(blockID)
+	if err != nil {
+		return blockIndexEntry{}, false, false, err
+	}
+	if ok {
+		return entry, true, false, nil
+	}
+	return blockIndexEntry{}, false, false, nil
 }
 
 // readAndIndexBlockFrom reads a block from the data file (main or late) based on the index entry
