@@ -5,7 +5,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-cd "$script_dir" || exit 1
+workload_dir=$(cd "${script_dir}/.." && pwd)
+cd "$workload_dir" || exit 1
 
 set -Eeuo pipefail
 
@@ -24,7 +25,7 @@ if [[ " ${VALID_BACKENDS} " != *" ${BACKEND} "* ]]; then
 	exit 1
 fi
 
-CONFIG_PATH="${CONFIG_PATH:-replay_config.json}"
+CONFIG_PATH="${CONFIG_PATH:-${workload_dir}/replay_config.json}"
 
 # 复用 replay.sh 中的常用参数默认值
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"

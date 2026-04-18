@@ -19,7 +19,7 @@ fi
 # - state-store only (PrefixDB-handled data types)
 # - cache trace only
 # - block window 20500000-20510000
-# - chunk sizes 4 KiB / 8 KiB / 16 KiB
+# - chunk sizes 32 KiB / 64 KiB
 
 DB_TYPE="prefixdb"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
@@ -29,5 +29,5 @@ CACHE_SIZE_CANDIDATES=(16)
 CACHE_COUNT_CANDIDATES=(0)
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
-CHUNK_FILE_SIZE_BYTES_CANDIDATES=(4096 8192 16384)
+CHUNK_FILE_SIZE_BYTES_CANDIDATES=(32768 65536)
 BLOCK_RANGE_CANDIDATES=("20500000:20510000")

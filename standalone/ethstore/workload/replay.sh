@@ -107,15 +107,16 @@ LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT=$(resolve_mount_point_from_path "$RUNNING_ROOT")
 
-# ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb64KB | database_statedb256KB
+# ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb32KB | database_statedb64KB | database_statedb256KB
 calculate_default_ethstore_statedb_dirname() {
     case "$CHUNK_FILE_SIZE_BYTES" in
         4096) echo "database_statedb4KB" ;;
         8192) echo "database_statedb8KB" ;; # database_statedb8KB_0326_compressed
         16384) echo "database_statedb16KB" ;;
+        32768) echo "database_statedb32KB" ;;
         65536) echo "database_statedb64KB" ;;
         262144) echo "database_statedb256KB" ;;
-        *) echo "Invalid CHUNK_FILE_SIZE_BYTES=${CHUNK_FILE_SIZE_BYTES}. Supported values: 4096, 8192, 16384, 65536, 262144" >&2; exit 1 ;;
+        *) echo "Invalid CHUNK_FILE_SIZE_BYTES=${CHUNK_FILE_SIZE_BYTES}. Supported values: 4096, 8192, 16384, 32768, 65536, 262144" >&2; exit 1 ;;
     esac
 }
 ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethstore_statedb_dirname)}"
