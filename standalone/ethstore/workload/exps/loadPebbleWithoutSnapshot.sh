@@ -39,6 +39,37 @@ PEBBLE_HANDLES="${PEBBLE_HANDLES:-32768}"
 export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
 export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
+normalize_bool_flag() {
+	local value="${1:-}"
+	value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+	case "$value" in
+		true|1|yes|y|on)
+			printf 'true'
+			;;
+		false|0|no|n|off)
+			printf 'false'
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+normalize_chainkv_state_flag() {
+	local normalized
+	if ! normalized=$(normalize_bool_flag "$CHAINKV_STATE"); then
+		echo "Invalid CHAINKV_STATE=${CHAINKV_STATE}; forcing true" >&2
+		CHAINKV_STATE="true"
+		return 0
+	fi
+	if [ "$normalized" != "true" ]; then
+		echo "CHAINKV_STATE=${CHAINKV_STATE} would disable ChainKV state path; forcing true" >&2
+	fi
+	CHAINKV_STATE="true"
+}
+
+normalize_chainkv_state_flag
+
 build_binary() {
 	mkdir -p ./bin
 	go mod download

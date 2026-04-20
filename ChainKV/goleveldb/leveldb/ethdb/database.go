@@ -215,6 +215,13 @@ func (db *LDBDatabase) Delete(key []byte) error {
 	return db.db.Delete(key, nil)
 }
 
+func (db *LDBDatabase) Delete_s(key []byte) error {
+	if db.delTimer != nil {
+		defer db.delTimer.UpdateSince(time.Now())
+	}
+	return db.db.Delete_s(key, nil)
+}
+
 func (db *LDBDatabase) NewIterator() iterator.Iterator {
 	return db.db.NewIterator(nil, nil)
 }
@@ -228,14 +235,18 @@ func (db *LDBDatabase) Close() {
 		errc := make(chan error)
 		db.quitChan <- errc
 		if err := <-errc; err != nil {
-			db.log.Error("Metrics collection failed", "err", err)
+			if db.log != nil {
+				db.log.Error("Metrics collection failed", "err", err)
+			}
 		}
 	}
 	err := db.db.Close()
-	if err == nil {
-		db.log.Info("Database closed")
-	} else {
-		db.log.Error("Failed to close database", "err", err)
+	if db.log != nil {
+		if err == nil {
+			db.log.Info("Database closed")
+		} else {
+			db.log.Error("Failed to close database", "err", err)
+		}
 	}
 }
 
@@ -345,11 +356,23 @@ func (b *ldbBatch) Put_s(key, value []byte) error {
 	return nil
 }
 
+func (b *ldbBatch) Delete(key []byte) error {
+	b.b.Delete(key)
+	b.size += len(key)
+	return nil
+}
+
+func (b *ldbBatch) Delete_s(key []byte) error {
+	b.b.Delete(key)
+	b.size += len(key)
+	return nil
+}
+
 func (b *ldbBatch) Write() error {
 	return b.db.Write(b.b, nil)
 }
 func (b *ldbBatch) Write_s() error {
-	return b.db.Write(b.b, nil)
+	return b.db.Write_s(b.b, nil)
 }
 func (b *ldbBatch) ValueSize() int {
 	return b.size
@@ -373,7 +396,7 @@ func (dt *table) Put(key []byte, value []byte) error {
 	return dt.db.Put(append([]byte(dt.prefix), key...), value)
 }
 func (dt *table) Put_s(key []byte, value []byte) error {
-	return dt.db.Put(append([]byte(dt.prefix), key...), value)
+	return dt.db.Put_s(append([]byte(dt.prefix), key...), value)
 }
 
 func (dt *table) Has(key []byte) (bool, error) {
@@ -390,6 +413,10 @@ func (dt *table) Delete(key []byte) error {
 	return dt.db.Delete(append([]byte(dt.prefix), key...))
 }
 
+func (dt *table) Delete_s(key []byte) error {
+	return dt.db.Delete_s(append([]byte(dt.prefix), key...))
+}
+
 func (dt *table) Close() {
 	// Do nothing; don't close the underlying DB.
 }
@@ -400,7 +427,7 @@ type tableBatch struct {
 }
 
 func (tb *tableBatch) Put_s(key []byte, value []byte) error {
-	return tb.batch.Put(append([]byte(tb.prefix), key...), value)
+	return tb.batch.Put_s(append([]byte(tb.prefix), key...), value)
 }
 
 func (tb *tableBatch) Write_s() error {
@@ -418,6 +445,14 @@ func (dt *table) NewBatch() Batch {
 
 func (tb *tableBatch) Put(key, value []byte) error {
 	return tb.batch.Put(append([]byte(tb.prefix), key...), value)
+}
+
+func (tb *tableBatch) Delete(key []byte) error {
+	return tb.batch.Delete(append([]byte(tb.prefix), key...))
+}
+
+func (tb *tableBatch) Delete_s(key []byte) error {
+	return tb.batch.Delete_s(append([]byte(tb.prefix), key...))
 }
 
 func (tb *tableBatch) Write() error {

@@ -833,6 +833,10 @@ func (db *DB) Delete(key []byte, wo *opt.WriteOptions) error {
 	return db.putRec(keyTypeDel, key, nil, wo)
 }
 
+func (db *DB) Delete_s(key []byte, wo *opt.WriteOptions) error {
+	return db.putRec_s(keyTypeDel, key, nil, wo)
+}
+
 func isMemOverlaps(icmp *iComparer, mem *memdb.DB, min, max []byte) bool {
 	iter := mem.NewIterator(nil)
 	defer iter.Release()

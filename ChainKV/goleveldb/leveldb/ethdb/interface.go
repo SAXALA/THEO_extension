@@ -36,6 +36,7 @@ type Database interface {
 	Get_s(key []byte) ([]byte, error)
 	Has(key []byte) (bool, error)
 	Delete(key []byte) error
+	Delete_s(key []byte) error
 	Close()
 	NewBatch() Batch
 }
@@ -46,6 +47,8 @@ type Database interface {
 //实现类型为ldbBatch
 type Batch interface {
 	Putter
+	Delete(key []byte) error
+	Delete_s(key []byte) error
 	ValueSize() int // amount of data in the batch
 	Write() error
 	Write_s() error

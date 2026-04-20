@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
+	chainkverrors "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
 	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
 	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
@@ -349,6 +350,34 @@ func reportReplayReadStats(title string, success map[string]int64, miss map[stri
 	sort.Strings(keys)
 	for _, k := range keys {
 		fmt.Printf("[%s] dataType=%s success=%d notfound=%d\n", title, k, success[k], miss[k])
+	}
+}
+
+func reportReplayOtherErrorStats(title string, countByType map[string]int64, total int64, countByErr map[string]int64) {
+	if total == 0 {
+		return
+	}
+	fmt.Printf("[%s][Global] count=%d\n", title, total)
+	dataTypes := make([]string, 0, len(countByType))
+	for dataType := range countByType {
+		dataTypes = append(dataTypes, dataType)
+	}
+	sort.Strings(dataTypes)
+	for _, dataType := range dataTypes {
+		fmt.Printf("[%s] dataType=%s count=%d\n", title, dataType, countByType[dataType])
+	}
+	errKeys := make([]string, 0, len(countByErr))
+	for errKey := range countByErr {
+		errKeys = append(errKeys, errKey)
+	}
+	sort.Slice(errKeys, func(i, j int) bool {
+		if countByErr[errKeys[i]] == countByErr[errKeys[j]] {
+			return errKeys[i] < errKeys[j]
+		}
+		return countByErr[errKeys[i]] > countByErr[errKeys[j]]
+	})
+	for _, errKey := range errKeys {
+		fmt.Printf("[%s] error=%q count=%d\n", title, errKey, countByErr[errKey])
 	}
 }
 
@@ -1125,10 +1154,19 @@ func (b *chainKVReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]by
 		}
 		return append([]byte(nil), val...), nil
 	}
+	var (
+		value []byte
+		err   error
+	)
 	if b.db.useStateForDataType(dataType) {
-		return b.db.db.Get_s(key)
+		value, err = b.db.db.Get_s(key)
+	} else {
+		value, err = b.db.db.Get(key)
 	}
-	return b.db.db.Get(key)
+	if err != nil && errors.Is(err, chainkverrors.ErrNotFound) {
+		return nil, ethstore.ErrNotFound
+	}
+	return value, err
 }
 
 func (b *chainKVReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
@@ -1150,17 +1188,17 @@ func (b *chainKVReplayBackend) StageDelete(key []byte, dataType ethstore.DataTyp
 		if b.stateBatch == nil {
 			b.stateBatch = b.db.db.NewBatch()
 		}
-		return b.stateBatch.Put_s(key, nil)
+		return b.stateBatch.Delete_s(key)
 	}
 	if b.nonStateBatch == nil {
 		b.nonStateBatch = b.db.db.NewBatch()
 	}
-	return b.nonStateBatch.Put(key, nil)
+	return b.nonStateBatch.Delete(key)
 }
 func (b *chainKVReplayBackend) CommitBlock() error {
 	if b.stateBatch != nil {
 		start := time.Now()
-		if err := b.stateBatch.Write(); err != nil {
+		if err := b.stateBatch.Write_s(); err != nil {
 			fmt.Printf("state batch commit failed: %v\n", err)
 		}
 		b.commitHist.observe(time.Since(start))
@@ -1222,14 +1260,28 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	globalStats := make(map[opType]*latencyHistogram)
 	getSuccessByType := make(map[string]int64)
 	getNotFoundByType := make(map[string]int64)
+	getOtherErrByType := make(map[string]int64)
+	getOtherErrByCause := make(map[string]int64)
 	iterNextSuccessByType := make(map[string]int64)
 	iterNextEndByType := make(map[string]int64)
 	var (
 		getSuccessTotal      int64
 		getNotFoundTotal     int64
+		getOtherErrTotal     int64
 		iterNextSuccessTotal int64
 		iterNextEndTotal     int64
 	)
+	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
+		fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n",
+			backend.Name(), reason, blockID, line, pending)
+		commitStart := time.Now()
+		if err := backend.CommitBlock(); err != nil {
+			return err
+		}
+		fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n",
+			backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
+		return nil
+	}
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
 		if _, ok := stats[kvTypeStr]; !ok {
 			stats[kvTypeStr] = make(map[opType]*latencyHistogram)
@@ -1280,7 +1332,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				if markerType == "end" && replayStarted {
 					pendingBlocks++
 					if pendingBlocks >= commitBlockInterval {
-						if commitErr := backend.CommitBlock(); commitErr != nil {
+						if commitErr := runCommit("block-boundary", markerID, lineCounter, pendingBlocks); commitErr != nil {
 							fmt.Printf("[%s] block commit failed at line %d: %v\n",
 								backend.Name(), lineCounter, commitErr)
 							break
@@ -1401,6 +1453,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			} else if errors.Is(opErr, ethstore.ErrNotFound) {
 				getNotFoundByType[kvTypeStr]++
 				getNotFoundTotal++
+			} else {
+				getOtherErrByType[kvTypeStr]++
+				getOtherErrByCause[opErr.Error()]++
+				getOtherErrTotal++
 			}
 		case opPut:
 			if len(keyBytes) == 0 {
@@ -1466,7 +1522,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	}
 
 	if !committedAtExit || pendingBlocks > 0 {
-		if commitErr := backend.CommitBlock(); commitErr != nil {
+		if commitErr := runCommit("finalize", -1, lineCounter, pendingBlocks); commitErr != nil {
 			fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
 		}
 	}
@@ -1477,6 +1533,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	reportLatencyStats(stats)
 	reportGlobalLatencyStats(globalStats)
 	reportReplayReadStats("GetStats", getSuccessByType, getNotFoundByType, getSuccessTotal, getNotFoundTotal)
+	reportReplayOtherErrorStats("GetOtherErrorStats", getOtherErrByType, getOtherErrTotal, getOtherErrByCause)
 	reportReplayReadStats("IteratorNextStats", iterNextSuccessByType, iterNextEndByType, iterNextSuccessTotal, iterNextEndTotal)
 	backend.PrintCommitStats()
 }

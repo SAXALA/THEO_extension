@@ -165,6 +165,37 @@ REPLAY_CGROUP_WRITE_MBPS_LIMIT="${REPLAY_CGROUP_WRITE_MBPS_LIMIT:-530}" # NVME 2
 REPLAY_CGROUP_READ_BPS_LIMIT="${REPLAY_CGROUP_READ_BPS_LIMIT:-$((REPLAY_CGROUP_READ_MBPS_LIMIT * 1000 * 1000))}"
 REPLAY_CGROUP_WRITE_BPS_LIMIT="${REPLAY_CGROUP_WRITE_BPS_LIMIT:-$((REPLAY_CGROUP_WRITE_MBPS_LIMIT * 1000 * 1000))}"
 
+normalize_bool_flag() {
+    local value="${1:-}"
+    value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        true|1|yes|y|on)
+            printf 'true'
+            ;;
+        false|0|no|n|off)
+            printf 'false'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+normalize_chainkv_state_flag() {
+    local normalized
+    if ! normalized=$(normalize_bool_flag "$CHAINKV_STATE"); then
+        echo "Invalid CHAINKV_STATE=${CHAINKV_STATE}; forcing true" >&2
+        CHAINKV_STATE="true"
+        return 0
+    fi
+    if [ "$normalized" != "true" ]; then
+        echo "CHAINKV_STATE=${CHAINKV_STATE} would disable ChainKV state path; forcing true" >&2
+    fi
+    CHAINKV_STATE="true"
+}
+
+normalize_chainkv_state_flag
+
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then
         echo "${SUDO_PASSWD}" | sudo -S "$@"

@@ -25,12 +25,16 @@ type fakeReplayBackend struct {
 	gets    [][]byte
 	commits int
 	dirty   bool
+	getFunc func([]byte, ethstore.DataType) ([]byte, error)
 }
 
 func (b *fakeReplayBackend) Name() string { return "fake" }
 
-func (b *fakeReplayBackend) Get(key []byte, _ ethstore.DataType) ([]byte, error) {
+func (b *fakeReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
 	b.gets = append(b.gets, append([]byte(nil), key...))
+	if b.getFunc != nil {
+		return b.getFunc(key, dataType)
+	}
 	return nil, ethstore.ErrNotFound
 }
 
@@ -621,6 +625,53 @@ func TestGetWithPebbleBatchOverlay_BatchPutAndDeletePrecedence(t *testing.T) {
 	}
 }
 
+func TestChainKVReplayBackendGetMapsStateNotFound(t *testing.T) {
+	backend, err := newChainKVReplayBackend(filepath.Join(t.TempDir(), "chainkv"), 16, 16, true)
+	if err != nil {
+		t.Fatalf("newChainKVReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	_, err = backend.Get([]byte{0x01, 0x02, 0x03}, ethstore.TrieNodeAccountDataType)
+	if !errors.Is(err, ethstore.ErrNotFound) {
+		t.Fatalf("expected ethstore.ErrNotFound from chainkv state get miss, got: %v", err)
+	}
+}
+
+func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
+	backend, err := newChainKVReplayBackend(filepath.Join(t.TempDir(), "chainkv"), 16, 16, true)
+	if err != nil {
+		t.Fatalf("newChainKVReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	key := []byte{0xaa, 0xbb, 0xcc}
+	if err := backend.StagePut(key, []byte("value"), ethstore.TrieNodeAccountDataType); err != nil {
+		t.Fatalf("StagePut failed: %v", err)
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock after put failed: %v", err)
+	}
+	got, err := backend.Get(key, ethstore.TrieNodeAccountDataType)
+	if err != nil {
+		t.Fatalf("Get after put failed: %v", err)
+	}
+	if string(got) != "value" {
+		t.Fatalf("unexpected value after put: %q", got)
+	}
+
+	if err := backend.StageDelete(key, ethstore.TrieNodeAccountDataType); err != nil {
+		t.Fatalf("StageDelete failed: %v", err)
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock after delete failed: %v", err)
+	}
+	_, err = backend.Get(key, ethstore.TrieNodeAccountDataType)
+	if !errors.Is(err, ethstore.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after tombstone delete, got: %v", err)
+	}
+}
+
 func TestReplayTrace_StartBlockSkipsEarlierBlocks(t *testing.T) {
 	backend := &fakeReplayBackend{}
 	traceFile := writeTraceFile(t,
@@ -758,5 +809,34 @@ func TestReplayTrace_CountsOnlyActuallyReplayedOpsButTracksTraceBytesRead(t *tes
 	}
 	if got, want := match[1], fmt.Sprintf("%d", len(traceContent)); got != want {
 		t.Fatalf("expected trace bytes to reflect bytes actually read from trace file, got %s want %s; output=%s", got, want, output)
+	}
+}
+
+func TestReplayTrace_ReportsGetOtherErrors(t *testing.T) {
+	backend := &fakeReplayBackend{
+		getFunc: func(_ []byte, _ ethstore.DataType) ([]byte, error) {
+			return nil, errors.New("boom")
+		},
+	}
+	traceFile := writeTraceFile(t,
+		"Processing block (start), ID: 600",
+		"OPType: Get, key: 41, size: 1",
+		"Processing block (end), ID: 600",
+	)
+
+	output := captureStdout(t, func() {
+		replayTrace(backend, traceFile, 0, allDBTypes, 0, 0, 1)
+	})
+	if !strings.Contains(output, "[GetStats][Global] success=0 notfound=0") {
+		t.Fatalf("expected zero success/notfound in GetStats, output=%s", output)
+	}
+	if !strings.Contains(output, "[GetOtherErrorStats][Global] count=1") {
+		t.Fatalf("expected GetOtherErrorStats global count, output=%s", output)
+	}
+	if !strings.Contains(output, "[GetOtherErrorStats] dataType=StateData count=1") {
+		t.Fatalf("expected GetOtherErrorStats by data type, output=%s", output)
+	}
+	if !strings.Contains(output, "[GetOtherErrorStats] error=\"boom\" count=1") {
+		t.Fatalf("expected GetOtherErrorStats by error cause, output=%s", output)
 	}
 }
