@@ -711,7 +711,7 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 		if cfg.AccountHashKeyPebbleDir == "" {
 			return fmt.Errorf("insertAccountHashKeyPebbleToEthStorePebble with ethstore backend requires accountHashKeyPebbleDir in config")
 		}
-		ethstorePebbleDir := "/mnt/ssd2/loaded/pebble_without"
+		ethstorePebbleDir := "/mnt/ssd2/loaded/ethstore/database_pebble_without"
 		fmt.Println("dir: " + ethstorePebbleDir)
 		if err := insertAccountHashKeyPebbleToEthStorePebble(cfg.AccountHashKeyPebbleDir, ethstorePebbleDir, pebbleCache, pebbleHandles); err != nil {
 			return fmt.Errorf("insert account hash key pebble to ethstore pebble failed: %w", err)
@@ -1272,8 +1272,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		iterNextEndTotal     int64
 	)
 	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
-		fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n",
-			backend.Name(), reason, blockID, line, pending)
+		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n",
+			// backend.Name(), reason, blockID, line, pending)
 		commitStart := time.Now()
 		if err := backend.CommitBlock(); err != nil {
 			return err
@@ -1778,6 +1778,11 @@ func main() {
 	// }
 	// defer ethBackend.Close()
 	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
+	// ethstorePebbleDir := "/mnt/ssd2/loaded/ethstore_pebble_without"
+	// fmt.Println("dir: " + ethstorePebbleDir)
+	// if err := insertAccountHashKeyPebbleToEthStorePebble(cfg.AccountHashKeyPebbleDir, ethstorePebbleDir, 0, 0); err != nil {
+	// 	return
+	// }
 	// return
 
 	switch *mode {
@@ -2172,6 +2177,14 @@ func copyPebbleStoreEntries(source *pebblestore.PebbleStore, target *pebblestore
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := append([]byte(nil), iter.Key()...)
 		value := append([]byte(nil), iter.Value()...)
+
+		// if val, err := target.Get(key); err == nil {
+		// 	if !bytes.Equal(val, value) {
+		// 		return count, fmt.Errorf("value mismatch for key %x: expected %x, got %x", key, value, val)
+		// 	}
+		// 	continue
+		// }
+
 		if err := target.Put(key, value); err != nil {
 			return count, fmt.Errorf("failed to copy item into target pebble store: %w", err)
 		}
