@@ -1274,12 +1274,12 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
 		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n",
 			// backend.Name(), reason, blockID, line, pending)
-		commitStart := time.Now()
+		// commitStart := time.Now()
 		if err := backend.CommitBlock(); err != nil {
 			return err
 		}
-		fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n",
-			backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
+		// fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n",
+		// 	backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
 		return nil
 	}
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {

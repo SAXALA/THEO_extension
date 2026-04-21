@@ -11,7 +11,7 @@ export TEST_RUN_ROUNDS
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 	set -euo pipefail
-	exec "${script_dir}/../multiple_replay.sh" replay ethstore cache "$script_path"
+	exec "${script_dir}/../multiple_replay.sh" replay all all "$script_path"
 fi
 
 # Experiment 1:

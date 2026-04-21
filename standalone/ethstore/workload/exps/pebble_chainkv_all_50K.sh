@@ -20,7 +20,7 @@ fi
 
 DB_TYPE="all"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
-BACKEND_CANDIDATES=(pebble chainkv)
+BACKEND_CANDIDATES=(chainkv)
 TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)
 CACHE_SIZE_CANDIDATES=(16)
 CACHE_COUNT_CANDIDATES=(0)
