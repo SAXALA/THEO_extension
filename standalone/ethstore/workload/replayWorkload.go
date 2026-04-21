@@ -29,6 +29,7 @@ import (
 	chainkverrors "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
 	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
 	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
+	chainkvutil "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
 	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
 	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
 	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
@@ -513,8 +514,8 @@ func (c *chainKVLDB) useStateForDataType(dataType ethstore.DataType) bool {
 }
 
 func (c *chainKVLDB) Close() {
-	if c.db != nil && c.db.LDB() != nil {
-		_ = c.db.LDB().Close()
+	if c.db != nil {
+		c.db.Close()
 	}
 }
 
@@ -1216,8 +1217,32 @@ func (b *chainKVReplayBackend) CommitBlock() error {
 	}
 	return nil
 }
-func (b *chainKVReplayBackend) NewIterator(_, _ []byte) replayIter {
-	return &chainKVIterWrapper{it: b.db.db.NewIterator()}
+
+func newChainKVIteratorRange(prefix, start []byte) *chainkvutil.Range {
+	if len(prefix) == 0 && len(start) == 0 {
+		return nil
+	}
+	var lowerBound []byte
+	if len(start) > 0 {
+		if len(prefix) > 0 && !bytes.HasPrefix(start, prefix) {
+			lowerBound = make([]byte, len(prefix)+len(start))
+			copy(lowerBound, prefix)
+			copy(lowerBound[len(prefix):], start)
+		} else {
+			lowerBound = append([]byte(nil), start...)
+		}
+	} else if len(prefix) > 0 {
+		lowerBound = append([]byte(nil), prefix...)
+	}
+	if len(prefix) == 0 {
+		return &chainkvutil.Range{Start: lowerBound}
+	}
+	prefixRange := chainkvutil.BytesPrefix(prefix)
+	return &chainkvutil.Range{Start: lowerBound, Limit: prefixRange.Limit}
+}
+
+func (b *chainKVReplayBackend) NewIterator(prefix, start []byte) replayIter {
+	return &chainKVIterWrapper{it: b.db.db.LDB().NewIterator(newChainKVIteratorRange(prefix, start), nil)}
 }
 func (b *chainKVReplayBackend) PrintCommitStats() {
 	reportHistogramSummary("chainkv commit (Batch.Write)", b.commitHist)
@@ -1272,14 +1297,12 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		iterNextEndTotal     int64
 	)
 	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
-		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n",
-			// backend.Name(), reason, blockID, line, pending)
+		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n", backend.Name(), reason, blockID, line, pending)
 		// commitStart := time.Now()
 		if err := backend.CommitBlock(); err != nil {
 			return err
 		}
-		// fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n",
-		// 	backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
+		// fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n", backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
 		return nil
 	}
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {

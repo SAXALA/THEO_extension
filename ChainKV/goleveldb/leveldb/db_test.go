@@ -626,6 +626,44 @@ func TestDB_EmptyBatch(t *testing.T) {
 	h.get("foo", false)
 }
 
+func TestDB_WriteSLargeBatch(t *testing.T) {
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: false,
+		WriteBuffer:                  64,
+	})
+	defer h.close()
+
+	batch := new(Batch)
+	key := []byte("state-key")
+	value := []byte(strings.Repeat("v", 128))
+	batch.Put(key, value)
+
+	if batch.internalLen <= h.o.GetWriteBuffer() {
+		t.Fatalf("expected batch to exceed write buffer: internalLen=%d writeBuffer=%d", batch.internalLen, h.o.GetWriteBuffer())
+	}
+
+	if err := h.db.Write_s(batch, h.wo); err != nil {
+		t.Fatal("Write_s: got error: ", err)
+	}
+
+	got, err := h.db.Get_s(key, h.ro)
+	if err != nil {
+		t.Fatal("Get_s: got error: ", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("Get_s: value mismatch: got=%q want=%q", got, value)
+	}
+
+	h.reopenDB()
+	got, err = h.db.Get_s(key, h.ro)
+	if err != nil {
+		t.Fatal("Get_s after reopen: got error: ", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("Get_s after reopen: value mismatch: got=%q want=%q", got, value)
+	}
+}
+
 func TestDB_GetFromFrozen(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
 		DisableLargeBatchTransaction: true,

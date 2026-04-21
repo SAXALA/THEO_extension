@@ -643,18 +643,11 @@ func (db *DB) Write_s(batch *Batch, wo *opt.WriteOptions) error {
 	if err := db.ok(); err != nil || batch == nil || batch.Len() == 0 {
 		return err
 	}
-	//如果批处理大小大于写缓冲区，则可以使用事务进行写。使用事务将批处理直接写入表中，跳过日志记录。
-	if batch.internalLen > db.s.o.GetWriteBuffer() && !db.s.o.GetDisableLargeBatchTransaction() {
-		tr, err := db.OpenTransaction()
-		if err != nil {
-			return err
-		}
-		if err := tr.Write(batch, wo); err != nil {
-			tr.Discard()
-			return err
-		}
-		return tr.Commit_s()
-	}
+	// State batches cannot use the large-batch transaction fast path yet.
+	// OpenTransaction() only initializes the regular memtable, while Commit_s()
+	// expects a state memtable and will crash on large state batches.
+	// Route all state writes through writeLocked_s until a dedicated state
+	// transaction path exists.
 
 	merge := !wo.GetNoWriteMerge() && !db.s.o.GetNoWriteMerge()
 	sync := wo.GetSync() && !db.s.o.GetNoSync()

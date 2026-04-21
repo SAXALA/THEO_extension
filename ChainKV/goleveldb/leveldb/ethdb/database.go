@@ -1,6 +1,7 @@
 package ethdb
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,6 +239,39 @@ func (db *LDBDatabase) Close() {
 			if db.log != nil {
 				db.log.Error("Metrics collection failed", "err", err)
 			}
+		}
+	}
+	if db.db != nil {
+		var stats leveldb.DBStats
+		if err := db.db.Stats(&stats); err == nil {
+			fmt.Printf("[ChainKV] metrics on close: ioRead=%d ioWrite=%d writeDelayCount=%d writeDelay=%s writePaused=%t aliveSnapshots=%d aliveIterators=%d blockCacheSize=%d openedTables=%d\n",
+				stats.IORead, stats.IOWrite, stats.WriteDelayCount, stats.WriteDelayDuration, stats.WritePaused,
+				stats.AliveSnapshots, stats.AliveIterators, stats.BlockCacheSize, stats.OpenedTablesCount)
+			fmt.Printf("[ChainKV] compaction metrics on close: memComp=%d level0Comp=%d nonLevel0Comp=%d seekComp=%d\n",
+				stats.MemComp, stats.Level0Comp, stats.NonLevel0Comp, stats.SeekComp)
+			if len(stats.LevelSizes) > 0 {
+				for level := range stats.LevelSizes {
+					fmt.Printf("[ChainKV] level %d metrics: tables=%d sizeBytes=%d readBytes=%d writeBytes=%d duration=%s\n",
+						level,
+						stats.LevelTablesCounts[level],
+						stats.LevelSizes[level],
+						stats.LevelRead[level],
+						stats.LevelWrite[level],
+						stats.LevelDurations[level])
+				}
+			}
+		} else {
+			fmt.Printf("[ChainKV] failed to collect DB stats on close: %v\n", err)
+		}
+
+		if prop, err := db.db.GetProperty("leveldb.iostats"); err == nil {
+			fmt.Printf("[ChainKV] property leveldb.iostats: %s\n", prop)
+		}
+		if prop, err := db.db.GetProperty("leveldb.writedelay"); err == nil {
+			fmt.Printf("[ChainKV] property leveldb.writedelay: %s\n", prop)
+		}
+		if prop, err := db.db.GetProperty("leveldb.stats"); err == nil {
+			fmt.Printf("[ChainKV] property leveldb.stats:\n%s\n", prop)
 		}
 	}
 	err := db.db.Close()

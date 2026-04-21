@@ -672,6 +672,44 @@ func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
 	}
 }
 
+func TestChainKVReplayBackendNewIteratorHonorsPrefixAndStart(t *testing.T) {
+	backend, err := newChainKVReplayBackend(filepath.Join(t.TempDir(), "chainkv"), 16, 16, false)
+	if err != nil {
+		t.Fatalf("newChainKVReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	seed := []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: []byte("p:1"), value: []byte("value-1")},
+		{key: []byte("p:2"), value: []byte("value-2")},
+		{key: []byte("q:1"), value: []byte("value-q")},
+	}
+	for _, kv := range seed {
+		if err := backend.StagePut(kv.key, kv.value, ethstore.HeaderDataType); err != nil {
+			t.Fatalf("StagePut failed for %q: %v", kv.key, err)
+		}
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock failed: %v", err)
+	}
+
+	it := backend.NewIterator([]byte("p:"), []byte("2"))
+	defer it.Release()
+
+	if !it.Next() {
+		t.Fatal("expected iterator to return the prefixed start key")
+	}
+	if got := string(it.Value()); got != "value-2" {
+		t.Fatalf("unexpected first iterator value: got %q want %q", got, "value-2")
+	}
+	if it.Next() {
+		t.Fatal("expected iterator to stop at prefix boundary")
+	}
+}
+
 func TestReplayTrace_StartBlockSkipsEarlierBlocks(t *testing.T) {
 	backend := &fakeReplayBackend{}
 	traceFile := writeTraceFile(t,
