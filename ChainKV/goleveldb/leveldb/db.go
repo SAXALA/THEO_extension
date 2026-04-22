@@ -438,7 +438,7 @@ func recoverTable(s *session, o *opt.Options) error {
 			tgoodKey, tcorruptedKey, tcorruptedBlock int
 			imin, imax                               []byte
 		)
-		tr, err := table.NewReader(reader, size, fd, nil, bpool, o)
+		tr, err := table.NewReader(reader, size, fd, nil, bpool, o, nil)
 		if err != nil {
 			return err
 		}
@@ -1379,8 +1379,14 @@ type DBStats struct {
 	IOWrite uint64
 	IORead  uint64
 
-	BlockCacheSize    int
-	OpenedTablesCount int
+	BlockCacheSize         int
+	OpenedTablesCount      int
+	BlockCacheDataBlocks   int64
+	BlockCacheDataSize     int64
+	BlockCacheIndexBlocks  int64
+	BlockCacheIndexSize    int64
+	BlockCacheFilterBlocks int64
+	BlockCacheFilterSize   int64
 
 	LevelSizes        Sizes
 	LevelTablesCounts []int
@@ -1413,6 +1419,13 @@ func (db *DB) Stats(s *DBStats) error {
 	} else {
 		s.BlockCacheSize = 0
 	}
+	blockCacheSnapshot := db.s.tops.blockStats.Snapshot()
+	s.BlockCacheDataBlocks = blockCacheSnapshot.DataBlocks
+	s.BlockCacheDataSize = blockCacheSnapshot.DataBytes
+	s.BlockCacheIndexBlocks = blockCacheSnapshot.IndexBlocks
+	s.BlockCacheIndexSize = blockCacheSnapshot.IndexBytes
+	s.BlockCacheFilterBlocks = blockCacheSnapshot.FilterBlocks
+	s.BlockCacheFilterSize = blockCacheSnapshot.FilterBytes
 
 	s.AliveIterators = atomic.LoadInt32(&db.aliveIters)
 	s.AliveSnapshots = atomic.LoadInt32(&db.aliveSnaps)

@@ -50,12 +50,12 @@ func NewLDBDatabase(file string, cache int, handles int) (*LDBDatabase, error) {
 	// Open the db and recover any potential corruptions
 	db, err := leveldb.OpenFile(file, &opt.Options{
 		OpenFilesCacheCapacity: handles,
-		BlockCacheCapacity:     cache / 2 * opt.MiB,
+		BlockCacheCapacity:     cache * opt.MiB, // cache / 2 * opt.MiB,
 		WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
 		Filter:                 filter.NewBloomFilter(10),
 		Compression:            opt.NoCompression,
 		//ReadOnly:true,
-		DisableBlockCache: true,
+		// DisableBlockCache: true,
 	})
 	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
 		db, err = leveldb.RecoverFile(file, nil)
@@ -244,9 +244,12 @@ func (db *LDBDatabase) Close() {
 	if db.db != nil {
 		var stats leveldb.DBStats
 		if err := db.db.Stats(&stats); err == nil {
-			fmt.Printf("[ChainKV] metrics on close: ioRead=%d ioWrite=%d writeDelayCount=%d writeDelay=%s writePaused=%t aliveSnapshots=%d aliveIterators=%d blockCacheSize=%d openedTables=%d\n",
+			fmt.Printf("[ChainKV] metrics on close: ioRead=%d ioWrite=%d writeDelayCount=%d writeDelay=%s writePaused=%t aliveSnapshots=%d aliveIterators=%d blockCacheSize=%d openedTables=%d blockCacheDataBlocks=%d blockCacheDataBytes=%d blockCacheIndexBlocks=%d blockCacheIndexBytes=%d blockCacheFilterBlocks=%d blockCacheFilterBytes=%d\n",
 				stats.IORead, stats.IOWrite, stats.WriteDelayCount, stats.WriteDelayDuration, stats.WritePaused,
-				stats.AliveSnapshots, stats.AliveIterators, stats.BlockCacheSize, stats.OpenedTablesCount)
+				stats.AliveSnapshots, stats.AliveIterators, stats.BlockCacheSize, stats.OpenedTablesCount,
+				stats.BlockCacheDataBlocks, stats.BlockCacheDataSize,
+				stats.BlockCacheIndexBlocks, stats.BlockCacheIndexSize,
+				stats.BlockCacheFilterBlocks, stats.BlockCacheFilterSize)
 			fmt.Printf("[ChainKV] compaction metrics on close: memComp=%d level0Comp=%d nonLevel0Comp=%d seekComp=%d\n",
 				stats.MemComp, stats.Level0Comp, stats.NonLevel0Comp, stats.SeekComp)
 			if len(stats.LevelSizes) > 0 {

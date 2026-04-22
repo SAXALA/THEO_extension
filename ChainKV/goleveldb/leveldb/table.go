@@ -639,6 +639,7 @@ type tOps struct {
 	evictRemoved bool
 	cache        *cache.Cache
 	bcache       *cache.Cache
+	blockStats   *table.BlockCacheStats
 	bpool        *util.BufferPool
 }
 
@@ -742,7 +743,7 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 		}
 
 		var tr *table.Reader
-		tr, err = table.NewReader(r, f.size, f.fd, bcache, t.bpool, t.s.o.Options)
+		tr, err = table.NewReader(r, f.size, f.fd, bcache, t.bpool, t.s.o.Options, t.blockStats)
 		if err != nil {
 			r.Close()
 			return 0, nil
@@ -769,7 +770,7 @@ func (t *tOps) open_s(f *sFile) (ch *cache.Handle, err error) {
 		}
 
 		var tr *table.Reader
-		tr, err = table.NewReader(r, f.size, f.fd, bcache, t.bpool, t.s.o.Options)
+		tr, err = table.NewReader(r, f.size, f.fd, bcache, t.bpool, t.s.o.Options, t.blockStats)
 		if err != nil {
 			r.Close()
 			return 0, nil
@@ -912,6 +913,7 @@ func newTableOps(s *session) *tOps {
 		evictRemoved: s.o.GetBlockCacheEvictRemoved(),
 		cache:        cache.NewCache(cacher),
 		bcache:       bcache,
+		blockStats:   &table.BlockCacheStats{},
 		bpool:        bpool,
 	}
 }

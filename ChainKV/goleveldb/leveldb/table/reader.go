@@ -513,6 +513,7 @@ type Reader struct {
 	fd     storage.FileDesc //文件描述符
 	reader io.ReaderAt
 	cache  *cache.NamespaceGetter
+	stats  *BlockCacheStats
 	err    error
 	bpool  *util.BufferPool
 	// Options
@@ -525,6 +526,35 @@ type Reader struct {
 	metaBH, indexBH, filterBH blockHandle //Handle
 	indexBlock                *block
 	filterBlock               *filterBlock
+}
+
+type trackedCacheValue struct {
+	value cache.Value
+	size  int
+	class BlockCacheClass
+	stats *BlockCacheStats
+}
+
+func (v *trackedCacheValue) Release() {
+	if releaser, ok := v.value.(util.Releaser); ok {
+		releaser.Release()
+	}
+	v.stats.remove(v.class, v.size)
+}
+
+func unwrapTrackedCacheValue(value cache.Value) cache.Value {
+	if tracked, ok := value.(*trackedCacheValue); ok {
+		return tracked.value
+	}
+	return value
+}
+
+func (r *Reader) trackCacheValue(class BlockCacheClass, size int, value cache.Value) cache.Value {
+	if value == nil || r.stats == nil {
+		return value
+	}
+	r.stats.add(class, size)
+	return &trackedCacheValue{value: value, size: size, class: class, stats: r.stats}
 }
 
 func (r *Reader) blockKind(bh blockHandle) string {
@@ -615,7 +645,7 @@ func (r *Reader) readBlock(bh blockHandle, verifyChecksum bool) (*block, error) 
 	return b, nil
 }
 
-func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool) (*block, util.Releaser, error) {
+func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool, class BlockCacheClass) (*block, util.Releaser, error) {
 	if r.cache != nil {
 		var (
 			err error
@@ -628,13 +658,14 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 				if err != nil {
 					return 0, nil
 				}
-				return cap(b.data), b
+				size = cap(b.data)
+				return size, r.trackCacheValue(class, size, b)
 			})
 		} else {
 			ch = r.cache.Get(bh.offset, nil)
 		}
 		if ch != nil {
-			b, ok := ch.Value().(*block)
+			b, ok := unwrapTrackedCacheValue(ch.Value()).(*block)
 			if !ok {
 				ch.Release()
 				return nil, nil, errors.New("leveldb/table: inconsistent block type")
@@ -686,13 +717,14 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 				if err != nil {
 					return 0, nil
 				}
-				return cap(b.data), b
+				size = cap(b.data)
+				return size, r.trackCacheValue(BlockCacheFilter, size, b)
 			})
 		} else {
 			ch = r.cache.Get(bh.offset, nil)
 		}
 		if ch != nil {
-			b, ok := ch.Value().(*filterBlock)
+			b, ok := unwrapTrackedCacheValue(ch.Value()).(*filterBlock)
 			if !ok {
 				ch.Release()
 				return nil, nil, errors.New("leveldb/table: inconsistent block type")
@@ -709,7 +741,7 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 
 func (r *Reader) getIndexBlock(fillCache bool) (b *block, rel util.Releaser, err error) {
 	if r.indexBlock == nil {
-		return r.readBlockCached(r.indexBH, true, fillCache)
+		return r.readBlockCached(r.indexBH, true, fillCache, BlockCacheIndex)
 	}
 	return r.indexBlock, util.NoopReleaser{}, nil
 }
@@ -762,7 +794,7 @@ func (r *Reader) newBlockIter(b *block, bReleaser util.Releaser, slice *util.Ran
 }
 
 func (r *Reader) getDataIter(dataBH blockHandle, slice *util.Range, verifyChecksum, fillCache bool) iterator.Iterator {
-	b, rel, err := r.readBlockCached(dataBH, verifyChecksum, fillCache)
+	b, rel, err := r.readBlockCached(dataBH, verifyChecksum, fillCache, BlockCacheData)
 	if err != nil {
 		return iterator.NewEmptyIterator(err)
 	}
@@ -971,7 +1003,7 @@ func (r *Reader) OffsetOf(key []byte) (offset int64, err error) {
 		return
 	}
 
-	indexBlock, rel, err := r.readBlockCached(r.indexBH, true, true)
+	indexBlock, rel, err := r.readBlockCached(r.indexBH, true, true, BlockCacheIndex)
 	if err != nil {
 		return
 	}
@@ -1022,7 +1054,7 @@ func (r *Reader) Release() {
 // The fi, cache and bpool is optional and can be nil.
 //
 // The returned table reader instance is safe for concurrent use.
-func NewReader(f io.ReaderAt, size int64, fd storage.FileDesc, cache *cache.NamespaceGetter, bpool *util.BufferPool, o *opt.Options) (*Reader, error) {
+func NewReader(f io.ReaderAt, size int64, fd storage.FileDesc, cache *cache.NamespaceGetter, bpool *util.BufferPool, o *opt.Options, stats *BlockCacheStats) (*Reader, error) {
 	if f == nil {
 		return nil, errors.New("leveldb/table: nil file")
 	}
@@ -1031,6 +1063,7 @@ func NewReader(f io.ReaderAt, size int64, fd storage.FileDesc, cache *cache.Name
 		fd:             fd,
 		reader:         f,
 		cache:          cache,
+		stats:          stats,
 		bpool:          bpool,
 		o:              o,
 		cmp:            o.GetComparer(),
