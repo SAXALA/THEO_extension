@@ -50,7 +50,7 @@ func NewLDBDatabase(file string, cache int, handles int) (*LDBDatabase, error) {
 	// Open the db and recover any potential corruptions
 	db, err := leveldb.OpenFile(file, &opt.Options{
 		OpenFilesCacheCapacity: handles,
-		BlockCacheCapacity:     cache * opt.MiB, // cache / 2 * opt.MiB,
+		BlockCacheCapacity:     cache / 2 * opt.MiB, // cache / 2 * opt.MiB,
 		WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
 		Filter:                 filter.NewBloomFilter(10),
 		Compression:            opt.NoCompression,
