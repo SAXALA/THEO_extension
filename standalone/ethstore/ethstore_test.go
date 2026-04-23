@@ -18,7 +18,9 @@ package ethstore
 
 import (
 	// For profiling
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os" // Added for os.MkdirTemp or t.TempDir()
 
@@ -246,4 +248,30 @@ func TestPraseBlockID(t *testing.T) {
 	}
 
 	fmt.Print("blockID: ", blockID, " foundBlockID: ", foundBlockID, " dataType: ", DataTypeStrings[dataType], "\n")
+}
+
+func TestAOLFutureBlockMissMapsToNotFound(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := New(tempDir, 10, "future_block_miss", false, 0, testPrefixCacheSizeBytes, 16)
+	require.NoError(t, err)
+	defer store.Close()
+
+	store.blockAol.latestBlockID = 1
+
+	key := make([]byte, 9)
+	key[0] = headerPrefix[0]
+	binary.BigEndian.PutUint64(key[1:9], 2)
+
+	_, err = store.Get(key, GetDataTypeFromKey(key))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected future AOL block lookup to map to ErrNotFound, got %v", err)
+	}
+
+	has, err := store.HasWithDataType(key, GetDataTypeFromKey(key))
+	if err != nil {
+		t.Fatalf("expected HasWithDataType to treat future AOL block lookup as miss, got error %v", err)
+	}
+	if has {
+		t.Fatalf("expected HasWithDataType to report false for future AOL block lookup")
+	}
 }

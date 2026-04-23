@@ -60,6 +60,8 @@ var baolDiskIOUsageNames = [...]string{
 	"index-meta",
 }
 
+var errRequestedFutureBlock = errors.New("requested future block")
+
 type baolDiskIOCounters struct {
 	readOps    uint64
 	readBytes  uint64
@@ -934,7 +936,7 @@ func (baol *BlockAppendOnlyLog) Get(key string) (string, bool, error) {
 	if blockID, ok := ParseBlockNumberFromKey([]byte(key), dataType); ok {
 		// For keys with embedded block numbers (Header, BlockBody, BlockReceipts)
 		if blockID > baol.latestBlockID {
-			return "", false, fmt.Errorf("Get: requested blockID %d > latestBlockID %d", blockID, baol.latestBlockID)
+			return "", false, fmt.Errorf("Get: requested blockID %d > latestBlockID %d: %w", blockID, baol.latestBlockID, errRequestedFutureBlock)
 			// return "", false, nil
 		} else if baol.latestBlockID-blockID > IgnoredThreshold {
 			return "", true, nil

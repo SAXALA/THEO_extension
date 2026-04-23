@@ -40,7 +40,7 @@ func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, 
 }
 
 func isNotFoundError(err error) bool {
-	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound)
+	return errors.Is(err, ErrNotFound) || errors.Is(err, pebble.ErrNotFound) || errors.Is(err, errRequestedFutureBlock)
 }
 
 // errorIterator is an ethdb.Iterator that always returns an error or represents an invalid state.
@@ -389,6 +389,9 @@ func (d *Database) HasWithDataType(key []byte, dataType DataType) (bool, error) 
 		}
 		valStr, exists, err = d.blockAol.Get(string(key))
 		if err != nil {
+			if isNotFoundError(err) {
+				return false, nil
+			}
 			return false, err
 		}
 		if exists {
@@ -451,6 +454,9 @@ func (d *Database) GetFromAOL(key []byte) ([]byte, error) {
 	}
 	valStr, exists, err = d.blockAol.Get(string(key))
 	if err != nil {
+		if isNotFoundError(err) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	if exists {
