@@ -1849,9 +1849,11 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 
 type baolStreamIterator struct {
 	baol *BlockAppendOnlyLog
+	prefix []byte
 
 	minBlockID uint64
 	maxBlockID uint64
+	lowerBound []byte
 
 	curBlockID      uint64
 	curBlockEntry   blockIndexEntry
@@ -1871,15 +1873,12 @@ type baolStreamIterator struct {
 }
 
 // NewIterator returns a streaming iterator over KV pairs in the data log,
-// in on-disk order (block by block, entry by entry), starting from the block
-// parsed from startKey.
+// in on-disk order (block by block, entry by entry), honoring the same
+// prefix/start lower-bound semantics as PebbleStore.NewIterator.
 //
-// If startKey is nil/empty, iteration starts from minBlockID.
-//
-// Behavior (per requirement): during NewIterator it reads the corresponding block index
-// and preloads the first KV pair in the data log (read sizes, then read key/value).
-// The first call to Next() returns that KV pair.
-func (baol *BlockAppendOnlyLog) NewIterator(startKey []byte) ethdb.Iterator {
+// To position the iterator, it only reads each candidate entry's header and key.
+// The value bytes are fetched only after the first in-range KV is identified.
+func (baol *BlockAppendOnlyLog) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	baol.mu.RLock()
 	if baol.closed {
 		baol.mu.RUnlock()
@@ -1891,44 +1890,54 @@ func (baol *BlockAppendOnlyLog) NewIterator(startKey []byte) ethdb.Iterator {
 
 	it := &baolStreamIterator{
 		baol:       baol,
+		prefix:     bytes.Clone(prefix),
 		minBlockID: minBlockID,
 		maxBlockID: maxBlockID,
 	}
-
-	// Determine start block ID.
-	start := uint64(0)
-	if len(startKey) > 0 {
-		dt := GetDataTypeFromKey(startKey)
-		if blockID, ok := ParseBlockNumberFromKey(startKey, dt); ok {
-			start = blockID
+	if len(start) > 0 {
+		if len(prefix) > 0 && !bytes.HasPrefix(start, prefix) {
+			it.lowerBound = make([]byte, len(prefix)+len(start))
+			copy(it.lowerBound, prefix)
+			copy(it.lowerBound[len(prefix):], start)
 		} else {
-			// startKey exists but doesn't encode a block number (e.g., it is a
-			// plain data key used as a hint). Fall back to iterating from the
-			// beginning of the log so callers that pass arbitrary prefix keys
-			// still get a valid iterator.
-			start = minBlockID
+			it.lowerBound = bytes.Clone(start)
 		}
-	} else {
-		start = minBlockID
+	} else if len(prefix) > 0 {
+		it.lowerBound = bytes.Clone(prefix)
 	}
 
-	if start == 0 {
+	// Determine start block ID.
+	startBlockID := uint64(0)
+	if len(it.lowerBound) > 0 {
+		dt := GetDataTypeFromKey(it.lowerBound)
+		if blockID, ok := ParseBlockNumberFromKey(it.lowerBound, dt); ok {
+			startBlockID = blockID
+		} else {
+			// If the lower bound does not encode a block number, fall back to the
+			// beginning of the log and filter entries lazily while streaming.
+			startBlockID = minBlockID
+		}
+	} else {
+		startBlockID = minBlockID
+	}
+
+	if startBlockID == 0 {
 		if maxBlockID == 0 {
 			// Empty log.
 			return it
 		}
 		// Fallback for legacy datasets where minBlockID isn't set.
-		start = 1
+		startBlockID = 1
 	}
-	if minBlockID != 0 && start < minBlockID {
-		start = minBlockID
+	if minBlockID != 0 && startBlockID < minBlockID {
+		startBlockID = minBlockID
 	}
-	if start > maxBlockID {
+	if startBlockID > maxBlockID {
 		// Start beyond current range => empty iterator.
 		return it
 	}
 
-	it.curBlockID = start
+	it.curBlockID = startBlockID
 	it.prefetchNext()
 	return it
 }
@@ -2006,7 +2015,21 @@ func (it *baolStreamIterator) prefetchNext() {
 			continue
 		}
 
-		key, value, bytesRead, err := it.readKVAt(it.nextOffset, it.curBlockEntry.EndOffset)
+		key, keyLen, valueLen, bytesRead, err := it.readKeyAt(it.nextOffset, it.curBlockEntry.EndOffset)
+		if err != nil {
+			it.err = err
+			it.hasNextKV = false
+			return
+		}
+		if len(it.lowerBound) > 0 && bytes.Compare(key, it.lowerBound) < 0 {
+			it.nextOffset += bytesRead
+			continue
+		}
+		if len(it.prefix) > 0 && !bytes.HasPrefix(key, it.prefix) {
+			it.nextOffset += bytesRead
+			continue
+		}
+		value, err := it.readValueAt(it.nextOffset, keyLen, valueLen)
 		if err != nil {
 			it.err = err
 			it.hasNextKV = false
@@ -2020,15 +2043,15 @@ func (it *baolStreamIterator) prefetchNext() {
 	}
 }
 
-func (it *baolStreamIterator) readKVAt(offset int64, blockEnd int64) ([]byte, []byte, int64, error) {
+func (it *baolStreamIterator) readKeyAt(offset int64, blockEnd int64) ([]byte, int64, int64, int64, error) {
 	const headerSize = int64(blockIDSize + keyLenSize + valueLenSize)
 	if offset+headerSize > blockEnd {
-		return nil, nil, 0, fmt.Errorf("corrupted entry header at offset %d: remaining=%d < headerSize=%d", offset, blockEnd-offset, headerSize)
+		return nil, 0, 0, 0, fmt.Errorf("corrupted entry header at offset %d: remaining=%d < headerSize=%d", offset, blockEnd-offset, headerSize)
 	}
 
 	hdr := make([]byte, headerSize)
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, hdr, offset, baolDiskIOUsageDataQuery); err != nil {
-		return nil, nil, 0, err
+		return nil, 0, 0, 0, err
 	}
 
 	keyLenU32 := binary.BigEndian.Uint32(hdr[blockIDSize : blockIDSize+keyLenSize])
@@ -2037,20 +2060,25 @@ func (it *baolStreamIterator) readKVAt(offset int64, blockEnd int64) ([]byte, []
 	valueLen := int64(valueLenU32)
 	maxInt := int64(int(^uint(0) >> 1))
 	if keyLen > maxInt || valueLen > maxInt {
-		return nil, nil, 0, fmt.Errorf("entry too large at offset %d: keyLen=%d valueLen=%d", offset, keyLen, valueLen)
+		return nil, 0, 0, 0, fmt.Errorf("entry too large at offset %d: keyLen=%d valueLen=%d", offset, keyLen, valueLen)
 	}
 	entrySize := headerSize + keyLen + valueLen
 	if offset+entrySize > blockEnd {
-		return nil, nil, 0, fmt.Errorf("corrupted entry at offset %d: entrySize=%d exceeds blockEnd=%d", offset, entrySize, blockEnd)
+		return nil, 0, 0, 0, fmt.Errorf("corrupted entry at offset %d: entrySize=%d exceeds blockEnd=%d", offset, entrySize, blockEnd)
 	}
 
 	key := make([]byte, int(keyLen))
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, key, offset+headerSize, baolDiskIOUsageDataQuery); err != nil {
-		return nil, nil, 0, err
+		return nil, 0, 0, 0, err
 	}
+	return key, keyLen, valueLen, entrySize, nil
+}
+
+func (it *baolStreamIterator) readValueAt(offset int64, keyLen int64, valueLen int64) ([]byte, error) {
+	const headerSize = int64(blockIDSize + keyLenSize + valueLenSize)
 	value := make([]byte, int(valueLen))
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, value, offset+headerSize+keyLen, baolDiskIOUsageDataQuery); err != nil {
-		return nil, nil, 0, err
+		return nil, err
 	}
-	return key, value, entrySize, nil
+	return value, nil
 }

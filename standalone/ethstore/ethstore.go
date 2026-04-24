@@ -843,7 +843,7 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	if AolHandledDataTypes[dataType] {
 		// This is an AOL-handled type, use the 'iterator' struct.
 		d.log.Trace("Creating new iterator for AOL", "prefix", common.Bytes2Hex(prefix), "start", common.Bytes2Hex(start), "dataType", DataTypeStrings[dataType])
-		return d.blockAol.NewIterator(prefix)
+		return d.blockAol.NewIterator(prefix, start)
 	}
 
 	// Not an AOL-handled type, delegate to PebbleStore.

@@ -355,11 +355,9 @@ func TestBlockAppendOnlyLog_IteratorOrder_HeaderBodyReceipts(t *testing.T) {
 	aol, cleanup := NewAppendOnlyLogTest(t, dir, 16)
 	defer cleanup()
 
-	// Keys are crafted to match the single-byte prefixes used by GetDataTypeFromKey:
-	// 'h' => Header, 'b' => Body, 'r' => Receipts.
-	headerKey := "h_header"
-	bodyKey := "b_body"
-	receiptKey := "r_receipts"
+	headerKey := makeTestHeaderKey(1, 'a')
+	bodyKey := makeTestHeaderKey(1, 'b')
+	receiptKey := makeTestHeaderKey(1, 'c')
 
 	kvs := map[string]string{
 		receiptKey: "V_R",
@@ -370,7 +368,7 @@ func TestBlockAppendOnlyLog_IteratorOrder_HeaderBodyReceipts(t *testing.T) {
 		t.Fatalf("Append failed: %v", err)
 	}
 
-	it := aol.NewIterator([]byte(headerKey))
+	it := aol.NewIterator(nil, []byte(headerKey))
 	defer it.Release()
 
 	if !it.Next() {
@@ -395,6 +393,50 @@ func TestBlockAppendOnlyLog_IteratorOrder_HeaderBodyReceipts(t *testing.T) {
 	}
 	if got := string(it.Key()); got != receiptKey {
 		t.Fatalf("third key mismatch: got=%q want=%q", got, receiptKey)
+	}
+}
+
+func TestBlockAppendOnlyLog_NewIteratorPrefetchesOneKVAtATime(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 16)
+	defer cleanup()
+
+	kvs := make(map[string]string, 8)
+	firstKey := makeTestHeaderKey(1, 'a')
+	for suffix := byte('a'); suffix < byte('i'); suffix++ {
+		kvs[makeTestHeaderKey(1, suffix)] = strings.Repeat(string(suffix), 128)
+	}
+	if err := aol.Append(1, kvs); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	entry, ok := aol.getBlockIndexEntry(1)
+	if !ok {
+		t.Fatal("expected block index entry for block 1")
+	}
+	blockSize := uint64(entry.EndOffset - entry.StartOffset)
+	beforeBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+
+	it := aol.NewIterator(nil, []byte(firstKey))
+	defer it.Release()
+
+	afterBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+	if delta := afterBytes - beforeBytes; delta == 0 {
+		t.Fatal("expected iterator construction to read the first KV")
+	} else if delta >= blockSize {
+		t.Fatalf("iterator construction read an entire block: delta=%d blockSize=%d", delta, blockSize)
+	}
+
+	if !it.Next() {
+		t.Fatalf("expected iterator to yield the first KV, err=%v", it.Error())
+	}
+	if got := string(it.Key()); got != firstKey {
+		t.Fatalf("first key mismatch: got=%q want=%q", got, firstKey)
+	}
+	if got := string(it.Value()); got != kvs[firstKey] {
+		t.Fatalf("first value mismatch: got=%q want=%q", got, kvs[firstKey])
 	}
 }
 

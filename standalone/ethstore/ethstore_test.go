@@ -275,3 +275,26 @@ func TestAOLFutureBlockMissMapsToNotFound(t *testing.T) {
 		t.Fatalf("expected HasWithDataType to report false for future AOL block lookup")
 	}
 }
+
+func TestEthStoreNewIteratorPassesStartToAOL(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := New(tempDir, 10, "iterator_start", false, 0, testPrefixCacheSizeBytes, 16)
+	require.NoError(t, err)
+	defer store.Close()
+
+	keyA := []byte(makeTestHeaderKey(7, 'a'))
+	keyB := []byte(makeTestHeaderKey(7, 'b'))
+	require.NoError(t, store.blockAol.Append(7, map[string]string{
+		string(keyA): "value-a",
+		string(keyB): "value-b",
+	}))
+
+	it := store.NewIterator(keyA[:1], keyB[1:])
+	defer it.Release()
+
+	require.True(t, it.Next(), "expected iterator to land on the requested lower bound")
+	assert.Equal(t, string(keyB), string(it.Key()))
+	assert.Equal(t, "value-b", string(it.Value()))
+	assert.False(t, it.Next(), "expected only one matching entry after the lower bound")
+	require.NoError(t, it.Error())
+}
