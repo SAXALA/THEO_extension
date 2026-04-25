@@ -115,6 +115,11 @@ type BlockAppendOnlyLog struct {
 	getDiskIndexStats     baolGetBreakdownStepStats
 	getDiskDataStats      baolGetBreakdownStepStats
 
+	iteratorMemoryIndexStats baolGetBreakdownStepStats
+	iteratorBlockIndexStats  baolGetBreakdownStepStats
+	iteratorKeyReadStats     baolGetBreakdownStepStats
+	iteratorValueReadStats   baolGetBreakdownStepStats
+
 	// opCount   uint64 // for debugging
 	// failedOps uint64 // for debugging
 }
@@ -495,6 +500,57 @@ func printBAOLGetBreakdownStep(label string, stats *baolGetBreakdownStepStats) {
 		time.Duration(noCacheNanos),
 		noCacheAvgMicros,
 	)
+}
+
+func baolBreakdownTotalNanos(stats ...*baolGetBreakdownStepStats) uint64 {
+	if !analysisStatsEnabled {
+		return 0
+	}
+	var total uint64
+	for _, stat := range stats {
+		if stat == nil {
+			continue
+		}
+		total += atomic.LoadUint64(&stat.cacheNanos)
+		total += atomic.LoadUint64(&stat.noCacheNanos)
+	}
+	return total
+}
+
+func printBAOLBreakdownSummary(label string, parts map[string]*baolGetBreakdownStepStats) {
+	if !analysisStatsEnabled || len(parts) == 0 {
+		return
+	}
+	totalNanos := baolBreakdownTotalNanos(func() []*baolGetBreakdownStepStats {
+		stats := make([]*baolGetBreakdownStepStats, 0, len(parts))
+		for _, stat := range parts {
+			stats = append(stats, stat)
+		}
+		return stats
+	}()...)
+	if totalNanos == 0 {
+		fmt.Printf("BlockStore %s summary: total=0s\n", label)
+		return
+	}
+
+	orderedLabels := make([]string, 0, len(parts))
+	for name := range parts {
+		orderedLabels = append(orderedLabels, name)
+	}
+	sort.Strings(orderedLabels)
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("BlockStore %s summary: total=%s", label, time.Duration(totalNanos)))
+	for _, name := range orderedLabels {
+		stat := parts[name]
+		partNanos := atomic.LoadUint64(&stat.cacheNanos) + atomic.LoadUint64(&stat.noCacheNanos)
+		share := 0.0
+		if totalNanos > 0 {
+			share = float64(partNanos) * 100 / float64(totalNanos)
+		}
+		builder.WriteString(fmt.Sprintf(" %s=%s(%.2f%%)", name, time.Duration(partNanos), share))
+	}
+	fmt.Println(builder.String())
 }
 
 // loadBlockIndex reads the index map file into memory using compact storage based on minBlockID.
@@ -1527,6 +1583,17 @@ func (baol *BlockAppendOnlyLog) Close() error {
 	printBAOLGetBreakdownStep("in-memory-index-fetch", &baol.getInMemoryIndexStats)
 	printBAOLGetBreakdownStep("disk-index-fetch", &baol.getDiskIndexStats)
 	printBAOLGetBreakdownStep("disk-data-fetch", &baol.getDiskDataStats)
+	printBAOLGetBreakdownStep("range-memory-index-seek", &baol.iteratorMemoryIndexStats)
+	printBAOLGetBreakdownStep("range-block-index-fetch", &baol.iteratorBlockIndexStats)
+	printBAOLGetBreakdownStep("range-key-read", &baol.iteratorKeyReadStats)
+	printBAOLGetBreakdownStep("range-value-fetch", &baol.iteratorValueReadStats)
+	printBAOLBreakdownSummary("range breakdown",
+		map[string]*baolGetBreakdownStepStats{
+			"memory-index-seek": &baol.iteratorMemoryIndexStats,
+			"block-index-fetch": &baol.iteratorBlockIndexStats,
+			"key-read":          &baol.iteratorKeyReadStats,
+			"value-fetch":       &baol.iteratorValueReadStats,
+		})
 
 	// Combine errors if any occurred
 	if len(errs) > 0 {
@@ -1854,6 +1921,8 @@ type baolStreamIterator struct {
 	minBlockID uint64
 	maxBlockID uint64
 	lowerBound []byte
+	seekKey    []byte
+	seekExact  bool
 
 	curBlockID      uint64
 	curBlockEntry   blockIndexEntry
@@ -1905,6 +1974,7 @@ func (baol *BlockAppendOnlyLog) NewIterator(prefix []byte, start []byte) ethdb.I
 	} else if len(prefix) > 0 {
 		it.lowerBound = bytes.Clone(prefix)
 	}
+	it.seekKey = bytes.Clone(it.lowerBound)
 
 	// Determine start block ID.
 	startBlockID := uint64(0)
@@ -1938,7 +2008,6 @@ func (baol *BlockAppendOnlyLog) NewIterator(prefix []byte, start []byte) ethdb.I
 	}
 
 	it.curBlockID = startBlockID
-	it.prefetchNext()
 	return it
 }
 
@@ -1947,17 +2016,19 @@ func (it *baolStreamIterator) Next() bool {
 		return false
 	}
 	if !it.hasNextKV {
-		return false
+		it.prefetchNext()
+		if it.err != nil || !it.hasNextKV {
+			return false
+		}
 	}
 	// Publish prefetched KV as current.
 	it.key = it.nextKey
 	it.value = it.nextValue
+	it.seekKey = bytes.Clone(it.key)
+	it.seekExact = true
 	it.hasNextKV = false
 	it.nextKey = nil
 	it.nextValue = nil
-
-	// Prefetch next one.
-	it.prefetchNext()
 	return true
 }
 
@@ -1988,12 +2059,18 @@ func (it *baolStreamIterator) prefetchNext() {
 			return
 		}
 
+		if handled := it.prefetchFromMemoryIndex(); handled {
+			return
+		}
+
 		// Load current block index entry if needed.
 		if !it.hasCurrentBlock {
+			indexLookupStart := time.Now()
 			it.baol.mu.RLock()
 			entry, ok := it.baol.getBlockIndexEntry(it.curBlockID)
 			closed := it.baol.closed
 			it.baol.mu.RUnlock()
+			recordBAOLGetBreakdownStep(&it.baol.iteratorBlockIndexStats, false, time.Since(indexLookupStart))
 			if closed {
 				it.err = ErrClosed
 				it.hasNextKV = false
@@ -2021,7 +2098,7 @@ func (it *baolStreamIterator) prefetchNext() {
 			it.hasNextKV = false
 			return
 		}
-		if len(it.lowerBound) > 0 && bytes.Compare(key, it.lowerBound) < 0 {
+		if it.keyBeforeSeek(key) {
 			it.nextOffset += bytesRead
 			continue
 		}
@@ -2043,14 +2120,107 @@ func (it *baolStreamIterator) prefetchNext() {
 	}
 }
 
+func (it *baolStreamIterator) prefetchFromMemoryIndex() bool {
+	if it.baol == nil || it.curBlockID == 0 {
+		return false
+	}
+
+	seekStart := time.Now()
+	it.baol.mu.RLock()
+	if it.baol.closed {
+		it.baol.mu.RUnlock()
+		it.err = ErrClosed
+		it.hasNextKV = false
+		return true
+	}
+	if it.baol.indexedBlocks == nil {
+		it.baol.mu.RUnlock()
+		return false
+	}
+	if _, ok := it.baol.indexedBlocks[it.curBlockID]; !ok {
+		it.baol.mu.RUnlock()
+		return false
+	}
+
+	var elem *skiplist.Element
+	if len(it.seekKey) > 0 {
+		elem = it.baol.skiplistIndex.Find(string(it.seekKey))
+		if it.seekExact && elem != nil && elem.Key().(string) == string(it.seekKey) {
+			elem = elem.Next()
+		}
+	} else {
+		elem = it.baol.skiplistIndex.Front()
+	}
+
+	for elem != nil {
+		keyStr := elem.Key().(string)
+		keyBytes := StringToBytes(keyStr)
+		if len(it.prefix) > 0 && !bytes.HasPrefix(keyBytes, it.prefix) {
+			if bytes.Compare(keyBytes, it.prefix) < 0 {
+				elem = elem.Next()
+				continue
+			}
+			recordBAOLGetBreakdownStep(&it.baol.iteratorMemoryIndexStats, true, time.Since(seekStart))
+			it.baol.mu.RUnlock()
+			it.hasNextKV = false
+			return true
+		}
+
+		ptr := elem.Value.(*kvPointer)
+		if ptr.BlockID < it.curBlockID {
+			elem = elem.Next()
+			continue
+		}
+		if ptr.BlockID > it.maxBlockID {
+			recordBAOLGetBreakdownStep(&it.baol.iteratorMemoryIndexStats, true, time.Since(seekStart))
+			it.baol.mu.RUnlock()
+			it.hasNextKV = false
+			return true
+		}
+
+		recordBAOLGetBreakdownStep(&it.baol.iteratorMemoryIndexStats, true, time.Since(seekStart))
+		valueStart := time.Now()
+		value, fromCache, err := it.baol.readValueBytesFromPointerWithSource(ptr)
+		recordBAOLGetBreakdownStep(&it.baol.iteratorValueReadStats, fromCache, time.Since(valueStart))
+		it.baol.mu.RUnlock()
+		if err != nil {
+			it.err = err
+			it.hasNextKV = false
+			return true
+		}
+
+		it.nextKey = append(it.nextKey[:0], keyBytes...)
+		it.nextValue = value
+		it.hasNextKV = true
+		it.curBlockID = ptr.BlockID
+		it.hasCurrentBlock = false
+		return true
+	}
+
+	recordBAOLGetBreakdownStep(&it.baol.iteratorMemoryIndexStats, true, time.Since(seekStart))
+	it.baol.mu.RUnlock()
+	it.hasNextKV = false
+	return true
+}
+
+func (it *baolStreamIterator) keyBeforeSeek(key []byte) bool {
+	if len(it.seekKey) == 0 {
+		return false
+	}
+	cmp := bytes.Compare(key, it.seekKey)
+	return cmp < 0 || (it.seekExact && cmp == 0)
+}
+
 func (it *baolStreamIterator) readKeyAt(offset int64, blockEnd int64) ([]byte, int64, int64, int64, error) {
 	const headerSize = int64(blockIDSize + keyLenSize + valueLenSize)
 	if offset+headerSize > blockEnd {
 		return nil, 0, 0, 0, fmt.Errorf("corrupted entry header at offset %d: remaining=%d < headerSize=%d", offset, blockEnd-offset, headerSize)
 	}
 
+	readStart := time.Now()
 	hdr := make([]byte, headerSize)
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, hdr, offset, baolDiskIOUsageDataQuery); err != nil {
+		recordBAOLGetBreakdownStep(&it.baol.iteratorKeyReadStats, false, time.Since(readStart))
 		return nil, 0, 0, 0, err
 	}
 
@@ -2069,16 +2239,21 @@ func (it *baolStreamIterator) readKeyAt(offset int64, blockEnd int64) ([]byte, i
 
 	key := make([]byte, int(keyLen))
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, key, offset+headerSize, baolDiskIOUsageDataQuery); err != nil {
+		recordBAOLGetBreakdownStep(&it.baol.iteratorKeyReadStats, false, time.Since(readStart))
 		return nil, 0, 0, 0, err
 	}
+	recordBAOLGetBreakdownStep(&it.baol.iteratorKeyReadStats, false, time.Since(readStart))
 	return key, keyLen, valueLen, entrySize, nil
 }
 
 func (it *baolStreamIterator) readValueAt(offset int64, keyLen int64, valueLen int64) ([]byte, error) {
 	const headerSize = int64(blockIDSize + keyLenSize + valueLenSize)
+	readStart := time.Now()
 	value := make([]byte, int(valueLen))
 	if _, err := it.baol.readAtWithStats(it.baol.dataFile, value, offset+headerSize+keyLen, baolDiskIOUsageDataQuery); err != nil {
+		recordBAOLGetBreakdownStep(&it.baol.iteratorValueReadStats, false, time.Since(readStart))
 		return nil, err
 	}
+	recordBAOLGetBreakdownStep(&it.baol.iteratorValueReadStats, false, time.Since(readStart))
 	return value, nil
 }

@@ -340,7 +340,8 @@ Common env vars:
 
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
-    load/replay ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
+    load ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
+    replay ethstore: when DB_TYPE=all/prefixdb, ETHSTORE_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
     load-account prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir
     load-storage prefixdb: uses replay_config.json 中 loadDataDir/accountHashKeyPebbleDir，并要求 PREFIXDB_ACCOUNT_STATE_DIR
     gc: backend must be ethstore, and GC_STATE_DIR must be provided
@@ -361,6 +362,10 @@ validate_inputs() {
     fi
 }
 
+ethstore_dbtype_needs_prefixdb() {
+    [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]
+}
+
 validate_runtime_requirements() {
     local needs_ethstore_prefixdb="false"
 
@@ -371,7 +376,9 @@ validate_runtime_requirements() {
 
     if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ]; then
         if [ "$BACKEND" = "ethstore" ] || [ "$BACKEND" = "all" ]; then
-            needs_ethstore_prefixdb="true"
+            if [ "$ACTION" = "load" ] || ethstore_dbtype_needs_prefixdb; then
+                needs_ethstore_prefixdb="true"
+            fi
         fi
     fi
 
@@ -716,6 +723,9 @@ restore_pebble_db() {
 }
 
 ensure_ethstore_permissions() {
+    if ! ethstore_dbtype_needs_prefixdb; then
+        return 0
+    fi
     echo "Fix ethstore permissions (prefixdb)..."
     # Ensure the lock directory exists and is writable to avoid LOCK permission denied.
     sudo_run chmod -R 777 "${ETHSTORE_PREFIXDB_DIR}"
@@ -785,7 +795,6 @@ resolve_ethstore_pebble_loaded_dir() {
 }
 
 sync_ethstore_loaded_to_running() {
-    ensure_ethstore_statedb_dirname
     local src_root="${LOADED_ROOT}/ethstore"
     local dst_prefix="${RUNNING_ROOT}/ethstore"
 
@@ -807,6 +816,7 @@ sync_ethstore_loaded_to_running() {
         fi
     fi
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]; then
+        ensure_ethstore_statedb_dirname
         if [ ! -d "${src_state}" ]; then
             echo "ethstore source directory missing under ${src_root}: ${ETHSTORE_STATEDB_DIRNAME}"
             exit 1

@@ -54,6 +54,17 @@ const (
 	allDBTypes
 )
 
+func describeEthstoreOpenedStores(dbType DBType) string {
+	switch dbType {
+	case AOL:
+		return "aol only"
+	case PrefixDB:
+		return "prefixdb+pebble"
+	default:
+		return "all"
+	}
+}
+
 // opRegex is compiled once at init time and reused across all replayTrace calls.
 var opRegex = regexp.MustCompile(`OPType:\s*(\w+)(?:,\s*key:\s*([0-9a-fA-F]+),\s*size:\s*(\d+)(?:,\s*value:\s*([0-9a-fA-F]+),\s*size:\s*(\d+))?)?(?:,\s*size:\s*(\d+))?(?:,\s*prefix:\s*([0-9a-fA-F]+),\s*start key:\s*([0-9a-fA-F]*))?`)
 
@@ -970,12 +981,15 @@ func newEthstoreReplayBackend(dir string, replayDBType DBType, contractCachePref
 	)
 	if replayDBType == PrefixDB {
 		store, err = ethstore.NewStateWithPebbleGCAndStoreSettings(dir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	} else if replayDBType == AOL {
+		store, err = ethstore.NewAOLOnly(dir, 6000)
 	} else {
 		store, err = ethstore.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
 	}
+	fmt.Printf("[ethstore] opened stores: %s\n", describeEthstoreOpenedStores(replayDBType))
 	return &ethstoreReplayBackend{
 		store:              store,
 		replayDBType:       replayDBType,

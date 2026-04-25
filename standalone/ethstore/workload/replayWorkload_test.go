@@ -102,6 +102,27 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-outCh
 }
 
+func TestDescribeEthstoreOpenedStores(t *testing.T) {
+	tests := []struct {
+		name   string
+		dbType DBType
+		want   string
+	}{
+		{name: "aol", dbType: AOL, want: "aol only"},
+		{name: "prefixdb", dbType: PrefixDB, want: "prefixdb+pebble"},
+		{name: "pebble", dbType: Pebble, want: "all"},
+		{name: "all", dbType: allDBTypes, want: "all"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeEthstoreOpenedStores(tt.dbType); got != tt.want {
+				t.Fatalf("describeEthstoreOpenedStores(%v) = %q, want %q", tt.dbType, got, tt.want)
+			}
+		})
+	}
+}
+
 type fakeGetterStore struct {
 	value   []byte
 	err     error
@@ -265,6 +286,38 @@ func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *te
 	}
 	if string(got) != "storage" {
 		t.Fatalf("unexpected storage value: %q", string(got))
+	}
+}
+
+func TestNewEthstoreReplayBackendAOLSkipsStateAndPebbleInitialization(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "ethstore")
+	brokenStatePath := filepath.Join(baseDir+"_state", "prefixdb")
+	if err := os.MkdirAll(brokenStatePath, 0o755); err != nil {
+		t.Fatalf("create broken state path failed: %v", err)
+	}
+	brokenPebblePath := filepath.Join(baseDir+"_pebble", "CURRENT")
+	if err := os.MkdirAll(brokenPebblePath, 0o755); err != nil {
+		t.Fatalf("create broken pebble path failed: %v", err)
+	}
+
+	backend, err := newEthstoreReplayBackend(baseDir, AOL, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("expected aol replay backend to skip state/pebble init, got %v", err)
+	}
+	defer backend.Close()
+
+	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), ethstore.HeaderDataType); err != nil {
+		t.Fatalf("StagePut failed: %v", err)
+	}
+	if err := backend.CommitBlock(); err != nil {
+		t.Fatalf("CommitBlock failed: %v", err)
+	}
+	got, err := backend.Get(makeAOLTestKey(1), ethstore.HeaderDataType)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if string(got) != "header-value" {
+		t.Fatalf("unexpected value: %q", string(got))
 	}
 }
 

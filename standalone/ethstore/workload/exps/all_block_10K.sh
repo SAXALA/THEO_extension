@@ -23,7 +23,7 @@ fi
 
 DB_TYPE="aol"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
-BACKEND_CANDIDATES=(ethstore pebble chainkv)
+BACKEND_CANDIDATES=(ethstore)
 TRACE_FILE_CANDIDATES=(nocache)
 CACHE_SIZE_CANDIDATES=(16)
 CACHE_COUNT_CANDIDATES=(0)

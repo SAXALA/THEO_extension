@@ -60,6 +60,14 @@ func makeTestHeaderKey(blockID uint64, suffix byte) string {
 	return string(key)
 }
 
+func makeTestBlockKey(prefix byte, blockID uint64, suffix byte) string {
+	key := make([]byte, 10)
+	key[0] = prefix
+	binary.BigEndian.PutUint64(key[1:9], blockID)
+	key[9] = suffix
+	return string(key)
+}
+
 func TestAppendOnlyLog_NonZeroStartingBlockID(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
@@ -396,7 +404,7 @@ func TestBlockAppendOnlyLog_IteratorOrder_HeaderBodyReceipts(t *testing.T) {
 	}
 }
 
-func TestBlockAppendOnlyLog_NewIteratorPrefetchesOneKVAtATime(t *testing.T) {
+func TestBlockAppendOnlyLog_NewIteratorUsesMemoryIndexWithoutDiskForInlineValue(t *testing.T) {
 	dir := setupTestDir(t)
 	defer cleanupTestDir(t, dir)
 
@@ -412,25 +420,70 @@ func TestBlockAppendOnlyLog_NewIteratorPrefetchesOneKVAtATime(t *testing.T) {
 		t.Fatalf("Append failed: %v", err)
 	}
 
-	entry, ok := aol.getBlockIndexEntry(1)
-	if !ok {
-		t.Fatal("expected block index entry for block 1")
-	}
-	blockSize := uint64(entry.EndOffset - entry.StartOffset)
 	beforeBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
 
 	it := aol.NewIterator(nil, []byte(firstKey))
 	defer it.Release()
 
 	afterBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
-	if delta := afterBytes - beforeBytes; delta == 0 {
-		t.Fatal("expected iterator construction to read the first KV")
-	} else if delta >= blockSize {
-		t.Fatalf("iterator construction read an entire block: delta=%d blockSize=%d", delta, blockSize)
+	if delta := afterBytes - beforeBytes; delta != 0 {
+		t.Fatalf("expected lazy iterator construction to avoid disk reads, delta=%d", delta)
 	}
 
+	beforeNextBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
 	if !it.Next() {
 		t.Fatalf("expected iterator to yield the first KV, err=%v", it.Error())
+	}
+	afterNextBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+	if delta := afterNextBytes - beforeNextBytes; delta != 0 {
+		t.Fatalf("expected inline-value first Next to stay in memory, delta=%d", delta)
+	}
+	if got := string(it.Key()); got != firstKey {
+		t.Fatalf("first key mismatch: got=%q want=%q", got, firstKey)
+	}
+	if got := string(it.Value()); got != kvs[firstKey] {
+		t.Fatalf("first value mismatch: got=%q want=%q", got, kvs[firstKey])
+	}
+}
+
+func TestBlockAppendOnlyLog_NewIteratorUsesMemoryIndexAndReadsOnlyMissingValue(t *testing.T) {
+	dir := setupTestDir(t)
+	defer cleanupTestDir(t, dir)
+
+	aol, cleanup := NewAppendOnlyLogTest(t, dir, 16)
+	defer cleanup()
+
+	firstKey := makeTestBlockKey('b', 1, 'a')
+	kvs := map[string]string{
+		firstKey:                     strings.Repeat("b", 128),
+		makeTestBlockKey('b', 1, 'b'): strings.Repeat("c", 128),
+	}
+	if err := aol.Append(1, kvs); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	beforeBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+
+	it := aol.NewIterator(nil, []byte(firstKey))
+	defer it.Release()
+
+	afterBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+	if delta := afterBytes - beforeBytes; delta != 0 {
+		t.Fatalf("expected lazy iterator construction to avoid disk reads, delta=%d", delta)
+	}
+
+	beforeNextBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+	beforeNextOps := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readOps)
+	if !it.Next() {
+		t.Fatalf("expected iterator to yield the first KV, err=%v", it.Error())
+	}
+	afterNextBytes := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readBytes)
+	afterNextOps := atomic.LoadUint64(&aol.diskIOStats[baolDiskIOUsageDataQuery].readOps)
+	if delta := afterNextBytes - beforeNextBytes; delta == 0 {
+		t.Fatal("expected first Next to read non-inline value bytes from disk")
+	}
+	if delta := afterNextOps - beforeNextOps; delta != 2 {
+		t.Fatalf("expected lazy first Next to perform exactly two data reads, got %d", delta)
 	}
 	if got := string(it.Key()); got != firstKey {
 		t.Fatalf("first key mismatch: got=%q want=%q", got, firstKey)

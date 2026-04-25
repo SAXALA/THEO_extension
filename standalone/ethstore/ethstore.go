@@ -188,6 +188,25 @@ func NewWithPrefixGCAndFileHandlesSettings(dirPath string, recentN int, namespac
 	return NewWithPrefixGCAndStoreSettings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, 0, 0)
 }
 
+// NewAOLOnly opens a Database wrapper backed only by BlockAppendOnlyLog.
+// It intentionally skips PrefixDB and Pebble initialization so AOL-only
+// replay can run without touching sibling _state/_pebble paths.
+func NewAOLOnly(dirPath string, recentN int) (*Database, error) {
+	logger := log.New("database", dirPath)
+	baol, err := NewBlockAppendOnlyLog(dirPath+"_aol", recentN, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
+	}
+	return &Database{
+		fn:                  dirPath,
+		log:                 logger,
+		quitChan:            make(chan chan error, 1),
+		blockAol:            baol,
+		baolkvs:             make(map[string]string),
+		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
+	}, nil
+}
+
 func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
 	logger := log.New("database", dirPath)
 
