@@ -1125,6 +1125,102 @@ func (b *ethstoreReplayBackend) PrintCommitStats() {
 	reportHistogramSummary("ethstore commit (Total)", b.blockTotalHist)
 }
 
+type recoveryFileReadStats struct {
+	fileCount int
+	bytesRead int64
+	duration  time.Duration
+}
+
+func fullReadRegularFiles(root string) (recoveryFileReadStats, error) {
+	start := time.Now()
+	stats := recoveryFileReadStats{}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			stats.duration = time.Since(start)
+			return stats, nil
+		}
+		return stats, err
+	}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info == nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		bytesRead, err := io.Copy(io.Discard, file)
+		if err != nil {
+			return err
+		}
+		stats.fileCount++
+		stats.bytesRead += bytesRead
+		return nil
+	})
+	stats.duration = time.Since(start)
+	if err != nil {
+		return recoveryFileReadStats{}, err
+	}
+	return stats, nil
+}
+
+func printRecoveryStoreTiming(label string, duration time.Duration) {
+	if duration <= 0 {
+		fmt.Printf("[recovery] %s startup=skipped\n", label)
+		return
+	}
+	fmt.Printf("[recovery] %s startup=%s\n", label, formatDurationCompact(duration))
+}
+
+func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
+	var (
+		store   *ethstore.Database
+		timings ethstore.StartupTimings
+		err     error
+	)
+	switch replayDBType {
+	case PrefixDB:
+		store, timings, err = ethstore.NewStateWithPebbleGCAndStoreSettingsWithStartupTimings(cfg.EthStoreDir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	case AOL:
+		store, timings, err = ethstore.NewAOLOnlyWithStartupTimings(cfg.EthStoreDir, 6000)
+	default:
+		store, timings, err = ethstore.NewWithPrefixGCAndStoreSettingsWithStartupTimings(cfg.EthStoreDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to open ethstore backend: %w", err)
+	}
+	defer store.Close()
+
+	fmt.Printf("[ethstore] opened stores: %s\n", describeEthstoreOpenedStores(replayDBType))
+
+	stateReadStats := recoveryFileReadStats{}
+	if timings.StateStoreOpen > 0 {
+		stateReadStats, err = fullReadRegularFiles(cfg.EthStoreDir + "_state")
+		if err != nil {
+			return fmt.Errorf("failed to fully read state store files: %w", err)
+		}
+	}
+
+	fmt.Println("[recovery] startup timing summary")
+	printRecoveryStoreTiming("pebbledb", timings.PebbleDBOpen)
+	printRecoveryStoreTiming("state store", timings.StateStoreOpen)
+	if timings.BlockStoreOpen > 0 {
+		fmt.Printf("[recovery] block store startup=%s read_bytes=%d\n", formatDurationCompact(timings.BlockStoreOpen), timings.BlockStoreReadBytes)
+	} else {
+		fmt.Println("[recovery] block store startup=skipped")
+	}
+	if timings.StateStoreOpen > 0 {
+		fmt.Printf("[recovery] state store full read=%s files=%d bytes=%d\n", formatDurationCompact(stateReadStats.duration), stateReadStats.fileCount, stateReadStats.bytesRead)
+	} else {
+		fmt.Println("[recovery] state store full read=skipped")
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // chainKVReplayBackend – wraps *chainKVLDB
 // ---------------------------------------------------------------------------
@@ -1688,7 +1784,7 @@ func main() {
 	})
 
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld/re/gc/upgrade-index")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/recovery/gc/upgrade-index")
 	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
@@ -1850,6 +1946,13 @@ func main() {
 			defer ethBackend.Close()
 			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		}
+	case "recovery":
+		if !strings.EqualFold(*backend, "ethstore") {
+			log.Fatalf("recovery only supports backend=ethstore")
+		}
+		if err := runRecovery(cfg, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression); err != nil {
+			log.Fatalf("recovery failed: %v", err)
+		}
 	case "gc":
 		if err := runGC(*backend, *contractCachePrefetchCount, *gcStateDir, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression); err != nil {
 			log.Fatalf("gc failed: %v", err)
@@ -1859,7 +1962,7 @@ func main() {
 			log.Fatalf("upgrade-index failed: %v", err)
 		}
 	default:
-		log.Fatalf("unknown mode %q, use ld/re/gc/upgrade-index", *mode)
+		log.Fatalf("unknown mode %q, use ld/re/recovery/gc/upgrade-index", *mode)
 	}
 }
 

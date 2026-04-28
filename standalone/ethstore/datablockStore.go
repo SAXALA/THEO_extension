@@ -461,6 +461,13 @@ func (baol *BlockAppendOnlyLog) printDiskIOStats() {
 	)
 }
 
+func (baol *BlockAppendOnlyLog) BootstrapReadBytes() uint64 {
+	if baol == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&baol.diskIOStats[baolDiskIOUsageBootstrap].readBytes)
+}
+
 func recordBAOLGetBreakdownStep(stats *baolGetBreakdownStepStats, fromCache bool, duration time.Duration) {
 	if !analysisStatsEnabled || stats == nil {
 		return

@@ -13,6 +13,7 @@ cd "$script_dir" || exit 1
 #   ./multiple_replay.sh [action] [backend|all] [trace-file|all] [config-script]
 # Examples:
 #   ./multiple_replay.sh replay ethstore nocache_snap
+#   ./multiple_replay.sh recovery ethstore
 #   ./multiple_replay.sh replay all all
 #   TEST_RUN_ROUNDS=3 ./multiple_replay.sh replay ethstore nocache_snap
 #   ./multiple_replay.sh load-account prefixdb all ./my_experiment.sh
@@ -37,7 +38,7 @@ TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)        # cache nocache_snap n
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
 # Chunk file size candidates in bytes (used by ethstore/prefixdb).
-CHUNK_FILE_SIZE_BYTES_CANDIDATES=(8192)
+CHUNK_FILE_SIZE_BYTES_CANDIDATES=(16384)
 
 # Replay block windows in start:end form.
 BLOCK_RANGE_CANDIDATES=("20500000:20550000")
@@ -109,7 +110,7 @@ usage() {
 	cat <<EOF
 Usage: $0 [action] [backend|all] [trace-file|all] [config-script]
 
-action:       load | load-account | load-storage | restore | replay | gc  (default: replay)
+action:       load | load-account | load-storage | restore | replay | recovery | gc  (default: replay)
 backend:      ethstore | chainkv | pebble | all            (default: all when omitted)
 trace-file:   cache | nocache | nocache_snap | all         (default: all for replay)
 config-script path to a bash script that defines experiment arrays
@@ -225,7 +226,7 @@ resolve_cache_count_candidates() {
 }
 
 resolve_replay_cgroup_cases() {
-	if [ "$ACTION" = "replay" ]; then
+	if [ "$ACTION" = "replay" ] || [ "$ACTION" = "recovery" ]; then
 		printf '%s\n' "${REPLAY_CGROUP_CASE_CANDIDATES[@]}"
 		return 0
 	fi

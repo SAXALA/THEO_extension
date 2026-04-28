@@ -168,6 +168,13 @@ type Database struct {
 	trieStorageAccountPathStats trieStorageGetBreakdownStepStats
 }
 
+type StartupTimings struct {
+	StateStoreOpen time.Duration
+	BlockStoreOpen time.Duration
+	BlockStoreReadBytes uint64
+	PebbleDBOpen   time.Duration
+}
+
 // The namespace is the prefix that the metrics reporting should use.
 func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, contractCachePrefetchCount int) (*Database, error) {
 	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0, 0, false, false)
@@ -192,29 +199,44 @@ func NewWithPrefixGCAndFileHandlesSettings(dirPath string, recentN int, namespac
 // It intentionally skips PrefixDB and Pebble initialization so AOL-only
 // replay can run without touching sibling _state/_pebble paths.
 func NewAOLOnly(dirPath string, recentN int) (*Database, error) {
+	db, _, err := NewAOLOnlyWithStartupTimings(dirPath, recentN)
+	return db, err
+}
+
+func NewAOLOnlyWithStartupTimings(dirPath string, recentN int) (*Database, StartupTimings, error) {
 	logger := log.New("database", dirPath)
+	blockStart := time.Now()
 	baol, err := NewBlockAppendOnlyLog(dirPath+"_aol", recentN, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize block append-only log: %w", err)
 	}
-	return &Database{
+	db := &Database{
 		fn:                  dirPath,
 		log:                 logger,
 		quitChan:            make(chan chan error, 1),
 		blockAol:            baol,
 		baolkvs:             make(map[string]string),
 		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
-	}, nil
+	}
+	return db, StartupTimings{BlockStoreOpen: time.Since(blockStart), BlockStoreReadBytes: baol.BootstrapReadBytes()}, nil
 }
 
 func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
+	db, _, err := NewWithPrefixGCAndStoreSettingsWithStartupTimings(dirPath, recentN, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	return db, err
+}
+
+func NewWithPrefixGCAndStoreSettingsWithStartupTimings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, StartupTimings, error) {
 	logger := log.New("database", dirPath)
+	timings := StartupTimings{}
 
 	dirPathState := dirPath + "_state"
+	stateStart := time.Now()
 	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
+	timings.StateStoreOpen = time.Since(stateStart)
 	db := &Database{
 		fn:                  dirPath, // Use directory path now
 		log:                 logger,
@@ -232,10 +254,13 @@ func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace stri
 		return db.GetParentAccountKey(storageKey[1:33])
 	}
 	// Initialize BlockAppendOnlyLog
+	blockStart := time.Now()
 	baol, err := NewBlockAppendOnlyLog(dirPath+"_aol", recentN, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize block append-only log: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize block append-only log: %w", err)
 	}
+	timings.BlockStoreOpen = time.Since(blockStart)
+	timings.BlockStoreReadBytes = baol.BootstrapReadBytes()
 	db.blockAol = baol
 	db.baolkvs = make(map[string]string)
 
@@ -243,13 +268,15 @@ func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace stri
 	pebblePath := dirPath + "_pebble"
 	logger.Info("Initializing Pebble store", "path", pebblePath)
 
+	pebbleStart := time.Now()
 	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, pebbleCache, pebbleHandles, namespace, readonly)
 	if err != nil {
 		// Close AOL if Pebble initialization fails
 		db.statepdb.Close()
 		baol.Close()
-		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize pebble store: %w", err)
 	}
+	timings.PebbleDBOpen = time.Since(pebbleStart)
 	db.pebble = pebbleStore
 
 	// Initialize metrics
@@ -262,7 +289,7 @@ func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace stri
 	// 	}
 	// }()
 
-	return db, nil
+	return db, timings, nil
 }
 
 // NewStateOnlyWithPrefixCacheSettings opens PrefixDB-only Database with a
@@ -301,13 +328,21 @@ func NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir string, chunkFileSi
 // NewStateWithPebbleGCAndStoreSettings opens PrefixDB plus the sibling Pebble
 // store needed for account-hash -> account-key resolution, while skipping AOL.
 func NewStateWithPebbleGCAndStoreSettings(dirPath string, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
+	db, _, err := NewStateWithPebbleGCAndStoreSettingsWithStartupTimings(dirPath, namespace, readonly, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+	return db, err
+}
+
+func NewStateWithPebbleGCAndStoreSettingsWithStartupTimings(dirPath string, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, StartupTimings, error) {
 	logger := log.New("database", dirPath)
+	timings := StartupTimings{}
 
 	dirPathState := dirPath + "_state"
+	stateStart := time.Now()
 	statePrefixdb, err := prefixdb.NewPrefixDBWithRuntimeOptions(dirPathState, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize prefixdb: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize prefixdb: %w", err)
 	}
+	timings.StateStoreOpen = time.Since(stateStart)
 
 	db := &Database{
 		fn:                  dirPath,
@@ -325,15 +360,17 @@ func NewStateWithPebbleGCAndStoreSettings(dirPath string, namespace string, read
 
 	pebblePath := dirPath + "_pebble"
 	logger.Info("Initializing Pebble store", "path", pebblePath)
+	pebbleStart := time.Now()
 	pebbleStore, err := pebblestore.NewPebbleStore(pebblePath, pebbleCache, pebbleHandles, namespace, readonly)
 	if err != nil {
 		db.statepdb.Close()
-		return nil, fmt.Errorf("failed to initialize pebble store: %w", err)
+		return nil, StartupTimings{}, fmt.Errorf("failed to initialize pebble store: %w", err)
 	}
+	timings.PebbleDBOpen = time.Since(pebbleStart)
 	db.pebble = pebbleStore
 	db.diskSizeGauge = metrics.GetOrRegisterGauge(namespace+"disk/size", nil)
 
-	return db, nil
+	return db, timings, nil
 }
 
 // Close stops the metrics collection and closes all io accesses to the underlying key-value store.

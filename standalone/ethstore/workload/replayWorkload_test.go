@@ -241,6 +241,36 @@ func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
 	}
 }
 
+func TestRunRecoveryReportsStartupTimingsAndSkipsReplay(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "ethstore")
+	cfg := replayConfig{EthStoreDir: baseDir}
+
+	output := captureStdout(t, func() {
+		if err := runRecovery(cfg, allDBTypes, 16, 0, 16, 0, 16, 16, 0, 0, 0, false, false); err != nil {
+			t.Fatalf("runRecovery failed: %v", err)
+		}
+	})
+
+	for _, want := range []string{
+		"[ethstore] opened stores: all",
+		"[recovery] pebbledb startup=",
+		"[recovery] state store startup=",
+		"[recovery] block store startup=",
+		"read_bytes=",
+		"[recovery] state store full read=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected recovery output to contain %q, got: %s", want, output)
+		}
+	}
+	if strings.Contains(output, "Replaying trace") {
+		t.Fatalf("recovery should not replay trace, got output: %s", output)
+	}
+	if strings.Contains(output, "Trace file bytes read") {
+		t.Fatalf("recovery should exit before replay summaries, got output: %s", output)
+	}
+}
+
 func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *testing.T) {
 	baseDir := filepath.Join(t.TempDir(), "ethstore")
 	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)

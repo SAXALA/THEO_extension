@@ -21,10 +21,10 @@ fi
 # - block window 20500000-20510000
 # - chunk sizes 32 KiB / 64 KiB
 
-DB_TYPE="aol"
+DB_TYPE="prefixdb"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
-BACKEND_CANDIDATES=(ethstore pebble chainkv)
-TRACE_FILE_CANDIDATES=(nocache)
+BACKEND_CANDIDATES=(ethstore)
+TRACE_FILE_CANDIDATES=(nocache_snap)
 CACHE_SIZE_CANDIDATES=(16)
 CACHE_COUNT_CANDIDATES=(0)
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)

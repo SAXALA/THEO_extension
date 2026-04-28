@@ -6,7 +6,7 @@ fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
-TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-2}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-3}"
 export TEST_RUN_ROUNDS
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
@@ -25,8 +25,8 @@ fi
 DB_TYPE="prefixdb"
 ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
 BACKEND_CANDIDATES=(ethstore)
-TRACE_FILE_CANDIDATES=(nocache_snap)
-CACHE_SIZE_CANDIDATES=(4 8 16 32 64)
+TRACE_FILE_CANDIDATES=(cache nocache)
+CACHE_SIZE_CANDIDATES=(4 8 16 32 64 128 256)
 CACHE_COUNT_CANDIDATES=(0)
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
 REPLAY_CGROUP_CASE_CANDIDATES=(false)

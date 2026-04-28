@@ -9,8 +9,8 @@ cd "$script_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
-ACTIONS="load load-account load-storage restore replay gc upgrade-index"
+# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | recovery(仅统计启动恢复开销) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
+ACTIONS="load load-account load-storage restore replay recovery gc upgrade-index"
 # 后端类型: ethstore | chainkv | pebble | prefixdb | all(依次执行前三者)
 BACKENDS="ethstore chainkv pebble prefixdb all"
 
@@ -51,7 +51,7 @@ fi
 GC_WORKERS="${GC_WORKERS:-$DEFAULT_GC_WORKERS}"
 
 # ethstore load 参数: chunk 文件大小（KiB），如 4096/8192/16384
-CHUNK_FILE_SIZE_BYTES="${CHUNK_FILE_SIZE_BYTES:-8192}"
+CHUNK_FILE_SIZE_BYTES="${CHUNK_FILE_SIZE_BYTES:-16384}"
 # ethstore 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
 TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-512}"
 
@@ -308,7 +308,7 @@ export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
 usage() {
     cat <<EOF
-Usage: $0 [load|load-account|load-storage|restore|replay|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
+Usage: $0 [load|load-account|load-storage|restore|replay|recovery|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
 
 Current values:
   action=${ACTION}
@@ -342,6 +342,7 @@ Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
     load ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
     replay ethstore: when DB_TYPE=all/prefixdb, ETHSTORE_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
+    recovery ethstore: when DB_TYPE=all/prefixdb, ETHSTORE_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
     load-account prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir
     load-storage prefixdb: uses replay_config.json 中 loadDataDir/accountHashKeyPebbleDir，并要求 PREFIXDB_ACCOUNT_STATE_DIR
     gc: backend must be ethstore, and GC_STATE_DIR must be provided
@@ -374,7 +375,7 @@ validate_runtime_requirements() {
         exit 1
     fi
 
-    if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ]; then
+    if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ] || [ "$ACTION" = "recovery" ]; then
         if [ "$BACKEND" = "ethstore" ] || [ "$BACKEND" = "all" ]; then
             if [ "$ACTION" = "load" ] || ethstore_dbtype_needs_prefixdb; then
                 needs_ethstore_prefixdb="true"
@@ -384,13 +385,13 @@ validate_runtime_requirements() {
 
     if [ "$needs_ethstore_prefixdb" = "true" ]; then
         if [ -z "$ETHSTORE_PREFIXDB_DIR" ]; then
-            echo "ethstore 的 load/replay 需要配置 ETHSTORE_PREFIXDB_DIR，当前为空。"
+            echo "ethstore 的 load/replay/recovery 需要配置 ETHSTORE_PREFIXDB_DIR，当前为空。"
             usage
             exit 1
         fi
     fi
 
-    if [ "$ACTION" = "replay" ]; then
+    if [ "$ACTION" = "replay" ] || [ "$ACTION" = "recovery" ]; then
         if [ ! -d "$LOADED_ROOT" ]; then
             echo "${ACTION} 需要已加载数据目录 LOADED_ROOT，当前不存在: ${LOADED_ROOT}"
             exit 1
@@ -399,6 +400,11 @@ validate_runtime_requirements() {
             echo "RUNNING_ROOT 不存在，自动创建: ${RUNNING_ROOT}"
             sudo_run mkdir -p "$RUNNING_ROOT"
         fi
+    fi
+
+    if [ "$ACTION" = "recovery" ] && [ "$BACKEND" != "ethstore" ]; then
+        echo "recovery 仅支持 ethstore backend（当前 BACKEND=${BACKEND}）"
+        exit 1
     fi
 
     if [ "$BACKEND" = "prefixdb" ] && [ "$ACTION" = "load" ]; then
@@ -538,7 +544,7 @@ cleanup_replay_cgroup() {
 }
 
 setup_replay_cgroup() {
-    if [ "$ACTION" != "replay" ] || [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" != "true" ]; then
+    if { [ "$ACTION" != "replay" ] && [ "$ACTION" != "recovery" ]; } || [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" != "true" ]; then
         return 1
     fi
     if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
@@ -938,7 +944,7 @@ build_run_tag() {
     fi
 
     local cgroup_tag=""
-    if [ "$action" = "replay" ]; then
+    if [ "$action" = "replay" ] || [ "$action" = "recovery" ]; then
         if [ "$REPLAY_CGROUP_IO_LIMIT_ENABLED" = "true" ]; then
             cgroup_tag="_cg_1"
         else
@@ -1216,6 +1222,34 @@ run_replay() {
     esac
 }
 
+run_recovery() {
+    local backend="$1"
+    # 每次恢复统计前，把已加载数据同步到 running/system 目录
+    sync_loaded_to_running_for_backend "$backend"
+    # Ensure cache drop happens after loaded DB is synced.
+    drop_caches
+    observe_disk_idle
+
+    local run_tag
+    run_tag=$(build_run_tag "recovery" "$backend")
+    local log_file="./replayLog/${run_tag}_${log_date}.log"
+    local io_file="./replayLog/${run_tag}_io_${log_date}.log"
+    case "$backend" in
+        ethstore)
+            ensure_ethstore_permissions
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode recovery -backend ethstore -db-type "$DB_TYPE" -cache-count "$CACHE_COUNT" \
+                -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
+            ;;
+        *)
+            echo "recovery 仅支持 ethstore backend"
+            exit 1
+            ;;
+     esac
+}
+
 run_gc() {
     local backend="$1"
     local run_tag
@@ -1279,6 +1313,9 @@ run_action() {
             ;;
         replay)
             run_replay "$backend"
+            ;;
+        recovery)
+            run_recovery "$backend"
             ;;
         gc)
             run_gc "$backend"
