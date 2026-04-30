@@ -400,6 +400,11 @@ func sanitizePrefixTreeGCWorkerCount(workers int) int {
 	return workers
 }
 
+// SanitizeGCWorkerCount returns the effective PrefixDB GC worker count.
+func SanitizeGCWorkerCount(workers int) int {
+	return sanitizePrefixTreeGCWorkerCount(workers)
+}
+
 func (pt *PrefixTree) shouldScheduleGC(sortedCount, unsortedCount uint32) bool {
 	if unsortedCount == 0 {
 		return false

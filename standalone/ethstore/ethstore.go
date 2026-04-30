@@ -169,10 +169,18 @@ type Database struct {
 }
 
 type StartupTimings struct {
-	StateStoreOpen time.Duration
-	BlockStoreOpen time.Duration
+	StateStoreOpen      time.Duration
+	BlockStoreOpen      time.Duration
 	BlockStoreReadBytes uint64
-	PebbleDBOpen   time.Duration
+	PebbleDBOpen        time.Duration
+}
+
+// StateGCWorkerCount returns the effective GC worker count for the state store.
+func (d *Database) StateGCWorkerCount() int {
+	if d == nil || d.statepdb == nil {
+		return 0
+	}
+	return d.statepdb.GCWorkerCount()
 }
 
 // The namespace is the prefix that the metrics reporting should use.

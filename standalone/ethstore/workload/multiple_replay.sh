@@ -27,14 +27,15 @@ TRACE_SELECTOR="${3:-all}"
 CONFIG_SCRIPT="${4:-}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-1}"
+TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-5}"
+ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="${ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
 
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16)      # e.g. 64 256
 CACHE_COUNT_CANDIDATES=(0)      # e.g. 64
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
-BACKEND_CANDIDATES=(chainkv)   # pebble ethstore chainkv
-TRACE_FILE_CANDIDATES=(cache nocache_snap nocache)        # cache nocache_snap nocache
+BACKEND_CANDIDATES=(ethstore)   # pebble ethstore chainkv
+TRACE_FILE_CANDIDATES=(cache)        # cache nocache_snap nocache
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
 # Chunk file size candidates in bytes (used by ethstore/prefixdb).

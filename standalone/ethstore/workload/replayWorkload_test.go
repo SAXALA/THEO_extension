@@ -271,6 +271,37 @@ func TestRunRecoveryReportsStartupTimingsAndSkipsReplay(t *testing.T) {
 	}
 }
 
+func TestFullReadRegularFilesReadsRegularFiles(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	files := map[string]string{
+		filepath.Join(root, "a.bin"):   "alpha",
+		filepath.Join(root, "b.bin"):   "beta",
+		filepath.Join(nested, "c.bin"): "gamma",
+	}
+	wantBytes := int64(0)
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile %s failed: %v", path, err)
+		}
+		wantBytes += int64(len(content))
+	}
+
+	stats, err := fullReadRegularFiles(root, 2)
+	if err != nil {
+		t.Fatalf("fullReadRegularFiles failed: %v", err)
+	}
+	if stats.fileCount != len(files) {
+		t.Fatalf("file count mismatch: got %d want %d", stats.fileCount, len(files))
+	}
+	if stats.bytesRead != wantBytes {
+		t.Fatalf("bytes read mismatch: got %d want %d", stats.bytesRead, wantBytes)
+	}
+}
+
 func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *testing.T) {
 	baseDir := filepath.Join(t.TempDir(), "ethstore")
 	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)

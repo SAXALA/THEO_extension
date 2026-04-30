@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	// Please replace "ethstore_module" with the actual module path defined in your ethstore/go.mod file
@@ -1131,7 +1132,14 @@ type recoveryFileReadStats struct {
 	duration  time.Duration
 }
 
-func fullReadRegularFiles(root string) (recoveryFileReadStats, error) {
+type recoveryFileReadResult struct {
+	bytesRead int64
+	err       error
+}
+
+var errRecoveryFileReadStopped = errors.New("recovery file read stopped")
+
+func fullReadRegularFiles(root string, workers int) (recoveryFileReadStats, error) {
 	start := time.Now()
 	stats := recoveryFileReadStats{}
 	if _, err := os.Stat(root); err != nil {
@@ -1141,31 +1149,100 @@ func fullReadRegularFiles(root string) (recoveryFileReadStats, error) {
 		}
 		return stats, err
 	}
-	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	workerCount := prefixdb.SanitizeGCWorkerCount(workers)
+	jobs := make(chan string, workerCount*2)
+	results := make(chan recoveryFileReadResult, workerCount)
+	done := make(chan struct{})
+	var closeDone sync.Once
+
+	stop := func() {
+		closeDone.Do(func() { close(done) })
+	}
+
+	walkErrCh := make(chan error, 1)
+	go func() {
+		defer close(jobs)
+		err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info == nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			select {
+			case jobs <- path:
+				return nil
+			case <-done:
+				return errRecoveryFileReadStopped
+			}
+		})
+		if errors.Is(err, errRecoveryFileReadStopped) {
+			err = nil
 		}
-		if info == nil || !info.Mode().IsRegular() {
-			return nil
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		bytesRead, err := io.Copy(io.Discard, file)
-		if err != nil {
-			return err
+		walkErrCh <- err
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				bytesRead, err := readRegularFileFully(path)
+				select {
+				case results <- recoveryFileReadResult{bytesRead: bytesRead, err: err}:
+				case <-done:
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+				stop()
+			}
+			continue
 		}
 		stats.fileCount++
-		stats.bytesRead += bytesRead
-		return nil
-	})
+		stats.bytesRead += result.bytesRead
+	}
+	if walkErr := <-walkErrCh; firstErr == nil && walkErr != nil {
+		firstErr = walkErr
+	}
 	stats.duration = time.Since(start)
-	if err != nil {
-		return recoveryFileReadStats{}, err
+	if firstErr != nil {
+		return recoveryFileReadStats{}, firstErr
 	}
 	return stats, nil
+}
+
+func readRegularFileFully(path string) (int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	bytesRead, err := io.Copy(io.Discard, file)
+	if err != nil {
+		return 0, err
+	}
+	return bytesRead, nil
 }
 
 func printRecoveryStoreTiming(label string, duration time.Duration) {
@@ -1199,7 +1276,7 @@ func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCou
 
 	stateReadStats := recoveryFileReadStats{}
 	if timings.StateStoreOpen > 0 {
-		stateReadStats, err = fullReadRegularFiles(cfg.EthStoreDir + "_state")
+		stateReadStats, err = fullReadRegularFiles(cfg.EthStoreDir+"_state", store.StateGCWorkerCount())
 		if err != nil {
 			return fmt.Errorf("failed to fully read state store files: %w", err)
 		}

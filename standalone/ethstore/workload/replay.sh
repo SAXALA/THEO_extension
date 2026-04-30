@@ -44,10 +44,11 @@ NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-false}"
 # segment index 是否启用 zstd 压缩；默认开启
 SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
 # 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
-DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
-if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
-    DEFAULT_GC_WORKERS=1
-fi
+# DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
+# if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
+#     DEFAULT_GC_WORKERS=1
+# fi
+DEFAULT_GC_WORKERS=128
 GC_WORKERS="${GC_WORKERS:-$DEFAULT_GC_WORKERS}"
 
 # ethstore load 参数: chunk 文件大小（KiB），如 4096/8192/16384

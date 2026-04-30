@@ -785,12 +785,12 @@ type PrefixDB struct {
 	nodeFileSortedCompression        bool
 	segmentIndexCompression          bool
 
-	storageCache              *storageValueCache
-	currentSegmentChunkBuffer *currentSegmentChunkBuffer
-	stroageCacheSizeLimit     uint64
-	storageChunkSize          int
-	segmentedChunkHardLimit   int // hard cap for individual chunk files
-	segmentIndexLevel2Size    int // target byte budget per L2 index shard; defaults to storageChunkSize
+	storageCache                    *storageValueCache
+	currentSegmentChunkBuffer       *currentSegmentChunkBuffer
+	stroageCacheSizeLimit           uint64
+	storageChunkSize                int
+	segmentedChunkHardLimit         int // hard cap for individual chunk files
+	segmentIndexLevel2Size          int // target byte budget per L2 index shard; defaults to storageChunkSize
 	segmentIndexMultiLevelThreshold int // serialized index bytes threshold for switching to multi-level layout
 
 	// storageBatcher enables BatchPut/BatchCommit for storage-only kvs.
@@ -819,7 +819,7 @@ type PrefixDB struct {
 	trieStorageLogPairs   uint64
 	trieStorageLogBytes   uint64
 
-	trieAccountGetStats              trieGetBreakdownStats
+	trieAccountGetStats               trieGetBreakdownStats
 	trieStorageAccountEntryStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexStats      trieStorageGetBreakdownStepStats
 	trieStorageSegmentIndexLayerStats trieStorageSegmentIndexLayerStats
@@ -1026,6 +1026,14 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 
 	fmt.Println(dirpath + " prefixDB Initialized.")
 	return db, nil
+}
+
+// GCWorkerCount returns the effective worker count used by PrefixDB GC.
+func (db *PrefixDB) GCWorkerCount() int {
+	if db == nil {
+		return 0
+	}
+	return sanitizePrefixTreeGCWorkerCount(db.gcWorkers)
 }
 
 func (db *PrefixDB) getAccount(key []byte) ([]byte, bool, error) {

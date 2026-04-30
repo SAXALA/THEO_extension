@@ -5691,6 +5691,30 @@ func TestPrefixTreeGCWorkerConcurrency(t *testing.T) {
 	}
 }
 
+func TestPrefixDBGCWorkerCountUsesRuntimeAndConfig(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"gc_workers":3}`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	fromConfig, err := NewPrefixDBWithRuntimeOptions(configDir, 64, 8, 16, 1e9, 0, 1e9, false, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions with config failed: %v", err)
+	}
+	defer fromConfig.Close()
+	if got := fromConfig.GCWorkerCount(); got != 3 {
+		t.Fatalf("config GC worker count mismatch: got %d want 3", got)
+	}
+
+	runtimeOverride, err := NewPrefixDBWithRuntimeOptions(t.TempDir(), 64, 8, 16, 1e9, 4, 1e9, false, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions with runtime override failed: %v", err)
+	}
+	defer runtimeOverride.Close()
+	if got := runtimeOverride.GCWorkerCount(); got != 4 {
+		t.Fatalf("runtime GC worker count mismatch: got %d want 4", got)
+	}
+}
+
 func TestStorageGCQueueCapacity(t *testing.T) {
 	if got := storageGCQueueCapacity(4); got != 32 {
 		t.Fatalf("queue capacity mismatch: got %d want %d", got, 32)
