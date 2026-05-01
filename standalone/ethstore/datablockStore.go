@@ -346,6 +346,56 @@ func (baol *BlockAppendOnlyLog) RecentN() int {
 	return baol.recentN
 }
 
+func (baol *BlockAppendOnlyLog) LatestBlockID() uint64 {
+	if baol == nil {
+		return 0
+	}
+	baol.mu.RLock()
+	defer baol.mu.RUnlock()
+	return baol.latestBlockID
+}
+
+func (baol *BlockAppendOnlyLog) MarkBlockCommitted(blockID uint64) error {
+	if baol == nil || blockID == 0 {
+		return nil
+	}
+	baol.mu.Lock()
+	defer baol.mu.Unlock()
+
+	if baol.closed {
+		return fmt.Errorf("block append-only log is closed")
+	}
+	baol.ensureWriteTrackingInitialized()
+	if blockID <= baol.latestBlockID {
+		return nil
+	}
+	if blockID > baol.latestBlockID+1 {
+		if err := baol.fillMissingBlocksUntil(blockID); err != nil {
+			return err
+		}
+	}
+	if baol.minBlockID == 0 {
+		baol.minBlockID = blockID
+	}
+	entry := blockIndexEntry{
+		BlockID:     blockID,
+		StartOffset: baol.currentOffset,
+		EndOffset:   baol.currentOffset,
+	}
+	if err := baol.writeIndexEntry(baol.indexMapFile, entry); err != nil {
+		return fmt.Errorf("failed to append commit marker for block %d: %w", blockID, err)
+	}
+	baol.latestBlockID = blockID
+	baol.updateRecentBlocks(blockID)
+	if err := baol.flushIndexBufferWithBlockID(baol.minBlockID); err != nil {
+		return fmt.Errorf("failed to flush commit marker index buffer for block %d: %w", blockID, err)
+	}
+	if err := baol.saveIndexMeta(); err != nil {
+		return fmt.Errorf("failed to save commit marker metadata for block %d: %w", blockID, err)
+	}
+	return nil
+}
+
 // loadIndexMeta loads the minimum and maximum block IDs from the metadata file.
 func (baol *BlockAppendOnlyLog) loadIndexMeta() error {
 	file, err := os.Open(baol.indexMetaFilePath)
@@ -1922,7 +1972,7 @@ func (baol *BlockAppendOnlyLog) readHeaderAndLocate(pointer *kvPointer) (*os.Fil
 }
 
 type baolStreamIterator struct {
-	baol *BlockAppendOnlyLog
+	baol   *BlockAppendOnlyLog
 	prefix []byte
 
 	minBlockID uint64

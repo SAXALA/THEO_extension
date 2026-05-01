@@ -176,6 +176,22 @@ func (c *sharedByteCache) Remove(namespace sharedCacheNamespace, key string) {
 	}
 }
 
+func (c *sharedByteCache) RemoveNamespace(namespace sharedCacheNamespace) {
+	if c == nil {
+		return
+	}
+	acquiredAt := c.lockWrite(&c.lockStats.remove)
+	defer c.unlockWrite(&c.lockStats.remove, acquiredAt)
+	for elem := c.ll.Front(); elem != nil; {
+		next := elem.Next()
+		entry, _ := elem.Value.(*sharedCacheEntry)
+		if entry != nil && entry.namespace == namespace {
+			c.removeElementLocked(elem)
+		}
+		elem = next
+	}
+}
+
 func (c *sharedByteCache) NamespaceStats(namespace sharedCacheNamespace) (usedBytes uint64, capacityBytes uint64) {
 	if c == nil {
 		return 0, 0

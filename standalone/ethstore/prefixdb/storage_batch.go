@@ -196,7 +196,7 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	var plans []storageCommitPlan
 	db.writeMutex.Lock()
 	err = func() error {
-		plans, err = db.prepareStorageCommitPlans(batch, unresolved, nil)
+		plans, err = db.prepareStorageCommitPlans(batch, unresolved, nil, 0)
 		if err != nil {
 			return err
 		}
@@ -254,7 +254,7 @@ func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (
 	return prepared, nil
 }
 
-func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte, unresolved map[string][]byte, accountOps map[string]WriteOperation) ([]storageCommitPlan, error) {
+func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte, unresolved map[string][]byte, accountOps map[string]WriteOperation, blockID uint64) ([]storageCommitPlan, error) {
 	if db.storageBatch == nil && len(batch) == 0 && len(unresolved) == 0 {
 		return nil, nil
 	}
@@ -288,7 +288,7 @@ func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte
 			prefixdbDebugf("BatchCommit: storage plan %d/%d account=%x keys=%d",
 				idx+1, len(accountKeys), []byte(accountKey), len(perAccount))
 			start := time.Now()
-			plan, err := db.buildStorageCommitPlan(accountKey, perAccount)
+			plan, err := db.buildStorageCommitPlanWithBlockID(accountKey, perAccount, blockID)
 			if err != nil {
 				prefixdbDebugf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%x error=%v",
 					[]byte(accountKey), err)
@@ -313,7 +313,7 @@ func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte
 				prefixdbDebugf("BatchCommit: storage plan %d/%d account=%x keys=%d",
 					task.index+1, len(accountKeys), []byte(task.accountKey), len(perAccount))
 				start := time.Now()
-				plan, err := db.buildStorageCommitPlan(task.accountKey, perAccount)
+				plan, err := db.buildStorageCommitPlanWithBlockID(task.accountKey, perAccount, blockID)
 				if err != nil {
 					prefixdbDebugf("prepareStorageCommitPlans: buildStorageCommitPlan failed - accountKey=%x error=%v",
 						[]byte(task.accountKey), err)
@@ -403,6 +403,10 @@ func (db *PrefixDB) resolveUnresolvedStorageBatch(batch map[string]map[string][]
 }
 
 func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[string][]byte) (storageCommitPlan, error) {
+	return db.buildStorageCommitPlanWithBlockID(accountKey, perAccount, 0)
+}
+
+func (db *PrefixDB) buildStorageCommitPlanWithBlockID(accountKey string, perAccount map[string][]byte, blockID uint64) (storageCommitPlan, error) {
 	plan := storageCommitPlan{accountKey: accountKey}
 	if db.testBuildStoragePlanHook != nil {
 		db.testBuildStoragePlanHook(accountKey)
@@ -440,7 +444,7 @@ func (db *PrefixDB) buildStorageCommitPlan(accountKey string, perAccount map[str
 	}
 	sortKVPairs(kvs)
 	plan.cacheEntries = kvs
-	info, inlineSegment, err := db.prepareStorageEntriesForCommit(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize)
+	info, inlineSegment, err := db.prepareStorageEntriesForCommit(accountKeyBytes, kvs, existingFileID, existingOffset, existingSize, blockID)
 	if err != nil {
 		return plan, err
 	}
@@ -485,7 +489,7 @@ func (db *PrefixDB) applyStorageCommitPlans(plans []storageCommitPlan, accountOp
 			_ = db.accountBatch.updateStoragePointer(plan.accountKey, plan.storageInfo)
 		}
 	}
-	return db.applyNodeBatch(nodeEntries, cacheUpdates)
+	return db.applyNodeBatch(nodeEntries, cacheUpdates, 0)
 }
 
 func (db *PrefixDB) commitStorageForAccount(accountKey string, kvs []kvPair) error {

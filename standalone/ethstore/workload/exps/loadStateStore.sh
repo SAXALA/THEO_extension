@@ -16,7 +16,7 @@ fi
 set -euo pipefail
 
 loaded_root="${LOADED_ROOT:-/mnt/ssd2/loaded}"
-state_store_sizes=(32768 65536)
+state_store_sizes=(16384)
 
 state_dirname_for_size() {
 	case "$1" in

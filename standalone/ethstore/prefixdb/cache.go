@@ -41,6 +41,15 @@ func NewNodeCache(capacityBytes uint64) (*NodeCache, error) {
 
 func (nc *NodeCache) Close() {}
 
+func (nc *NodeCache) Clear() {
+	if nc == nil || nc.shared == nil {
+		return
+	}
+	nc.lock.Lock()
+	defer nc.lock.Unlock()
+	nc.shared.RemoveNamespace(sharedCacheNamespaceNode)
+}
+
 func newSharedNodeCache(shared *sharedByteCache) *NodeCache {
 	if shared == nil {
 		return nil

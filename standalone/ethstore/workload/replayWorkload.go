@@ -871,7 +871,7 @@ type replayBackend interface {
 	// StageDelete stages a delete within the current block batch.
 	StageDelete(key []byte, dataType ethstore.DataType) error
 	// CommitBlock commits all staged operations for the current block.
-	CommitBlock() error
+	CommitBlock(blockID uint64) error
 	// NewIterator creates a new iterator for prefix/start.
 	// May return a noopIter when the backend cannot iterate over that prefix.
 	NewIterator(prefix, start []byte) replayIter
@@ -942,7 +942,7 @@ func (b *pebbleBaselineReplayBackend) StageDelete(key []byte, _ ethstore.DataTyp
 	}
 	return batch.Delete(key)
 }
-func (b *pebbleBaselineReplayBackend) CommitBlock() error {
+func (b *pebbleBaselineReplayBackend) CommitBlock(blockID uint64) error {
 	if b.batch == nil {
 		return nil
 	}
@@ -1069,9 +1069,21 @@ func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataTy
 	return batch.Delete(key)
 }
 
-func (b *ethstoreReplayBackend) CommitBlock() error {
+func (b *ethstoreReplayBackend) CommitBlock(blockID uint64) error {
 	blockStart := time.Now()
 	committedAny := false
+	stateCommitted := false
+	hadAOLCommit := b.aolDirty
+	if b.prefixdbDirty {
+		start := time.Now()
+		if err := b.store.PrefixdbBatchCommitWithBlockID(blockID); err != nil {
+			return err
+		}
+		b.prefixdbCommitHist.observe(time.Since(start))
+		b.prefixdbDirty = false
+		stateCommitted = true
+		committedAny = true
+	}
 	if b.aolDirty {
 		start := time.Now()
 		err := b.store.CommitAOLBatch()
@@ -1082,14 +1094,10 @@ func (b *ethstoreReplayBackend) CommitBlock() error {
 		b.aolDirty = false
 		committedAny = true
 	}
-	if b.prefixdbDirty {
-		start := time.Now()
-		if err := b.store.PrefixdbBatchCommit(); err != nil {
+	if stateCommitted && !hadAOLCommit && blockID > 0 {
+		if err := b.store.MarkBlockCommitted(blockID); err != nil {
 			return err
 		}
-		b.prefixdbCommitHist.observe(time.Since(start))
-		b.prefixdbDirty = false
-		committedAny = true
 	}
 	if b.pebbleBatch != nil {
 		start := time.Now()
@@ -1274,6 +1282,26 @@ func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCou
 
 	fmt.Printf("[ethstore] opened stores: %s\n", describeEthstoreOpenedStores(replayDBType))
 
+	latestBlockID := store.LatestBlockID()
+	if latestBlockID == 0 && replayDBType == PrefixDB {
+		var blockReadBytes uint64
+		latestBlockID, blockReadBytes, err = ethstore.ReadLatestBlockID(cfg.EthStoreDir, 6000)
+		if err != nil {
+			return fmt.Errorf("failed to read latest block ID from block store: %w", err)
+		}
+		if timings.BlockStoreOpen == 0 {
+			timings.BlockStoreReadBytes = blockReadBytes
+		}
+	}
+	if latestBlockID > 0 {
+		if err := store.TrimStateLogsAfterCommitTag(latestBlockID); err != nil {
+			return fmt.Errorf("failed to trim state logs after block %d commit tag: %w", latestBlockID, err)
+		}
+		fmt.Printf("[recovery] state logs trimmed after commit tag block=%d\n", latestBlockID)
+	} else if timings.StateStoreOpen > 0 {
+		fmt.Println("[recovery] state log trim skipped: latest block ID is 0")
+	}
+
 	stateReadStats := recoveryFileReadStats{}
 	if timings.StateStoreOpen > 0 {
 		stateReadStats, err = fullReadRegularFiles(cfg.EthStoreDir+"_state", store.StateGCWorkerCount())
@@ -1383,7 +1411,7 @@ func (b *chainKVReplayBackend) StageDelete(key []byte, dataType ethstore.DataTyp
 	}
 	return b.nonStateBatch.Delete(key)
 }
-func (b *chainKVReplayBackend) CommitBlock() error {
+func (b *chainKVReplayBackend) CommitBlock(blockID uint64) error {
 	if b.stateBatch != nil {
 		start := time.Now()
 		if err := b.stateBatch.Write_s(); err != nil {
@@ -1463,6 +1491,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		committedAtExit    bool
 		replayStarted      bool
 		pendingBlocks      int64
+		lastEndedBlockID   int64
 		lastIterDataType   ethstore.DataType = ethstore.DataType(-1)
 	)
 	if startBlockID <= 0 {
@@ -1486,7 +1515,11 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
 		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n", backend.Name(), reason, blockID, line, pending)
 		// commitStart := time.Now()
-		if err := backend.CommitBlock(); err != nil {
+		var commitBlockID uint64
+		if blockID > 0 {
+			commitBlockID = uint64(blockID)
+		}
+		if err := backend.CommitBlock(commitBlockID); err != nil {
 			return err
 		}
 		// fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n", backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
@@ -1540,6 +1573,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 						backend.Name(), markerID, lineCounter)
 				}
 				if markerType == "end" && replayStarted {
+					lastEndedBlockID = markerID
 					pendingBlocks++
 					if pendingBlocks >= commitBlockInterval {
 						if commitErr := runCommit("block-boundary", markerID, lineCounter, pendingBlocks); commitErr != nil {
@@ -1732,7 +1766,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	}
 
 	if !committedAtExit || pendingBlocks > 0 {
-		if commitErr := runCommit("finalize", -1, lineCounter, pendingBlocks); commitErr != nil {
+		if commitErr := runCommit("finalize", lastEndedBlockID, lineCounter, pendingBlocks); commitErr != nil {
 			fmt.Printf("[%s] final commit failed: %v\n", backend.Name(), commitErr)
 		}
 	}

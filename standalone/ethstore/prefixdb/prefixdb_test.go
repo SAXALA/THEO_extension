@@ -2775,6 +2775,240 @@ func TestRefreshSegmentIndexCacheUpdatesEntries(t *testing.T) {
 	}
 }
 
+func TestTrimLogsAfterCommitTagRemovesTrailingStateData(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x55)
+	accountHash := bytes.Repeat([]byte{0x55}, 32)
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x01)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-10"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, storageKey, []byte("storage-10"), accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(10); err != nil {
+		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+
+	accountInfo, err := db.accountFile.Stat()
+	if err != nil {
+		t.Fatalf("account Stat failed: %v", err)
+	}
+	accountSizeBefore := accountInfo.Size()
+	storagePath, _ := db.storagePathByFileID(db.storageCurFileID)
+	storageInfo, err := os.Stat(storagePath)
+	if err != nil {
+		t.Fatalf("storage Stat failed: %v", err)
+	}
+	storageSizeBefore := storageInfo.Size()
+
+	extraAccount, err := db.ConvertKV(accountKey, []byte("account-11"))
+	if err != nil {
+		t.Fatalf("ConvertKV failed: %v", err)
+	}
+	if _, err := db.accountFile.WriteAt(extraAccount, accountSizeBefore); err != nil {
+		t.Fatalf("append extra account failed: %v", err)
+	}
+	extraStorage, release, _, err := db.serializeStorageSegment([]kvPair{{key: []byte{0x01}, val: []byte("storage-11")}})
+	if err != nil {
+		t.Fatalf("serializeStorageSegment failed: %v", err)
+	}
+	if _, err := db.storageCurFile.WriteAt(extraStorage, storageSizeBefore); err != nil {
+		release()
+		t.Fatalf("append extra storage failed: %v", err)
+	}
+	release()
+
+	if err := db.TrimLogsAfterCommitTag(10); err != nil {
+		t.Fatalf("TrimLogsAfterCommitTag failed: %v", err)
+	}
+	accountInfo, err = db.accountFile.Stat()
+	if err != nil {
+		t.Fatalf("account Stat after trim failed: %v", err)
+	}
+	if accountInfo.Size() != accountSizeBefore {
+		t.Fatalf("account log size after trim=%d want=%d", accountInfo.Size(), accountSizeBefore)
+	}
+	storageInfo, err = os.Stat(storagePath)
+	if err != nil {
+		t.Fatalf("storage Stat after trim failed: %v", err)
+	}
+	if storageInfo.Size() != storageSizeBefore {
+		t.Fatalf("storage log size after trim=%d want=%d", storageInfo.Size(), storageSizeBefore)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorageWithBlockID(accountKey, []kvPair{{key: []byte{0x01}, val: []byte("chunk-10")}}, 10); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorageWithBlockID failed: %v", err)
+	}
+	chunkPath := filepath.Join(folderPath, chunkFileNameForOrdinal(0))
+	chunkInfo, err := os.Stat(chunkPath)
+	if err != nil {
+		t.Fatalf("chunk Stat failed: %v", err)
+	}
+	chunkSizeBefore := chunkInfo.Size()
+	if err := db.appendChunkFile(chunkPath, []kvPair{{key: []byte{0x02}, val: []byte("chunk-11")}}, chunkSizeBefore, 11); err != nil {
+		t.Fatalf("appendChunkFile failed: %v", err)
+	}
+	if err := db.TrimLogsAfterCommitTag(10); err != nil {
+		t.Fatalf("TrimLogsAfterCommitTag chunk failed: %v", err)
+	}
+	chunkInfo, err = os.Stat(chunkPath)
+	if err != nil {
+		t.Fatalf("chunk Stat after trim failed: %v", err)
+	}
+	if chunkInfo.Size() != chunkSizeBefore {
+		t.Fatalf("chunk log size after trim=%d want=%d", chunkInfo.Size(), chunkSizeBefore)
+	}
+}
+
+func TestTrimLogsAfterCommitTagUsesPreviousTagAndRollsBackNodeIndex(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 1024, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+
+	accountKey := bytes.Repeat([]byte{0x5c}, 32)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-10"), nil); err != nil {
+		t.Fatalf("BatchPut account block 10 failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(10); err != nil {
+		t.Fatalf("BatchCommitWithBlockID block 10 failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-12"), nil); err != nil {
+		t.Fatalf("BatchPut account block 12 failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(12); err != nil {
+		t.Fatalf("BatchCommitWithBlockID block 12 failed: %v", err)
+	}
+
+	if err := db.TrimLogsAfterCommitTag(11); err != nil {
+		t.Fatalf("TrimLogsAfterCommitTag failed: %v", err)
+	}
+	got, ok, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected account after recovery trim")
+	}
+	if string(got) != "account-10" {
+		t.Fatalf("account value after trim=%q want %q", got, "account-10")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	db = nil
+	reopened, err := NewPrefixDB(baseDir, 1024, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+	got, ok, err = reopened.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil {
+		t.Fatalf("Get account after reopen failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected account after recovery trim reopen")
+	}
+	if string(got) != "account-10" {
+		t.Fatalf("account value after reopen=%q want %q", got, "account-10")
+	}
+}
+
+func TestGCAllStorageChunkFilesKeepsOnlyLastCommitTag(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 64, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x66)
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorageWithBlockID(accountKey, []kvPair{{key: []byte{0x01}, val: []byte("chunk-10")}}, 10); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorageWithBlockID failed: %v", err)
+	}
+	if _, _, _, err := db.updateAccountNamedSegmentedStorageWithBlockID(accountKey, []kvPair{{key: []byte{0x02}, val: []byte("chunk-11")}}, 11); err != nil {
+		t.Fatalf("updateAccountNamedSegmentedStorageWithBlockID failed: %v", err)
+	}
+	if err := db.GCAllStorageChunkFiles(); err != nil {
+		t.Fatalf("GCAllStorageChunkFiles failed: %v", err)
+	}
+
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	entries, err := os.ReadDir(folderPath)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	tagCount := 0
+	var lastTag uint64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dat") {
+			continue
+		}
+		payload, err := os.ReadFile(filepath.Join(folderPath, entry.Name()))
+		if err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+		count, blockID := countChunkCommitTagsForTest(payload)
+		tagCount += count
+		if blockID != 0 {
+			lastTag = blockID
+		}
+	}
+	if tagCount != 1 {
+		t.Fatalf("commit tag count after GC=%d want=1", tagCount)
+	}
+	if lastTag != 11 {
+		t.Fatalf("last commit tag after GC=%d want=11", lastTag)
+	}
+}
+
+func countChunkCommitTagsForTest(payload []byte) (int, uint64) {
+	cursor := len(payload)
+	count := 0
+	var last uint64
+	for cursor > 0 {
+		if cursor < segmentedChunkEntryHeaderSize {
+			return count, last
+		}
+		footer := payload[cursor-segmentedChunkEntryHeaderSize : cursor]
+		klen := int(readUint16BE(footer[:2]))
+		vlen := int(readUint16BE(footer[2:4]))
+		if klen == 0 && vlen == 0 {
+			blockID, ok := chunkCommitTagBlockID(payload, cursor)
+			if !ok {
+				return count, last
+			}
+			count++
+			if last == 0 {
+				last = blockID
+			}
+			cursor -= commitTagRecordSize
+			continue
+		}
+		recordSize := segmentedChunkEntryHeaderSize + klen + vlen
+		if recordSize > cursor {
+			return count, last
+		}
+		cursor -= recordSize
+	}
+	return count, last
+}
+
 func TestGCAllStorageChunkFilesRefreshesSegmentIndexCache(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)
@@ -4733,7 +4967,7 @@ func TestAppendChunkFileReadsBackWithoutLeadingKVCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeChunkFile failed: %v", err)
 	}
-	if err := db.appendChunkFile(filepath.Join(folderPath, chunkFileNameForOrdinal(0)), []kvPair{{key: []byte{0x0b}, val: []byte("value-b")}}, int64(chunkSize)); err != nil {
+	if err := db.appendChunkFile(filepath.Join(folderPath, chunkFileNameForOrdinal(0)), []kvPair{{key: []byte{0x0b}, val: []byte("value-b")}}, int64(chunkSize), 0); err != nil {
 		t.Fatalf("appendChunkFile failed: %v", err)
 	}
 
@@ -5014,7 +5248,7 @@ func TestAppendChunkFileUpdatesCachedChunkWhenPrefetchDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat failed: %v", err)
 	}
-	if err := db.appendChunkFile(chunkPath, []kvPair{{key: []byte("ab"), val: []byte("value-ab")}}, info.Size()); err != nil {
+	if err := db.appendChunkFile(chunkPath, []kvPair{{key: []byte("ab"), val: []byte("value-ab")}}, info.Size(), 0); err != nil {
 		t.Fatalf("appendChunkFile failed: %v", err)
 	}
 	if !db.isSegmentChunkCached(folderPath, fileName) {
@@ -5768,7 +6002,7 @@ func TestPrepareStorageCommitPlansRunsWorkersAcrossFolders(t *testing.T) {
 	var plans []storageCommitPlan
 	var planErr error
 	go func() {
-		plans, planErr = db.prepareStorageCommitPlans(batch, nil, nil)
+		plans, planErr = db.prepareStorageCommitPlans(batch, nil, nil, 0)
 		close(done)
 	}()
 

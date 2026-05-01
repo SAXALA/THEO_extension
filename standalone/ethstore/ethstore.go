@@ -183,6 +183,27 @@ func (d *Database) StateGCWorkerCount() int {
 	return d.statepdb.GCWorkerCount()
 }
 
+func (d *Database) LatestBlockID() uint64 {
+	if d == nil || d.blockAol == nil {
+		return 0
+	}
+	return d.blockAol.LatestBlockID()
+}
+
+func (d *Database) TrimStateLogsAfterCommitTag(blockID uint64) error {
+	if d == nil || d.statepdb == nil {
+		return nil
+	}
+	return d.statepdb.TrimLogsAfterCommitTag(blockID)
+}
+
+func (d *Database) MarkBlockCommitted(blockID uint64) error {
+	if d == nil || d.blockAol == nil || blockID == 0 {
+		return nil
+	}
+	return d.blockAol.MarkBlockCommitted(blockID)
+}
+
 // The namespace is the prefix that the metrics reporting should use.
 func New(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, prefixTreeCacheSize uint64, contractCachePrefetchCount int) (*Database, error) {
 	return NewWithPrefixGCSettings(dirPath, recentN, namespace, readonly, chunkFileSize, int(prefixTreeCacheSize/(1024*1024)), contractCachePrefetchCount, 0, 0, 0, false, false)
@@ -227,6 +248,16 @@ func NewAOLOnlyWithStartupTimings(dirPath string, recentN int) (*Database, Start
 		accountHashKeyCache: newAccountHashToKeyCache(defaultAccountHashToKeyCacheCapacity),
 	}
 	return db, StartupTimings{BlockStoreOpen: time.Since(blockStart), BlockStoreReadBytes: baol.BootstrapReadBytes()}, nil
+}
+
+func ReadLatestBlockID(dirPath string, recentN int) (uint64, uint64, error) {
+	logger := log.New("database", dirPath)
+	baol, err := NewBlockAppendOnlyLog(dirPath+"_aol", recentN, logger)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer baol.Close()
+	return baol.LatestBlockID(), baol.BootstrapReadBytes(), nil
 }
 
 func NewWithPrefixGCAndStoreSettings(dirPath string, recentN int, namespace string, readonly bool, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool, prefixdbHandles int, pebbleCache int, pebbleHandles int) (*Database, error) {
@@ -738,11 +769,15 @@ func (d *Database) CommitAOLBatch() error {
 }
 
 func (d *Database) PrefixdbBatchCommit() error {
+	return d.PrefixdbBatchCommitWithBlockID(0)
+}
+
+func (d *Database) PrefixdbBatchCommitWithBlockID(blockID uint64) error {
 
 	if d.statepdb == nil {
 		return fmt.Errorf("PrefixDB is not initialized, cannot commit batch")
 	}
-	err := d.statepdb.BatchCommit()
+	err := d.statepdb.BatchCommitWithBlockID(blockID)
 	if err != nil {
 		return fmt.Errorf("failed to commit batch for PrefixDB: %w", err)
 	}

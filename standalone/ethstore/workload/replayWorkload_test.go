@@ -50,7 +50,7 @@ func (b *fakeReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
 	return nil
 }
 
-func (b *fakeReplayBackend) CommitBlock() error {
+func (b *fakeReplayBackend) CommitBlock(blockID uint64) error {
 	if b.dirty {
 		b.commits++
 		b.dirty = false
@@ -229,7 +229,7 @@ func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
 	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut account failed: %v", err)
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
 	got, err := backend.Get(accountKey, ethstore.TrieNodeAccountDataType)
@@ -238,6 +238,25 @@ func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
 	}
 	if string(got) != "account" {
 		t.Fatalf("unexpected account value: %q", string(got))
+	}
+}
+
+func TestEthstoreReplayBackendStateOnlyCommitAdvancesBlockMarker(t *testing.T) {
+	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	if err != nil {
+		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+	}
+	defer backend.Close()
+
+	accountKey := append([]byte{'A'}, bytes.Repeat([]byte{0x12}, 32)...)
+	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+		t.Fatalf("StagePut account failed: %v", err)
+	}
+	if err := backend.CommitBlock(7); err != nil {
+		t.Fatalf("CommitBlock failed: %v", err)
+	}
+	if latest := backend.store.LatestBlockID(); latest != 7 {
+		t.Fatalf("latest block marker=%d want=7", latest)
 	}
 }
 
@@ -337,7 +356,7 @@ func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *te
 	if err := backend.StagePut(storageKey, []byte("storage"), ethstore.TrieNodeStorageDataType); err != nil {
 		t.Fatalf("StagePut storage failed: %v", err)
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
 
@@ -370,7 +389,7 @@ func TestNewEthstoreReplayBackendAOLSkipsStateAndPebbleInitialization(t *testing
 	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), ethstore.HeaderDataType); err != nil {
 		t.Fatalf("StagePut failed: %v", err)
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
 	got, err := backend.Get(makeAOLTestKey(1), ethstore.HeaderDataType)
@@ -763,7 +782,7 @@ func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
 	if err := backend.StagePut(key, []byte("value"), ethstore.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut failed: %v", err)
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock after put failed: %v", err)
 	}
 	got, err := backend.Get(key, ethstore.TrieNodeAccountDataType)
@@ -777,7 +796,7 @@ func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
 	if err := backend.StageDelete(key, ethstore.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StageDelete failed: %v", err)
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock after delete failed: %v", err)
 	}
 	_, err = backend.Get(key, ethstore.TrieNodeAccountDataType)
@@ -806,7 +825,7 @@ func TestChainKVReplayBackendNewIteratorHonorsPrefixAndStart(t *testing.T) {
 			t.Fatalf("StagePut failed for %q: %v", kv.key, err)
 		}
 	}
-	if err := backend.CommitBlock(); err != nil {
+	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
 

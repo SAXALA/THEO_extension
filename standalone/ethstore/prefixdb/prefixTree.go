@@ -28,6 +28,7 @@ const (
 	maxCacheFilesHandles            = 65536
 	maxPooledBufferSize             = 1024 * 1024 // 1MB
 	globalFileName                  = "global.node"
+	nodeCommitTagMagic              = 0x434d54424c4f434b // "CMTBLOCK"
 	defaultNodeFileGCRatioThreshold = 1.0
 	maxPrefixTreeGCWorkers          = 64
 )
@@ -346,16 +347,17 @@ type PrefixTree struct {
 	mergeStop chan struct{}
 	mergeWait sync.WaitGroup
 
-	fileHandleCache   *lru.Cache
-	sharedCache       *sharedByteCache
-	fileStripeLocks   stripedRWLocks // striped locks for file operations
-	globalNodeMu      sync.RWMutex
-	globalNodeIndex   *skiplist.SkipList
-	globalFile        *os.File
-	globalHeader      FileNodeHeader
-	globalCommitDepth int
-	globalCommitDirty bool
-	globalCommitBatch map[string]NodeInfo
+	fileHandleCache     *lru.Cache
+	sharedCache         *sharedByteCache
+	fileStripeLocks     stripedRWLocks // striped locks for file operations
+	globalNodeMu        sync.RWMutex
+	globalNodeIndex     *skiplist.SkipList
+	globalFile          *os.File
+	globalHeader        FileNodeHeader
+	globalCommitDepth   int
+	globalCommitDirty   bool
+	globalCommitBlockID uint64
+	globalCommitBatch   map[string]NodeInfo
 
 	// node file access stats (read path)
 	fileNodeCacheHits     uint64
@@ -708,6 +710,26 @@ func encodeNodeEntries(entries []NodeInfo) []byte {
 	return buf
 }
 
+func appendNodeCommitTag(dst []byte, blockID uint64) []byte {
+	if blockID == 0 {
+		return dst
+	}
+	entry := make([]byte, NodeEntrySize)
+	binary.BigEndian.PutUint64(entry[33:41], nodeCommitTagMagic)
+	binary.BigEndian.PutUint64(entry[57:65], blockID)
+	return append(dst, entry...)
+}
+
+func nodeCommitTagBlockID(entry []byte) (uint64, bool) {
+	if len(entry) < NodeEntrySize || entry[0] != 0 {
+		return 0, false
+	}
+	if binary.BigEndian.Uint64(entry[33:41]) != nodeCommitTagMagic {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(entry[57:65]), true
+}
+
 func (pt *PrefixTree) loadGlobalNodeIndex() error {
 	filePath := filepath.Join(pt.fileNodeDir, pt.globalFileID)
 	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
@@ -781,10 +803,17 @@ func (pt *PrefixTree) getFromGlobalNode(key []byte) (NodeInfo, bool, error) {
 }
 
 func (pt *PrefixTree) beginGlobalCommit() {
+	pt.beginGlobalCommitWithBlockID(0)
+}
+
+func (pt *PrefixTree) beginGlobalCommitWithBlockID(blockID uint64) {
 	pt.globalNodeMu.Lock()
 	pt.globalCommitDepth++
 	if pt.globalCommitBatch == nil {
 		pt.globalCommitBatch = make(map[string]NodeInfo)
+	}
+	if blockID > pt.globalCommitBlockID {
+		pt.globalCommitBlockID = blockID
 	}
 	pt.globalNodeMu.Unlock()
 }
@@ -798,13 +827,20 @@ func (pt *PrefixTree) endGlobalCommit() error {
 		return nil
 	}
 	pt.globalCommitDepth--
-	if pt.globalCommitDepth > 0 || !pt.globalCommitDirty {
+	if pt.globalCommitDepth > 0 {
 		prefixdbDebugf("PrefixTree endGlobalCommit: skipped dirty=%t depth=%d elapsed=%s",
 			pt.globalCommitDirty, pt.globalCommitDepth, time.Since(commitStart))
 		return nil
 	}
+	if !pt.globalCommitDirty {
+		prefixdbDebugf("PrefixTree endGlobalCommit: skipped dirty=%t depth=%d elapsed=%s",
+			pt.globalCommitDirty, pt.globalCommitDepth, time.Since(commitStart))
+		pt.globalCommitBlockID = 0
+		return nil
+	}
 	defer func() {
 		pt.globalCommitDirty = false
+		pt.globalCommitBlockID = 0
 		clear(pt.globalCommitBatch)
 	}()
 	if len(pt.globalCommitBatch) == 0 {
@@ -817,7 +853,7 @@ func (pt *PrefixTree) endGlobalCommit() error {
 	}
 	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
 	prefixdbDebugf("PrefixTree endGlobalCommit: append start entries=%d", len(entries))
-	err := pt.appendGlobalNodeEntries(entries)
+	err := pt.appendGlobalNodeEntriesWithBlockID(entries, pt.globalCommitBlockID)
 	prefixdbDebugf("PrefixTree endGlobalCommit: append done elapsed=%s err=%v", time.Since(commitStart), err)
 	return err
 }
@@ -827,6 +863,10 @@ func (pt *PrefixTree) appendGlobalNodeEntry(nodeInfo NodeInfo) error {
 }
 
 func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
+	return pt.appendGlobalNodeEntriesWithBlockID(entries, 0)
+}
+
+func (pt *PrefixTree) appendGlobalNodeEntriesWithBlockID(entries []NodeInfo, blockID uint64) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -842,6 +882,7 @@ func (pt *PrefixTree) appendGlobalNodeEntries(entries []NodeInfo) error {
 	for _, entry := range entries {
 		buf = append(buf, encodeNodeEntry(entry)...)
 	}
+	buf = appendNodeCommitTag(buf, blockID)
 	if _, err := pt.globalFile.WriteAt(buf, writeOffset); err != nil {
 		return fmt.Errorf("write global node entries failed: %w", err)
 	}
@@ -1120,7 +1161,7 @@ func (pt *PrefixTree) Put(key []byte, accountOffset uint64, accountSize uint32, 
 		storageFileID: storageFileID,
 		storageOffset: storageOffset,
 		storageSize:   storageSize,
-	}})
+	}}, 0)
 
 }
 
@@ -1129,15 +1170,19 @@ func (pt *PrefixTree) PutNode(key []byte, node *TrieNode) error {
 }
 
 func (pt *PrefixTree) PutNodeInfos(entries []NodeInfo) error {
+	return pt.PutNodeInfosWithBlockID(entries, 0)
+}
+
+func (pt *PrefixTree) PutNodeInfosWithBlockID(entries []NodeInfo, blockID uint64) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	pt.lock.Lock()
 	defer pt.lock.Unlock()
-	return pt.putNodeInfosLocked(entries)
+	return pt.putNodeInfosLocked(entries, blockID)
 }
 
-func (pt *PrefixTree) putNodeInfosLocked(entries []NodeInfo) error {
+func (pt *PrefixTree) putNodeInfosLocked(entries []NodeInfo, blockID uint64) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1160,20 +1205,20 @@ func (pt *PrefixTree) putNodeInfosLocked(entries []NodeInfo) error {
 		perFile[fileID] = append(perFile[fileID], cloned)
 	}
 	if len(globalEntries) > 0 {
-		if err := pt.putGlobalNodeInfos(globalEntries); err != nil {
+		if err := pt.putGlobalNodeInfos(globalEntries, blockID); err != nil {
 			return err
 		}
 	}
 	sort.Strings(fileOrder)
 	for _, fileID := range fileOrder {
-		if err := pt.appendFileNodeEntries(fileID, perFile[fileID]); err != nil {
+		if err := pt.appendFileNodeEntriesWithBlockID(fileID, perFile[fileID], blockID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (pt *PrefixTree) putGlobalNodeInfos(entries []NodeInfo) error {
+func (pt *PrefixTree) putGlobalNodeInfos(entries []NodeInfo, blockID uint64) error {
 	pt.globalNodeMu.Lock()
 	defer pt.globalNodeMu.Unlock()
 	if pt.globalNodeIndex == nil {
@@ -1200,10 +1245,14 @@ func (pt *PrefixTree) putGlobalNodeInfos(entries []NodeInfo) error {
 	if pt.globalCommitDepth > 0 {
 		return nil
 	}
-	return pt.appendGlobalNodeEntries(appendEntries)
+	return pt.appendGlobalNodeEntriesWithBlockID(appendEntries, blockID)
 }
 
 func (pt *PrefixTree) appendFileNodeEntries(fileID string, entries []NodeInfo) error {
+	return pt.appendFileNodeEntriesWithBlockID(fileID, entries, 0)
+}
+
+func (pt *PrefixTree) appendFileNodeEntriesWithBlockID(fileID string, entries []NodeInfo, blockID uint64) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1231,7 +1280,7 @@ func (pt *PrefixTree) appendFileNodeEntries(fileID string, entries []NodeInfo) e
 	if err != nil {
 		return fmt.Errorf("stat file failed: %w", err)
 	}
-	entryData := encodeNodeEntries(entries)
+	entryData := appendNodeCommitTag(encodeNodeEntries(entries), blockID)
 	if info.Size() == 0 {
 		header := FileNodeHeader{Magic: FileNodeMagic, Version: fileNodeVersionBase}
 		fileData, err := encodeFileNodeAndPayload(header, entryData)
@@ -1270,6 +1319,67 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 		storageOffset: storageOffset,
 		storageSize:   storageSize,
 	}})
+}
+
+func findNodeCommitTagEnd(payload []byte, targetBlockID uint64) (int64, bool) {
+	headerSize := binary.Size(FileNodeHeader{})
+	if len(payload) <= headerSize {
+		return 0, false
+	}
+	for cursor := len(payload); cursor >= headerSize+NodeEntrySize; cursor -= NodeEntrySize {
+		blockID, ok := nodeCommitTagBlockID(payload[cursor-NodeEntrySize : cursor])
+		if !ok {
+			continue
+		}
+		if blockID <= targetBlockID {
+			return int64(cursor), true
+		}
+	}
+	return 0, false
+}
+
+func (pt *PrefixTree) TrimNodeFilesAfterCommitTag(blockID uint64) error {
+	if pt == nil || blockID == 0 {
+		return nil
+	}
+	pt.lock.Lock()
+	defer pt.lock.Unlock()
+
+	trimmed := make([]string, 0)
+	err := filepath.WalkDir(pt.fileNodeDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		end, ok := findNodeCommitTagEnd(payload, blockID)
+		if !ok || end >= int64(len(payload)) {
+			return nil
+		}
+		if err := os.Truncate(path, end); err != nil {
+			return err
+		}
+		trimmed = append(trimmed, filepath.Base(path))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if pt.fileHandleCache != nil {
+		pt.fileHandleCache.Purge()
+	}
+	for _, fileID := range trimmed {
+		pt.invalidateFileNodeCache(fileID)
+	}
+	return pt.loadGlobalNodeIndex()
 }
 
 // Delete deletes a key from the prefix tree
