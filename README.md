@@ -99,7 +99,7 @@ cd replayWorkload
 ```bash
 cd replayWorkload
 
-# Replay 50K blocks with THEO on CacheTrace
+# Replay with THEO on CacheTrace
 TRACE_FILE=cache ./replay.sh replay theo
 
 # Replay with PebbleDB
@@ -109,13 +109,21 @@ TRACE_FILE=cache ./replay.sh replay pebble
 TRACE_FILE=cache ./replay.sh replay chainkv
 ```
 
+### 6. Manually recover from a crash
+
+```bash
+cd replayWorkload
+# Recover THEO
+./exps/recoverTheo.sh
+```
+
 ---
 
 ## Running the Full Evaluation (Paper Experiments)
 
 All paper experiments (Exp#1–#9) can be reproduced with the scripts in `replayWorkload/exps/`.
 
-### Exp#1–#7: Main evaluation (all backends × all traces, 50K blocks)
+### Exp#1–#8: Main evaluation (all backends × all traces, 50K blocks)
 
 ```bash
 cd replayWorkload
@@ -123,6 +131,13 @@ TEST_RUN_ROUNDS=5 ./exps/all_all_50K.sh
 ```
 
 This runs 5 rounds of each (THEO / PebbleDB / ChainKV) × (CacheTrace / NocacheTrace / BareTrace) combination.
+
+```bash
+cd replayWorkload
+./exps/recoverTheo.sh
+```
+
+This tests the crash recovery procedure on THEO.
 
 ### Sub-backend ablation (Appendix)
 
