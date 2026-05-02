@@ -5376,6 +5376,13 @@ func (db *PrefixDB) readSegmentIndexForKeyByPathWithSource(folderPath string, ke
 func (db *PrefixDB) readSegmentIndexForKeyByPathWithSourceAndTracker(folderPath string, key []byte, tracker *cacheMissCostTracker) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
 	entryLock, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
 	defer unlock()
+	return db.readSegmentIndexForKeyByPathWithSourceAndTrackerLocked(folderPath, key, tracker, entryLock)
+}
+
+func (db *PrefixDB) readSegmentIndexForKeyByPathWithSourceAndTrackerLocked(folderPath string, key []byte, tracker *cacheMissCostTracker, entryLock *segmentIndexFolderLock) ([]segmentChunkMeta, segmentIndexLookupSource, error) {
+	if entryLock == nil {
+		return db.readSegmentIndexForKeyByPathWithSourceAndTracker(folderPath, key, tracker)
+	}
 	generation := atomic.LoadUint64(&entryLock.gen)
 	if len(key) == 0 {
 		return db.readSegmentIndexLockedInternalByPathWithTracker(folderPath, true, tracker)
@@ -7601,7 +7608,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPath(folderPath string, accountKe
 }
 
 func (db *PrefixDB) readSegmentedChunkToCacheByPathWithTracker(folderPath string, accountKey []byte, storageKey []byte, tracker *cacheMissCostTracker) ([]byte, *segmentedStorageReadFailure, error) {
-	unlock := db.lockSegmentIndexFolder(folderPath)
+	entryLock, unlock := db.lockSegmentIndexFolderReadEntry(folderPath)
 	var gcMeta *segmentChunkMeta
 	var gcBacking *bufferLease
 	var gcChunkData []byte
@@ -7616,7 +7623,7 @@ func (db *PrefixDB) readSegmentedChunkToCacheByPathWithTracker(folderPath string
 	}()
 	failure := &segmentedStorageReadFailure{folderPath: folderPath, indexFile: segmentIndexFileName}
 	indexStart := time.Now()
-	metas, segmentIndexSource, err := db.readSegmentIndexForKeyByPathWithSourceAndTracker(folderPath, storageKey, tracker)
+	metas, segmentIndexSource, err := db.readSegmentIndexForKeyByPathWithSourceAndTrackerLocked(folderPath, storageKey, tracker, entryLock)
 	if len(metas) > 0 {
 		duration := time.Since(indexStart)
 		recordTrieStorageGetBreakdownStep(&db.trieStorageSegmentIndexStats, segmentIndexSource.fromCache(), duration)

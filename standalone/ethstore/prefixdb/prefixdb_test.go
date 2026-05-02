@@ -7020,6 +7020,65 @@ func TestSegmentedFolderConcurrencyPatterns(t *testing.T) {
 		readValue(t, db, folderPath, accountKey, []byte{'a'}, "value-a")
 	})
 
+	t.Run("reader index lookup does not self-deadlock behind queued writer", func(t *testing.T) {
+		db := newDB(t)
+		defer db.Close()
+
+		_, folderPath := seedAccount(t, db, 0x65)
+		entry, releaseReader := db.lockSegmentIndexFolderReadEntry(folderPath)
+		releasedReader := false
+		defer func() {
+			if !releasedReader {
+				releaseReader()
+			}
+		}()
+
+		writerDone := make(chan struct{})
+		go func() {
+			unlock := db.lockSegmentIndexFolderWrite(folderPath)
+			unlock()
+			close(writerDone)
+		}()
+
+		select {
+		case <-writerDone:
+			t.Fatal("writer completed while reader still held the folder read lock")
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		lookupDone := make(chan error, 1)
+		go func() {
+			metas, _, err := db.readSegmentIndexForKeyByPathWithSourceAndTrackerLocked(folderPath, []byte{'m'}, nil, entry)
+			if err != nil {
+				lookupDone <- err
+				return
+			}
+			if selectSegmentChunkMeta(metas, []byte{'m'}) == nil {
+				lookupDone <- fmt.Errorf("selected chunk meta not found")
+				return
+			}
+			lookupDone <- nil
+		}()
+
+		select {
+		case err := <-lookupDone:
+			if err != nil {
+				t.Fatalf("locked segment index lookup failed: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("locked segment index lookup deadlocked behind queued writer")
+		}
+
+		releaseReader()
+		releasedReader = true
+
+		select {
+		case <-writerDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("queued writer did not finish after reader released")
+		}
+	})
+
 	t.Run("different folders remain independent", func(t *testing.T) {
 		db := newDB(t)
 		defer db.Close()
