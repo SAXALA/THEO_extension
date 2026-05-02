@@ -67,12 +67,12 @@ Edit `replayWorkload/replay_config.json` to point to your trace files and target
   "traceFile":       "/path/to/geth-trace-withcache-...",
   "traceFileNocache": "/path/to/geth-trace-without-cache-...",
   "traceFileNoCacheWithSnapshot": "/path/to/geth-trace-no-cache-enable-snapshot",
-  "theoDir":         "/data/running/theo",
-  "pebbleDir":       "/data/running/pebble",
-  "chainKVDir":      "/data/running/chainkv",
-  "loadedTheoDir":   "/mnt/ssd2/loaded/theo",
-  "loadedPebbleDir": "/mnt/ssd2/loaded/pebble",
-  "loadedChainKVDir": "/mnt/ssd2/loaded/chainkv"
+  "theoDir":         "/path/to/running/theo",
+  "pebbleDir":       "/path/to/running/pebble",
+  "chainKVDir":      "/path/to/running/chainkv",
+  "loadedTheoDir":   "/path/to/loaded/theo",
+  "loadedPebbleDir": "/path/to/loaded/pebble",
+  "loadedChainKVDir": "/path/to/loaded/chainkv"
 }
 ```
 
