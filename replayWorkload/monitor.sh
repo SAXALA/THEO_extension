@@ -13,7 +13,7 @@ if [ -z "$TARGET" ]; then
 fi
 
 # sudo password; leave empty to use interactive sudo
-SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
+SUDO_PASSWD="${SUDO_PASSWD:-admin}"
 
 sudo_run() {
     if [ -n "${SUDO_PASSWD}" ]; then

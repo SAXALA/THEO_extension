@@ -76,7 +76,15 @@ Edit `replayWorkload/replay_config.json` to point to your trace files and target
 }
 ```
 
-### 4. Load data (one-time setup)
+### 4. Required before running scripts: configure sudo password
+
+Before running evaluation scripts, make sure `SUDO_PASSWD` is configured for your environment. Or manually modified in the two scripts: `replayWorkload/replay.sh` or `replayWorkload/monitor.sh`
+
+```bash
+SUDO_PASSWD="${SUDO_PASSWD:-admin}"
+```
+
+### 5. Load data (one-time setup)
 
 ```bash
 cd replayWorkload
@@ -94,7 +102,7 @@ cd replayWorkload
 ./exps/loadLSMWithoutSnapshot.sh all
 ```
 
-### 5. Run a single experiment
+### 6. Run a single experiment
 
 ```bash
 cd replayWorkload
@@ -109,7 +117,7 @@ TRACE_FILE=cache ./replay.sh replay pebble
 TRACE_FILE=cache ./replay.sh replay chainkv
 ```
 
-### 6. Manually recover from a crash
+### 7. Manually recover from a crash
 
 ```bash
 cd replayWorkload

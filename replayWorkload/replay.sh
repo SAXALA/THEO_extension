@@ -143,7 +143,7 @@ CURRENT_REPLAY_PID=""
 CURRENT_MONITOR_PID=""
 
 # sudo password; leave empty to use interactive sudo
-SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
+SUDO_PASSWD="${SUDO_PASSWD:-admin}"
 # rsync 3.2.x may be affected by the 1 GB max-alloc limit by default; 0 means no extra restriction.
 RSYNC_MAX_ALLOC="${RSYNC_MAX_ALLOC:-0}"
 # By default only data content matters; owner/group/perms metadata is not preserved. The script runs chmod later.
