@@ -283,6 +283,7 @@ func encodeFileNodeAndPayload(header FileNodeHeader, payload []byte) ([]byte, er
 }
 
 func nodeFileContainsKey(sortedSlice, unsortedSlice, key []byte) bool {
+	lookupKey := nodeLookupKey(key)
 	unsortedCount := uint32(len(unsortedSlice) / NodeEntrySize)
 	if unsortedCount > 0 {
 		totalSize := int(unsortedCount) * NodeEntrySize
@@ -292,42 +293,19 @@ func nodeFileContainsKey(sortedSlice, unsortedSlice, key []byte) bool {
 			if offsetInBuf+NodeEntrySize > int64(totalSize) {
 				break
 			}
-			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
-			if bytes.Equal(dec.key, key) {
+			entry := unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize]
+			if isNodeCommitTagEntry(entry) {
+				continue
+			}
+			dec := decodeNodeEntry(entry)
+			if bytes.Equal(dec.key, lookupKey) {
 				return !isNodeInfoTombstone(dec)
 			}
 		}
 	}
 
-	sortedCount := uint32(len(sortedSlice) / NodeEntrySize)
-	if sortedCount == 0 {
-		return false
-	}
-	getKeyAt := func(idx uint32) []byte {
-		start := int(idx) * NodeEntrySize
-		keyLen := int(sortedSlice[start])
-		if keyLen > MaxKeySize {
-			keyLen = MaxKeySize
-		}
-		return sortedSlice[start+1 : start+1+keyLen]
-	}
-	low, high := uint32(0), sortedCount-1
-	for low <= high {
-		mid := (low + high) / 2
-		cmp := bytes.Compare(getKeyAt(mid), key)
-		if cmp == 0 {
-			start := int(mid) * NodeEntrySize
-			dec := decodeNodeEntry(sortedSlice[start : start+NodeEntrySize])
-			return !isNodeInfoTombstone(dec)
-		}
-		if cmp < 0 {
-			low = mid + 1
-		} else {
-			if mid == 0 {
-				break
-			}
-			high = mid - 1
-		}
+	if dec, found := findNodeInfoInSortedSlice(sortedSlice, lookupKey); found {
+		return !isNodeInfoTombstone(dec)
 	}
 	return false
 }
@@ -665,7 +643,11 @@ func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []
 		if end > len(sortedSlice) {
 			break
 		}
-		dec := decodeNodeEntry(sortedSlice[start:end])
+		entry := sortedSlice[start:end]
+		if isNodeCommitTagEntry(entry) {
+			continue
+		}
+		dec := decodeNodeEntry(entry)
 		if len(dec.key) > 0 && !isNodeInfoTombstone(dec) {
 			m[string(dec.key)] = dec
 		}
@@ -677,7 +659,11 @@ func buildEntriesFromSlices(header FileNodeHeader, sortedSlice, unsortedSlice []
 		if end > len(unsortedSlice) {
 			break
 		}
-		dec := decodeNodeEntry(unsortedSlice[start:end])
+		entry := unsortedSlice[start:end]
+		if isNodeCommitTagEntry(entry) {
+			continue
+		}
+		dec := decodeNodeEntry(entry)
 		if len(dec.key) == 0 {
 			continue
 		}
@@ -720,18 +706,106 @@ func appendNodeCommitTag(dst []byte, blockID uint64) []byte {
 	return append(dst, entry...)
 }
 
+func nodeLookupKey(key []byte) []byte {
+	if len(key) > MaxKeySize {
+		return key[:MaxKeySize]
+	}
+	return key
+}
+
+func isZeroNodeEntryRange(entry []byte, start, end int) bool {
+	for _, b := range entry[start:end] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func nodeCommitTagBlockID(entry []byte) (uint64, bool) {
 	if len(entry) < NodeEntrySize || entry[0] != 0 {
+		return 0, false
+	}
+	if !isZeroNodeEntryRange(entry, 1, 33) {
 		return 0, false
 	}
 	if binary.BigEndian.Uint64(entry[33:41]) != nodeCommitTagMagic {
 		return 0, false
 	}
-	return binary.BigEndian.Uint64(entry[57:65]), true
+	if binary.BigEndian.Uint32(entry[41:45]) != 0 || binary.BigEndian.Uint32(entry[45:49]) != 0 || binary.BigEndian.Uint64(entry[49:57]) != 0 {
+		return 0, false
+	}
+	blockID := binary.BigEndian.Uint64(entry[57:65])
+	if blockID == 0 {
+		return 0, false
+	}
+	return blockID, true
+}
+
+func isNodeCommitTagEntry(entry []byte) bool {
+	_, ok := nodeCommitTagBlockID(entry)
+	return ok
+}
+
+func findNodeInfoInSortedSlice(sortedSlice, key []byte) (NodeInfo, bool) {
+	sortedCount := uint32(len(sortedSlice) / NodeEntrySize)
+	if sortedCount == 0 {
+		return NodeInfo{}, false
+	}
+	lookupKey := nodeLookupKey(key)
+	hasCommitTag := false
+	for i := uint32(0); i < sortedCount; i++ {
+		start := int(i) * NodeEntrySize
+		if isNodeCommitTagEntry(sortedSlice[start : start+NodeEntrySize]) {
+			hasCommitTag = true
+			break
+		}
+	}
+	if hasCommitTag {
+		for i := uint32(0); i < sortedCount; i++ {
+			start := int(i) * NodeEntrySize
+			entry := sortedSlice[start : start+NodeEntrySize]
+			if isNodeCommitTagEntry(entry) {
+				continue
+			}
+			dec := decodeNodeEntry(entry)
+			if bytes.Equal(dec.key, lookupKey) {
+				return dec, true
+			}
+		}
+		return NodeInfo{}, false
+	}
+	getKeyAt := func(idx uint32) []byte {
+		start := int(idx) * NodeEntrySize
+		keyLen := int(sortedSlice[start])
+		if keyLen > MaxKeySize {
+			keyLen = MaxKeySize
+		}
+		return sortedSlice[start+1 : start+1+keyLen]
+	}
+	low, high := uint32(0), sortedCount-1
+	for low <= high {
+		mid := (low + high) / 2
+		cmp := bytes.Compare(getKeyAt(mid), lookupKey)
+		if cmp == 0 {
+			start := int(mid) * NodeEntrySize
+			return decodeNodeEntry(sortedSlice[start : start+NodeEntrySize]), true
+		}
+		if cmp < 0 {
+			low = mid + 1
+		} else {
+			if mid == 0 {
+				break
+			}
+			high = mid - 1
+		}
+	}
+	return NodeInfo{}, false
 }
 
 func (pt *PrefixTree) loadGlobalNodeIndex() error {
 	filePath := filepath.Join(pt.fileNodeDir, pt.globalFileID)
+
 	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return err
@@ -792,6 +866,9 @@ func (pt *PrefixTree) getFromGlobalNode(key []byte) (NodeInfo, bool, error) {
 		return NodeInfo{}, false, nil
 	}
 	elem := pt.globalNodeIndex.Get(bytesToString(key))
+	if elem == nil && len(key) > MaxKeySize {
+		elem = pt.globalNodeIndex.Get(bytesToString(nodeLookupKey(key)))
+	}
 	if elem == nil {
 		return NodeInfo{}, false, nil
 	}
@@ -1326,9 +1403,24 @@ func findLastNodeCommitTagEnd(payload []byte) (int64, bool) {
 	if len(payload) <= headerSize {
 		return 0, false
 	}
-	entryBytes := len(payload) - headerSize
-	cursor := headerSize + (entryBytes/NodeEntrySize)*NodeEntrySize
-	for ; cursor >= headerSize+NodeEntrySize; cursor -= NodeEntrySize {
+	var header FileNodeHeader
+	if err := binary.Read(bytes.NewReader(payload[:headerSize]), binary.BigEndian, &header); err != nil {
+		return 0, false
+	}
+	if header.Magic != FileNodeMagic {
+		return 0, false
+	}
+	sortedStored, err := nodeFileStoredSortedPayloadSize(header)
+	if err != nil {
+		return 0, false
+	}
+	unsortedStart := headerSize + sortedStored
+	if unsortedStart > len(payload) {
+		return 0, false
+	}
+	entryBytes := len(payload) - unsortedStart
+	cursor := unsortedStart + (entryBytes/NodeEntrySize)*NodeEntrySize
+	for ; cursor >= unsortedStart+NodeEntrySize; cursor -= NodeEntrySize {
 		if _, ok := nodeCommitTagBlockID(payload[cursor-NodeEntrySize : cursor]); ok {
 			return int64(cursor), true
 		}
@@ -1761,42 +1853,17 @@ func (pt *PrefixTree) getFromFileNodeWithBreakdown(fileID string, Key []byte, br
 
 	var latestAccountHit *NodeInfo
 	var latestStorageHit *NodeInfo
+	lookupKey := nodeLookupKey(Key)
 	findSortedHit := func() *NodeInfo {
 		if sortedCount == 0 || sortedSlice == nil {
 			return nil
 		}
-		getKeyAt := func(idx uint32) []byte {
-			start := int(idx) * NodeEntrySize
-			keyLen := int(sortedSlice[start])
-			if keyLen > MaxKeySize {
-				keyLen = MaxKeySize
-			}
-			return sortedSlice[start+1 : start+1+keyLen]
+		dec, found := findNodeInfoInSortedSlice(sortedSlice, lookupKey)
+		if !found || isNodeInfoTombstone(dec) {
+			return nil
 		}
-
-		low, high := uint32(0), sortedCount-1
-		for low <= high {
-			mid := (low + high) / 2
-			k := getKeyAt(mid)
-			cmp := bytes.Compare(k, Key)
-			if cmp == 0 {
-				start := int(mid) * NodeEntrySize
-				dec := decodeNodeEntry(sortedSlice[start : start+NodeEntrySize])
-				if isNodeInfoTombstone(dec) {
-					return nil
-				}
-				result := dec
-				return &result
-			} else if cmp < 0 {
-				low = mid + 1
-			} else {
-				if mid == 0 {
-					break
-				}
-				high = mid - 1
-			}
-		}
-		return nil
+		result := dec
+		return &result
 	}
 	mergeForRead := func(base *NodeInfo, overlay *NodeInfo) NodeInfo {
 		if overlay == nil {
@@ -1820,8 +1887,12 @@ func (pt *PrefixTree) getFromFileNodeWithBreakdown(fileID string, Key []byte, br
 			if offsetInBuf+NodeEntrySize > int64(totalSize) {
 				break
 			}
-			dec := decodeNodeEntry(unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize])
-			if bytes.Equal(dec.key, Key) {
+			entry := unsortedSlice[offsetInBuf : offsetInBuf+NodeEntrySize]
+			if isNodeCommitTagEntry(entry) {
+				continue
+			}
+			dec := decodeNodeEntry(entry)
+			if bytes.Equal(dec.key, lookupKey) {
 				addUint64Stat(&pt.fileNodeUnsortedHits, 1)
 				addUint64Stat(&pt.fileNodeUnsortedSum, uint64(unsortedCount))
 				if isNodeInfoTombstone(dec) {

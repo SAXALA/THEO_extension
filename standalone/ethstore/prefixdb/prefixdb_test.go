@@ -2953,6 +2953,177 @@ func TestTrimLogsAfterCommitTagUsesEachLogsLastTag(t *testing.T) {
 	}
 }
 
+func TestNodeCommitTagIsFixedSizeEntryAndDoesNotBreakSortedLookup(t *testing.T) {
+	firstKey := bytes.Repeat([]byte{0x10}, MaxKeySize)
+	secondKey := bytes.Repeat([]byte{0x20}, MaxKeySize)
+	first := NodeInfo{key: firstKey, accountOffset: 10, accountSize: 3}
+	second := NodeInfo{key: secondKey, accountOffset: 20, accountSize: 4}
+
+	tagged := appendNodeCommitTag(encodeNodeEntries([]NodeInfo{first, second}), 99)
+	if got := len(tagged); got != 3*NodeEntrySize {
+		t.Fatalf("tagged node payload size=%d, want %d", got, 3*NodeEntrySize)
+	}
+	if got := len(tagged) % NodeEntrySize; got != 0 {
+		t.Fatalf("tagged node payload is not entry aligned: remainder=%d", got)
+	}
+	if blockID, ok := nodeCommitTagBlockID(tagged[len(tagged)-NodeEntrySize:]); !ok || blockID != 99 {
+		t.Fatalf("tail node entry is not commit tag: blockID=%d ok=%t", blockID, ok)
+	}
+
+	found, ok := findNodeInfoInSortedSlice(tagged, secondKey)
+	if !ok || found.accountOffset != second.accountOffset || found.accountSize != second.accountSize {
+		t.Fatalf("sorted lookup with trailing tag failed: found=%+v ok=%t", found, ok)
+	}
+	entries := buildEntriesFromSlices(FileNodeHeader{}, tagged, nil)
+	if len(entries) != 2 {
+		t.Fatalf("GC entry rebuild included commit tag: got %d entries want 2", len(entries))
+	}
+}
+
+func TestLegacyDataWithoutCommitTagsSurvivesRecoveryTrimAndGC(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDBWithRuntimeOptions(baseDir, 32, 8, 0, 1e9, 1, 1, true, false, 0)
+	if err != nil {
+		t.Fatalf("NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+
+	accountKey := makeTestAccountKey(0x5d)
+	accountHash := bytes.Repeat([]byte{0x5d}, 32)
+	storageKey := append(append([]byte{'O'}, accountHash...), 0x01)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("legacy-account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, storageKey, []byte("legacy-storage"), accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(0); err != nil {
+		t.Fatalf("legacy BatchCommitWithBlockID failed: %v", err)
+	}
+
+	accountPayload, err := os.ReadFile(db.accountFile.Name())
+	if err != nil {
+		t.Fatalf("ReadFile account failed: %v", err)
+	}
+	if _, ok := lastForwardCommitTagBlockID(accountPayload, true); ok {
+		t.Fatal("legacy account log unexpectedly contains a commit tag")
+	}
+	storagePath, _ := db.storagePathByFileID(db.storageCurFileID)
+	storagePayload, err := os.ReadFile(storagePath)
+	if err != nil {
+		t.Fatalf("ReadFile storage failed: %v", err)
+	}
+	if _, ok := lastForwardCommitTagBlockID(storagePayload, false); ok {
+		t.Fatal("legacy storage log unexpectedly contains a commit tag")
+	}
+
+	segAccountKey := makeTestAccountKey(0x5e)
+	segStorageSuffix := []byte{0x02}
+	segStorageKey := makeTestStorageRawKey(segAccountKey, segStorageSuffix...)
+	if _, _, _, err := db.rewriteAccountNamedSegmentedStorage(segAccountKey, []kvPair{{key: segStorageSuffix, val: bytes.Repeat([]byte{'s'}, 96)}}); err != nil {
+		t.Fatalf("rewriteAccountNamedSegmentedStorage failed: %v", err)
+	}
+	folderPath := db.segmentedFolderPathForAccount(segAccountKey)
+	chunkPath := filepath.Join(folderPath, chunkFileNameForOrdinal(0))
+	chunkPayload, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatalf("ReadFile chunk failed: %v", err)
+	}
+	if count, blockID := countChunkCommitTagsForTest(chunkPayload); count != 0 || blockID != 0 {
+		t.Fatalf("legacy chunk tags=(count=%d block=%d), want none", count, blockID)
+	}
+	gotAccount, ok, err := db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil || !ok || string(gotAccount) != "legacy-account" {
+		t.Fatalf("legacy account read before trim: value=%q ok=%t err=%v", gotAccount, ok, err)
+	}
+	gotStorage, ok, err := db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil || !ok || string(gotStorage) != "legacy-storage" {
+		t.Fatalf("legacy storage read before trim: value=%q ok=%t err=%v", gotStorage, ok, err)
+	}
+	gotSegmented, ok, err := db.Get(datatypepkg.TrieNodeStorageDataType, segStorageKey, segAccountKey)
+	if err != nil || !ok || !bytes.Equal(gotSegmented, bytes.Repeat([]byte{'s'}, 96)) {
+		t.Fatalf("legacy segmented read before trim: len=%d ok=%t err=%v", len(gotSegmented), ok, err)
+	}
+
+	if err := db.TrimLogsAfterCommitTag(100); err != nil {
+		t.Fatalf("TrimLogsAfterCommitTag on legacy data failed: %v", err)
+	}
+	gotAccount, ok, err = db.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil || !ok || string(gotAccount) != "legacy-account" {
+		t.Fatalf("legacy account read after trim: value=%q ok=%t err=%v", gotAccount, ok, err)
+	}
+	gotStorage, ok, err = db.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil || !ok || string(gotStorage) != "legacy-storage" {
+		t.Fatalf("legacy storage read after trim: value=%q ok=%t err=%v", gotStorage, ok, err)
+	}
+	gotSegmented, ok, err = db.Get(datatypepkg.TrieNodeStorageDataType, segStorageKey, segAccountKey)
+	if err != nil || !ok || !bytes.Equal(gotSegmented, bytes.Repeat([]byte{'s'}, 96)) {
+		t.Fatalf("legacy segmented read after trim: len=%d ok=%t err=%v", len(gotSegmented), ok, err)
+	}
+	if err := db.waitForStorageGCIdle(); err != nil {
+		t.Fatalf("waitForStorageGCIdle failed: %v", err)
+	}
+	metas, err := db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath failed: %v", err)
+	}
+	if len(metas) == 0 {
+		t.Fatal("expected segmented metas after background GC")
+	}
+	for _, meta := range metas {
+		payload, err := os.ReadFile(filepath.Join(folderPath, meta.FileName))
+		if err != nil {
+			t.Fatalf("ReadFile GC chunk failed: %v", err)
+		}
+		if count, blockID := countChunkCommitTagsForTest(payload); count != 0 || blockID != 0 {
+			t.Fatalf("background GC added tag to legacy chunk %s: count=%d block=%d", meta.FileName, count, blockID)
+		}
+	}
+
+	if err := db.GCAllStorageChunkFiles(); err != nil {
+		t.Fatalf("GCAllStorageChunkFiles on legacy data failed: %v", err)
+	}
+	metas, err = db.readSegmentIndexNoCacheByPath(folderPath)
+	if err != nil {
+		t.Fatalf("readSegmentIndexNoCacheByPath after full GC failed: %v", err)
+	}
+	for _, meta := range metas {
+		payload, err := os.ReadFile(filepath.Join(folderPath, meta.FileName))
+		if err != nil {
+			t.Fatalf("ReadFile full-GC chunk failed: %v", err)
+		}
+		if count, blockID := countChunkCommitTagsForTest(payload); count != 0 || blockID != 0 {
+			t.Fatalf("full GC added tag to legacy chunk %s: count=%d block=%d", meta.FileName, count, blockID)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	db = nil
+	reopened, err := NewPrefixDBWithRuntimeOptions(baseDir, 32, 8, 0, 1e9, 1, 1, true, false, 0)
+	if err != nil {
+		t.Fatalf("reopen NewPrefixDBWithRuntimeOptions failed: %v", err)
+	}
+	defer reopened.Close()
+	gotAccount, ok, err = reopened.Get(datatypepkg.TrieNodeAccountDataType, accountKey, nil)
+	if err != nil || !ok || string(gotAccount) != "legacy-account" {
+		t.Fatalf("legacy account read after reopen: value=%q ok=%t err=%v", gotAccount, ok, err)
+	}
+	gotStorage, ok, err = reopened.Get(datatypepkg.TrieNodeStorageDataType, storageKey, accountKey)
+	if err != nil || !ok || string(gotStorage) != "legacy-storage" {
+		t.Fatalf("legacy storage read after reopen: value=%q ok=%t err=%v", gotStorage, ok, err)
+	}
+	gotSegmented, ok, err = reopened.Get(datatypepkg.TrieNodeStorageDataType, segStorageKey, segAccountKey)
+	if err != nil || !ok || !bytes.Equal(gotSegmented, bytes.Repeat([]byte{'s'}, 96)) {
+		t.Fatalf("legacy segmented read after reopen: len=%d ok=%t err=%v", len(gotSegmented), ok, err)
+	}
+}
+
 func TestGCAllStorageChunkFilesKeepsOnlyLastCommitTag(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 16)
