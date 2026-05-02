@@ -175,7 +175,7 @@ func TestPutAndGet(t *testing.T) {
 
 			parts := strings.Split(line, ", Value :")
 			if len(parts) != 2 {
-				t.Logf("无法解析行: %s", line)
+				t.Logf("Failed to parse line: %s", line)
 				continue
 			}
 			keyPart := strings.TrimPrefix(parts[0], "Key: ")

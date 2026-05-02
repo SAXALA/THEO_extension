@@ -564,7 +564,7 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int, skipSnapshot bo
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
+			log.Printf("Failed to parse line: %s", line)
 			continue
 		}
 
@@ -2122,7 +2122,7 @@ func pebbleDBLoadData(pebbleDir string, dataFile string, pebbleCache int, pebble
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
+			log.Printf("Failed to parse line: %s", line)
 			continue
 		}
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
@@ -2248,7 +2248,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
+			log.Printf("Failed to parse line: %s", line)
 			continue
 		}
 		keyPart := strings.TrimPrefix(parts[0], "Key: ")
@@ -2382,7 +2382,7 @@ func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, tota
 
 		parts := strings.Split(string(line), "\tvalue:")
 		if len(parts) != 2 {
-			// log.Printf("无法解析行: %s", line)
+			// log.Printf("Failed to parse line: %s", line)
 			continue
 		}
 		counter++
@@ -2505,7 +2505,7 @@ func loadTheoPebble(dirPath string, testFilePath string, accountHashIndexDir str
 
 		parts := strings.Split(line, ", Value :")
 		if len(parts) != 2 {
-			log.Printf("无法解析行: %s", line)
+			log.Printf("Failed to parse line: %s", line)
 			if err == io.EOF {
 				break
 			}
@@ -2599,7 +2599,7 @@ func (v valueNode) isNode() {}
 func findKeyValuePair(accountHashHex string, ps *pebblestore.PebbleStore) (string, string, error) {
 	targetPath, err := hexToNibbles(accountHashHex)
 	if err != nil {
-		return "", "", fmt.Errorf("无效的十六进制哈希: %v", err)
+		return "", "", fmt.Errorf("Invalid hexadecimal hash: %v", err)
 	}
 
 	finalPath, finalValue, err := findRecursive(targetPath, 0, ps)
@@ -2610,9 +2610,9 @@ func findKeyValuePair(accountHashHex string, ps *pebblestore.PebbleStore) (strin
 	finalDBKey := accountTrieNodeKey(finalPath)
 	// decodedValue, err := decodeAccountValue(finalValue)
 	// if err != nil {
-	// 	return finalDBKey, finalValue, fmt.Errorf("找到键值对，但解码失败: %v", err)
+	// 	return finalDBKey, finalValue, fmt.Errorf("Found key-value pair but decoding failed: %v", err)
 	// }
-	// finalValue = fmt.Sprintf("%s (解码: %s)", finalValue, decodedValue)
+	// finalValue = fmt.Sprintf("%s (Decode: %s)", finalValue, decodedValue)
 	return finalDBKey, finalValue, nil
 }
 
@@ -2633,69 +2633,69 @@ func hexToNibbles(h string) ([]byte, error) {
 }
 
 func findRecursive(path []byte, pos int, ps *pebblestore.PebbleStore) ([]byte, string, error) {
-	// fmt.Printf("递归步骤:\n")
-	// fmt.Printf("  - 当前已走路径 (逻辑): %x\n", path[:pos])
-	// fmt.Printf("  - 剩余待查路径: %x\n", path[pos:])
+	// fmt.Printf("Recursive step:\n")
+	// fmt.Printf("  - Current traversed path (logical): %x\n", path[:pos])
+	// fmt.Printf("  - Remaining path to query: %x\n", path[pos:])
 	if pos > len(path) {
-		// fmt.Println("  - 到达路径末尾，返回空结果")
-		return nil, "", fmt.Errorf("到达路径末尾，没有指定分支")
+		// fmt.Println("  - Reached end of path, returning empty result")
+		return nil, "", fmt.Errorf("Reached end of path without specifying branch")
 	}
 
 	dbKey := accountTrieNodeKey(path[:pos])
 
 	decode, err := hex.DecodeString(dbKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("无法解码数据库键 %s: %v", dbKey, err)
+		return nil, "", fmt.Errorf("Failed to decode database key %s: %v", dbKey, err)
 	}
 
 	value, err := ps.Get(decode)
 	if err != nil {
-		// fmt.Printf("无法从数据库中获取键 %s: %v\n", dbKey, err)
+		// fmt.Printf("Failed to retrieve key from database %s: %v\n", dbKey, err)
 		return findRecursive(path, pos+1, ps)
-		// return nil, "", fmt.Errorf("无法从数据库中获取键 %s: %v", dbKey, err)
+		// return nil, "", fmt.Errorf("Failed to retrieve key from database %s: %v", dbKey, err)
 	}
 
 	n, err := decodeNode(value)
 	if err != nil {
 		return nil, "", err
 	}
-	// fmt.Printf("  - 解码节点为: %T\n", n)
+	// fmt.Printf("  - Decode node as: %T\n", n)
 
 	switch node := n.(type) {
 	case *shortNode:
 		if !node.isLeaf {
-			// fmt.Printf("  - ShortNode不是叶子节点，继续查找...\n")
+			// fmt.Printf("  - ShortNode is not a leaf node, continue searching...\n")
 			if pos+len(node.Key) >= len(path) {
-				return nil, "", fmt.Errorf("到达ShortNode但路径已耗尽，没有指定分支,accountHash: %s", encodePath(path, true))
+				return nil, "", fmt.Errorf("Reached ShortNode but path exhausted, no branch specified,accountHash: %s", encodePath(path, true))
 			}
-			// 继续查找剩余路径
+			// Continue querying remaining path
 			return findRecursive(path, pos+len(node.Key), ps)
 		}
 		remainBytes := encodePath(path[pos:], true)
 		if _, isValue := node.Val.(valueNode); isValue && len(remainBytes) == len(node.Key) {
-			// fmt.Printf(" 节点key(字节) %x, 待查询的剩余路径 %x\n", node.Key, remainBytes)
-			// fmt.Println("  - ShortNode包含ValueNode，路径完全匹配。查找成功!")
+			// fmt.Printf(" Node key (bytes) %x, Remaining path to query %x\n", node.Key, remainBytes)
+			// fmt.Println("  - ShortNode contains ValueNode, path fully matched. Search successful!")
 
-			return path[:pos], "", nil //暂时不返回value
+			return path[:pos], "", nil //Temporarily not returning value
 			// return path[:pos], value, nil
 		}
 
 		if len(remainBytes) < len(node.Key) || !bytes.Equal(remainBytes[:len(node.Key)], node.Key) {
-			return nil, "", fmt.Errorf("路径不匹配: 节点key(字节) %x, 待查询的剩余路径  %x", node.Key, path[pos:])
+			return nil, "", fmt.Errorf("Path mismatch: Node key (bytes) %x, Remaining path to query  %x", node.Key, path[pos:])
 		}
-		// fmt.Printf("  - ShortNode匹配路径前缀(字节): %x\n", node.Key)
+		// fmt.Printf("  - ShortNode matches path prefix (bytes): %x\n", node.Key)
 		return findRecursive(path, pos+len(node.Key), ps)
 
 	case *fullNode:
 		if pos >= len(path) {
-			return nil, "", fmt.Errorf("到达FullNode但路径已耗尽，没有指定分支")
+			return nil, "", fmt.Errorf("Reached FullNode but path exhausted, no branch specified")
 		}
 		// nibble := path[pos]
-		// fmt.Printf("  - FullNode选择分支: %x\n", nibble)
+		// fmt.Printf("  - FullNode selects branch: %x\n", nibble)
 		return findRecursive(path, pos+1, ps)
 	}
 
-	return nil, "", fmt.Errorf("未知的节点类型或逻辑错误")
+	return nil, "", fmt.Errorf("Unknown node type or logic error")
 }
 
 func accountTrieNodeKey(path []byte) string {
@@ -2724,12 +2724,12 @@ func decodeNode(value []byte) (node, error) {
 	case 2:
 		keyBytes, ok := decoded[0].([]byte)
 		if !ok {
-			return nil, fmt.Errorf("无效的shortNode键类型")
+			return nil, fmt.Errorf("Invalid shortNode key type")
 		}
 
 		_, isLeaf := decodePath(keyBytes)
 
-		// fmt.Printf("  - 解码为: shortNode (是叶子节点: %v)\n", isLeaf)
+		// fmt.Printf("  - Decoded as: shortNode (is leaf node: %v)\n", isLeaf)
 
 		var value node
 		switch v := decoded[1].(type) {
@@ -2746,17 +2746,17 @@ func decodeNode(value []byte) (node, error) {
 		return &shortNode{Key: keyBytes, Val: value, isLeaf: isLeaf}, nil
 
 	case 17:
-		// fmt.Println("  - 解码为: fullNode")
-		// 检查fullNode第17个元素是否有value
+		// fmt.Println("  - Decoded as: fullNode")
+		// Check if fullNode element 17 has value
 		if len(decoded) == 17 {
 			if val, ok := decoded[16].([]byte); ok && len(val) > 0 {
-				fmt.Printf("  - fullNode第17项为value: %x\n", val)
+				fmt.Printf("  - fullNode element 17 is value: %x\n", val)
 			}
 		}
 		return &fullNode{}, nil
 	}
 
-	return nil, fmt.Errorf("未知的节点编码格式，解码后长度为 %d", len(decoded))
+	return nil, fmt.Errorf("Unknown node encoding format, decoded length is %d", len(decoded))
 }
 
 func isHexBytes(data []byte) bool {
@@ -2775,11 +2775,11 @@ func isHexBytes(data []byte) bool {
 	return true
 }
 
-// encodePath 将 nibble 路径编码为压缩的字节数组
+// encodePath encodes nibble path to compressed byte array
 func encodePath(nibbles []byte, terminator bool) []byte {
 	oddLen := len(nibbles)%2 != 0
 
-	// 构造 prefix
+	// Construct prefix
 	var flags byte
 	if terminator {
 		flags |= 0x20
@@ -2790,11 +2790,11 @@ func encodePath(nibbles []byte, terminator bool) []byte {
 
 	var encoded []byte
 	if oddLen {
-		// 前缀低4位放入第一个 nibble
+		// Put lower 4 bits of prefix into first nibble
 		prefix := flags | (nibbles[0] & 0x0F)
 		encoded = append([]byte{prefix}, packNibbles(nibbles[1:])...)
 	} else {
-		// 低4位为0
+		// Lower 4 bits are 0
 		prefix := flags
 		encoded = append([]byte{prefix}, packNibbles(nibbles)...)
 	}
@@ -2802,7 +2802,7 @@ func encodePath(nibbles []byte, terminator bool) []byte {
 	return encoded
 }
 
-// packNibbles 将 nibble 数组每两个合并成一个 byte
+// packNibbles merges every two nibbles into one byte
 func packNibbles(nibbles []byte) []byte {
 	out := make([]byte, (len(nibbles)+1)/2)
 	for i := 0; i < len(nibbles); i++ {
@@ -2815,7 +2815,7 @@ func packNibbles(nibbles []byte) []byte {
 	return out
 }
 
-// decodePath 将编码后的字节数组解码为 nibble 路径和 terminator 标志
+// decodePath decodes encoded byte array to nibble path and terminator flag
 func decodePath(encoded []byte) (nibbles []byte, terminator bool) {
 	if len(encoded) == 0 {
 		return nil, false
@@ -2828,7 +2828,7 @@ func decodePath(encoded []byte) (nibbles []byte, terminator bool) {
 	unpacked := unpackToNibbles(encoded[1:])
 
 	if oddLen {
-		// 低4位是第一个 nibble
+		// Lower 4 bits are first nibble
 		nibbles = append([]byte{prefix & 0x0F}, unpacked...)
 	} else {
 		nibbles = unpacked
@@ -2836,7 +2836,7 @@ func decodePath(encoded []byte) (nibbles []byte, terminator bool) {
 	return
 }
 
-// unpackToNibbles 将字节数组还原为 nibble 数组
+// unpackToNibbles restores byte array to nibble array
 func unpackToNibbles(bytes []byte) []byte {
 	nibbles := make([]byte, 0, len(bytes)*2)
 	for _, b := range bytes {
