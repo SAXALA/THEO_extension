@@ -313,9 +313,10 @@ func (f *accountFolderFilter) maybeContains(accountKey []byte) bool {
 }
 
 type storageGCJob struct {
-	folderPath  string
-	fileName    string
-	chunkBuffer *storageGCChunkBuffer
+	folderPath     string
+	fileName       string
+	chunkBuffer    *storageGCChunkBuffer
+	lastTagBlockID uint64
 }
 
 func (job storageGCJob) key() string {
@@ -6438,16 +6439,16 @@ func (db *PrefixDB) storagePathByFileID(fileID uint32) (path string, realID uint
 	return filepath.Join(db.storageDir, fmt.Sprintf("storage_%08d.dat", realID)), realID
 }
 
-func findForwardCommitTagEnd(payload []byte, targetBlockID uint64, allowLeadingPadding bool) (int64, bool) {
+func findLastForwardCommitTagEnd(payload []byte, allowLeadingPadding bool) (int64, bool) {
 	if allowLeadingPadding && len(payload) > 0 && payload[0] == 0 {
-		if end, ok := findForwardCommitTagEndFrom(payload, targetBlockID, 1); ok {
+		if end, ok := findLastForwardCommitTagEndFrom(payload, 1); ok {
 			return end, true
 		}
 	}
-	return findForwardCommitTagEndFrom(payload, targetBlockID, 0)
+	return findLastForwardCommitTagEndFrom(payload, 0)
 }
 
-func findForwardCommitTagEndFrom(payload []byte, targetBlockID uint64, start int) (int64, bool) {
+func findLastForwardCommitTagEndFrom(payload []byte, start int) (int64, bool) {
 	cursor := start
 	var end int64
 	found := false
@@ -6458,15 +6459,12 @@ func findForwardCommitTagEndFrom(payload []byte, targetBlockID uint64, start int
 		klen := int(readUint16BE(payload[cursor : cursor+2]))
 		vlen := int(readUint16BE(payload[cursor+2 : cursor+4]))
 		if klen == 0 && vlen == 0 {
-			blockID, ok := forwardCommitTagBlockID(payload, cursor)
-			if !ok {
+			if _, ok := forwardCommitTagBlockID(payload, cursor); !ok {
 				return end, found
 			}
 			cursor += commitTagRecordSize
-			if blockID <= targetBlockID {
-				end = int64(cursor)
-				found = true
-			}
+			end = int64(cursor)
+			found = true
 			continue
 		}
 		cursor += segmentedChunkEntryHeaderSize
@@ -6478,36 +6476,36 @@ func findForwardCommitTagEndFrom(payload []byte, targetBlockID uint64, start int
 	return end, found
 }
 
-func findChunkCommitTagEnd(payload []byte, targetBlockID uint64) (int64, bool) {
+func findLastChunkCommitTagEnd(payload []byte) (int64, bool) {
 	cursor := len(payload)
 	for cursor > 0 {
 		if cursor < segmentedChunkEntryHeaderSize {
-			return 0, false
+			break
 		}
 		footer := payload[cursor-segmentedChunkEntryHeaderSize : cursor]
 		klen := int(readUint16BE(footer[:2]))
 		vlen := int(readUint16BE(footer[2:4]))
 		if klen == 0 && vlen == 0 {
-			blockID, ok := chunkCommitTagBlockID(payload, cursor)
-			if !ok {
-				return 0, false
-			}
-			if blockID <= targetBlockID {
+			if _, ok := chunkCommitTagBlockID(payload, cursor); ok {
 				return int64(cursor), true
 			}
-			cursor -= commitTagRecordSize
-			continue
+			break
 		}
 		recordSize := segmentedChunkEntryHeaderSize + klen + vlen
 		if recordSize > cursor {
-			return 0, false
+			break
 		}
 		cursor -= recordSize
+	}
+	for cursor := len(payload); cursor >= commitTagRecordSize; cursor-- {
+		if blockID, ok := chunkCommitTagBlockID(payload, cursor); ok && blockID != 0 {
+			return int64(cursor), true
+		}
 	}
 	return 0, false
 }
 
-func trimFileAfterCommitTag(path string, targetBlockID uint64, chunkFormat bool, allowLeadingPadding bool) (bool, error) {
+func trimFileAfterLastCommitTag(path string, chunkFormat bool, allowLeadingPadding bool) (bool, error) {
 	payload, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
@@ -6517,9 +6515,9 @@ func trimFileAfterCommitTag(path string, targetBlockID uint64, chunkFormat bool,
 		ok  bool
 	)
 	if chunkFormat {
-		end, ok = findChunkCommitTagEnd(payload, targetBlockID)
+		end, ok = findLastChunkCommitTagEnd(payload)
 	} else {
-		end, ok = findForwardCommitTagEnd(payload, targetBlockID, allowLeadingPadding)
+		end, ok = findLastForwardCommitTagEnd(payload, allowLeadingPadding)
 	}
 	if !ok {
 		return false, nil
@@ -6543,7 +6541,7 @@ func (db *PrefixDB) TrimLogsAfterCommitTag(blockID uint64) error {
 		if err := db.accountFile.Sync(); err != nil {
 			return fmt.Errorf("sync account log before recovery trim: %w", err)
 		}
-		if _, err := trimFileAfterCommitTag(db.accountFile.Name(), blockID, false, true); err != nil {
+		if _, err := trimFileAfterLastCommitTag(db.accountFile.Name(), false, true); err != nil {
 			return fmt.Errorf("trim account log: %w", err)
 		}
 	}
@@ -6570,7 +6568,7 @@ func (db *PrefixDB) TrimLogsAfterCommitTag(blockID uint64) error {
 					continue
 				}
 				chunkPath := filepath.Join(path, chunkEntry.Name())
-				if _, trimErr := trimFileAfterCommitTag(chunkPath, blockID, true, false); trimErr != nil {
+				if _, trimErr := trimFileAfterLastCommitTag(chunkPath, true, false); trimErr != nil {
 					return fmt.Errorf("trim storage chunk %s: %w", chunkPath, trimErr)
 				}
 				db.removeCachedSegmentChunkEntries(path, chunkEntry.Name())
@@ -6581,7 +6579,7 @@ func (db *PrefixDB) TrimLogsAfterCommitTag(blockID uint64) error {
 		if n, _ := fmt.Sscanf(entry.Name(), "storage_%08d.dat", &fileID); n != 1 {
 			continue
 		}
-		trimmed, trimErr := trimFileAfterCommitTag(path, blockID, false, false)
+		trimmed, trimErr := trimFileAfterLastCommitTag(path, false, false)
 		if trimErr != nil {
 			return fmt.Errorf("trim storage log %s: %w", path, trimErr)
 		}
@@ -6911,6 +6909,14 @@ func (db *PrefixDB) readSegmentedChunkBufferToCache(buf []byte, accountKey []byt
 		footer := buf[cursor-segmentedChunkEntryHeaderSize : cursor]
 		klen := int(readUint16BE(footer[:2]))
 		vlen := int(readUint16BE(footer[2:4]))
+		if klen == 0 && vlen == 0 {
+			if _, ok := chunkCommitTagBlockID(buf, cursor); !ok {
+				failure.reason = "segment-chunk-corrupted"
+				return nil, failure
+			}
+			cursor -= commitTagRecordSize
+			continue
+		}
 		recordDataLen := klen + vlen
 		recordStart := cursor - segmentedChunkEntryHeaderSize - recordDataLen
 		if recordStart < 0 {
@@ -7041,17 +7047,21 @@ func (db *PrefixDB) stopStorageGCWorker() {
 }
 
 func (db *PrefixDB) isStorageGCIdle() bool {
+	queued, inFlight := db.storageGCStatus()
+	return queued == 0 && inFlight == 0
+}
+
+func (db *PrefixDB) storageGCStatus() (queued int, inFlight int) {
 	if db == nil {
-		return true
+		return 0, 0
 	}
-	queued := 0
 	if db.storageGCQueue != nil {
 		queued = len(db.storageGCQueue)
 	}
 	db.storageGCMu.Lock()
-	inFlight := len(db.storageGCInFlight)
+	inFlight = len(db.storageGCInFlight)
 	db.storageGCMu.Unlock()
-	return queued == 0 && inFlight == 0
+	return queued, inFlight
 }
 
 func (db *PrefixDB) maybeScheduleStorageGC(folderPath string, meta *segmentChunkMeta, backing *bufferLease, chunkData []byte) {
@@ -7085,6 +7095,11 @@ func (db *PrefixDB) maybeScheduleStorageGC(folderPath string, meta *segmentChunk
 		return
 	}
 	job := storageGCJob{folderPath: folderPath, fileName: meta.FileName}
+	if len(chunkData) > 0 {
+		job.lastTagBlockID, _ = lastChunkCommitTagBlockID(chunkData)
+	} else if backing != nil {
+		job.lastTagBlockID, _ = lastChunkCommitTagBlockID(backing.Bytes())
+	}
 	key := job.key()
 	db.storageGCMu.Lock()
 	if db.storageGCInFlight == nil {
@@ -7234,11 +7249,15 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 		lruBacked[job.fileName] = db.isReadSegmentChunkCached(folderPath, job.fileName)
 
 		var (
-			preloaded []kvPair
+			preloaded      []kvPair
+			lastTagBlockID = job.lastTagBlockID
 		)
 		backingIdx := uniqueIdx[u]
 		if chunkBuffers[backingIdx] != nil {
 			payload := chunkBuffers[backingIdx].Bytes()
+			if lastTagBlockID == 0 {
+				lastTagBlockID, _ = lastChunkCommitTagBlockID(payload)
+			}
 			kvCount, pErr := countChunkEntriesFromTail(payload)
 			if pErr == nil {
 				entries := borrowStorageEntries(kvCount)
@@ -7250,7 +7269,7 @@ func (db *PrefixDB) runStorageGCBatch(jobs []storageGCJob) error {
 			}
 		}
 
-		chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, nil)
+		chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, nil, lastTagBlockID)
 		if preloaded != nil {
 			releaseStorageEntries(preloaded)
 		}
@@ -7375,10 +7394,14 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 	nextOrd := maxOrd + 1
 
 	var (
-		preloaded []kvPair
+		preloaded      []kvPair
+		lastTagBlockID = job.lastTagBlockID
 	)
 	if job.chunkBuffer != nil {
 		payload := job.chunkBuffer.Bytes()
+		if lastTagBlockID == 0 {
+			lastTagBlockID, _ = lastChunkCommitTagBlockID(payload)
+		}
 		kvCount, err := countChunkEntriesFromTail(payload)
 		if err == nil {
 			entries := borrowStorageEntries(kvCount)
@@ -7390,7 +7413,7 @@ func (db *PrefixDB) runStorageGCJob(job storageGCJob) error {
 		}
 	}
 
-	chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, nil)
+	chunkMetas, nextOrd2, err := db.rewriteChunkWithDedupToNewFiles(folderPath, metas[idx], nil, nextOrd, preloaded, nil, lastTagBlockID)
 	if preloaded != nil {
 		releaseStorageEntries(preloaded)
 	}
@@ -7485,17 +7508,16 @@ func reserveChunkFileName(folderPath string, startOrdinal int) (name string, nex
 // rewriteChunkWithDedupToNewFiles rewrites a chunk with deduplication and splits by target size,
 // writing results into NEW chunk files (never overwriting meta.FileName). It returns the new metas
 // and the next suggested ordinal.
-func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segmentChunkMeta, additions []kvPair, startOrdinal int, existing []kvPair, backing *bufferLease) ([]segmentChunkMeta, int, error) {
+func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segmentChunkMeta, additions []kvPair, startOrdinal int, existing []kvPair, backing *bufferLease, lastTagBlockID uint64) ([]segmentChunkMeta, int, error) {
 	var err error
 	var bytesWritten uint64
-	var lastTagBlockID uint64
 	if existing == nil {
 		existing, backing, err = db.readSegmentChunkFileWithUsageByPathPreferCache(folderPath, meta.FileName, diskIOUsageStorageGC)
 		if err != nil {
 			return nil, startOrdinal, err
 		}
 	}
-	if backing != nil {
+	if lastTagBlockID == 0 && backing != nil {
 		lastTagBlockID, _ = lastChunkCommitTagBlockID(backing.Bytes())
 	}
 	if backing != nil {
@@ -7525,7 +7547,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 		}
 	}()
 
-	for idx, chunk := range chunks {
+	for _, chunk := range chunks {
 		name, next, rErr := reserveChunkFileName(folderPath, ordinal)
 		if rErr != nil {
 			err = rErr
@@ -7533,11 +7555,7 @@ func (db *PrefixDB) rewriteChunkWithDedupToNewFiles(folderPath string, meta segm
 		}
 		reserved = append(reserved, name)
 		ordinal = next
-		blockID := uint64(0)
-		if idx == len(chunks)-1 {
-			blockID = lastTagBlockID
-		}
-		chunkSize, _, wErr := db.writeChunkFileWithUsageAndPayload(folderPath, name, chunk, diskIOUsageStorageGC, false, blockID)
+		chunkSize, _, wErr := db.writeChunkFileWithUsageAndPayload(folderPath, name, chunk, diskIOUsageStorageGC, false, lastTagBlockID)
 		if wErr != nil {
 			err = wErr
 			return nil, startOrdinal, wErr
@@ -7795,13 +7813,26 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 			unlock()
 			continue
 		}
-		allEntries := make([]kvPair, 0)
-		var lastTagBlockID uint64
+		type taggedKVPair struct {
+			pair      kvPair
+			commitTag uint64
+		}
+		type taggedChunk struct {
+			entries   []kvPair
+			commitTag uint64
+		}
+		allEntries := make([]taggedKVPair, 0)
 		for _, meta := range metas {
 			entries, backing, err := db.readSegmentChunkFileWithUsageByPath(folderPath, meta.FileName, diskIOUsageStorageGC)
 			if err != nil {
 				unlock()
 				return err
+			}
+			var sourceTagBlockID uint64
+			if backing != nil {
+				if tagBlockID, ok := lastChunkCommitTagBlockID(backing.Bytes()); ok {
+					sourceTagBlockID = tagBlockID
+				}
 			}
 			for _, entry := range entries {
 				keyCopy := append([]byte(nil), entry.key...)
@@ -7809,39 +7840,68 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 				if entry.val != nil {
 					valCopy = append([]byte(nil), entry.val...)
 				}
-				allEntries = append(allEntries, kvPair{key: keyCopy, val: valCopy})
+				allEntries = append(allEntries, taggedKVPair{pair: kvPair{key: keyCopy, val: valCopy}, commitTag: sourceTagBlockID})
 			}
 			if backing != nil {
-				if tagBlockID, ok := lastChunkCommitTagBlockID(backing.Bytes()); ok {
-					lastTagBlockID = tagBlockID
-				}
 				backing.Release()
 			}
 		}
 
 		if len(allEntries) > 1 {
-			sortKVPairs(allEntries)
-			allEntries = dedupSortedKVPairs(allEntries)
+			sort.SliceStable(allEntries, func(i, j int) bool {
+				return bytes.Compare(allEntries[i].pair.key, allEntries[j].pair.key) < 0
+			})
+			out := allEntries[:0]
+			for i := 0; i < len(allEntries); {
+				j := i + 1
+				for j < len(allEntries) && bytes.Equal(allEntries[j].pair.key, allEntries[i].pair.key) {
+					j++
+				}
+				out = append(out, allEntries[j-1])
+				i = j
+			}
+			allEntries = out
 		}
 
 		updated := make([]segmentChunkMeta, 0, len(metas))
 		keep := make(map[string]struct{})
 		if len(allEntries) > 0 {
-			chunks := splitEntriesBySize(allEntries, db.segmentedChunkTargetSize())
+			chunks := make([]taggedChunk, 0, len(allEntries)/64+1)
+			limit := db.segmentedChunkTargetSize()
+			current := make([]kvPair, 0)
+			currentSize := 0
+			var currentTag uint64
+			flushChunk := func() {
+				if len(current) == 0 {
+					return
+				}
+				chunks = append(chunks, taggedChunk{entries: current, commitTag: currentTag})
+				current = nil
+				currentSize = 0
+				currentTag = 0
+			}
+			for _, entry := range allEntries {
+				entrySize := segmentedChunkEntryHeaderSize + len(entry.pair.key) + len(entry.pair.val)
+				if currentSize+entrySize > limit && len(current) > 0 {
+					flushChunk()
+				}
+				current = append(current, entry.pair)
+				currentSize += entrySize
+				if entry.commitTag > currentTag {
+					currentTag = entry.commitTag
+				}
+			}
+			flushChunk()
 			for i, chunk := range chunks {
 				fileName := chunkFileNameForOrdinal(uint32(i))
-				blockID := uint64(0)
-				if i == len(chunks)-1 {
-					blockID = lastTagBlockID
-				}
-				_, _, err := db.writeChunkFileWithUsageAndPayload(folderPath, fileName, chunk, diskIOUsageStorageGC, false, blockID)
+				_, _, err := db.writeChunkFileWithUsageAndPayload(folderPath, fileName, chunk.entries, diskIOUsageStorageGC, false, chunk.commitTag)
 				if err != nil {
 					unlock()
 					return err
 				}
 				updated = append(updated, segmentChunkMeta{
 					FileName: fileName,
-					KeyStart: cloneBytes(chunk[0].key),
+					KeyStart: cloneBytes(chunk.entries[0].key),
 				})
 				keep[fileName] = struct{}{}
 			}
@@ -7864,7 +7924,11 @@ func (db *PrefixDB) GCAllStorageChunkFiles() error {
 		}
 		db.refreshSegmentIndexCacheByPathLocked(folderPath, updated)
 		if accountKey, ok := db.managedAccountKeyForFolderPath(folderPath); ok {
-			db.syncStorageCacheEntries(accountKey, allEntries)
+			plainEntries := make([]kvPair, 0, len(allEntries))
+			for _, entry := range allEntries {
+				plainEntries = append(plainEntries, entry.pair)
+			}
+			db.syncStorageCacheEntries(accountKey, plainEntries)
 		}
 		unlock()
 	}

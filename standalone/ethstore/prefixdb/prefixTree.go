@@ -1321,17 +1321,15 @@ func (pt *PrefixTree) putIntoFileNode(fileID string, key []byte, accountOffset u
 	}})
 }
 
-func findNodeCommitTagEnd(payload []byte, targetBlockID uint64) (int64, bool) {
+func findLastNodeCommitTagEnd(payload []byte) (int64, bool) {
 	headerSize := binary.Size(FileNodeHeader{})
 	if len(payload) <= headerSize {
 		return 0, false
 	}
-	for cursor := len(payload); cursor >= headerSize+NodeEntrySize; cursor -= NodeEntrySize {
-		blockID, ok := nodeCommitTagBlockID(payload[cursor-NodeEntrySize : cursor])
-		if !ok {
-			continue
-		}
-		if blockID <= targetBlockID {
+	entryBytes := len(payload) - headerSize
+	cursor := headerSize + (entryBytes/NodeEntrySize)*NodeEntrySize
+	for ; cursor >= headerSize+NodeEntrySize; cursor -= NodeEntrySize {
+		if _, ok := nodeCommitTagBlockID(payload[cursor-NodeEntrySize : cursor]); ok {
 			return int64(cursor), true
 		}
 	}
@@ -1357,7 +1355,7 @@ func (pt *PrefixTree) TrimNodeFilesAfterCommitTag(blockID uint64) error {
 		if err != nil {
 			return err
 		}
-		end, ok := findNodeCommitTagEnd(payload, blockID)
+		end, ok := findLastNodeCommitTagEnd(payload)
 		if !ok || end >= int64(len(payload)) {
 			return nil
 		}

@@ -1295,9 +1295,9 @@ func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCou
 	}
 	if latestBlockID > 0 {
 		if err := store.TrimStateLogsAfterCommitTag(latestBlockID); err != nil {
-			return fmt.Errorf("failed to trim state logs after block %d commit tag: %w", latestBlockID, err)
+			return fmt.Errorf("failed to trim state logs after their last commit tags at block marker %d: %w", latestBlockID, err)
 		}
-		fmt.Printf("[recovery] state logs trimmed after commit tag block=%d\n", latestBlockID)
+		fmt.Printf("[recovery] state logs trimmed after per-log last commit tags, block marker=%d\n", latestBlockID)
 	} else if timings.StateStoreOpen > 0 {
 		fmt.Println("[recovery] state log trim skipped: latest block ID is 0")
 	}
