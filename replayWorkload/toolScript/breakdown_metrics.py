@@ -5,7 +5,7 @@ Output is CSV only, one row per main replay log. For each main log, this script
 extracts two breakdown groups from the log body:
 - BlockStore get breakdown [...]
 - PrefixDB TrieNodeStorage get breakdown [...]
-- EthStore TrieNodeStorage get breakdown [...]
+- Theo TrieNodeStorage get breakdown [...]
 
 Each breakdown line contributes six values:
 - cacheCount
@@ -41,7 +41,7 @@ from typing import Any
 
 BACKEND_RE = re.compile(r"^BACKEND=(.+)$")
 BREAKDOWN_RE = re.compile(
-    r"^(BlockStore get breakdown|PrefixDB TrieNodeStorage get breakdown|EthStore TrieNodeStorage get breakdown) "
+    r"^(BlockStore get breakdown|PrefixDB TrieNodeStorage get breakdown|Theo TrieNodeStorage get breakdown) "
     r"\[([^\]]+)\]:\s+"
     r"cacheCount=(\d+)\s+cacheTotal=([^\s]+)\s+cacheAvg=([^\s]+)\s+"
     r"noCacheCount=(\d+)\s+noCacheTotal=([^\s]+)\s+noCacheAvg=([^\s]+)\s*$"
@@ -227,7 +227,7 @@ def parse_log(path: Path) -> dict[str, Any]:
         result["warnings"].append("missing BlockStore breakdown lines")
     if not result["state_store"]:
         result["warnings"].append(
-            "missing PrefixDB/EthStore TrieNodeStorage breakdown lines"
+            "missing PrefixDB/Theo TrieNodeStorage breakdown lines"
         )
 
     return result

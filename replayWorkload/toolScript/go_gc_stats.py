@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute GCCount statistics from ethstore replay logs.
+"""Compute GCCount statistics from theo replay logs.
 
 Parses lines like:
     GCCount for folder 192218: 1
@@ -10,7 +10,7 @@ Aggregates counts per folder (sums if a folder appears multiple times), then pri
 - average per-folder GC count
 
 Usage:
-    python3 gc_stats.py path/to/ethstoreLog_*.log
+    python3 gc_stats.py path/to/theoLog_*.log
     python3 gc_stats.py path/to/*.log
 """
 
@@ -41,7 +41,7 @@ def parse_file(path: Path) -> dict[int, int]:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="GCCount stats from ethstore logs")
+    ap = argparse.ArgumentParser(description="GCCount stats from theo logs")
     ap.add_argument("files", nargs="+", help="log file(s) to parse")
     args = ap.parse_args(argv)
 

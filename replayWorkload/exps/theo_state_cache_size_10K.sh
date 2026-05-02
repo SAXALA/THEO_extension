@@ -15,7 +15,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 # Experiment 1:
-# - ethstore only
+# - theo only
 # - state-store only (PrefixDB-handled data types)
 # - cache trace only
 # - block window 20500000-20510000
@@ -23,8 +23,8 @@ fi
 # - cache sizes 16 MiB / 32 MiB / 64 MiB / 128 MiB / 256 MiB / 512 MiB
 
 DB_TYPE="prefixdb"
-ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
-BACKEND_CANDIDATES=(ethstore)
+THEO_PREFIXDB_PEBBLE_SOURCE_DIR="/mnt/gen3/theo-ssd-backup/index/accountHash_key_pebble"
+BACKEND_CANDIDATES=(theo)
 TRACE_FILE_CANDIDATES=(cache nocache)
 CACHE_SIZE_CANDIDATES=(4 8 16 32 64 128 256)
 CACHE_COUNT_CANDIDATES=(0)

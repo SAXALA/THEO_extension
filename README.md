@@ -1,4 +1,4 @@
-# EthStore
+# THEO
 
 ## Build
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract replay metrics from ethstore/pebble replay logs.
+"""Extract replay metrics from theo/pebble replay logs.
 
 Output is CSV only, one row per main replay log. For each main log, this script
 auto-detects the paired "*_io_*.log" file and computes:

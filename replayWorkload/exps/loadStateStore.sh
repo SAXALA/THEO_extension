@@ -34,7 +34,7 @@ state_dirname_for_size() {
 
 for state_store_size in "${state_store_sizes[@]}"; do
 	state_dirname=$(state_dirname_for_size "$state_store_size")
-	state_dir="${loaded_root}/ethstore/${state_dirname}"
+	state_dir="${loaded_root}/theo/${state_dirname}"
 	backup_dir="${state_dir}_bak"
 
 	echo "Load account data with CHUNK_FILE_SIZE_BYTES=${state_store_size}"

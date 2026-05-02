@@ -1,4 +1,4 @@
-package ethstore
+package theo
 
 import (
 	"bytes"

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package ethstore
+package theo
 
 import (
 	// For profiling
@@ -45,13 +45,13 @@ func (a keyValueStoreAdapter) Get(key []byte) ([]byte, error) {
 	return a.Database.Get(key, GetDataTypeFromKey(key))
 }
 
-func TestEthStore(t *testing.T) {
+func TestTheo(t *testing.T) {
 	t.Run("DatabaseSuite", func(t *testing.T) {
 		dbtest.TestDatabaseSuite(t, func() ethdb.KeyValueStore {
 			// Use a temporary directory for the database path
 			tempDir := t.TempDir() // Go 1.15+ feature for creating temp dirs
 
-			// Use the actual New constructor from ethstore.go
+			// Use the actual New constructor from theo.go
 			// Parameters for New: dirPath string, recentN int, namespace string, readonly bool
 			db, err := New(tempDir, 10, "testdb", false, 0, testPrefixCacheSizeBytes, 16)
 			if err != nil {
@@ -62,9 +62,9 @@ func TestEthStore(t *testing.T) {
 	})
 }
 
-func BenchmarkEthStore(b *testing.B) {
+func BenchmarkTheo(b *testing.B) {
 	dbtest.BenchDatabaseSuite(b, func() ethdb.KeyValueStore {
-		tempDir, err := os.MkdirTemp("", "ethstore_bench_")
+		tempDir, err := os.MkdirTemp("", "theo_bench_")
 		if err != nil {
 			b.Fatalf("Failed to create temp dir for benchmark: %v", err)
 		}
@@ -77,8 +77,8 @@ func BenchmarkEthStore(b *testing.B) {
 	})
 }
 
-// TestEthStore_Lifecycle tests the Open function and the lifecycle of the Database wrapper.
-func TestEthStore_Lifecycle(t *testing.T) {
+// TestTheo_Lifecycle tests the Open function and the lifecycle of the Database wrapper.
+func TestTheo_Lifecycle(t *testing.T) {
 	t.Run("OpenInMemoryAndWrap", func(t *testing.T) {
 		tempDir := t.TempDir()
 		// Call the actual New constructor
@@ -126,9 +126,9 @@ func TestEthStore_Lifecycle(t *testing.T) {
 	})
 }
 
-// TestEthStore_SpecificBlockOperations tests block-specific operations,
-// assuming your ethstore.Database struct has such methods (e.g., from blockStore.go logic).
-func TestEthStore_SpecificBlockOperations(t *testing.T) {
+// TestTheo_SpecificBlockOperations tests block-specific operations,
+// assuming your theo.Database struct has such methods (e.g., from blockStore.go logic).
+func TestTheo_SpecificBlockOperations(t *testing.T) {
 	tempDir := t.TempDir()
 	store, err := New(tempDir, 10, "specific_ops_test", false, 0, testPrefixCacheSizeBytes, 16) // Using temp dir
 	require.NoError(t, err)
@@ -136,7 +136,7 @@ func TestEthStore_SpecificBlockOperations(t *testing.T) {
 	defer store.Close() // Ensure the database is closed at the end
 
 	t.Run("StoreAndRetrieveBlock", func(t *testing.T) {
-		t.Log("Skipping TestEthStore_SpecificBlockOperations/StoreAndRetrieveBlock: Implement this test with actual block operation methods from ethstore.Database.")
+		t.Log("Skipping TestTheo_SpecificBlockOperations/StoreAndRetrieveBlock: Implement this test with actual block operation methods from theo.Database.")
 	})
 }
 
@@ -276,7 +276,7 @@ func TestAOLFutureBlockMissMapsToNotFound(t *testing.T) {
 	}
 }
 
-func TestEthStoreNewIteratorPassesStartToAOL(t *testing.T) {
+func TestTheoNewIteratorPassesStartToAOL(t *testing.T) {
 	tempDir := t.TempDir()
 	store, err := New(tempDir, 10, "iterator_start", false, 0, testPrefixCacheSizeBytes, 16)
 	require.NoError(t, err)

@@ -9,15 +9,15 @@ cd "$script_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | recovery(仅统计启动恢复开销) | gc(手动触发ethstore state db GC) | upgrade-index(升级 segment index 文件)
+# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | recovery(仅统计启动恢复开销) | gc(手动触发theo state db GC) | upgrade-index(升级 segment index 文件)
 ACTIONS="load load-account load-storage restore replay recovery gc upgrade-index"
-# 后端类型: ethstore | chainkv | pebble | prefixdb | all(依次执行前三者)
-BACKENDS="ethstore chainkv pebble prefixdb all"
+# 后端类型: theo | aol | chainkv | pebble | prefixdb | all(依次执行 theo/chainkv/pebble)
+BACKENDS="theo aol chainkv pebble prefixdb all"
 
 # 位置参数1: ACTION，可选值见 ACTIONS，默认 replay
 ACTION="${1:-replay}"
-# 位置参数2: BACKEND，可选值见 BACKENDS，默认 ethstore
-BACKEND="${2:-${WORKLOAD_BACKEND:-ethstore}}"
+# 位置参数2: BACKEND，可选值见 BACKENDS，默认 theo
+BACKEND="${2:-${WORKLOAD_BACKEND:-theo}}"
 if [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
     BACKEND="${2:-prefixdb}"
 fi
@@ -31,9 +31,9 @@ END_BLOCK_ID="${END_BLOCK_ID:-20550000}"
 COMMIT_BLOCK_INTERVAL="${COMMIT_BLOCK_INTERVAL:-1}"
 # trace 文件类型，可选值: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
-# 仅对 ethstore/pebble 回放生效；可选值: all | aol | prefixdb | pebble
+# 仅对 theo/pebble 回放生效；可选值: all | aol | prefixdb | pebble
 DB_TYPE="${DB_TYPE:-all}"
-# ethstore 回放参数，storage chunk cache 数量
+# theo 回放参数，storage chunk cache 数量
 CACHE_COUNT="${CACHE_COUNT:-32}"
 # PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
@@ -51,9 +51,9 @@ SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
 DEFAULT_GC_WORKERS=128
 GC_WORKERS="${GC_WORKERS:-$DEFAULT_GC_WORKERS}"
 
-# ethstore load 参数: chunk 文件大小（KiB），如 4096/8192/16384
+# theo load 参数: chunk 文件大小（KiB），如 4096/8192/16384
 CHUNK_FILE_SIZE_BYTES="${CHUNK_FILE_SIZE_BYTES:-16384}"
-# ethstore 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
+# theo 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
 TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-512}"
 
 # Keep byte conversions for logging only; Go now receives MiB and converts internally.
@@ -108,8 +108,8 @@ LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT=$(resolve_mount_point_from_path "$RUNNING_ROOT")
 
-# ethstore statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb32KB | database_statedb64KB | database_statedb256KB
-calculate_default_ethstore_statedb_dirname() {
+# theo statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb32KB | database_statedb64KB | database_statedb256KB
+calculate_default_theo_statedb_dirname() {
     case "$CHUNK_FILE_SIZE_BYTES" in
         4096) echo "database_statedb4KB" ;;
         8192) echo "database_statedb8KB" ;; # database_statedb8KB_0326_compressed
@@ -120,19 +120,19 @@ calculate_default_ethstore_statedb_dirname() {
         *) echo "Invalid CHUNK_FILE_SIZE_BYTES=${CHUNK_FILE_SIZE_BYTES}. Supported values: 4096, 8192, 16384, 32768, 65536, 262144" >&2; exit 1 ;;
     esac
 }
-ETHSTORE_STATEDB_DIRNAME="${ETHSTORE_STATEDB_DIRNAME:-$(calculate_default_ethstore_statedb_dirname)}"
+THEO_STATEDB_DIRNAME="${THEO_STATEDB_DIRNAME:-$(calculate_default_theo_statedb_dirname)}"
 
 # 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
-GC_STATE_DIR="${GC_STATE_DIR:-${LOADED_ROOT}/ethstore/${ETHSTORE_STATEDB_DIRNAME}}"
+GC_STATE_DIR="${GC_STATE_DIR:-${LOADED_ROOT}/theo/${THEO_STATEDB_DIRNAME}}"
 # segment index 升级目录：直接在该 statedb 目录执行，不进行复制
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
 # prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
 PREFIXDB_ACCOUNT_STATE_DIR="${PREFIXDB_ACCOUNT_STATE_DIR:-}"
-# ethstore prefixdb replay 可选专用 Pebble 源目录；仅在特定实验需要隔离 accountHash->accountKey 索引时使用
-ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="${ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
+# theo prefixdb replay 可选专用 Pebble 源目录；仅在特定实验需要隔离 accountHash->accountKey 索引时使用
+THEO_PREFIXDB_PEBBLE_SOURCE_DIR="${THEO_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
 
-# ethstore prefixdb 目录（用于权限预检查）
-ETHSTORE_PREFIXDB_DIR="${ETHSTORE_PREFIXDB_DIR:-${RUNNING_ROOT}/ethstore_state/prefixdb}"
+# theo prefixdb 目录（用于权限预检查）
+THEO_PREFIXDB_DIR="${THEO_PREFIXDB_DIR:-${RUNNING_ROOT}/theo_state/prefixdb}"
 
 log_date=$(date +%m-%d-%H-%M-%S)
 log_dir="./replayLog"
@@ -309,7 +309,7 @@ export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
 
 usage() {
     cat <<EOF
-Usage: $0 [load|load-account|load-storage|restore|replay|recovery|gc|upgrade-index] [ethstore|chainkv|pebble|prefixdb|all]
+Usage: $0 [load|load-account|load-storage|restore|replay|recovery|gc|upgrade-index] [theo|aol|chainkv|pebble|prefixdb|all]
 
 Current values:
   action=${ACTION}
@@ -327,10 +327,10 @@ Common env vars:
     CHUNK_FILE_SIZE_BYTES(bytes), TOTAL_CACHE_SIZE_MIB(MiB)
     CHAINKV_CACHE_MB, PEBBLE_CACHE_MB, CHAINKV_HANDLES, PEBBLE_HANDLES, PREFIXDB_HANDLES
     CHAINKV_STATE(true|false), CHAINKV_LOAD_LIMIT(0=unlimited)
-    LOADED_ROOT RUNNING_ROOT ETHSTORE_STATEDB_DIRNAME
+    LOADED_ROOT RUNNING_ROOT THEO_STATEDB_DIRNAME
     GC_STATE_DIR
     UPGRADE_STATE_DIR
-    ETHSTORE_PREFIXDB_DIR SUDO_PASSWD
+    THEO_PREFIXDB_DIR SUDO_PASSWD
     IDLE_OBSERVE_ENABLED IDLE_OBSERVE_INTERVAL_SECONDS IDLE_OBSERVE_MAX_SECONDS
     IDLE_OBSERVE_STABLE_WINDOWS IDLE_OBSERVE_MAX_DIRTY_KB
     REPLAY_CGROUP_IO_LIMIT_ENABLED(true|false)
@@ -341,13 +341,14 @@ Common env vars:
 
 Required by action/backend:
     restore: uses LOADED_ROOT as source and RUNNING_ROOT as target
-    load ethstore: ETHSTORE_PREFIXDB_DIR (default: RUNNING_ROOT/ethstore_state)
-    replay ethstore: when DB_TYPE=all/prefixdb, ETHSTORE_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
-    recovery ethstore: when DB_TYPE=all/prefixdb, ETHSTORE_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
-    load-account prefixdb: uses replay_config.json 中 loadedEthStoreDir/loadDataDir
+    load aol: only loads the theo append-only block store from aolDataFile
+    load theo: loads aol + prefixdb + pebble; THEO_PREFIXDB_DIR defaults to RUNNING_ROOT/theo_state
+    replay theo: when DB_TYPE=all/prefixdb, THEO_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
+    recovery theo: when DB_TYPE=all/prefixdb, THEO_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
+    load-account prefixdb: uses replay_config.json 中 loadedTheoDir/loadDataDir
     load-storage prefixdb: uses replay_config.json 中 loadDataDir/accountHashKeyPebbleDir，并要求 PREFIXDB_ACCOUNT_STATE_DIR
-    gc: backend must be ethstore, and GC_STATE_DIR must be provided
-    upgrade-index: backend must be ethstore, and UPGRADE_STATE_DIR must be provided
+    gc: backend must be theo, and GC_STATE_DIR must be provided
+    upgrade-index: backend must be theo, and UPGRADE_STATE_DIR must be provided
 EOF
 }
 
@@ -364,12 +365,12 @@ validate_inputs() {
     fi
 }
 
-ethstore_dbtype_needs_prefixdb() {
+theo_dbtype_needs_prefixdb() {
     [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]
 }
 
 validate_runtime_requirements() {
-    local needs_ethstore_prefixdb="false"
+    local needs_theo_prefixdb="false"
 
     if [ -z "$DISK_MOUNT_POINT" ]; then
         echo "无法根据 RUNNING_ROOT 推导挂载点: ${RUNNING_ROOT}"
@@ -377,16 +378,16 @@ validate_runtime_requirements() {
     fi
 
     if [ "$ACTION" = "load" ] || [ "$ACTION" = "replay" ] || [ "$ACTION" = "recovery" ]; then
-        if [ "$BACKEND" = "ethstore" ] || [ "$BACKEND" = "all" ]; then
-            if [ "$ACTION" = "load" ] || ethstore_dbtype_needs_prefixdb; then
-                needs_ethstore_prefixdb="true"
+        if [ "$BACKEND" = "theo" ] || [ "$BACKEND" = "all" ]; then
+            if [ "$ACTION" = "load" ] || theo_dbtype_needs_prefixdb; then
+                needs_theo_prefixdb="true"
             fi
         fi
     fi
 
-    if [ "$needs_ethstore_prefixdb" = "true" ]; then
-        if [ -z "$ETHSTORE_PREFIXDB_DIR" ]; then
-            echo "ethstore 的 load/replay/recovery 需要配置 ETHSTORE_PREFIXDB_DIR，当前为空。"
+    if [ "$needs_theo_prefixdb" = "true" ]; then
+        if [ -z "$THEO_PREFIXDB_DIR" ]; then
+            echo "theo 的 load/replay/recovery 需要配置 THEO_PREFIXDB_DIR，当前为空。"
             usage
             exit 1
         fi
@@ -403,8 +404,8 @@ validate_runtime_requirements() {
         fi
     fi
 
-    if [ "$ACTION" = "recovery" ] && [ "$BACKEND" != "ethstore" ]; then
-        echo "recovery 仅支持 ethstore backend（当前 BACKEND=${BACKEND}）"
+    if [ "$ACTION" = "recovery" ] && [ "$BACKEND" != "theo" ]; then
+        echo "recovery 仅支持 theo backend（当前 BACKEND=${BACKEND}）"
         exit 1
     fi
 
@@ -429,8 +430,8 @@ validate_runtime_requirements() {
         fi
     fi
 
-    if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "ethstore" ]; then
-        echo "${ACTION} 仅支持 ethstore backend（当前 BACKEND=${BACKEND}）"
+    if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "theo" ]; then
+        echo "${ACTION} 仅支持 theo backend（当前 BACKEND=${BACKEND}）"
         exit 1
     fi
     if [ "$ACTION" = "gc" ]; then
@@ -477,6 +478,8 @@ build_replay_binary() {
         exit 1
     fi
     mkdir -p ./bin
+    rm -f ./replayWorkload ./workload
+    find ./bin -maxdepth 1 -type f ! -name replayWorkload -delete
     # if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
     if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
         echo "构建 replayWorkload 失败，退出。"
@@ -699,10 +702,10 @@ observe_disk_idle() {
     echo "Idle observation reached max wait ${IDLE_OBSERVE_MAX_SECONDS}s; continue with latest device state" >&2
 }
 
-restore_ethstore_db() {
-    echo "Restore ethstore database..."
-    local src_root="${LOADED_ROOT}/ethstore"
-    local dst_prefix="${RUNNING_ROOT}/ethstore"
+restore_theo_db() {
+    echo "Restore theo database..."
+    local src_root="${LOADED_ROOT}/theo"
+    local dst_prefix="${RUNNING_ROOT}/theo"
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "aol" ]; then
         sudo_rsync_run -avP --delete "${src_root}/database_aol/" "${dst_prefix}_aol/"
         sudo_run chmod -R 777 "${dst_prefix}_aol/"
@@ -712,7 +715,7 @@ restore_ethstore_db() {
         sudo_run chmod -R 777 "${dst_prefix}_pebble/"
     fi
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]; then
-        sudo_rsync_run -avP --delete "${src_root}/${ETHSTORE_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
+        sudo_rsync_run -avP --delete "${src_root}/${THEO_STATEDB_DIRNAME}/" "${dst_prefix}_state/"
         sudo_run chmod -R 777 "${dst_prefix}_state/"
     fi
 }
@@ -729,21 +732,21 @@ restore_pebble_db() {
     sudo_run chmod -R 777 "${RUNNING_ROOT}/pebble/"
 }
 
-ensure_ethstore_permissions() {
-    if ! ethstore_dbtype_needs_prefixdb; then
+ensure_theo_permissions() {
+    if ! theo_dbtype_needs_prefixdb; then
         return 0
     fi
-    echo "Fix ethstore permissions (prefixdb)..."
+    echo "Fix theo permissions (prefixdb)..."
     # Ensure the lock directory exists and is writable to avoid LOCK permission denied.
-    sudo_run chmod -R 777 "${ETHSTORE_PREFIXDB_DIR}"
+    sudo_run chmod -R 777 "${THEO_PREFIXDB_DIR}"
 }
 
-ensure_ethstore_statedb_dirname() {
-    local src_state="${LOADED_ROOT}/ethstore/${ETHSTORE_STATEDB_DIRNAME}"
+ensure_theo_statedb_dirname() {
+    local src_state="${LOADED_ROOT}/theo/${THEO_STATEDB_DIRNAME}"
     if [ ! -d "${src_state}" ]; then
-        echo "Invalid ETHSTORE_STATEDB_DIRNAME=${ETHSTORE_STATEDB_DIRNAME}. Directory not found: ${src_state}"
-        echo "Available state dirs under ${LOADED_ROOT}/ethstore:"
-        ls -1d "${LOADED_ROOT}/ethstore"/database_statedb* 2>/dev/null || true
+        echo "Invalid THEO_STATEDB_DIRNAME=${THEO_STATEDB_DIRNAME}. Directory not found: ${src_state}"
+        echo "Available state dirs under ${LOADED_ROOT}/theo:"
+        ls -1d "${LOADED_ROOT}/theo"/database_statedb* 2>/dev/null || true
         exit 1
     fi
 }
@@ -782,80 +785,80 @@ resolve_pebble_loaded_dir() {
     esac
 }
 
-resolve_ethstore_pebble_loaded_dir() {
-    if [ "$DB_TYPE" = "prefixdb" ] && [ -n "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR" ]; then
-        printf "%s" "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR"
+resolve_theo_pebble_loaded_dir() {
+    if [ "$DB_TYPE" = "prefixdb" ] && [ -n "$THEO_PREFIXDB_PEBBLE_SOURCE_DIR" ]; then
+        printf "%s" "$THEO_PREFIXDB_PEBBLE_SOURCE_DIR"
         return 0
     fi
     case "$(normalize_trace_selector)" in
         cache|nocache_snap)
-            printf "%s" "${LOADED_ROOT}/ethstore/database_pebble"
+            printf "%s" "${LOADED_ROOT}/theo/database_pebble"
             ;;
         nocache)
-            printf "%s" "${LOADED_ROOT}/ethstore/database_pebble_without"
+            printf "%s" "${LOADED_ROOT}/theo/database_pebble_without"
             ;;
         *)
-            echo "Unsupported TRACE_FILE for ethstore pebble replay sync: ${TRACE_FILE}" >&2
+            echo "Unsupported TRACE_FILE for theo pebble replay sync: ${TRACE_FILE}" >&2
             exit 1
             ;;
     esac
 }
 
-sync_ethstore_loaded_to_running() {
-    local src_root="${LOADED_ROOT}/ethstore"
-    local dst_prefix="${RUNNING_ROOT}/ethstore"
+sync_theo_loaded_to_running() {
+    local src_root="${LOADED_ROOT}/theo"
+    local dst_prefix="${RUNNING_ROOT}/theo"
 
     local src_aol="${src_root}/database_aol"
     local src_pebble
-    src_pebble="$(resolve_ethstore_pebble_loaded_dir)"
-    local src_state="${src_root}/${ETHSTORE_STATEDB_DIRNAME}"
+    src_pebble="$(resolve_theo_pebble_loaded_dir)"
+    local src_state="${src_root}/${THEO_STATEDB_DIRNAME}"
 
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "aol" ]; then
         if [ ! -d "${src_aol}" ]; then
-            echo "ethstore source directory missing under ${src_root}: database_aol"
+            echo "theo source directory missing under ${src_root}: database_aol"
             exit 1
         fi
     fi
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "pebble" ]; then
         if [ ! -d "${src_pebble}" ]; then
-            echo "ethstore source directory missing under ${src_root}: database_pebble"
+            echo "theo source directory missing under ${src_root}: database_pebble"
             exit 1
         fi
     fi
     if [ "$DB_TYPE" = "all" ] || [ "$DB_TYPE" = "prefixdb" ]; then
-        ensure_ethstore_statedb_dirname
+        ensure_theo_statedb_dirname
         if [ ! -d "${src_state}" ]; then
-            echo "ethstore source directory missing under ${src_root}: ${ETHSTORE_STATEDB_DIRNAME}"
+            echo "theo source directory missing under ${src_root}: ${THEO_STATEDB_DIRNAME}"
             exit 1
         fi
         if [ ! -d "${src_pebble}" ]; then
-            echo "ethstore source directory missing under ${src_root}: $(basename "${src_pebble}")"
+            echo "theo source directory missing under ${src_root}: $(basename "${src_pebble}")"
             exit 1
         fi
     fi
 
     case "$DB_TYPE" in
         prefixdb)
-            echo "Sync ethstore state+pebble data: ${src_state} -> ${dst_prefix}_state, ${src_pebble} -> ${dst_prefix}_pebble"
+            echo "Sync theo state+pebble data: ${src_state} -> ${dst_prefix}_state, ${src_pebble} -> ${dst_prefix}_pebble"
             sudo_run mkdir -p "${dst_prefix}_state" "${dst_prefix}_pebble"
             sudo_rsync_run -avP --delete "${src_state}/" "${dst_prefix}_state/"
             sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
             sudo_run chmod -R 777 "${dst_prefix}_state" "${dst_prefix}_pebble"
             ;;
         aol)
-            echo "Sync ethstore block data: ${src_aol} -> ${dst_prefix}_aol"
+            echo "Sync theo block data: ${src_aol} -> ${dst_prefix}_aol"
             sudo_run mkdir -p "${dst_prefix}_aol"
             sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
             sudo_run chmod -R 777 "${dst_prefix}_aol"
             ;;
         pebble)
-            echo "Sync ethstore pebble data: ${src_pebble} -> ${dst_prefix}_pebble"
+            echo "Sync theo pebble data: ${src_pebble} -> ${dst_prefix}_pebble"
             sudo_run mkdir -p "${dst_prefix}_pebble"
             sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
             sudo_run chmod -R 777 "${dst_prefix}_pebble"
             ;;
         *)
-            echo "Sync ethstore data: ${src_root} -> ${dst_prefix}{_aol,_pebble,_state}"
+            echo "Sync theo data: ${src_root} -> ${dst_prefix}{_aol,_pebble,_state}"
             sudo_run mkdir -p "${dst_prefix}_aol" "${dst_prefix}_pebble" "${dst_prefix}_state"
             sudo_rsync_run -avP --delete "${src_aol}/" "${dst_prefix}_aol/"
             sudo_rsync_run -avP --delete "${src_pebble}/" "${dst_prefix}_pebble/"
@@ -896,8 +899,8 @@ sync_pebble_loaded_to_running() {
 sync_loaded_to_running_for_backend() {
     local backend="$1"
     case "$backend" in
-        ethstore)
-            sync_ethstore_loaded_to_running
+        theo)
+            sync_theo_loaded_to_running
             ;;
         chainkv)
             sync_chainkv_loaded_to_running
@@ -961,7 +964,7 @@ build_run_tag() {
         printf "%s" "${base_tag}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}${round_tag}${cgroup_tag}"
     elif [ "$backend" = "prefixdb" ]; then
         printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}${cgroup_tag}"
-    elif [ "$backend" = "ethstore" ]; then
+    elif [ "$backend" = "theo" ]; then
         printf "%s" "${base_tag}_cfs_${CHUNK_FILE_SIZE_BYTES}_tcs_${TOTAL_CACHE_SIZE_MIB}_pfh_${PREFIXDB_HANDLES}_pbc_${PEBBLE_CACHE_MB}_pbh_${PEBBLE_HANDLES}_cc_${CACHE_COUNT}_ngcr_${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD}_gcw_${GC_WORKERS}_sgct_${STORAGE_GC_THRESHOLD}_nfsc_${NODE_FILE_SORTED_COMPRESSION}_sic_${SEGMENT_INDEX_COMPRESSION}${round_tag}${cgroup_tag}"
     else
         printf "%s" "${base_tag}${round_tag}${cgroup_tag}"
@@ -982,15 +985,15 @@ print_param_snapshot() {
     printf 'DB_TYPE=%s\n' "$DB_TYPE"
     printf 'RUN_ROUND=%s\n' "$RUN_ROUND"
     printf 'RUN_ROUNDS=%s\n' "$RUN_ROUNDS"
-    printf 'ETHSTORE_PREFIXDB_DIR=%s\n' "$ETHSTORE_PREFIXDB_DIR"
+    printf 'THEO_PREFIXDB_DIR=%s\n' "$THEO_PREFIXDB_DIR"
     printf 'LOADED_ROOT=%s\n' "$LOADED_ROOT"
     printf 'RUNNING_ROOT=%s\n' "$RUNNING_ROOT"
     printf 'DISK_MOUNT_POINT=%s\n' "$DISK_MOUNT_POINT"
-    printf 'ETHSTORE_STATEDB_DIRNAME=%s\n' "$ETHSTORE_STATEDB_DIRNAME"
+    printf 'THEO_STATEDB_DIRNAME=%s\n' "$THEO_STATEDB_DIRNAME"
     printf 'GC_STATE_DIR=%s\n' "$GC_STATE_DIR"
     printf 'UPGRADE_STATE_DIR=%s\n' "$UPGRADE_STATE_DIR"
     printf 'PREFIXDB_ACCOUNT_STATE_DIR=%s\n' "$PREFIXDB_ACCOUNT_STATE_DIR"
-    printf 'ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR=%s\n' "$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR"
+    printf 'THEO_PREFIXDB_PEBBLE_SOURCE_DIR=%s\n' "$THEO_PREFIXDB_PEBBLE_SOURCE_DIR"
     printf 'IDLE_OBSERVE_ENABLED=%s\n' "$IDLE_OBSERVE_ENABLED"
     printf 'IDLE_OBSERVE_INTERVAL_SECONDS=%s\n' "$IDLE_OBSERVE_INTERVAL_SECONDS"
     printf 'IDLE_OBSERVE_MAX_SECONDS=%s\n' "$IDLE_OBSERVE_MAX_SECONDS"
@@ -1005,7 +1008,7 @@ print_param_snapshot() {
     printf 'REPLAY_CGROUP_READ_BPS_LIMIT=%s\n' "$REPLAY_CGROUP_READ_BPS_LIMIT"
     printf 'REPLAY_CGROUP_WRITE_BPS_LIMIT=%s\n' "$REPLAY_CGROUP_WRITE_BPS_LIMIT"
 
-    if [ "$snapshot_backend" = "ethstore" ]; then
+    if [ "$snapshot_backend" = "theo" ]; then
         printf 'CACHE_COUNT=%s\n' "$CACHE_COUNT"
         printf 'NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD=%s\n' "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD"
         printf 'GC_WORKERS=%s\n' "$GC_WORKERS"
@@ -1099,10 +1102,16 @@ run_load() {
     local log_file="./replayLog/${run_tag}_${log_date}.log"
     local io_file="./replayLog/${run_tag}_io_${log_date}.log"
     case "$backend" in
-        ethstore)
-            ensure_ethstore_permissions
+        theo)
+            ensure_theo_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode ld -backend ethstore -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
+                -mode ld -backend theo -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
+                -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
+                -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
+            ;;
+        aol)
+            run_and_monitor "$backend" "$log_file" "$io_file" \
+                -mode ld -backend aol -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
@@ -1177,8 +1186,8 @@ run_restore() {
         printf "\n"
 
     case "$backend" in
-        ethstore)
-            restore_ethstore_db
+        theo)
+            restore_theo_db
             ;;
         chainkv)
             restore_chainkv_db
@@ -1203,10 +1212,10 @@ run_replay() {
     local log_file="./replayLog/${run_tag}_${log_date}.log"
     local io_file="./replayLog/${run_tag}_io_${log_date}.log"
     case "$backend" in
-        ethstore)
-            ensure_ethstore_permissions
+        theo)
+            ensure_theo_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode re -backend ethstore -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
+                -mode re -backend theo -max-ops "$WORKLOAD_MAX_OPS" -db-type "$DB_TYPE" -trace-file "$TRACE_FILE" -cache-count "$CACHE_COUNT" \
                 -start-block-id "$START_BLOCK_ID" -end-block-id "$END_BLOCK_ID" -commit-block-interval "$COMMIT_BLOCK_INTERVAL" \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
@@ -1236,16 +1245,16 @@ run_recovery() {
     local log_file="./replayLog/${run_tag}_${log_date}.log"
     local io_file="./replayLog/${run_tag}_io_${log_date}.log"
     case "$backend" in
-        ethstore)
-            ensure_ethstore_permissions
+        theo)
+            ensure_theo_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode recovery -backend ethstore -db-type "$DB_TYPE" -cache-count "$CACHE_COUNT" \
+                -mode recovery -backend theo -db-type "$DB_TYPE" -cache-count "$CACHE_COUNT" \
                 -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" -pebble-cache "$PEBBLE_CACHE_MB" -pebble-handles "$PEBBLE_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "recovery 仅支持 ethstore backend"
+            echo "recovery 仅支持 theo backend"
             exit 1
             ;;
      esac
@@ -1259,16 +1268,16 @@ run_gc() {
     local io_file="./replayLog/${run_tag}_io_${log_date}.log"
 
     case "$backend" in
-        ethstore)
-            ensure_ethstore_permissions
+        theo)
+            ensure_theo_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode gc -backend ethstore -cache-count "$CACHE_COUNT" \
+                -mode gc -backend theo -cache-count "$CACHE_COUNT" \
                 -gc-state-dir "$GC_STATE_DIR" -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "gc 仅支持 ethstore backend"
+            echo "gc 仅支持 theo backend"
             exit 1
             ;;
     esac
@@ -1282,16 +1291,16 @@ run_upgrade_index() {
     local io_file="./replayLog/${run_tag}_io_${log_date}.log"
 
     case "$backend" in
-        ethstore)
-            ensure_ethstore_permissions
+        theo)
+            ensure_theo_permissions
             run_and_monitor "$backend" "$log_file" "$io_file" \
-                -mode upgrade-index -backend ethstore -upgrade-state-dir "$UPGRADE_STATE_DIR" \
+                -mode upgrade-index -backend theo -upgrade-state-dir "$UPGRADE_STATE_DIR" \
                 -cache-count "$CACHE_COUNT" -contract-chunk-file-size-bytes "$CHUNK_FILE_SIZE_BYTES" -total-cache-size-mib "$TOTAL_CACHE_SIZE_MIB" -prefixdb-handles "$PREFIXDB_HANDLES" \
                 -node-file-gc-unsorted-ratio-threshold "$NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD" -gc-workers "$GC_WORKERS" -storage-gc-threshold "$STORAGE_GC_THRESHOLD" \
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "upgrade-index 仅支持 ethstore backend"
+            echo "upgrade-index 仅支持 theo backend"
             exit 1
             ;;
     esac
@@ -1338,7 +1347,7 @@ main() {
     build_replay_binary
 
     if [ "$BACKEND" = "all" ]; then
-        for b in ethstore chainkv pebble; do
+        for b in theo chainkv pebble; do
             echo "==== ${ACTION} ${b} ===="
             run_action "$b"
         done

@@ -1,5 +1,5 @@
 // Package pebblestore provides the single authoritative PebbleDB-backed
-// key-value store implementation shared by the ethstore and prefixdb packages.
+// key-value store implementation shared by the theo and prefixdb packages.
 package pebblestore
 
 import (
@@ -34,7 +34,7 @@ const (
 )
 
 // PebbleStore is a PebbleDB-backed key-value store used both as an internal
-// component of ethstore (alongside AOL and PrefixDB) and as a standalone
+// component of theo (alongside AOL and PrefixDB) and as a standalone
 // baseline for comparison experiments.
 type PebbleStore struct {
 	fn             string

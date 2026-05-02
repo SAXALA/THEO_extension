@@ -900,7 +900,7 @@ type PrefixDB struct {
 	// storageBatcher enables BatchPut/BatchCommit for storage-only kvs.
 	storageBatch *storageBatcher
 	// ParentKeyResolver, when set, is used to resolve a parent account key from
-	// a storage key. It is intended to be set by the owning `ethstore.Database`
+	// a storage key. It is intended to be set by the owning `theo.Database`
 	// so that PrefixDB can defer resolution to the higher-level store.
 	ParentKeyResolver func([]byte) []byte
 	// for debug

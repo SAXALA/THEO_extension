@@ -11,17 +11,17 @@ cd "$workload_dir" || exit 1
 set -Eeuo pipefail
 
 # 用法:
-#   ./loadPebbleWithSnapshot.sh [chainkv|pebble|all]
+#   ./loadWithoutSnapshot.sh [chainkv|pebble|theoPebble|all]
 # 示例:
-#   ./loadPebbleWithSnapshot.sh all
-#   ./loadPebbleWithSnapshot.sh chainkv
+#   ./loadWithoutSnapshot.sh all
+#   ./loadWithoutSnapshot.sh chainkv
 
 BACKEND="${1:-all}"
-VALID_BACKENDS="chainkv pebble all"
+VALID_BACKENDS="chainkv pebble theoPebble all"
 
 if [[ " ${VALID_BACKENDS} " != *" ${BACKEND} "* ]]; then
 	echo "Invalid backend: ${BACKEND}"
-	echo "Usage: $0 [chainkv|pebble|all]"
+	echo "Usage: $0 [chainkv|pebble|theoPebble|all]"
 	exit 1
 fi
 
@@ -72,28 +72,40 @@ normalize_chainkv_state_flag
 
 build_binary() {
 	mkdir -p ./bin
+	rm -f ./replayWorkload ./workload
+	find ./bin -maxdepth 1 -type f ! -name replayWorkload -delete
 	go mod download
 	GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go
 }
 
-run_chainkv_with_snapshot() {
-	echo "==== load chainkv (with snapshots) ===="
+run_chainkv_without_snapshot() {
+	echo "==== load chainkvWithoutSnapshots ===="
 	./bin/replayWorkload \
 		-config "$CONFIG_PATH" \
 		-mode ld \
-		-backend chainkv \
+		-backend chainkvWithoutSnapshots \
 		-ckv-cache "$CHAINKV_CACHE_MB" \
 		-ckv-handles "$CHAINKV_HANDLES" \
 		-ckv-state "$CHAINKV_STATE" \
 		-ckv-limit "$CHAINKV_LOAD_LIMIT"
 }
 
-run_pebble_with_snapshot() {
-	echo "==== load pebble (with snapshots) ===="
+run_pebble_without_snapshot() {
+	echo "==== load pebbleWithoutSnapshots ===="
 	./bin/replayWorkload \
 		-config "$CONFIG_PATH" \
 		-mode ld \
-		-backend pebble \
+		-backend pebbleWithoutSnapshots \
+		-pebble-cache "$PEBBLE_CACHE_MB" \
+		-pebble-handles "$PEBBLE_HANDLES"
+}
+
+run_theo_pebble_without_snapshot() {
+	echo "==== load theoPebbleWithoutSnapshots ===="
+	./bin/replayWorkload \
+		-config "$CONFIG_PATH" \
+		-mode ld \
+		-backend theoPebbleWithoutSnapshots \
 		-pebble-cache "$PEBBLE_CACHE_MB" \
 		-pebble-handles "$PEBBLE_HANDLES"
 }
@@ -103,14 +115,18 @@ main() {
 
 	case "$BACKEND" in
 		pebble)
-			run_pebble_with_snapshot
+			run_pebble_without_snapshot
 			;;
-		chainkv)
-			run_chainkv_with_snapshot
+		theoPebble)
+			run_theo_pebble_without_snapshot
+			;;
+        chainkv)
+			run_chainkv_without_snapshot
 			;;
 		all)
-			run_pebble_with_snapshot
-			run_chainkv_with_snapshot
+			run_pebble_without_snapshot
+            run_chainkv_without_snapshot
+			run_theo_pebble_without_snapshot
 			;;
 	esac
 }

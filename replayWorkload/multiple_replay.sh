@@ -12,12 +12,12 @@ cd "$script_dir" || exit 1
 # Usage:
 #   ./multiple_replay.sh [action] [backend|all] [trace-file|all] [config-script]
 # Examples:
-#   ./multiple_replay.sh replay ethstore nocache_snap
-#   ./multiple_replay.sh recovery ethstore
+#   ./multiple_replay.sh replay theo nocache_snap
+#   ./multiple_replay.sh recovery theo
 #   ./multiple_replay.sh replay all all
-#   TEST_RUN_ROUNDS=3 ./multiple_replay.sh replay ethstore nocache_snap
+#   TEST_RUN_ROUNDS=3 ./multiple_replay.sh replay theo nocache_snap
 #   ./multiple_replay.sh load-account prefixdb all ./my_experiment.sh
-#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/ethstore/database_statedb8KB \
+#   PREFIXDB_ACCOUNT_STATE_DIR=/mnt/ssd2/loaded/theo/database_statedb8KB \
 #     ./multiple_replay.sh load-storage prefixdb all ./my_experiment.sh
 
 ACTION="${1:-replay}"
@@ -28,17 +28,17 @@ CONFIG_SCRIPT="${4:-}"
 DB_TYPE="${DB_TYPE:-all}"
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
 TEST_RUN_ROUNDS="${TEST_RUN_ROUNDS:-5}"
-ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="${ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
+THEO_PREFIXDB_PEBBLE_SOURCE_DIR="${THEO_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
 
 # Fill these arrays with candidate values (MiB / count).
 CACHE_SIZE_CANDIDATES=(16)      # e.g. 64 256
 CACHE_COUNT_CANDIDATES=(0)      # e.g. 64
 COMMIT_BLOCK_INTERVAL_CANDIDATES=(1)
-BACKEND_CANDIDATES=(ethstore)   # pebble ethstore chainkv
+BACKEND_CANDIDATES=(theo)   # pebble theo chainkv
 TRACE_FILE_CANDIDATES=(cache)        # cache nocache_snap nocache
 REPLAY_CGROUP_CASE_CANDIDATES=(false)
 
-# Chunk file size candidates in bytes (used by ethstore/prefixdb).
+# Chunk file size candidates in bytes (used by theo/prefixdb).
 CHUNK_FILE_SIZE_BYTES_CANDIDATES=(16384)
 
 # Replay block windows in start:end form.
@@ -112,7 +112,7 @@ usage() {
 Usage: $0 [action] [backend|all] [trace-file|all] [config-script]
 
 action:       load | load-account | load-storage | restore | replay | recovery | gc  (default: replay)
-backend:      ethstore | chainkv | pebble | all            (default: all when omitted)
+backend:      theo | chainkv | pebble | all            (default: all when omitted)
 trace-file:   cache | nocache | nocache_snap | all         (default: all for replay)
 config-script path to a bash script that defines experiment arrays
 		      (optional; when omitted, built-in defaults are used)
@@ -217,7 +217,7 @@ resolve_backend_cache_mib() {
 resolve_cache_count_candidates() {
 	local backend="$1"
 	case "$backend" in
-		ethstore)
+		theo)
 			printf '%s\n' "${CACHE_COUNT_CANDIDATES[@]}"
 			;;
 		*)
@@ -237,7 +237,7 @@ resolve_replay_cgroup_cases() {
 resolve_chunk_file_size_candidates() {
 	local backend="$1"
 	case "$backend" in
-		ethstore|prefixdb)
+		theo|prefixdb)
 			printf '%s\n' "${CHUNK_FILE_SIZE_BYTES_CANDIDATES[@]}"
 			;;
 		*)
@@ -350,14 +350,14 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 
 								for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
 									run_idx=$((run_idx + 1))
-									if [ "$backend" = "ethstore" ]; then
+									if [ "$backend" = "theo" ]; then
 										echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file BLOCK_RANGE=${start_block_id}-${end_block_id} CHUNK_FILE_SIZE_BYTES=${chunk_file_size_bytes} TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
 										TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
 										CACHE_COUNT="$cache_count" \
 										COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
 										TRACE_FILE="$trace_file" \
 										DB_TYPE="$DB_TYPE" \
-										ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR="$ETHSTORE_PREFIXDB_PEBBLE_SOURCE_DIR" \
+										THEO_PREFIXDB_PEBBLE_SOURCE_DIR="$THEO_PREFIXDB_PEBBLE_SOURCE_DIR" \
 										WORKLOAD_MAX_OPS="$WORKLOAD_MAX_OPS" \
 										CHUNK_FILE_SIZE_BYTES="$chunk_file_size_bytes" \
 										START_BLOCK_ID="$start_block_id" \

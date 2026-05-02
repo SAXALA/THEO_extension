@@ -1,4 +1,4 @@
-package ethstore
+package theo
 
 import (
 	"bytes"
@@ -680,8 +680,8 @@ func (d *Database) PutWithDataType(key []byte, value []byte, dataType DataType) 
 		return fmt.Errorf("Pebble store is not initialized, cannot store non-AOL key %x (type %s)", key, DataTypeStrings[dataType])
 	}
 
-	// fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
-	// fmt.Printf("EthStore.Put Pebble: key=%x\n", key)
+	// fmt.Printf("Theo.Put Pebble: key=%x\n", key)
+	// fmt.Printf("Theo.Put Pebble: key=%x\n", key)
 	err := d.pebble.Put(key, value)
 
 	if err != nil {
@@ -959,7 +959,7 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 
 // NewPebbleIterator creates an iterator using the underlying Pebble store directly.
 // This is useful for replay workloads that want to exercise Pebble iterator behavior
-// and intentionally bypass EthStore's higher-level routing (e.g., AOL-specific iterators).
+// and intentionally bypass Theo's higher-level routing (e.g., AOL-specific iterators).
 func (d *Database) NewPebbleIterator(prefix []byte, start []byte) ethdb.Iterator {
 	d.quitLock.RLock()
 	defer d.quitLock.RUnlock()
@@ -1017,7 +1017,7 @@ func (d *Database) Stat() (string, error) {
 	if d.closed {
 		return "", ErrClosed
 	}
-	return fmt.Sprintf("ethstore(path=%s, recentN=%d)", d.fn, 0), nil
+	return fmt.Sprintf("theo(path=%s, recentN=%d)", d.fn, 0), nil
 }
 
 // Compact flattens the underlying data store for the given key range.
@@ -1131,7 +1131,7 @@ func (d *Database) printTrieNodeStorageGetBreakdown() {
 	if noCacheCount > 0 {
 		noCacheAvgMicros = float64(noCacheNanos) / float64(noCacheCount) / 1000.0
 	}
-	fmt.Printf("EthStore TrieNodeStorage get breakdown [account-hash->account-path]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+	fmt.Printf("Theo TrieNodeStorage get breakdown [account-hash->account-path]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
 		cacheCountNum,
 		time.Duration(cacheNanos),
 		cacheAvgMicros,

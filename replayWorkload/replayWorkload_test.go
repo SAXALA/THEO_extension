@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
-	ethstore "theo.local/THEO"
+	theo "theo.local/THEO"
 	datatypepkg "theo.local/THEO/datatype"
 	"theo.local/THEO/pebblestore"
 	prefixdb "theo.local/THEO/prefixdb"
@@ -25,26 +25,26 @@ type fakeReplayBackend struct {
 	gets    [][]byte
 	commits int
 	dirty   bool
-	getFunc func([]byte, ethstore.DataType) ([]byte, error)
+	getFunc func([]byte, theo.DataType) ([]byte, error)
 }
 
 func (b *fakeReplayBackend) Name() string { return "fake" }
 
-func (b *fakeReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
+func (b *fakeReplayBackend) Get(key []byte, dataType theo.DataType) ([]byte, error) {
 	b.gets = append(b.gets, append([]byte(nil), key...))
 	if b.getFunc != nil {
 		return b.getFunc(key, dataType)
 	}
-	return nil, ethstore.ErrNotFound
+	return nil, theo.ErrNotFound
 }
 
-func (b *fakeReplayBackend) StagePut(key, _ []byte, _ ethstore.DataType) error {
+func (b *fakeReplayBackend) StagePut(key, _ []byte, _ theo.DataType) error {
 	b.puts = append(b.puts, append([]byte(nil), key...))
 	b.dirty = true
 	return nil
 }
 
-func (b *fakeReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
+func (b *fakeReplayBackend) StageDelete(key []byte, _ theo.DataType) error {
 	b.deletes = append(b.deletes, append([]byte(nil), key...))
 	b.dirty = true
 	return nil
@@ -102,7 +102,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-outCh
 }
 
-func TestDescribeEthstoreOpenedStores(t *testing.T) {
+func TestDescribeTheoOpenedStores(t *testing.T) {
 	tests := []struct {
 		name   string
 		dbType DBType
@@ -116,8 +116,8 @@ func TestDescribeEthstoreOpenedStores(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := describeEthstoreOpenedStores(tt.dbType); got != tt.want {
-				t.Fatalf("describeEthstoreOpenedStores(%v) = %q, want %q", tt.dbType, got, tt.want)
+			if got := describeTheoOpenedStores(tt.dbType); got != tt.want {
+				t.Fatalf("describeTheoOpenedStores(%v) = %q, want %q", tt.dbType, got, tt.want)
 			}
 		})
 	}
@@ -152,7 +152,7 @@ func (s *fakeGetterStore) Get(key []byte) ([]byte, error) {
 		return nil, s.err
 	}
 	if s.value == nil {
-		return nil, ethstore.ErrNotFound
+		return nil, theo.ErrNotFound
 	}
 	ret := make([]byte, len(s.value))
 	copy(ret, s.value)
@@ -182,14 +182,14 @@ func makeAOLTestKey(block uint64) []byte {
 	return key
 }
 
-func TestEthstoreReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) {
-	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+func TestTheoReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) {
+	backend, err := newTheoReplayBackend(filepath.Join(t.TempDir(), "theo"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
-		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+		t.Fatalf("newTheoReplayBackend failed: %v", err)
 	}
 	defer backend.Close()
 
-	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), ethstore.HeaderDataType); err != nil {
+	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), theo.HeaderDataType); err != nil {
 		t.Fatalf("StagePut failed: %v", err)
 	}
 	if backend.prefixdbDirty {
@@ -197,14 +197,14 @@ func TestEthstoreReplayBackendAOLStagePutDoesNotMarkPrefixDBDirty(t *testing.T) 
 	}
 }
 
-func TestEthstoreReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.T) {
-	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+func TestTheoReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.T) {
+	backend, err := newTheoReplayBackend(filepath.Join(t.TempDir(), "theo"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
-		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+		t.Fatalf("newTheoReplayBackend failed: %v", err)
 	}
 	defer backend.Close()
 
-	if err := backend.StageDelete(makeAOLTestKey(1), ethstore.HeaderDataType); err != nil {
+	if err := backend.StageDelete(makeAOLTestKey(1), theo.HeaderDataType); err != nil {
 		t.Fatalf("StageDelete failed: %v", err)
 	}
 	if backend.prefixdbDirty {
@@ -212,27 +212,27 @@ func TestEthstoreReplayBackendAOLStageDeleteDoesNotMarkPrefixDBDirty(t *testing.
 	}
 }
 
-func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
-	baseDir := filepath.Join(t.TempDir(), "ethstore")
-	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)
+func TestNewTheoReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "theo")
+	brokenAOLDataPath := filepath.Join(baseDir+"_aol", theo.BlockdataFileName)
 	if err := os.MkdirAll(brokenAOLDataPath, 0o755); err != nil {
 		t.Fatalf("create broken AOL path failed: %v", err)
 	}
 
-	backend, err := newEthstoreReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	backend, err := newTheoReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("expected prefixdb replay backend to skip AOL init, got %v", err)
 	}
 	defer backend.Close()
 
 	accountKey := append([]byte{'A'}, bytes.Repeat([]byte{0x11}, 32)...)
-	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+	if err := backend.StagePut(accountKey, []byte("account"), theo.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut account failed: %v", err)
 	}
 	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
-	got, err := backend.Get(accountKey, ethstore.TrieNodeAccountDataType)
+	got, err := backend.Get(accountKey, theo.TrieNodeAccountDataType)
 	if err != nil {
 		t.Fatalf("Get account failed: %v", err)
 	}
@@ -241,15 +241,15 @@ func TestNewEthstoreReplayBackendPrefixDBSkipsAOLInitialization(t *testing.T) {
 	}
 }
 
-func TestEthstoreReplayBackendStateOnlyCommitAdvancesBlockMarker(t *testing.T) {
-	backend, err := newEthstoreReplayBackend(filepath.Join(t.TempDir(), "ethstore"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+func TestTheoReplayBackendStateOnlyCommitAdvancesBlockMarker(t *testing.T) {
+	backend, err := newTheoReplayBackend(filepath.Join(t.TempDir(), "theo"), allDBTypes, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
-		t.Fatalf("newEthstoreReplayBackend failed: %v", err)
+		t.Fatalf("newTheoReplayBackend failed: %v", err)
 	}
 	defer backend.Close()
 
 	accountKey := append([]byte{'A'}, bytes.Repeat([]byte{0x12}, 32)...)
-	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+	if err := backend.StagePut(accountKey, []byte("account"), theo.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut account failed: %v", err)
 	}
 	if err := backend.CommitBlock(7); err != nil {
@@ -261,8 +261,8 @@ func TestEthstoreReplayBackendStateOnlyCommitAdvancesBlockMarker(t *testing.T) {
 }
 
 func TestRunRecoveryReportsStartupTimingsAndSkipsReplay(t *testing.T) {
-	baseDir := filepath.Join(t.TempDir(), "ethstore")
-	cfg := replayConfig{EthStoreDir: baseDir}
+	baseDir := filepath.Join(t.TempDir(), "theo")
+	cfg := replayConfig{TheoDir: baseDir}
 
 	output := captureStdout(t, func() {
 		if err := runRecovery(cfg, allDBTypes, 16, 0, 16, 0, 16, 16, 0, 0, 0, false, false); err != nil {
@@ -271,7 +271,7 @@ func TestRunRecoveryReportsStartupTimingsAndSkipsReplay(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"[ethstore] opened stores: all",
+		"[theo] opened stores: all",
 		"[recovery] pebbledb startup=",
 		"[recovery] state store startup=",
 		"[recovery] block store startup=",
@@ -321,9 +321,9 @@ func TestFullReadRegularFilesReadsRegularFiles(t *testing.T) {
 	}
 }
 
-func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *testing.T) {
-	baseDir := filepath.Join(t.TempDir(), "ethstore")
-	brokenAOLDataPath := filepath.Join(baseDir+"_aol", ethstore.BlockdataFileName)
+func TestNewTheoReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "theo")
+	brokenAOLDataPath := filepath.Join(baseDir+"_aol", theo.BlockdataFileName)
 	if err := os.MkdirAll(brokenAOLDataPath, 0o755); err != nil {
 		t.Fatalf("create broken AOL path failed: %v", err)
 	}
@@ -344,23 +344,23 @@ func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *te
 		t.Fatalf("close auxiliary pebble failed: %v", err)
 	}
 
-	backend, err := newEthstoreReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	backend, err := newTheoReplayBackend(baseDir, PrefixDB, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("expected prefixdb replay backend to open with sibling pebble, got %v", err)
 	}
 	defer backend.Close()
 
-	if err := backend.StagePut(accountKey, []byte("account"), ethstore.TrieNodeAccountDataType); err != nil {
+	if err := backend.StagePut(accountKey, []byte("account"), theo.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut account failed: %v", err)
 	}
-	if err := backend.StagePut(storageKey, []byte("storage"), ethstore.TrieNodeStorageDataType); err != nil {
+	if err := backend.StagePut(storageKey, []byte("storage"), theo.TrieNodeStorageDataType); err != nil {
 		t.Fatalf("StagePut storage failed: %v", err)
 	}
 	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
 
-	got, err := backend.Get(storageKey, ethstore.TrieNodeStorageDataType)
+	got, err := backend.Get(storageKey, theo.TrieNodeStorageDataType)
 	if err != nil {
 		t.Fatalf("Get storage failed: %v", err)
 	}
@@ -369,8 +369,8 @@ func TestNewEthstoreReplayBackendPrefixDBUsesPebbleForStorageAccountLookup(t *te
 	}
 }
 
-func TestNewEthstoreReplayBackendAOLSkipsStateAndPebbleInitialization(t *testing.T) {
-	baseDir := filepath.Join(t.TempDir(), "ethstore")
+func TestNewTheoReplayBackendAOLSkipsStateAndPebbleInitialization(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), "theo")
 	brokenStatePath := filepath.Join(baseDir+"_state", "prefixdb")
 	if err := os.MkdirAll(brokenStatePath, 0o755); err != nil {
 		t.Fatalf("create broken state path failed: %v", err)
@@ -380,19 +380,19 @@ func TestNewEthstoreReplayBackendAOLSkipsStateAndPebbleInitialization(t *testing
 		t.Fatalf("create broken pebble path failed: %v", err)
 	}
 
-	backend, err := newEthstoreReplayBackend(baseDir, AOL, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
+	backend, err := newTheoReplayBackend(baseDir, AOL, 0, 8*1024, 16, 0, 16, 16, 0, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("expected aol replay backend to skip state/pebble init, got %v", err)
 	}
 	defer backend.Close()
 
-	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), ethstore.HeaderDataType); err != nil {
+	if err := backend.StagePut(makeAOLTestKey(1), []byte("header-value"), theo.HeaderDataType); err != nil {
 		t.Fatalf("StagePut failed: %v", err)
 	}
 	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock failed: %v", err)
 	}
-	got, err := backend.Get(makeAOLTestKey(1), ethstore.HeaderDataType)
+	got, err := backend.Get(makeAOLTestKey(1), theo.HeaderDataType)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestLoadPebbleLoadsOnlyNonAOLAndNonPrefixDBEntries(t *testing.T) {
 		t.Fatalf("auxStore.Close failed: %v", err)
 	}
 
-	if err := loadEthStorePebble(pebbleDir, dataFile, auxDir, 0, 0, false); err != nil {
+	if err := loadTheoPebble(pebbleDir, dataFile, auxDir, 0, 0, false); err != nil {
 		t.Fatalf("loadPebble failed: %v", err)
 	}
 
@@ -753,7 +753,7 @@ func TestGetWithPebbleBatchOverlay_BatchPutAndDeletePrecedence(t *testing.T) {
 	_, err = getWithPebbleBatchOverlay(batch, key, func() ([]byte, error) {
 		return ps.Get(key)
 	})
-	if !errors.Is(err, ethstore.ErrNotFound) {
+	if !errors.Is(err, theo.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound from batch tombstone, got: %v", err)
 	}
 }
@@ -765,9 +765,9 @@ func TestChainKVReplayBackendGetMapsStateNotFound(t *testing.T) {
 	}
 	defer backend.Close()
 
-	_, err = backend.Get([]byte{0x01, 0x02, 0x03}, ethstore.TrieNodeAccountDataType)
-	if !errors.Is(err, ethstore.ErrNotFound) {
-		t.Fatalf("expected ethstore.ErrNotFound from chainkv state get miss, got: %v", err)
+	_, err = backend.Get([]byte{0x01, 0x02, 0x03}, theo.TrieNodeAccountDataType)
+	if !errors.Is(err, theo.ErrNotFound) {
+		t.Fatalf("expected theo.ErrNotFound from chainkv state get miss, got: %v", err)
 	}
 }
 
@@ -779,13 +779,13 @@ func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
 	defer backend.Close()
 
 	key := []byte{0xaa, 0xbb, 0xcc}
-	if err := backend.StagePut(key, []byte("value"), ethstore.TrieNodeAccountDataType); err != nil {
+	if err := backend.StagePut(key, []byte("value"), theo.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StagePut failed: %v", err)
 	}
 	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock after put failed: %v", err)
 	}
-	got, err := backend.Get(key, ethstore.TrieNodeAccountDataType)
+	got, err := backend.Get(key, theo.TrieNodeAccountDataType)
 	if err != nil {
 		t.Fatalf("Get after put failed: %v", err)
 	}
@@ -793,14 +793,14 @@ func TestChainKVReplayBackendStageDeleteWritesTombstone(t *testing.T) {
 		t.Fatalf("unexpected value after put: %q", got)
 	}
 
-	if err := backend.StageDelete(key, ethstore.TrieNodeAccountDataType); err != nil {
+	if err := backend.StageDelete(key, theo.TrieNodeAccountDataType); err != nil {
 		t.Fatalf("StageDelete failed: %v", err)
 	}
 	if err := backend.CommitBlock(0); err != nil {
 		t.Fatalf("CommitBlock after delete failed: %v", err)
 	}
-	_, err = backend.Get(key, ethstore.TrieNodeAccountDataType)
-	if !errors.Is(err, ethstore.ErrNotFound) {
+	_, err = backend.Get(key, theo.TrieNodeAccountDataType)
+	if !errors.Is(err, theo.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after tombstone delete, got: %v", err)
 	}
 }
@@ -821,7 +821,7 @@ func TestChainKVReplayBackendNewIteratorHonorsPrefixAndStart(t *testing.T) {
 		{key: []byte("q:1"), value: []byte("value-q")},
 	}
 	for _, kv := range seed {
-		if err := backend.StagePut(kv.key, kv.value, ethstore.HeaderDataType); err != nil {
+		if err := backend.StagePut(kv.key, kv.value, theo.HeaderDataType); err != nil {
 			t.Fatalf("StagePut failed for %q: %v", kv.key, err)
 		}
 	}
@@ -985,7 +985,7 @@ func TestReplayTrace_CountsOnlyActuallyReplayedOpsButTracksTraceBytesRead(t *tes
 
 func TestReplayTrace_ReportsGetOtherErrors(t *testing.T) {
 	backend := &fakeReplayBackend{
-		getFunc: func(_ []byte, _ ethstore.DataType) ([]byte, error) {
+		getFunc: func(_ []byte, _ theo.DataType) ([]byte, error) {
 			return nil, errors.New("boom")
 		},
 	}

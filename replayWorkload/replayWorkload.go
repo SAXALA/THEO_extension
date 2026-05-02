@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	// Please replace "ethstore_module" with the actual module path defined in your ethstore/go.mod file
+	// Please replace "theo_module" with the actual module path defined in your theo/go.mod file
 
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -31,7 +31,7 @@ import (
 	chainkvdb "theo.local/ChainKV/goleveldb/leveldb/ethdb"
 	"theo.local/ChainKV/goleveldb/leveldb/iterator"
 	chainkvutil "theo.local/ChainKV/goleveldb/leveldb/util"
-	ethstore "theo.local/THEO"
+	theo "theo.local/THEO"
 	"theo.local/THEO/pebblestore"
 	prefixdb "theo.local/THEO/prefixdb"
 )
@@ -55,7 +55,7 @@ const (
 	allDBTypes
 )
 
-func describeEthstoreOpenedStores(dbType DBType) string {
+func describeTheoOpenedStores(dbType DBType) string {
 	switch dbType {
 	case AOL:
 		return "aol only"
@@ -229,8 +229,8 @@ func opTypeName(op opType) string {
 	return fmt.Sprintf("opType(%d)", op)
 }
 
-func dataTypeName(dt ethstore.DataType) string {
-	if name, ok := ethstore.DataTypeStrings[dt]; ok {
+func dataTypeName(dt theo.DataType) string {
+	if name, ok := theo.DataTypeStrings[dt]; ok {
 		return name
 	}
 	return fmt.Sprintf("DataType(%d)", dt)
@@ -238,11 +238,11 @@ func dataTypeName(dt ethstore.DataType) string {
 
 // classifyDataType returns the stats bucket label for a given data type:
 // "AOL", "PrefixDB", or the raw data-type name for pebble-handled types.
-func classifyDataType(dt ethstore.DataType) string {
-	if ethstore.AolHandledDataTypes[dt] {
+func classifyDataType(dt theo.DataType) string {
+	if theo.AolHandledDataTypes[dt] {
 		return "BlockData"
 	}
-	if ethstore.PrefixDBHandledDataTypes[dt] {
+	if theo.PrefixDBHandledDataTypes[dt] {
 		return "StateData"
 	}
 	return "OtherData"
@@ -430,11 +430,11 @@ type replayConfig struct {
 	TraceFile                    string `json:"traceFile"`
 	TraceFileNocache             string `json:"traceFileNocache"`
 	TraceFileNoCacheWithSnapshot string `json:"traceFileNoCacheWithSnapshot"`
-	EthStoreDir                  string `json:"ethstoreDir"`
+	TheoDir                      string `json:"theoDir"`
 	PebbleDBDir                  string `json:"pebbleDir"`
 	ChainKVDir                   string `json:"chainKVDir"`
 	AccountHashKeyPebbleDir      string `json:"accountHashKeyPebbleDir"`
-	LoadedEthstoreDir            string `json:"loadedEthStoreDir"`
+	LoadedTheoDir                string `json:"loadedTheoDir"`
 	LoadedPebbleDir              string `json:"loadedPebbleDir"`
 	LoadedChainKVDir             string `json:"loadedChainKVDir"`
 }
@@ -464,11 +464,11 @@ func formatPrefixDBStateDirName(chunkFileSize int) string {
 	return "database_statedb" + strconv.Itoa(chunkFileSize/1024) + "KB"
 }
 
-func formatEthstoreRuntimeStateDir(databaseDir string) string {
+func formatTheoRuntimeStateDir(databaseDir string) string {
 	return strings.TrimSpace(databaseDir) + "_state"
 }
 
-func formatEthstoreRuntimePebbleDir(databaseDir string) string {
+func formatTheoRuntimePebbleDir(databaseDir string) string {
 	return strings.TrimSpace(databaseDir) + "_pebble"
 }
 
@@ -485,7 +485,7 @@ func resolvePrefixDBStateDir(databaseDir string, explicitStateDir string, chunkF
 	}
 	baseDir := strings.TrimSpace(databaseDir)
 	if baseDir == "" {
-		return "", fmt.Errorf("loadPrefixDB requires non-empty databaseDir (loadedEthStoreDir)")
+		return "", fmt.Errorf("loadPrefixDB requires non-empty databaseDir (loadedTheoDir)")
 	}
 	return filepath.Join(baseDir, formatPrefixDBStateDirName(chunkFileSize)), nil
 }
@@ -521,8 +521,8 @@ func NewChainKVLDB(path string, cache int, handles int, useState bool) (*chainKV
 	}, nil
 }
 
-func (c *chainKVLDB) useStateForDataType(dataType ethstore.DataType) bool {
-	return c.useState && ethstore.PrefixDBHandledDataTypes[dataType]
+func (c *chainKVLDB) useStateForDataType(dataType theo.DataType) bool {
+	return c.useState && theo.PrefixDBHandledDataTypes[dataType]
 }
 
 func (c *chainKVLDB) Close() {
@@ -585,7 +585,7 @@ func chainKVLoadData(db *chainKVLDB, dataFile string, limit int, skipSnapshot bo
 			}
 		}
 
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		dataType := theo.GetDataTypeFromKey(keyBytes)
 		if db.useStateForDataType(dataType) {
 			err = db.db.Put_s(keyBytes, valueBytes)
 		} else {
@@ -670,64 +670,76 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 			return fmt.Errorf("pebble load failed: %w", err)
 		}
 		return nil
-	case strings.EqualFold(backend, "ethstore"):
-		if cfg.LoadedEthstoreDir == "" {
-			return fmt.Errorf("ld with ethstore backend requires loadedEthStoreDir in config")
+	case strings.EqualFold(backend, "theo"):
+		if cfg.LoadedTheoDir == "" {
+			return fmt.Errorf("ld with theo backend requires loadedTheoDir in config")
 		}
 		if cfg.LoadDataDir == "" {
-			return fmt.Errorf("ld with ethstore backend requires loadDataDir in config")
+			return fmt.Errorf("ld with theo backend requires loadDataDir in config")
 		}
 
 		//load  block store
 		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
 		if aolDataFile == "" {
-			return fmt.Errorf("ld with ethstore backend requires aolDataFile in config")
+			return fmt.Errorf("ld with theo backend requires aolDataFile in config")
 		}
-		if err := loadBlockStore(cfg.LoadedEthstoreDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
-			return fmt.Errorf("ethstore aol load failed: %w", err)
+		if err := loadBlockStore(cfg.LoadedTheoDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+			return fmt.Errorf("theo aol load failed: %w", err)
 		}
-		if err := loadPrefixDB(cfg.LoadedEthstoreDir, formatEthstoreRuntimeStateDir(cfg.LoadedEthstoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbLoadStageAll, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
-			return fmt.Errorf("ethstore prefixdb load failed: %w", err)
+		if err := loadPrefixDB(cfg.LoadedTheoDir, formatTheoRuntimeStateDir(cfg.LoadedTheoDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbLoadStageAll, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+			return fmt.Errorf("theo prefixdb load failed: %w", err)
 		}
 
-		if err := loadEthStorePebble(formatEthstoreRuntimePebbleDir(cfg.LoadedEthstoreDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, false); err != nil {
-			return fmt.Errorf("ethstore pebble load failed: %w", err)
+		if err := loadTheoPebble(formatTheoRuntimePebbleDir(cfg.LoadedTheoDir), cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, false); err != nil {
+			return fmt.Errorf("theo pebble load failed: %w", err)
+		}
+		return nil
+	case strings.EqualFold(backend, "aol"):
+		if cfg.LoadedTheoDir == "" {
+			return fmt.Errorf("ld with aol backend requires loadedTheoDir in config")
+		}
+		aolDataFile := strings.TrimSpace(cfg.AolDataFile)
+		if aolDataFile == "" {
+			return fmt.Errorf("ld with aol backend requires aolDataFile in config")
+		}
+		if err := loadBlockStore(cfg.LoadedTheoDir, aolDataFile, contractChunkFileSizeBytes, totalCacheSizeMiB, pebbleCache, pebbleHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+			return fmt.Errorf("aol load failed: %w", err)
 		}
 		return nil
 	case strings.EqualFold(backend, "prefixdb"):
-		if strings.TrimSpace(cfg.LoadedEthstoreDir) == "" {
-			return fmt.Errorf("ld with prefixdb backend requires loadedEthStoreDir in config")
+		if strings.TrimSpace(cfg.LoadedTheoDir) == "" {
+			return fmt.Errorf("ld with prefixdb backend requires loadedTheoDir in config")
 		}
 		if strings.TrimSpace(cfg.LoadDataDir) == "" {
 			return fmt.Errorf("ld with prefixdb backend requires loadDataDir in config")
 		}
-		if err := loadPrefixDB(cfg.LoadedEthstoreDir, prefixdbStateDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbStage, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
+		if err := loadPrefixDB(cfg.LoadedTheoDir, prefixdbStateDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, prefixdbStage, contractChunkFileSizeBytes, totalCacheSizeMiB, prefixdbHandles, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression); err != nil {
 			return fmt.Errorf("prefixdb load failed: %w", err)
 		}
 		return nil
-	case strings.EqualFold(backend, "ethstorePebbleWithoutSnapshots"):
-		if cfg.LoadedEthstoreDir == "" {
-			return fmt.Errorf("ld with ethstorePebbleWithoutSnapshots backend requires loadedEthStoreDir in config")
+	case strings.EqualFold(backend, "theoPebbleWithoutSnapshots"):
+		if cfg.LoadedTheoDir == "" {
+			return fmt.Errorf("ld with theoPebbleWithoutSnapshots backend requires loadedTheoDir in config")
 		}
 		if cfg.LoadDataDir == "" {
-			return fmt.Errorf("ld with ethstorePebbleWithoutSnapshots backend requires loadDataDir in config")
+			return fmt.Errorf("ld with theoPebbleWithoutSnapshots backend requires loadDataDir in config")
 		}
-		withoutSnapshotEthstorePebbleDir := formatWithoutSnapshotDBDir(formatEthstoreRuntimePebbleDir(cfg.LoadedEthstoreDir))
-		if err := loadEthStorePebble(withoutSnapshotEthstorePebbleDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, true); err != nil {
-			return fmt.Errorf("ethstore pebble load failed: %w", err)
+		withoutSnapshotTheoPebbleDir := formatWithoutSnapshotDBDir(formatTheoRuntimePebbleDir(cfg.LoadedTheoDir))
+		if err := loadTheoPebble(withoutSnapshotTheoPebbleDir, cfg.LoadDataDir, cfg.AccountHashKeyPebbleDir, pebbleCache, pebbleHandles, true); err != nil {
+			return fmt.Errorf("theo pebble load failed: %w", err)
 		}
 		return nil
-	case strings.EqualFold(backend, "insertAccountHashKeyPebbleToEthStorePebble"):
-		if cfg.LoadedEthstoreDir == "" {
-			return fmt.Errorf("insertAccountHashKeyPebbleToEthStorePebble with ethstore backend requires loadedEthStoreDir in config")
+	case strings.EqualFold(backend, "insertAccountHashKeyPebbleToTheoPebble"):
+		if cfg.LoadedTheoDir == "" {
+			return fmt.Errorf("insertAccountHashKeyPebbleToTheoPebble with theo backend requires loadedTheoDir in config")
 		}
 		if cfg.AccountHashKeyPebbleDir == "" {
-			return fmt.Errorf("insertAccountHashKeyPebbleToEthStorePebble with ethstore backend requires accountHashKeyPebbleDir in config")
+			return fmt.Errorf("insertAccountHashKeyPebbleToTheoPebble with theo backend requires accountHashKeyPebbleDir in config")
 		}
-		ethstorePebbleDir := "/mnt/ssd2/loaded/ethstore/database_pebble_without"
-		fmt.Println("dir: " + ethstorePebbleDir)
-		if err := insertAccountHashKeyPebbleToEthStorePebble(cfg.AccountHashKeyPebbleDir, ethstorePebbleDir, pebbleCache, pebbleHandles); err != nil {
-			return fmt.Errorf("insert account hash key pebble to ethstore pebble failed: %w", err)
+		theoPebbleDir := "/mnt/ssd2/loaded/theo/database_pebble_without"
+		fmt.Println("dir: " + theoPebbleDir)
+		if err := insertAccountHashKeyPebbleToTheoPebble(cfg.AccountHashKeyPebbleDir, theoPebbleDir, pebbleCache, pebbleHandles); err != nil {
+			return fmt.Errorf("insert account hash key pebble to theo pebble failed: %w", err)
 		}
 		return nil
 	default:
@@ -736,14 +748,14 @@ func runLoadData(cfg replayConfig, backend string, contractChunkFileSizeBytes in
 }
 
 func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
-	if !strings.EqualFold(backend, "ethstore") {
-		return fmt.Errorf("gc mode currently supports ethstore backend only")
+	if !strings.EqualFold(backend, "theo") {
+		return fmt.Errorf("gc mode currently supports theo backend only")
 	}
 	stateDir := strings.TrimSpace(gcStateDir)
 	if stateDir == "" {
 		return fmt.Errorf("gc mode requires -gc-state-dir")
 	}
-	store, err := ethstore.NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
+	store, err := theo.NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
 		return fmt.Errorf("gc: failed to open state db: %w", err)
 	}
@@ -753,19 +765,19 @@ func runGC(backend string, contractCachePrefetchCount int, gcStateDir string, ch
 	if err := store.GCPrefixTree(); err != nil {
 		return fmt.Errorf("gc: failed to run state db GC: %w", err)
 	}
-	fmt.Printf("ethstore state db GC finished in %s\n", time.Since(start))
+	fmt.Printf("theo state db GC finished in %s\n", time.Since(start))
 	return nil
 }
 
 func runUpgradeIndex(backend string, upgradeStateDir string, chunkFileSize int, totalCacheSizeMiB int, contractCachePrefetchCount int, prefixdbHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
-	if !strings.EqualFold(backend, "ethstore") {
-		return fmt.Errorf("upgrade-index mode currently supports ethstore backend only")
+	if !strings.EqualFold(backend, "theo") {
+		return fmt.Errorf("upgrade-index mode currently supports theo backend only")
 	}
 	stateDir := strings.TrimSpace(upgradeStateDir)
 	if stateDir == "" {
 		return fmt.Errorf("upgrade-index mode requires -upgrade-state-dir")
 	}
-	store, err := ethstore.NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
+	store, err := theo.NewStateOnlyWithPrefixGCAndFileHandlesSettings(stateDir, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles)
 	if err != nil {
 		return fmt.Errorf("upgrade-index: failed to open state db: %w", err)
 	}
@@ -775,7 +787,7 @@ func runUpgradeIndex(backend string, upgradeStateDir string, chunkFileSize int, 
 	if err := store.UpgradeSegmentIndexFiles(); err != nil {
 		return fmt.Errorf("upgrade-index: failed to upgrade segment index files: %w", err)
 	}
-	fmt.Printf("ethstore segment index upgrade finished in %s\n", time.Since(start))
+	fmt.Printf("theo segment index upgrade finished in %s\n", time.Since(start))
 	return nil
 }
 
@@ -803,13 +815,13 @@ func ensureQueryableBatch(batch ethdb.Batch, owner string) error {
 // batch first (read-your-writes semantics).  When batch is nil or does not
 // implement batchReader it falls back to fallbackGet.
 // A nil value returned by BatchGet means the key is deleted in the batch,
-// which is reported as ethstore.ErrNotFound.
+// which is reported as theo.ErrNotFound.
 func getWithPebbleBatchOverlay(batch ethdb.Batch, key []byte, fallbackGet func() ([]byte, error)) ([]byte, error) {
 	if batch != nil {
 		if br, ok := batch.(batchReader); ok {
 			if val, found := br.BatchGet(key); found {
 				if val == nil {
-					return nil, ethstore.ErrNotFound
+					return nil, theo.ErrNotFound
 				}
 				return val, nil
 			}
@@ -832,7 +844,7 @@ type replayIter interface {
 }
 
 // noopIter is a placeholder for when an iterator cannot be created
-// (e.g., EthStore skips 'O'-prefix iterators).
+// (e.g., Theo skips 'O'-prefix iterators).
 type noopIter struct{}
 
 func (noopIter) Next() bool    { return false }
@@ -865,11 +877,11 @@ type replayBackend interface {
 	// Name returns a short human-readable backend identifier.
 	Name() string
 	// Get reads key, consulting pending batch when applicable.
-	Get(key []byte, dataType ethstore.DataType) ([]byte, error)
+	Get(key []byte, dataType theo.DataType) ([]byte, error)
 	// StagePut stages a put within the current block batch.
-	StagePut(key, value []byte, dataType ethstore.DataType) error
+	StagePut(key, value []byte, dataType theo.DataType) error
 	// StageDelete stages a delete within the current block batch.
-	StageDelete(key []byte, dataType ethstore.DataType) error
+	StageDelete(key []byte, dataType theo.DataType) error
 	// CommitBlock commits all staged operations for the current block.
 	CommitBlock(blockID uint64) error
 	// NewIterator creates a new iterator for prefix/start.
@@ -881,14 +893,14 @@ type replayBackend interface {
 	Close()
 }
 
-func shouldSkipByDBType(dt ethstore.DataType, dbType DBType) bool {
+func shouldSkipByDBType(dt theo.DataType, dbType DBType) bool {
 	switch dbType {
 	case AOL:
-		return !ethstore.AolHandledDataTypes[dt]
+		return !theo.AolHandledDataTypes[dt]
 	case PrefixDB:
-		return !ethstore.PrefixDBHandledDataTypes[dt]
+		return !theo.PrefixDBHandledDataTypes[dt]
 	case Pebble:
-		return ethstore.AolHandledDataTypes[dt] || ethstore.PrefixDBHandledDataTypes[dt]
+		return theo.AolHandledDataTypes[dt] || theo.PrefixDBHandledDataTypes[dt]
 	}
 	return false
 }
@@ -914,7 +926,7 @@ func newPebbleBaselineReplayBackend(dir string, cache int, handles int) (*pebble
 func (b *pebbleBaselineReplayBackend) Name() string { return "baseline-pebble" }
 func (b *pebbleBaselineReplayBackend) Close()       { b.store.Close() }
 
-func (b *pebbleBaselineReplayBackend) Get(key []byte, _ ethstore.DataType) ([]byte, error) {
+func (b *pebbleBaselineReplayBackend) Get(key []byte, _ theo.DataType) ([]byte, error) {
 	return getWithPebbleBatchOverlay(b.batch, key, func() ([]byte, error) {
 		return b.store.Get(key)
 	})
@@ -928,14 +940,14 @@ func (b *pebbleBaselineReplayBackend) ensureBatch() (ethdb.Batch, error) {
 	}
 	return b.batch, nil
 }
-func (b *pebbleBaselineReplayBackend) StagePut(key, value []byte, _ ethstore.DataType) error {
+func (b *pebbleBaselineReplayBackend) StagePut(key, value []byte, _ theo.DataType) error {
 	batch, err := b.ensureBatch()
 	if err != nil {
 		return err
 	}
 	return batch.Put(key, value)
 }
-func (b *pebbleBaselineReplayBackend) StageDelete(key []byte, _ ethstore.DataType) error {
+func (b *pebbleBaselineReplayBackend) StageDelete(key []byte, _ theo.DataType) error {
 	batch, err := b.ensureBatch()
 	if err != nil {
 		return err
@@ -960,11 +972,11 @@ func (b *pebbleBaselineReplayBackend) PrintCommitStats() {
 }
 
 // ---------------------------------------------------------------------------
-// ethstoreReplayBackend – wraps *ethstore.Database
+// theoReplayBackend – wraps *theo.Database
 // ---------------------------------------------------------------------------
 
-type ethstoreReplayBackend struct {
-	store              *ethstore.Database
+type theoReplayBackend struct {
+	store              *theo.Database
 	replayDBType       DBType
 	aolDirty           bool
 	pebbleBatch        ethdb.Batch
@@ -975,23 +987,23 @@ type ethstoreReplayBackend struct {
 	blockTotalHist     *latencyHistogram
 }
 
-func newEthstoreReplayBackend(dir string, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*ethstoreReplayBackend, error) {
+func newTheoReplayBackend(dir string, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) (*theoReplayBackend, error) {
 	var (
-		store *ethstore.Database
+		store *theo.Database
 		err   error
 	)
 	if replayDBType == PrefixDB {
-		store, err = ethstore.NewStateWithPebbleGCAndStoreSettings(dir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+		store, err = theo.NewStateWithPebbleGCAndStoreSettings(dir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	} else if replayDBType == AOL {
-		store, err = ethstore.NewAOLOnly(dir, 6000)
+		store, err = theo.NewAOLOnly(dir, 6000)
 	} else {
-		store, err = ethstore.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+		store, err = theo.NewWithPrefixGCAndStoreSettings(dir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("newEthstoreReplayBackend: open store: %w", err)
+		return nil, fmt.Errorf("newTheoReplayBackend: open store: %w", err)
 	}
-	fmt.Printf("[ethstore] opened stores: %s\n", describeEthstoreOpenedStores(replayDBType))
-	return &ethstoreReplayBackend{
+	fmt.Printf("[theo] opened stores: %s\n", describeTheoOpenedStores(replayDBType))
+	return &theoReplayBackend{
 		store:              store,
 		replayDBType:       replayDBType,
 		prefixdbCommitHist: newLatencyHistogram(),
@@ -1001,13 +1013,13 @@ func newEthstoreReplayBackend(dir string, replayDBType DBType, contractCachePref
 	}, nil
 }
 
-func (b *ethstoreReplayBackend) Name() string { return "ethstore" }
-func (b *ethstoreReplayBackend) Close()       { b.store.Close() }
-func (b *ethstoreReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
-	if ethstore.AolHandledDataTypes[dataType] {
+func (b *theoReplayBackend) Name() string { return "theo" }
+func (b *theoReplayBackend) Close()       { b.store.Close() }
+func (b *theoReplayBackend) Get(key []byte, dataType theo.DataType) ([]byte, error) {
+	if theo.AolHandledDataTypes[dataType] {
 		return b.store.GetFromAOL(key)
 	}
-	if ethstore.PrefixDBHandledDataTypes[dataType] {
+	if theo.PrefixDBHandledDataTypes[dataType] {
 		return b.store.GetFromPrefixDB(key, dataType)
 	}
 	return getWithPebbleBatchOverlay(b.pebbleBatch, key, func() ([]byte, error) {
@@ -1015,25 +1027,25 @@ func (b *ethstoreReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]b
 	})
 }
 
-func (b *ethstoreReplayBackend) ensurePebbleBatch() (ethdb.Batch, error) {
+func (b *theoReplayBackend) ensurePebbleBatch() (ethdb.Batch, error) {
 	if b.pebbleBatch == nil {
 		b.pebbleBatch = b.store.NewBatch()
 	}
-	if err := ensureQueryableBatch(b.pebbleBatch, "ethstoreReplayBackend"); err != nil {
+	if err := ensureQueryableBatch(b.pebbleBatch, "theoReplayBackend"); err != nil {
 		return nil, err
 	}
 	return b.pebbleBatch, nil
 }
 
-func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
-	if ethstore.AolHandledDataTypes[dataType] {
+func (b *theoReplayBackend) StagePut(key, value []byte, dataType theo.DataType) error {
+	if theo.AolHandledDataTypes[dataType] {
 		err := b.store.BatchPutToAOL(key, value, dataType)
 		if err == nil {
 			b.aolDirty = true
 		}
 		return err
 	}
-	if ethstore.PrefixDBHandledDataTypes[dataType] {
+	if theo.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchPutToPrefixDB(key, value, dataType)
 		if err == nil {
 			b.prefixdbDirty = true
@@ -1047,15 +1059,15 @@ func (b *ethstoreReplayBackend) StagePut(key, value []byte, dataType ethstore.Da
 	return batch.Put(key, value)
 }
 
-func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
-	if ethstore.AolHandledDataTypes[dataType] {
+func (b *theoReplayBackend) StageDelete(key []byte, dataType theo.DataType) error {
+	if theo.AolHandledDataTypes[dataType] {
 		err := b.store.BatchDeleteFromAOL(key, dataType)
 		if err == nil {
 			b.aolDirty = true
 		}
 		return err
 	}
-	if ethstore.PrefixDBHandledDataTypes[dataType] {
+	if theo.PrefixDBHandledDataTypes[dataType] {
 		err := b.store.BatchDeleteFromPrefixDB(key, dataType)
 		if err == nil {
 			b.prefixdbDirty = true
@@ -1069,7 +1081,7 @@ func (b *ethstoreReplayBackend) StageDelete(key []byte, dataType ethstore.DataTy
 	return batch.Delete(key)
 }
 
-func (b *ethstoreReplayBackend) CommitBlock(blockID uint64) error {
+func (b *theoReplayBackend) CommitBlock(blockID uint64) error {
 	blockStart := time.Now()
 	committedAny := false
 	stateCommitted := false
@@ -1114,24 +1126,24 @@ func (b *ethstoreReplayBackend) CommitBlock(blockID uint64) error {
 	return nil
 }
 
-func (b *ethstoreReplayBackend) NewIterator(prefix, start []byte) replayIter {
+func (b *theoReplayBackend) NewIterator(prefix, start []byte) replayIter {
 	return ethdbIterWrapper{b.store.NewIterator(prefix, start)}
 }
 
-func (b *ethstoreReplayBackend) PrintCommitStats() {
+func (b *theoReplayBackend) PrintCommitStats() {
 	switch b.replayDBType {
 	case AOL:
-		reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
+		reportHistogramSummary("Theo commit (Block store)", b.blockdbCommitHist)
 	case PrefixDB:
-		reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
+		reportHistogramSummary("theo commit (State store)", b.prefixdbCommitHist)
 	case Pebble:
-		reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+		reportHistogramSummary("theo commit (PebbleDB)", b.pebbleCommitHist)
 	default:
-		reportHistogramSummary("EthStore commit (Block store)", b.blockdbCommitHist)
-		reportHistogramSummary("ethstore commit (State store)", b.prefixdbCommitHist)
-		reportHistogramSummary("ethstore commit (PebbleDB)", b.pebbleCommitHist)
+		reportHistogramSummary("Theo commit (Block store)", b.blockdbCommitHist)
+		reportHistogramSummary("theo commit (State store)", b.prefixdbCommitHist)
+		reportHistogramSummary("theo commit (PebbleDB)", b.pebbleCommitHist)
 	}
-	reportHistogramSummary("ethstore commit (Total)", b.blockTotalHist)
+	reportHistogramSummary("theo commit (Total)", b.blockTotalHist)
 }
 
 type recoveryFileReadStats struct {
@@ -1263,29 +1275,29 @@ func printRecoveryStoreTiming(label string, duration time.Duration) {
 
 func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCount int, chunkFileSize int, totalCacheSizeMiB int, prefixdbHandles int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
 	var (
-		store   *ethstore.Database
-		timings ethstore.StartupTimings
+		store   *theo.Database
+		timings theo.StartupTimings
 		err     error
 	)
 	switch replayDBType {
 	case PrefixDB:
-		store, timings, err = ethstore.NewStateWithPebbleGCAndStoreSettingsWithStartupTimings(cfg.EthStoreDir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+		store, timings, err = theo.NewStateWithPebbleGCAndStoreSettingsWithStartupTimings(cfg.TheoDir, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	case AOL:
-		store, timings, err = ethstore.NewAOLOnlyWithStartupTimings(cfg.EthStoreDir, 6000)
+		store, timings, err = theo.NewAOLOnlyWithStartupTimings(cfg.TheoDir, 6000)
 	default:
-		store, timings, err = ethstore.NewWithPrefixGCAndStoreSettingsWithStartupTimings(cfg.EthStoreDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
+		store, timings, err = theo.NewWithPrefixGCAndStoreSettingsWithStartupTimings(cfg.TheoDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, contractCachePrefetchCount, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, prefixdbHandles, pebbleCache, pebbleHandles)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to open ethstore backend: %w", err)
+		return fmt.Errorf("failed to open theo backend: %w", err)
 	}
 	defer store.Close()
 
-	fmt.Printf("[ethstore] opened stores: %s\n", describeEthstoreOpenedStores(replayDBType))
+	fmt.Printf("[theo] opened stores: %s\n", describeTheoOpenedStores(replayDBType))
 
 	latestBlockID := store.LatestBlockID()
 	if latestBlockID == 0 && replayDBType == PrefixDB {
 		var blockReadBytes uint64
-		latestBlockID, blockReadBytes, err = ethstore.ReadLatestBlockID(cfg.EthStoreDir, 6000)
+		latestBlockID, blockReadBytes, err = theo.ReadLatestBlockID(cfg.TheoDir, 6000)
 		if err != nil {
 			return fmt.Errorf("failed to read latest block ID from block store: %w", err)
 		}
@@ -1304,7 +1316,7 @@ func runRecovery(cfg replayConfig, replayDBType DBType, contractCachePrefetchCou
 
 	stateReadStats := recoveryFileReadStats{}
 	if timings.StateStoreOpen > 0 {
-		stateReadStats, err = fullReadRegularFiles(cfg.EthStoreDir+"_state", store.StateGCWorkerCount())
+		stateReadStats, err = fullReadRegularFiles(cfg.TheoDir+"_state", store.StateGCWorkerCount())
 		if err != nil {
 			return fmt.Errorf("failed to fully read state store files: %w", err)
 		}
@@ -1350,7 +1362,7 @@ func newChainKVReplayBackend(dbDir string, cache, handles int, useState bool) (*
 func (b *chainKVReplayBackend) Name() string { return "chainkv" }
 func (b *chainKVReplayBackend) Close()       { b.db.Close() }
 
-func (b *chainKVReplayBackend) pendingOverlay(dataType ethstore.DataType) map[string][]byte {
+func (b *chainKVReplayBackend) pendingOverlay(dataType theo.DataType) map[string][]byte {
 	if b.db.useStateForDataType(dataType) {
 		if b.statePending == nil {
 			b.statePending = make(map[string][]byte)
@@ -1363,10 +1375,10 @@ func (b *chainKVReplayBackend) pendingOverlay(dataType ethstore.DataType) map[st
 	return b.nonStatePending
 }
 
-func (b *chainKVReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]byte, error) {
+func (b *chainKVReplayBackend) Get(key []byte, dataType theo.DataType) ([]byte, error) {
 	if val, found := b.pendingOverlay(dataType)[string(key)]; found {
 		if val == nil {
-			return nil, ethstore.ErrNotFound
+			return nil, theo.ErrNotFound
 		}
 		return append([]byte(nil), val...), nil
 	}
@@ -1380,12 +1392,12 @@ func (b *chainKVReplayBackend) Get(key []byte, dataType ethstore.DataType) ([]by
 		value, err = b.db.db.Get(key)
 	}
 	if err != nil && errors.Is(err, chainkverrors.ErrNotFound) {
-		return nil, ethstore.ErrNotFound
+		return nil, theo.ErrNotFound
 	}
 	return value, err
 }
 
-func (b *chainKVReplayBackend) StagePut(key, value []byte, dataType ethstore.DataType) error {
+func (b *chainKVReplayBackend) StagePut(key, value []byte, dataType theo.DataType) error {
 	b.pendingOverlay(dataType)[string(key)] = append([]byte(nil), value...)
 	if b.db.useStateForDataType(dataType) {
 		if b.stateBatch == nil {
@@ -1398,7 +1410,7 @@ func (b *chainKVReplayBackend) StagePut(key, value []byte, dataType ethstore.Dat
 	}
 	return b.nonStateBatch.Put(key, value)
 }
-func (b *chainKVReplayBackend) StageDelete(key []byte, dataType ethstore.DataType) error {
+func (b *chainKVReplayBackend) StageDelete(key []byte, dataType theo.DataType) error {
 	b.pendingOverlay(dataType)[string(key)] = nil
 	if b.db.useStateForDataType(dataType) {
 		if b.stateBatch == nil {
@@ -1492,7 +1504,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		replayStarted      bool
 		pendingBlocks      int64
 		lastEndedBlockID   int64
-		lastIterDataType   ethstore.DataType = ethstore.DataType(-1)
+		lastIterDataType   theo.DataType = theo.DataType(-1)
 	)
 	if startBlockID <= 0 {
 		replayStarted = true
@@ -1616,7 +1628,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		opTypeStr := matches[1]
 		keyHex := ""
 		var keyBytes []byte
-		dataType := ethstore.DataType(-1)
+		dataType := theo.DataType(-1)
 		if len(matches) >= 3 && matches[2] != "" {
 			keyHex = matches[2]
 			keyBytes, err = hex.DecodeString(keyHex)
@@ -1624,7 +1636,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				continue
 			}
 			if len(keyBytes) > 0 {
-				dataType = ethstore.GetDataTypeFromKey(keyBytes)
+				dataType = theo.GetDataTypeFromKey(keyBytes)
 			}
 		}
 		var valueHex string
@@ -1642,7 +1654,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			if err != nil {
 				continue
 			}
-			dataType = ethstore.GetDataTypeFromKey(iterPrefixBytes)
+			dataType = theo.GetDataTypeFromKey(iterPrefixBytes)
 			if matches[8] != "" {
 				iterStartBytes, err = hex.DecodeString(matches[8])
 				if err != nil {
@@ -1677,8 +1689,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		//debug
 		// testKeyHex := "4fc01cf44b5fd388621bce9fca946de503c1f9fa5c34765867954352ad3baec0080f01"
 		// testKeyBytes, _ := hex.DecodeString(testKeyHex)
-		// val, err := backend.Get(testKeyBytes, ethstore.TrieNodeStorageDataType)
-		// if err != nil && !errors.Is(err, ethstore.ErrNotFound) {
+		// val, err := backend.Get(testKeyBytes, theo.TrieNodeStorageDataType)
+		// if err != nil && !errors.Is(err, theo.ErrNotFound) {
 		// 	fmt.Printf("Debug: Get error for key %s: %v\n", testKeyHex, err)
 		// } else if err == nil {
 		// 	fmt.Printf("Debug: Get success for key %s: value length %d\n", testKeyHex, len(val))
@@ -1694,7 +1706,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 				logicReadSize += int64(len(val))
 				getSuccessByType[kvTypeStr]++
 				getSuccessTotal++
-			} else if errors.Is(opErr, ethstore.ErrNotFound) {
+			} else if errors.Is(opErr, theo.ErrNotFound) {
 				getNotFoundByType[kvTypeStr]++
 				getNotFoundTotal++
 			} else {
@@ -1755,7 +1767,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		}
 		// comment to disable operation failed output
 		// if opErr != nil {
-		// 	if dataType != ethstore.SnapshotAccountDataType && dataType != ethstore.SnapshotStorageDataType {
+		// 	if dataType != theo.SnapshotAccountDataType && dataType != theo.SnapshotStorageDataType {
 		// 		fmt.Printf("[%s] op %s failed for key %s: %v\n",
 		// 			backend.Name(), opTypeStr, keyHex, opErr)
 		// 	}
@@ -1825,7 +1837,7 @@ func printRuntimeArgsSnapshot(
 	fmt.Printf("trace_file_selector=%s\n", traceFileSelector)
 	fmt.Printf("trace_file_resolved=%s\n", resolvedTraceFile)
 
-	if strings.EqualFold(backend, "ethstore") {
+	if strings.EqualFold(backend, "theo") {
 		fmt.Printf("state_cache_prefetch_count=%d\n", contractCachePrefetchCount)
 		fmt.Printf("contract_chunk_file_mib=%d\n", contractChunkFileSizeBytes)
 		fmt.Printf("total_cache_size_mib=%d\n", totalCacheSizeMiB)
@@ -1896,7 +1908,7 @@ func main() {
 
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
 	mode := flag.String("mode", "re", "Mode of operation: ld/re/recovery/gc/upgrade-index")
-	backend := flag.String("backend", "ethstore", "Backend for ld/re mode: ethstore, chainkv, or pebble")
+	backend := flag.String("backend", "theo", "Backend for ld/re mode: theo, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
 	endBlockID := flag.Int64("end-block-id", 0, "Replay end block ID (0 means no early stop by block ID)")
@@ -2016,15 +2028,15 @@ func main() {
 	}()
 
 	// For quick debugging
-	// ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+	// ethBackend, ethErr := newTheoReplayBackend(cfg.TheoDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
 	// if ethErr != nil {
-	// 	log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+	// 	log.Fatalf("re: failed to open theo backend: %v", ethErr)
 	// }
 	// defer ethBackend.Close()
 	// replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
-	// ethstorePebbleDir := "/mnt/ssd2/loaded/ethstore_pebble_without"
-	// fmt.Println("dir: " + ethstorePebbleDir)
-	// if err := insertAccountHashKeyPebbleToEthStorePebble(cfg.AccountHashKeyPebbleDir, ethstorePebbleDir, 0, 0); err != nil {
+	// theoPebbleDir := "/mnt/ssd2/loaded/theo_pebble_without"
+	// fmt.Println("dir: " + theoPebbleDir)
+	// if err := insertAccountHashKeyPebbleToTheoPebble(cfg.AccountHashKeyPebbleDir, theoPebbleDir, 0, 0); err != nil {
 	// 	return
 	// }
 	// return
@@ -2050,16 +2062,16 @@ func main() {
 			defer pbBackend.Close()
 			replayTrace(pbBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		} else {
-			ethBackend, ethErr := newEthstoreReplayBackend(cfg.EthStoreDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
+			ethBackend, ethErr := newTheoReplayBackend(cfg.TheoDir, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression)
 			if ethErr != nil {
-				log.Fatalf("re: failed to open ethstore backend: %v", ethErr)
+				log.Fatalf("re: failed to open theo backend: %v", ethErr)
 			}
 			defer ethBackend.Close()
 			replayTrace(ethBackend, traceFile, *maxOps, dbType, *startBlockID, *endBlockID, *commitBlockInterval)
 		}
 	case "recovery":
-		if !strings.EqualFold(*backend, "ethstore") {
-			log.Fatalf("recovery only supports backend=ethstore")
+		if !strings.EqualFold(*backend, "theo") {
+			log.Fatalf("recovery only supports backend=theo")
 		}
 		if err := runRecovery(cfg, dbType, *contractCachePrefetchCount, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *prefixdbHandles, *pebbleCache, *pebbleHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression); err != nil {
 			log.Fatalf("recovery failed: %v", err)
@@ -2166,7 +2178,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 	var acccuntHashKeyPebble *pebblestore.PebbleStore
 	if stage == prefixdbLoadStageAll || stage == prefixdbLoadStageStorage {
 		if len(pebbleDir) == 0 {
-			pebbleDir = "/mnt/gen3/ethstore-ssd-backup/index/accountHash_key_pebble"
+			pebbleDir = "/mnt/gen3/theo-ssd-backup/index/accountHash_key_pebble"
 		}
 		dbPath := strings.TrimSpace(pebbleDir)
 		if dbPath == "" {
@@ -2255,7 +2267,7 @@ func loadPrefixDB(databaseDir string, explicitStateDir string, dataFile string, 
 		if err != nil {
 			return fmt.Errorf("failed to decode value: %w", err)
 		}
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
+		dataType := theo.GetDataTypeFromKey(keyBytes)
 		var accountKey []byte
 
 		if keyBytes[0] != 'O' && keyBytes[0] != 'A' {
@@ -2334,7 +2346,7 @@ func resolvePrefixDBLoadAccountKey(index interface{ Get([]byte) ([]byte, error) 
 	}
 	accountKey, err := index.Get(storageKey[1:33])
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) || errors.Is(err, ethstore.ErrNotFound) {
+		if errors.Is(err, pebble.ErrNotFound) || errors.Is(err, theo.ErrNotFound) {
 			return nil, nil
 		}
 		return nil, err
@@ -2343,9 +2355,9 @@ func resolvePrefixDBLoadAccountKey(index interface{ Get([]byte) ([]byte, error) 
 }
 
 func loadBlockStore(dataBaseDir string, notxFile string, chunkFileSize int, totalCacheSizeMiB int, pebbleCache int, pebbleHandles int, nodeFileGCRatioThreshold float64, gcWorkers int, storageGCThreshold float64, nodeFileSortedCompression bool, segmentIndexCompression bool) error {
-	store, err := ethstore.NewWithPrefixGCAndStoreSettings(dataBaseDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, 16, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, 0, pebbleCache, pebbleHandles)
+	store, err := theo.NewWithPrefixGCAndStoreSettings(dataBaseDir, 6000, "put_test", false, chunkFileSize, totalCacheSizeMiB, 16, nodeFileGCRatioThreshold, gcWorkers, storageGCThreshold, nodeFileSortedCompression, segmentIndexCompression, 0, pebbleCache, pebbleHandles)
 	if err != nil {
-		return fmt.Errorf("failed to create EthStore instance: %w", err)
+		return fmt.Errorf("failed to create Theo instance: %w", err)
 	}
 	defer store.Close()
 	fmt.Println("Start aol put test...")
@@ -2444,11 +2456,11 @@ func copyPebbleStoreEntries(source *pebblestore.PebbleStore, target *pebblestore
 	return count, nil
 }
 
-func loadEthStorePebble(dirPath string, testFilePath string, accountHashIndexDir string, pebbleCache int, pebbleHandles int, skipSnapShot bool) error {
+func loadTheoPebble(dirPath string, testFilePath string, accountHashIndexDir string, pebbleCache int, pebbleHandles int, skipSnapShot bool) error {
 	dirPath = strings.TrimSpace(dirPath)
 	testFilePath = strings.TrimSpace(testFilePath)
 	if dirPath == "" || testFilePath == "" {
-		return fmt.Errorf("loadEthStorePebble requires non-empty dirPath and testFilePath")
+		return fmt.Errorf("loadTheoPebble requires non-empty dirPath and testFilePath")
 	}
 	fmt.Println("Start load pebble...")
 	pdb, err := pebblestore.NewPebbleStore(dirPath, pebbleCache, pebbleHandles, "pebble_load", false)
@@ -2522,8 +2534,8 @@ func loadEthStorePebble(dirPath string, testFilePath string, accountHashIndexDir
 			continue
 		}
 
-		dataType := ethstore.GetDataTypeFromKey(keyBytes)
-		if !ethstore.AolHandledDataTypes[dataType] && !ethstore.PrefixDBHandledDataTypes[dataType] {
+		dataType := theo.GetDataTypeFromKey(keyBytes)
+		if !theo.AolHandledDataTypes[dataType] && !theo.PrefixDBHandledDataTypes[dataType] {
 			// Perform the Put operation
 			startTime := time.Now()
 			err = pdb.Put(keyBytes, valueBytes)
@@ -2834,24 +2846,24 @@ func unpackToNibbles(bytes []byte) []byte {
 	return nibbles
 }
 
-func insertAccountHashKeyPebbleToEthStorePebble(accountHashKeyPebbleDir string, ethStorePebbleDir string, pebbleCache int, pebbleHandles int) error {
-	fmt.Println("Start copying account hash key pebble entries into ethstore pebble..." + accountHashKeyPebbleDir + " -> " + ethStorePebbleDir)
+func insertAccountHashKeyPebbleToTheoPebble(accountHashKeyPebbleDir string, theoPebbleDir string, pebbleCache int, pebbleHandles int) error {
+	fmt.Println("Start copying account hash key pebble entries into theo pebble..." + accountHashKeyPebbleDir + " -> " + theoPebbleDir)
 	accountHashKeyPebble, err := pebblestore.NewPebbleStore(accountHashKeyPebbleDir, pebbleCache, pebbleHandles, "accountHash_key_pebble_load", false)
 	if err != nil {
 		return fmt.Errorf("failed to create PebbleStore instance for account hash key pebble: %w", err)
 	}
 	defer accountHashKeyPebble.Close()
 
-	ethStorePebble, err := pebblestore.NewPebbleStore(ethStorePebbleDir, pebbleCache, pebbleHandles, "ethstore_pebble_load", false)
+	theoPebble, err := pebblestore.NewPebbleStore(theoPebbleDir, pebbleCache, pebbleHandles, "theo_pebble_load", false)
 	if err != nil {
-		return fmt.Errorf("failed to create PebbleStore instance for ethstore pebble: %w", err)
+		return fmt.Errorf("failed to create PebbleStore instance for theo pebble: %w", err)
 	}
-	defer ethStorePebble.Close()
+	defer theoPebble.Close()
 
-	copiedCount, err := copyPebbleStoreEntries(accountHashKeyPebble, ethStorePebble)
+	copiedCount, err := copyPebbleStoreEntries(accountHashKeyPebble, theoPebble)
 	if err != nil {
-		return fmt.Errorf("failed to copy entries from account hash key pebble to ethstore pebble: %w", err)
+		return fmt.Errorf("failed to copy entries from account hash key pebble to theo pebble: %w", err)
 	}
-	fmt.Printf("Copied %d entries from account hash key pebble to ethstore pebble\n", copiedCount)
+	fmt.Printf("Copied %d entries from account hash key pebble to theo pebble\n", copiedCount)
 	return nil
 }
