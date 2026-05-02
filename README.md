@@ -9,7 +9,7 @@ Ethereum execution clients (Geth) persist all blockchain data as key-value (KV) 
 
 Forcing these heterogeneous KV classes into the same LSM-tree structure causes unnecessary write amplification, read amplification, and compaction overhead, especially as node resources tighten.
 
-**THEO** is a **p**rotocol-**t**ransparent **h**ybrid storage system for **E**thereum n**o**des that addresses this KV-class heterogeneity by routing each class to a structurally appropriate backend while preserving Geth's KV interface, authenticated data structures (ADSs), and block-level crash consistency.
+**THEO** is a protocol-**t**ransparent **h**ybrid storage system for **E**thereum n**o**des that addresses this KV-class heterogeneity by routing each class to a structurally appropriate backend while preserving Geth's KV interface, authenticated data structures (ADSs), and block-level crash consistency.
 
 ### Key Results
 
