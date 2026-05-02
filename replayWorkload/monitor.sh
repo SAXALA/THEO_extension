@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- 1. 参数与进程查找 ---
+# --- 1. Parameter Parsing and Process Lookup ---
 TARGET=$1
 INTERVAL=${2:-1}
 LOGFILE=${3:-"monitor_${TARGET}.log"}
@@ -8,11 +8,11 @@ SSD_TARGET=${4:-"/mnt/ssd2"}
 STATFILE="${LOGFILE}.stat"
 
 if [ -z "$TARGET" ]; then
-    echo "使用方法: $0 <进程名|PID> [间隔/s] [日志文件名] [SSD挂载点|块设备]"
+    echo "Usage: $0 <process-name|PID> [interval/s] [log-file-name] [SSD-mount-point|block-device]"
     exit 1
 fi
 
-# sudo 密码；留空则使用交互式 sudo
+# sudo password; leave empty to use interactive sudo
 SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
 
 sudo_run() {
@@ -23,28 +23,28 @@ sudo_run() {
     fi
 }
 
-# 支持传入 PID 或进程名
+# Support passing PID or process name
 if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
     MAIN_PID="$TARGET"
     PROCESS_DESC="PID $MAIN_PID"
 else
-    # 根据进程名查找最新的 PID
+    # Find the latest PID by process name
     MAIN_PID=$(pgrep -n "$TARGET")
     PROCESS_DESC="$TARGET (PID: $MAIN_PID)"
 fi
 
 if [ -z "$MAIN_PID" ]; then
-    echo "错误: 未找到目标 '$TARGET' 对应的进程。"
+    echo "Error: no process found for target '$TARGET'."
     exit 1
 fi
 
 if [ ! -d "/proc/$MAIN_PID" ]; then
-    echo "错误: PID $MAIN_PID 不存在。"
+    echo "Error: PID $MAIN_PID does not exist."
     exit 1
 fi
 
-echo "开始监控进程: $PROCESS_DESC"
-echo "采样间隔: ${INTERVAL}s | 日志保存至: $LOGFILE"
+echo "Start monitoring process: $PROCESS_DESC"
+echo "Sampling interval: ${INTERVAL}s | Log saved to: $LOGFILE"
 
 resolve_root_block_device() {
     local dev_name="$1"
@@ -80,7 +80,7 @@ resolve_block_device() {
         return 1
     fi
 
-    # 统一设备名，供 /sys/class/block/<name>/stat 使用。
+    # Normalize the device name for use with /sys/class/block/<name>/stat.
     dev=$(basename "$dev")
     if [ -f "/sys/class/block/${dev}/stat" ]; then
         echo "$dev"
@@ -395,7 +395,7 @@ read_nand_rw_counters() {
 
 BLOCK_DEVICE=$(resolve_block_device "$SSD_TARGET")
 if [ -z "$BLOCK_DEVICE" ]; then
-    echo "错误: 无法从 '$SSD_TARGET' 解析块设备，请传入有效挂载点或块设备路径（如 /mnt/ssd2 或 /dev/nvme0n1p1）。"
+    echo "Error: cannot resolve block device from '$SSD_TARGET'. Please provide a valid mount point or block device path (e.g. /mnt/ssd2 or /dev/nvme0n1p1)."
     exit 1
 fi
 
@@ -411,9 +411,9 @@ elif [ -n "$SSD_MODEL" ] && is_intel_p4510_model "$SSD_MODEL"; then
     NAND_DEVICE_NAME=$(resolve_nvme_controller_name "$BLOCK_DEVICE" || true)
 fi
 
-echo "SSD 统计目标: $SSD_TARGET (device: $BLOCK_DEVICE, model: ${SSD_MODEL:-unknown}) | 统计日志: $STATFILE"
+echo "SSD stats target: $SSD_TARGET (device: $BLOCK_DEVICE, model: ${SSD_MODEL:-unknown}) | Stats log: $STATFILE"
 
-# 写入 CSV 表头以便后续分析
+# Write CSV header for later analysis
 if [ ! -f "$LOGFILE" ]; then
     echo "TIMESTAMP,CPU_USAGE,RSS_KB,CPU_JIFFIES,CPU_SEC,IO_READ_KB,IO_WRITE_KB,FS_READ_OPS,FS_WRITE_OPS,TOTAL_SYSCR,TOTAL_SYSCW,TOTAL_RCHAR,TOTAL_WCHAR" > "$LOGFILE"
 fi
@@ -422,10 +422,10 @@ if [ ! -f "$STATFILE" ]; then
     echo "START_TIMESTAMP,END_TIMESTAMP,DEVICE,BLOCK_READ_BYTES_DIFF,BLOCK_WRITE_BYTES_DIFF,BLOCK_READ_BYTES_START,BLOCK_WRITE_BYTES_START,BLOCK_READ_BYTES_END,BLOCK_WRITE_BYTES_END,FS_READ_OPS_DIFF,FS_WRITE_OPS_DIFF,FS_READ_OPS_START,FS_WRITE_OPS_START,FS_READ_OPS_END,FS_WRITE_OPS_END,NAND_TOTAL_READ_DIFF,NAND_TOTAL_READ_START,NAND_TOTAL_READ_END,NAND_IO_READ_DIFF,NAND_IO_READ_START,NAND_IO_READ_END,NAND_GC_READ_DIFF,NAND_GC_READ_START,NAND_GC_READ_END,NAND_TOTAL_WRITE_DIFF,NAND_TOTAL_WRITE_START,NAND_TOTAL_WRITE_END,NAND_IO_WRITE_DIFF,NAND_IO_WRITE_START,NAND_IO_WRITE_END,NAND_GC_WRITE_DIFF,NAND_GC_WRITE_START,NAND_GC_WRITE_END,NAND_COUNTER_SOURCE" > "$STATFILE"
 fi
 
-# 获取系统时钟频率 HZ
+# Get system clock frequency HZ
 HZ=$(getconf CLK_TCK)
 
-# SSD 统计只记录进程开始与结束两点，输出总差值。
+# SSD stats are recorded only at process start and end, outputting the total diff.
 START_TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 START_DISK_BYTES=($(read_disk_bytes "$BLOCK_DEVICE"))
 SSD_START_READ=${START_DISK_BYTES[0]}
@@ -453,20 +453,20 @@ fi
 
 if [ "$NAND_START_OK" -eq 0 ]; then
     if [ -z "$NAND_READ_METHOD" ]; then
-        echo "警告: 设备 ${SSD_MODEL:-unknown} 未匹配到支持的 NAND 统计采集方式；当前仅支持华为 SSD (hioadm) 和 Intel P4510 (nvme intel smart-log-add)。" >&2
+        echo "Warning: device ${SSD_MODEL:-unknown} did not match any supported NAND stats collection method; currently only Huawei SSD (hioadm) and Intel P4510 (nvme intel smart-log-add) are supported." >&2
     else
-        echo "警告: 无法通过 ${NAND_READ_METHOD} 读取 /dev/${NAND_DEVICE_NAME:-$BLOCK_DEVICE} 的 NAND 读写统计；请检查 sudo 权限、工具是否已安装，或确认设备是否暴露相应厂商字段。" >&2
+        echo "Warning: failed to read NAND R/W stats from /dev/${NAND_DEVICE_NAME:-$BLOCK_DEVICE} via ${NAND_READ_METHOD}; check sudo permissions, ensure the tool is installed, or verify the device exposes the vendor-specific fields." >&2
     fi
 fi
 
-# --- 2. 循环监控 ---
+# --- 2. Monitor Loop ---
 while [ -d "/proc/$MAIN_PID" ]; do
     if [ ! -r "/proc/$MAIN_PID/stat" ] || [ ! -r "/proc/$MAIN_PID/io" ] || [ ! -r "/proc/$MAIN_PID/status" ]; then
         break
     fi
 
-    # 记录采样开始前的数据
-    # 使用 /proc/$PID/stat 时，我们要提取的是第 14 和 15 个字段 (utime, stime)
+    # Record data before the sampling interval
+    # When reading /proc/$PID/stat, we extract fields 14 and 15 (utime, stime)
     CPU_TOTAL_BEFORE=$(grep '^cpu ' /proc/stat | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     PROC_STAT_BEFORE=($(cat /proc/$MAIN_PID/stat))
     UTIME_BEFORE=${PROC_STAT_BEFORE[13]}
@@ -480,11 +480,11 @@ while [ -d "/proc/$MAIN_PID" ]; do
 
     sleep "${INTERVAL}"
 
-    # 检查进程在 sleep 期间是否退出
+    # Check if the process exited during sleep
     if [ ! -d "/proc/$MAIN_PID" ]; then break; fi
     if [ ! -r "/proc/$MAIN_PID/stat" ] || [ ! -r "/proc/$MAIN_PID/io" ] || [ ! -r "/proc/$MAIN_PID/status" ]; then break; fi
 
-    # 记录采样结束后的数据
+    # Record data after the sampling interval
     TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
     CPU_TOTAL_AFTER=$(grep '^cpu ' /proc/stat | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     PROC_STAT_AFTER=($(cat /proc/$MAIN_PID/stat))
@@ -498,8 +498,8 @@ while [ -d "/proc/$MAIN_PID" ]; do
     SYSCW_AFTER=${FS_IO_AFTER[1]}
     RSS=$(awk '/VmRSS/ {print $2}' /proc/$MAIN_PID/status 2>/dev/null || echo 0)
 
-    # --- 3. 数据计算 ---
-    # CPU 使用率计算
+    # --- 3. Data Calculation ---
+    # CPU usage calculation
     CPU_USAGE=$(awk -v ut_b=$UTIME_BEFORE -v st_b=$STIME_BEFORE \
                     -v ut_a=$UTIME_AFTER -v st_a=$STIME_AFTER \
                     -v tot_b=$CPU_TOTAL_BEFORE -v tot_a=$CPU_TOTAL_AFTER \
@@ -510,20 +510,20 @@ while [ -d "/proc/$MAIN_PID" ]; do
                         else print "0.00";
                     }')
 
-    # 累计消耗的 CPU 秒数
+    # Accumulated CPU seconds consumed
     CPU_TIME_SEC=$(awk -v j=$((UTIME_AFTER + STIME_AFTER)) -v h=$HZ 'BEGIN {printf "%.2f", j/h}')
     
-    # 本次间隔内的 I/O 增量 (KB)
+    # I/O delta in this interval (KB)
     IO_READ_KB=$(((IO_AFTER_READ - IO_BEFORE_READ) / 1024))
     IO_WRITE_KB=$(((IO_AFTER_WRITE - IO_BEFORE_WRITE) / 1024))
     FS_READ_OPS=$((SYSCR_AFTER - SYSCR_BEFORE))
     FS_WRITE_OPS=$((SYSCW_AFTER - SYSCW_BEFORE))
 
-    # --- 4. 输出与保存 ---
+    # --- 4. Output and Save ---
     DATA_LINE="$TIMESTAMP, $CPU_USAGE, $RSS, $((UTIME_AFTER + STIME_AFTER)), $CPU_TIME_SEC, $IO_READ_KB, $IO_WRITE_KB, $FS_READ_OPS, $FS_WRITE_OPS, $SYSCR_AFTER, $SYSCW_AFTER, $IO_AFTER_READ, $IO_AFTER_WRITE"
     echo "$DATA_LINE" >> "$LOGFILE"
     
-    # 可选：在屏幕上实时打印缩略信息
+    # Optional: print abbreviated info to screen in real time
     # echo "[$(date +%T)] CPU: $CPU_USAGE% | RSS: ${RSS}KB | IO Read: ${IO_READ_KB}KB"
 done
 
@@ -584,4 +584,4 @@ fi
 STAT_LINE="$START_TIMESTAMP,$END_TIMESTAMP,$BLOCK_DEVICE,$SSD_READ_DIFF,$SSD_WRITE_DIFF,$SSD_START_READ,$SSD_START_WRITE,$SSD_END_READ,$SSD_END_WRITE,$FS_READ_OPS_DIFF,$FS_WRITE_OPS_DIFF,$FS_START_READ_OPS,$FS_START_WRITE_OPS,$FS_END_READ_OPS,$FS_END_WRITE_OPS,$NAND_TOTAL_READ_DIFF,$NAND_TOTAL_START_READ,$NAND_TOTAL_END_READ,$NAND_IO_READ_DIFF,$NAND_IO_START_READ,$NAND_IO_END_READ,$NAND_GC_READ_DIFF,$NAND_GC_START_READ,$NAND_GC_END_READ,$NAND_TOTAL_WRITE_DIFF,$NAND_TOTAL_START_WRITE,$NAND_TOTAL_END_WRITE,$NAND_IO_WRITE_DIFF,$NAND_IO_START_WRITE,$NAND_IO_END_WRITE,$NAND_GC_WRITE_DIFF,$NAND_GC_START_WRITE,$NAND_GC_END_WRITE,$NAND_COUNTER_SOURCE"
 echo "$STAT_LINE" >> "$STATFILE"
 
-echo -e "\n进程已结束。监控日志已保存至: $LOGFILE 和 $STATFILE"
+echo -e "\nProcess exited. Monitor logs saved to: $LOGFILE and $STATFILE"

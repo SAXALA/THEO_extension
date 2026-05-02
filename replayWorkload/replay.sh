@@ -9,41 +9,41 @@ cd "$script_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 可执行动作: load(加载数据) | load-account(prefixdb 仅加载 account) | load-storage(prefixdb 仅加载 storage) | restore(恢复数据库目录) | replay(回放trace) | recovery(仅统计启动恢复开销) | gc(手动触发theo state db GC) | upgrade-index(升级 segment index 文件)
+# Available actions: load(load data) | load-account(prefixdb: load account only) | load-storage(prefixdb: load storage only) | restore(restore database directory) | replay(replay trace) | recovery(measure startup recovery cost only) | gc(manually trigger theo state db GC) | upgrade-index(upgrade segment index files)
 ACTIONS="load load-account load-storage restore replay recovery gc upgrade-index"
-# 后端类型: theo | aol | chainkv | pebble | prefixdb | all(依次执行 theo/chainkv/pebble)
+# Backend types: theo | aol | chainkv | pebble | prefixdb | all(run theo/chainkv/pebble in sequence)
 BACKENDS="theo aol chainkv pebble prefixdb all"
 
-# 位置参数1: ACTION，可选值见 ACTIONS，默认 replay
+# Positional arg 1: ACTION, see ACTIONS for valid values, default: replay
 ACTION="${1:-replay}"
-# 位置参数2: BACKEND，可选值见 BACKENDS，默认 theo
+# Positional arg 2: BACKEND, see BACKENDS for valid values, default: theo
 BACKEND="${2:-${WORKLOAD_BACKEND:-theo}}"
 if [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; then
     BACKEND="${2:-prefixdb}"
 fi
 
-# 回放最大操作数；0 代表不限制
+# Max replay operations; 0 means unlimited
 WORKLOAD_MAX_OPS="${WORKLOAD_MAX_OPS:-0}"
-# 回放 block 窗口；0 代表不限制（起点从头/终点不限）
+# Replay block window; 0 means unlimited (start from beginning / no end limit)
 START_BLOCK_ID="${START_BLOCK_ID:-20500000}"
 END_BLOCK_ID="${END_BLOCK_ID:-20550000}"
-# 每累计处理多少个 block 才 commit 一次；默认每 1 个 block commit 一次
+# How many blocks to process before committing; default: commit every 1 block
 COMMIT_BLOCK_INTERVAL="${COMMIT_BLOCK_INTERVAL:-1}"
-# trace 文件类型，可选值: cache | nocache | nocache_snap
+# Trace file type, valid values: cache | nocache | nocache_snap
 TRACE_FILE="${TRACE_FILE:-nocache_snap}"
-# 仅对 theo/pebble 回放生效；可选值: all | aol | prefixdb | pebble
+# Applies to theo/pebble replay only; valid values: all | aol | prefixdb | pebble
 DB_TYPE="${DB_TYPE:-all}"
-# theo 回放参数，storage chunk cache 数量
+# theo replay parameter: number of storage chunk caches
 CACHE_COUNT="${CACHE_COUNT:-32}"
-# PrefixTree node file GC 阈值：当 unsorted/sorted 达到该比例时触发 GC
+# PrefixTree node file GC threshold: trigger GC when unsorted/sorted ratio reaches this value
 NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD="${NODE_FILE_GC_UNSORTED_RATIO_THRESHOLD:-0.2}"
-# segmented storage GC 阈值：当 CHUNK_FILE_SIZE_BYTES >= target_chunk_size * threshold 时触发 GC
+# Segmented storage GC threshold: trigger GC when CHUNK_FILE_SIZE_BYTES >= target_chunk_size * threshold
 STORAGE_GC_THRESHOLD="${STORAGE_GC_THRESHOLD:-2}"
-# node file sorted part 是否启用 zstd 压缩；默认开启
+# Whether to enable zstd compression for node file sorted part; disabled by default
 NODE_FILE_SORTED_COMPRESSION="${NODE_FILE_SORTED_COMPRESSION:-false}"
-# segment index 是否启用 zstd 压缩；默认开启
+# Whether to enable zstd compression for segment index; disabled by default
 SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
-# 统一 GC worker 数；默认使用系统 CPU 数量的一半，最少 1
+# Unified GC worker count; defaults to half the number of CPU cores, minimum 1
 # DEFAULT_GC_WORKERS=$(($(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1) / 2))
 # if [ "$DEFAULT_GC_WORKERS" -lt 1 ]; then
 #     DEFAULT_GC_WORKERS=1
@@ -51,29 +51,29 @@ SEGMENT_INDEX_COMPRESSION="${SEGMENT_INDEX_COMPRESSION:-false}"
 DEFAULT_GC_WORKERS=128
 GC_WORKERS="${GC_WORKERS:-$DEFAULT_GC_WORKERS}"
 
-# theo load 参数: chunk 文件大小（KiB），如 4096/8192/16384
+# theo load parameter: chunk file size (KiB), e.g. 4096/8192/16384
 CHUNK_FILE_SIZE_BYTES="${CHUNK_FILE_SIZE_BYTES:-16384}"
-# theo 参数: PrefixDB 总缓存大小（MiB），所有 cache 共用
+# theo parameter: total PrefixDB cache size (MiB), shared by all caches
 TOTAL_CACHE_SIZE_MIB="${TOTAL_CACHE_SIZE_MIB:-512}"
 
 # Keep byte conversions for logging only; Go now receives MiB and converts internally.
 TOTAL_CACHE_SIZE_BYTES=$((TOTAL_CACHE_SIZE_MIB * 1024 * 1024))
 
-# chainkv 参数: cache 大小（MB）
+# chainkv parameter: cache size (MB)
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
-# pebble 参数: cache 大小（MB）
+# pebble parameter: cache size (MB)
 PEBBLE_CACHE_MB="${PEBBLE_CACHE_MB:-16}"
-# pebble 参数: handles 数量
+# pebble parameter: number of handles
 PEBBLE_HANDLES="${PEBBLE_HANDLES:-32768}"
-# prefixdb 参数: file handle cache 数量
+# prefixdb parameter: number of file handle caches
 PREFIXDB_HANDLES="${PREFIXDB_HANDLES:-32768}"
-# chainkv 参数: leveldb handles 数量
+# chainkv parameter: number of leveldb handles
 CHAINKV_HANDLES="${CHAINKV_HANDLES:-32768}"
-# chainkv 参数: true/false，是否启用 state 特化路径（Put_s/Get_s）
+# chainkv parameter: true/false, whether to enable the state-specialized path (Put_s/Get_s)
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
-# chainkv load 限制条数；0 代表不限制
+# chainkv load row limit; 0 means unlimited
 CHAINKV_LOAD_LIMIT="${CHAINKV_LOAD_LIMIT:-0}"
-# 多轮回放参数（由 multiple_replay.sh 注入）
+# Multi-round replay parameters (injected by multiple_replay.sh)
 RUN_ROUND="${RUN_ROUND:-0}"
 RUN_ROUNDS="${RUN_ROUNDS:-0}"
 
@@ -102,13 +102,13 @@ resolve_mount_point_from_path() {
     printf "%s" "$mount_point"
 }
 
-# 已加载数据根目录（source）与回放运行目录（target）。
-# 默认把 loaded 放到另一块 SSD，给 /data 上的 running 目录腾出更多可用空间。
+# Root directory for loaded data (source) and replay run directory (target).
+# By default, loaded data is placed on a separate SSD, freeing more space on /data for the running directory.
 LOADED_ROOT="${LOADED_ROOT:-/mnt/ssd2/loaded}"
 RUNNING_ROOT="${RUNNING_ROOT:-/data/running}"
 DISK_MOUNT_POINT=$(resolve_mount_point_from_path "$RUNNING_ROOT")
 
-# theo statedb 目录名，可选: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb32KB | database_statedb64KB | database_statedb256KB
+# theo statedb directory name, options: database_statedb4KB | database_statedb8KB | database_statedb16KB | database_statedb32KB | database_statedb64KB | database_statedb256KB
 calculate_default_theo_statedb_dirname() {
     case "$CHUNK_FILE_SIZE_BYTES" in
         4096) echo "database_statedb4KB" ;;
@@ -122,16 +122,16 @@ calculate_default_theo_statedb_dirname() {
 }
 THEO_STATEDB_DIRNAME="${THEO_STATEDB_DIRNAME:-$(calculate_default_theo_statedb_dirname)}"
 
-# 手动 GC 目录：直接在该 statedb 目录执行，不进行复制
+# Manual GC directory: run directly in this statedb directory without copying
 GC_STATE_DIR="${GC_STATE_DIR:-${LOADED_ROOT}/theo/${THEO_STATEDB_DIRNAME}}"
-# segment index 升级目录：直接在该 statedb 目录执行，不进行复制
+# Segment index upgrade directory: run directly in this statedb directory without copying
 UPGRADE_STATE_DIR="${UPGRADE_STATE_DIR:-${GC_STATE_DIR}}"
-# prefixdb storage 阶段要求给出已经 load 完 account 的 statedb 目录
+# prefixdb storage stage requires the statedb directory where account loading has been completed
 PREFIXDB_ACCOUNT_STATE_DIR="${PREFIXDB_ACCOUNT_STATE_DIR:-}"
-# theo prefixdb replay 可选专用 Pebble 源目录；仅在特定实验需要隔离 accountHash->accountKey 索引时使用
+# Optional dedicated Pebble source directory for theo prefixdb replay; used only when a specific experiment requires isolating the accountHash->accountKey index
 THEO_PREFIXDB_PEBBLE_SOURCE_DIR="${THEO_PREFIXDB_PEBBLE_SOURCE_DIR:-}"
 
-# theo prefixdb 目录（用于权限预检查）
+# theo prefixdb directory (used for permission pre-check)
 THEO_PREFIXDB_DIR="${THEO_PREFIXDB_DIR:-${RUNNING_ROOT}/theo_state/prefixdb}"
 
 log_date=$(date +%m-%d-%H-%M-%S)
@@ -142,20 +142,20 @@ mkdir -p "$log_dir"
 CURRENT_REPLAY_PID=""
 CURRENT_MONITOR_PID=""
 
-# sudo 密码；留空则使用交互式 sudo
+# sudo password; leave empty to use interactive sudo
 SUDO_PASSWD="${SUDO_PASSWD:-qwe123}"
-# rsync 3.2.x 默认可能受 1GB max-alloc 限制影响；0 表示不额外限制。
+# rsync 3.2.x may be affected by the 1 GB max-alloc limit by default; 0 means no extra restriction.
 RSYNC_MAX_ALLOC="${RSYNC_MAX_ALLOC:-0}"
-# 默认只关心数据内容，不强制保留 owner/group/perms 等元数据；脚本稍后会统一 chmod。
+# By default only data content matters; owner/group/perms metadata is not preserved. The script runs chmod later.
 RSYNC_PRESERVE_METADATA="${RSYNC_PRESERVE_METADATA:-false}"
-# replay 前清理后的空闲观察配置。
+# Idle observation config after pre-replay cleanup.
 IDLE_OBSERVE_ENABLED="${IDLE_OBSERVE_ENABLED:-true}"
 IDLE_OBSERVE_INTERVAL_SECONDS="${IDLE_OBSERVE_INTERVAL_SECONDS:-5}"
 IDLE_OBSERVE_MAX_SECONDS="${IDLE_OBSERVE_MAX_SECONDS:-120}"
 IDLE_OBSERVE_STABLE_WINDOWS="${IDLE_OBSERVE_STABLE_WINDOWS:-3}"
 IDLE_OBSERVE_MAX_DIRTY_KB="${IDLE_OBSERVE_MAX_DIRTY_KB:-1024}"
 
-# replay 进程可选 cgroup v2 IO 限速；默认关闭。
+# Optional cgroup v2 IO throttle for replay process; disabled by default.
 # https://www.samsung.com.cn/memory-storage/nvme-ssd/870-evo-4tb-sata-3-2-5-ssd-mz-77e4t0bw/
 REPLAY_CGROUP_IO_LIMIT_ENABLED="${REPLAY_CGROUP_IO_LIMIT_ENABLED:-false}"
 REPLAY_CGROUP_NAME_PREFIX="${REPLAY_CGROUP_NAME_PREFIX:-theo-replay}"
@@ -345,8 +345,8 @@ Required by action/backend:
     load theo: loads aol + prefixdb + pebble; THEO_PREFIXDB_DIR defaults to RUNNING_ROOT/theo_state
     replay theo: when DB_TYPE=all/prefixdb, THEO_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
     recovery theo: when DB_TYPE=all/prefixdb, THEO_PREFIXDB_DIR is required; DB_TYPE=aol/pebble does not need it
-    load-account prefixdb: uses replay_config.json 中 loadedTheoDir/loadDataDir
-    load-storage prefixdb: uses replay_config.json 中 loadDataDir/accountHashKeyPebbleDir，并要求 PREFIXDB_ACCOUNT_STATE_DIR
+    load-account prefixdb: uses loadedTheoDir/loadDataDir from replay_config.json
+    load-storage prefixdb: uses loadDataDir/accountHashKeyPebbleDir from replay_config.json, requires PREFIXDB_ACCOUNT_STATE_DIR
     gc: backend must be theo, and GC_STATE_DIR must be provided
     upgrade-index: backend must be theo, and UPGRADE_STATE_DIR must be provided
 EOF
@@ -373,7 +373,7 @@ validate_runtime_requirements() {
     local needs_theo_prefixdb="false"
 
     if [ -z "$DISK_MOUNT_POINT" ]; then
-        echo "无法根据 RUNNING_ROOT 推导挂载点: ${RUNNING_ROOT}"
+        echo "Cannot derive mount point from RUNNING_ROOT: ${RUNNING_ROOT}"
         exit 1
     fi
 
@@ -387,7 +387,7 @@ validate_runtime_requirements() {
 
     if [ "$needs_theo_prefixdb" = "true" ]; then
         if [ -z "$THEO_PREFIXDB_DIR" ]; then
-            echo "theo 的 load/replay/recovery 需要配置 THEO_PREFIXDB_DIR，当前为空。"
+            echo "theo load/replay/recovery requires THEO_PREFIXDB_DIR to be set, but it is currently empty."
             usage
             exit 1
         fi
@@ -395,63 +395,63 @@ validate_runtime_requirements() {
 
     if [ "$ACTION" = "replay" ] || [ "$ACTION" = "recovery" ]; then
         if [ ! -d "$LOADED_ROOT" ]; then
-            echo "${ACTION} 需要已加载数据目录 LOADED_ROOT，当前不存在: ${LOADED_ROOT}"
+            echo "${ACTION} requires loaded data directory LOADED_ROOT, which does not exist: ${LOADED_ROOT}"
             exit 1
         fi
         if [ ! -d "$RUNNING_ROOT" ]; then
-            echo "RUNNING_ROOT 不存在，自动创建: ${RUNNING_ROOT}"
+            echo "RUNNING_ROOT does not exist, creating it: ${RUNNING_ROOT}"
             sudo_run mkdir -p "$RUNNING_ROOT"
         fi
     fi
 
     if [ "$ACTION" = "recovery" ] && [ "$BACKEND" != "theo" ]; then
-        echo "recovery 仅支持 theo backend（当前 BACKEND=${BACKEND}）"
+        echo "recovery only supports theo backend (current BACKEND=${BACKEND})"
         exit 1
     fi
 
     if [ "$BACKEND" = "prefixdb" ] && [ "$ACTION" = "load" ]; then
-        echo "prefixdb backend 已拆分为 load-account / load-storage，请使用新的 action"
+        echo "prefixdb backend has been split into load-account / load-storage, please use the new action"
         exit 1
     fi
 
     if { [ "$ACTION" = "load-account" ] || [ "$ACTION" = "load-storage" ]; } && [ "$BACKEND" != "prefixdb" ]; then
-        echo "${ACTION} 仅支持 prefixdb backend（当前 BACKEND=${BACKEND}）"
+        echo "${ACTION} only supports prefixdb backend (current BACKEND=${BACKEND})"
         exit 1
     fi
 
     if [ "$ACTION" = "load-storage" ]; then
         if [ -z "$PREFIXDB_ACCOUNT_STATE_DIR" ]; then
-            echo "load-storage 需要 PREFIXDB_ACCOUNT_STATE_DIR（已完成 account load 的 statedb 目录）"
+            echo "load-storage requires PREFIXDB_ACCOUNT_STATE_DIR (statedb directory where account loading has been completed)"
             exit 1
         fi
         if [ ! -d "$PREFIXDB_ACCOUNT_STATE_DIR" ]; then
-            echo "PREFIXDB_ACCOUNT_STATE_DIR 不存在: ${PREFIXDB_ACCOUNT_STATE_DIR}"
+            echo "PREFIXDB_ACCOUNT_STATE_DIR does not exist: ${PREFIXDB_ACCOUNT_STATE_DIR}"
             exit 1
         fi
     fi
 
     if { [ "$ACTION" = "gc" ] || [ "$ACTION" = "upgrade-index" ]; } && [ "$BACKEND" != "theo" ]; then
-        echo "${ACTION} 仅支持 theo backend（当前 BACKEND=${BACKEND}）"
+        echo "${ACTION} only supports theo backend (current BACKEND=${BACKEND})"
         exit 1
     fi
     if [ "$ACTION" = "gc" ]; then
         if [ -z "$GC_STATE_DIR" ]; then
-            echo "gc 需要 GC_STATE_DIR（直接指定 statedb 目录）"
+            echo "gc requires GC_STATE_DIR (direct path to the statedb directory)"
             exit 1
         fi
         if [ ! -d "$GC_STATE_DIR" ]; then
-            echo "GC_STATE_DIR 不存在: ${GC_STATE_DIR}"
+            echo "GC_STATE_DIR does not exist: ${GC_STATE_DIR}"
             exit 1
         fi
     fi
 
     if [ "$ACTION" = "upgrade-index" ]; then
         if [ -z "$UPGRADE_STATE_DIR" ]; then
-            echo "upgrade-index 需要 UPGRADE_STATE_DIR（直接指定 statedb 目录）"
+            echo "upgrade-index requires UPGRADE_STATE_DIR (direct path to the statedb directory)"
             exit 1
         fi
         if [ ! -d "$UPGRADE_STATE_DIR" ]; then
-            echo "UPGRADE_STATE_DIR 不存在: ${UPGRADE_STATE_DIR}"
+            echo "UPGRADE_STATE_DIR does not exist: ${UPGRADE_STATE_DIR}"
             exit 1
         fi
     fi
@@ -465,7 +465,7 @@ validate_runtime_requirements() {
             REPLAY_CGROUP_WRITE_BPS_LIMIT; do
             numeric_value="${!numeric_name}"
             if ! [[ "$numeric_value" =~ ^[0-9]+$ ]] || [ "$numeric_value" -le 0 ]; then
-                echo "${numeric_name} 必须是正整数，当前值=${numeric_value}"
+                echo "${numeric_name} must be a positive integer, current value=${numeric_value}"
                 exit 1
             fi
         done
@@ -474,7 +474,7 @@ validate_runtime_requirements() {
 
 build_replay_binary() {
     if ! go mod download; then
-        echo "依赖下载失败，请检查网络或 GOPROXY 配置（当前 GOPROXY=$GOPROXY）"
+        echo "Dependency download failed; check your network or GOPROXY setting (current GOPROXY=$GOPROXY)"
         exit 1
     fi
     mkdir -p ./bin
@@ -482,7 +482,7 @@ build_replay_binary() {
     find ./bin -maxdepth 1 -type f ! -name replayWorkload -delete
     # if ! GOAMD64=v4 go build -tags theo_no_analysis_stats -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
     if ! GOAMD64=v4 go build -trimpath -ldflags="-s -w" -o ./bin/replayWorkload ./replayWorkload.go; then
-        echo "构建 replayWorkload 失败，退出。"
+        echo "Failed to build replayWorkload, exiting."
         exit 1
     fi
 }
@@ -1116,7 +1116,7 @@ run_load() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         prefixdb)
-            echo "prefixdb backend 已拆分为 load-account / load-storage，请使用新的 action"
+            echo "prefixdb backend has been split into load-account / load-storage, please use the new action"
             exit 1
             ;;
         chainkv)
@@ -1146,7 +1146,7 @@ run_load_account() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "load-account 仅支持 prefixdb backend"
+            echo "load-account only supports prefixdb backend"
             exit 1
             ;;
     esac
@@ -1168,7 +1168,7 @@ run_load_storage() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "load-storage 仅支持 prefixdb backend"
+            echo "load-storage only supports prefixdb backend"
             exit 1
             ;;
     esac
@@ -1201,7 +1201,7 @@ run_restore() {
 
 run_replay() {
     local backend="$1"
-    # 每次回放前，把已加载数据同步到 running/system 目录
+    # Before each replay, sync loaded data to the running/system directory
     sync_loaded_to_running_for_backend "$backend"
     # Ensure cache drop happens after loaded DB is synced.
     drop_caches
@@ -1234,7 +1234,7 @@ run_replay() {
 
 run_recovery() {
     local backend="$1"
-    # 每次恢复统计前，把已加载数据同步到 running/system 目录
+    # Before each recovery measurement, sync loaded data to the running/system directory
     sync_loaded_to_running_for_backend "$backend"
     # Ensure cache drop happens after loaded DB is synced.
     drop_caches
@@ -1254,7 +1254,7 @@ run_recovery() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "recovery 仅支持 theo backend"
+            echo "recovery only supports theo backend"
             exit 1
             ;;
      esac
@@ -1277,7 +1277,7 @@ run_gc() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "gc 仅支持 theo backend"
+            echo "gc only supports theo backend"
             exit 1
             ;;
     esac
@@ -1300,7 +1300,7 @@ run_upgrade_index() {
                 -node-file-sorted-compression="$NODE_FILE_SORTED_COMPRESSION" -segment-index-compression="$SEGMENT_INDEX_COMPRESSION"
             ;;
         *)
-            echo "upgrade-index 仅支持 theo backend"
+            echo "upgrade-index only supports theo backend"
             exit 1
             ;;
     esac

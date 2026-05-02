@@ -10,9 +10,9 @@ cd "$workload_dir" || exit 1
 
 set -Eeuo pipefail
 
-# 用法:
+# Usage:
 #   ./loadWithoutSnapshot.sh [chainkv|pebble|theoPebble|all]
-# 示例:
+# Examples:
 #   ./loadWithoutSnapshot.sh all
 #   ./loadWithoutSnapshot.sh chainkv
 
@@ -27,7 +27,7 @@ fi
 
 CONFIG_PATH="${CONFIG_PATH:-${workload_dir}/replay_config.json}"
 
-# 复用 replay.sh 中的常用参数默认值
+# Reuse common parameter defaults from replay.sh
 CHAINKV_CACHE_MB="${CHAINKV_CACHE_MB:-16}"
 CHAINKV_HANDLES="${CHAINKV_HANDLES:-32768}"
 CHAINKV_STATE="${CHAINKV_STATE:-true}"
