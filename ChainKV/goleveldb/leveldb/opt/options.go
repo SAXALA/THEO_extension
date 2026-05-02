@@ -10,9 +10,9 @@ package opt
 import (
 	"math"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/cache"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/filter"
+	"theo.local/ChainKV/goleveldb/leveldb/cache"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/filter"
 )
 
 const (

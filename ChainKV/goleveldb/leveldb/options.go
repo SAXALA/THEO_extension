@@ -7,8 +7,8 @@
 package leveldb
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/filter"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/filter"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
 )
 
 func dupOptions(o *opt.Options) *opt.Options {

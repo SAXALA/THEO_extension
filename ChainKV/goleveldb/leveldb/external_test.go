@@ -10,8 +10,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/testutil"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/testutil"
 )
 
 var _ = testutil.Defer(func() {

@@ -19,7 +19,7 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 var (

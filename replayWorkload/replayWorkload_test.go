@@ -13,10 +13,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
-	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
-	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
-	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
+	ethstore "theo.local/THEO"
+	datatypepkg "theo.local/THEO/datatype"
+	"theo.local/THEO/pebblestore"
+	prefixdb "theo.local/THEO/prefixdb"
 )
 
 type fakeReplayBackend struct {

@@ -14,10 +14,10 @@ import (
 
 	"github.com/golang/snappy"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/filter"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/filter"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 func sharedPrefixLen(a, b []byte) int {

@@ -12,9 +12,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/iterator"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 type tSet struct {

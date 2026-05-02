@@ -10,7 +10,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 type harness struct {

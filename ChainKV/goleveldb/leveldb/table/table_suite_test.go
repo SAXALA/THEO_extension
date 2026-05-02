@@ -3,7 +3,7 @@ package table
 import (
 	"testing"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/testutil"
+	"theo.local/ChainKV/goleveldb/leveldb/testutil"
 )
 
 func TestTable(t *testing.T) {

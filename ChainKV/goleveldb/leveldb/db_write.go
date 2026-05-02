@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/memdb"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/memdb"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 // 写日志，把batch中的数据写入日志

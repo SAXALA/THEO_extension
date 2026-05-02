@@ -10,15 +10,15 @@ import (
 	"bytes"
 	"fmt"
 
-	//"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/testutil"
+	//"theo.local/ChainKV/goleveldb/leveldb/testutil"
 	"io"
 	"math/rand"
 	"testing"
 	"time"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/filter"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/filter"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 const ctValSize = 1000

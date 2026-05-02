@@ -5,7 +5,7 @@
 ### 1. 初始化项目（已完成）
 
 ```bash
-cd /Users/tinoryj/Projects/EthStore/ChainKV
+cd ./ChainKV
 
 # 已创建 go.mod
 # 已创建 cache 符号链接（指向 cache-sgc）
@@ -59,8 +59,8 @@ ChainKV/
 2. ✅ **创建 cache 符号链接**：`goleveldb/leveldb/cache -> cache-sgc`
 3. ✅ **配置 Go 环境**：
    ```bash
-   go env -w GOPRIVATE=github.com/tinoryj/EthStore
-   go env -w GONOSUMDB=github.com/tinoryj/EthStore
+   go env -w GOPRIVATE=theo.local
+   go env -w GONOSUMDB=theo.local
    ```
 4. ✅ **完善 replayWorkload.go**：添加完整的 main 函数和功能
 5. ✅ **编译成功**：生成可执行文件

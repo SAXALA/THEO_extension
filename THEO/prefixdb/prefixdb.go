@@ -19,7 +19,7 @@ import (
 	"time"
 	"unsafe"
 
-	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
+	datatypepkg "theo.local/THEO/datatype"
 )
 
 const storageMaxFileSize int64 = 1 << 30 // 1GB

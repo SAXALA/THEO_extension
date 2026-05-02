@@ -7,7 +7,7 @@
 package leveldb
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/filter"
+	"theo.local/ChainKV/goleveldb/leveldb/filter"
 )
 
 type iFilter struct {

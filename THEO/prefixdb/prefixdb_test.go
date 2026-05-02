@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
+	datatypepkg "theo.local/THEO/datatype"
 )
 
 func TestSortStrategyThreshold(t *testing.T) {

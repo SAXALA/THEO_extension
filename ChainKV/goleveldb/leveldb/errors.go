@@ -7,7 +7,7 @@
 package leveldb
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
+	"theo.local/ChainKV/goleveldb/leveldb/errors"
 )
 
 // Common errors.

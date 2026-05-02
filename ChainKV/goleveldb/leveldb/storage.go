@@ -3,7 +3,7 @@ package leveldb
 import (
 	"sync/atomic"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 type iStorage struct {

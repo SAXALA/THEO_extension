@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ldberrors "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
+	ldberrors "theo.local/ChainKV/goleveldb/leveldb/errors"
 )
 
 func TestLDBDatabaseDeleteS(t *testing.T) {

@@ -32,38 +32,25 @@
 *.app
 
 tools
-standalone/ethstore/index
-standalone/ethstore/log
-standalone/svg
+THEO/index
+THEO/log
+THEO/svg
 
 
 
 
-standalone/ethstore/workload/workload
-standalone/ethstore/testWorkload/testWorkload
+replayWorkload/workload
+THEO/testWorkload/testWorkload
 
 go-ethereum-1.15.7/ethdb/prefixdb/question.md
 go-ycsb
 go-ycsb/*
 go-ycsb
-standalone/ethstore/workload/monitoe.sh
-standalone/ethstore/tool_script/*
+replayWorkload/monitoe.sh
 go-ycsb
 *.DS_Store
-standalone/ethstore/workload/vtuneAna.sh
-standalone/ethstore/workload/vtuneOut/
-
-standalone/ethstore/toolScript/*
-standalone/ethstore/workload/vtuneAna.sh
-standalone/ethstore/workload/baseline.log
-standalone/ethstore/workload/baselineIO.log
-standalone/ethstore/workload/ethstore
-standalone/ethstore/workload/ethstore.log
-standalone/ethstore/workload/ethstoreIO.log
-standalone/ethstore/workload/bin/*
-standalone/ethstore/workload/replayLog/*
-standalone/ethstore/workload/*.log
-standalone/ethstore/workload/*.out
-standalone/ethstore/workload/ethstoreIO_02-24_io_trend.png
-standalone/ethstore/workload/ethstoreIO_02-24.log1
-standalone/ethstore/workload/ethstoreIO_02-24_io_summary.txt
+replayWorkload/replayWorkload
+replayWorkload/bin/*
+replayWorkload/replayLog/*
+replayWorkload/*.log
+replayWorkload/*.out

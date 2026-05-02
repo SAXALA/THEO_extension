@@ -7,7 +7,7 @@
 package leveldb
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
 )
 
 type iComparer struct {

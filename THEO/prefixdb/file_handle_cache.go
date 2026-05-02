@@ -22,10 +22,10 @@ type fileHandleCacheKey struct {
 }
 
 type fileHandleCache struct {
-	cache       *lru.Cache
-	closeCh     chan *os.File
-	closeMu     sync.Mutex
-	closeCond   *sync.Cond
+	cache        *lru.Cache
+	closeCh      chan *os.File
+	closeMu      sync.Mutex
+	closeCond    *sync.Cond
 	closePending int
 }
 

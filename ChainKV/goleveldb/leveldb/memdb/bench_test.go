@@ -12,7 +12,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
 )
 
 func BenchmarkPut(b *testing.B) {

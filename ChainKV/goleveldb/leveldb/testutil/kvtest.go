@@ -13,8 +13,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/errors"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 func TestFind(db Find, kv KeyValue) {

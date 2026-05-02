@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/journal"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/memdb"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/journal"
+	"theo.local/ChainKV/goleveldb/leveldb/memdb"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 var (

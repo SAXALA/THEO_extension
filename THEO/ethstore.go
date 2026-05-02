@@ -14,8 +14,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
-	"github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
+	"theo.local/THEO/pebblestore"
+	"theo.local/THEO/prefixdb"
 )
 
 type trieStorageGetBreakdownStepStats struct {

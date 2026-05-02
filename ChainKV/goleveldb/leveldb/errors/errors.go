@@ -11,8 +11,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 // Common errors.

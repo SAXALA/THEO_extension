@@ -9,10 +9,10 @@ package leveldb
 import (
 	. "github.com/onsi/gomega"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/testutil"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/iterator"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/testutil"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 type testingDB struct {

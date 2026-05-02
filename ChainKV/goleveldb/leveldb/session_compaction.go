@@ -9,9 +9,9 @@ package leveldb
 import (
 	"sync/atomic"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/memdb"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/opt"
+	"theo.local/ChainKV/goleveldb/leveldb/iterator"
+	"theo.local/ChainKV/goleveldb/leveldb/memdb"
+	"theo.local/ChainKV/goleveldb/leveldb/opt"
 )
 
 const (
@@ -46,7 +46,7 @@ func (s *session) flushMemdb_s(rec *sessionRecord, mdb *memdb.DBs, maxLevel int)
 	//key-space is strictly incrementing it will not overlaps with
 	//higher level, thus maximum possible level is always picked, while
 	//overlapping deletion marker pushed into lower level.
-	// See: https://github.com/tinoryj/EthStore/ChainKV/goleveldb/issues/127.
+	// See: https://theo.local/ChainKV/goleveldb/issues/127.
 	flushLevel := s.pickMemdbLevel_s(t.imin.ukey(), t.imax.ukey(), maxLevel)
 	rec.addTableFile_s(flushLevel, t)
 	//fmt.Println("t.fd:",t.fd,"\n","t.size:",t.size,"\n","t.imax:",t.imax,"\n","t.imin:",t.imin)
@@ -72,7 +72,7 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 	// key-space is strictly incrementing it will not overlaps with
 	// higher level, thus maximum possible level is always picked, while
 	// overlapping deletion marker pushed into lower level.
-	// See: https://github.com/tinoryj/EthStore/ChainKV/goleveldb/issues/127.
+	// See: https://theo.local/ChainKV/goleveldb/issues/127.
 	flushLevel := s.pickMemdbLevel(t.imin.ukey(), t.imax.ukey(), maxLevel) //当前的level？
 	rec.addTableFile(flushLevel, t)
 

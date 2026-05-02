@@ -12,8 +12,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/errors"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 type byteReader interface {

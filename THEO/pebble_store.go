@@ -1,6 +1,6 @@
 package ethstore
 
-import "github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
+import "theo.local/THEO/pebblestore"
 
 // PebbleStore is the PebbleDB-backed key-value store used both as an internal
 // component of ethstore and as a standalone baseline for benchmarks.

@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
+	"theo.local/THEO/pebblestore"
 )
 
 // helper function to create a temporary directory for tests

@@ -26,8 +26,8 @@ var (
 
 const (
 	metricsGatheringInterval = 3 * time.Second
-	minCache                = 16
-	minHandles              = 16
+	minCache                 = 16
+	minHandles               = 16
 	defaultCacheValue        = 16
 	defaultHandlesValue      = 32768
 	defaultNamespaceValue    = "pebble"
@@ -109,7 +109,7 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 
 	maxMemTableSize := (1<<31)<<(^uint(0)>>63) - 1
 	memTableLimit := 2
-	memTableSize := cache * 1024 * 1024 / 4 
+	memTableSize := cache * 1024 * 1024 / 4
 	if memTableSize >= maxMemTableSize {
 		memTableSize = maxMemTableSize - 1
 	}
@@ -121,19 +121,19 @@ func NewPebbleStore(file string, cache int, handles int, namespace string, reado
 		writeOptions: &pebble.WriteOptions{Sync: true},
 	}
 	opt := &pebble.Options{
-		Cache:        pebble.NewCache(int64(cache * 1024 * 1024)),
-		MaxOpenFiles: handles,
-		MemTableSize: uint64(memTableSize),
+		Cache:                       pebble.NewCache(int64(cache * 1024 * 1024)),
+		MaxOpenFiles:                handles,
+		MemTableSize:                uint64(memTableSize),
 		MemTableStopWritesThreshold: memTableLimit,
 		MaxConcurrentCompactions: func() int {
 			return 16 // runtime.NumCPU() / 2
 		},
-		L0CompactionThreshold:       4,
-		L0StopWritesThreshold:       12,
+		L0CompactionThreshold: 4,
+		L0StopWritesThreshold: 12,
 		// L0CompactionFileThreshold:   1000,
-		LBaseMaxBytes:               64 << 20, // 64 MB
-		BytesPerSync:                512 << 10, // 512 KB
-		DisableWAL:                  false,
+		LBaseMaxBytes: 64 << 20,  // 64 MB
+		BytesPerSync:  512 << 10, // 512 KB
+		DisableWAL:    false,
 		Levels: []pebble.LevelOptions{
 			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
 			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},

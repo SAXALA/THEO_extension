@@ -7,9 +7,9 @@
 package iterator
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/errors"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 type dir int

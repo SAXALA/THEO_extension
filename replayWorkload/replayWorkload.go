@@ -27,13 +27,13 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
-	chainkverrors "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
-	chainkvdb "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/ethdb"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
-	chainkvutil "github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
-	ethstore "github.com/tinoryj/EthStore/standalone/ethstore"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
-	prefixdb "github.com/tinoryj/EthStore/standalone/ethstore/prefixdb"
+	chainkverrors "theo.local/ChainKV/goleveldb/leveldb/errors"
+	chainkvdb "theo.local/ChainKV/goleveldb/leveldb/ethdb"
+	"theo.local/ChainKV/goleveldb/leveldb/iterator"
+	chainkvutil "theo.local/ChainKV/goleveldb/leveldb/util"
+	ethstore "theo.local/THEO"
+	"theo.local/THEO/pebblestore"
+	prefixdb "theo.local/THEO/prefixdb"
 )
 
 type opType int

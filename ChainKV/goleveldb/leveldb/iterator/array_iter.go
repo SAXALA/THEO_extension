@@ -7,7 +7,7 @@
 package iterator
 
 import (
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 // BasicArray is the interface that wraps basic Len and Search method.

@@ -455,7 +455,7 @@ func TestBlockAppendOnlyLog_NewIteratorUsesMemoryIndexAndReadsOnlyMissingValue(t
 
 	firstKey := makeTestBlockKey('b', 1, 'a')
 	kvs := map[string]string{
-		firstKey:                     strings.Repeat("b", 128),
+		firstKey:                      strings.Repeat("b", 128),
 		makeTestBlockKey('b', 1, 'b'): strings.Repeat("c", 128),
 	}
 	if err := aol.Append(1, kvs); err != nil {

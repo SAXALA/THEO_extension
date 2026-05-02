@@ -5,8 +5,8 @@ import (
 	"sync"
 	"unsafe"
 
-	datatypepkg "github.com/tinoryj/EthStore/standalone/ethstore/datatype"
-	"github.com/tinoryj/EthStore/standalone/ethstore/pebblestore"
+	datatypepkg "theo.local/THEO/datatype"
+	"theo.local/THEO/pebblestore"
 )
 
 type DataType = datatypepkg.DataType

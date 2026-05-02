@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
 )
 
 var defaultIComparer = &iComparer{comparer.DefaultComparer}

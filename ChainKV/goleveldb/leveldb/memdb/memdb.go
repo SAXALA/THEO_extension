@@ -4,10 +4,10 @@ import (
 	"math/rand"
 	"sync"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/comparer"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/errors"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/iterator"
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/util"
+	"theo.local/ChainKV/goleveldb/leveldb/comparer"
+	"theo.local/ChainKV/goleveldb/leveldb/errors"
+	"theo.local/ChainKV/goleveldb/leveldb/iterator"
+	"theo.local/ChainKV/goleveldb/leveldb/util"
 )
 
 // Common errors.

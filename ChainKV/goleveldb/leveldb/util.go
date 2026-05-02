@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/storage"
+	"theo.local/ChainKV/goleveldb/leveldb/storage"
 )
 
 func shorten(str string) string {

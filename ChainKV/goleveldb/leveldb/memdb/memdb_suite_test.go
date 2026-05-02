@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/tinoryj/EthStore/ChainKV/goleveldb/leveldb/testutil"
+	"theo.local/ChainKV/goleveldb/leveldb/testutil"
 )
 
 type ANEWDB struct {

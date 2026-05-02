@@ -13,8 +13,8 @@ type Config struct {
 	BaseDir string `json:"base_dir"`
 	// Sub-directories or file paths relative to BaseDir (or absolute).
 	// If empty, defaults will be used.
-	AccountDir    string `json:"account_dir"`
-	StorageDir    string `json:"storage_dir"`
+	AccountDir string `json:"account_dir"`
+	StorageDir string `json:"storage_dir"`
 	// NodeFileGCUnsortedRatioThreshold triggers file-node GC when
 	// unsorted_count / sorted_count reaches this ratio.
 	// Values <= 0 fall back to the default 1.0.
@@ -42,9 +42,9 @@ type Config struct {
 func DefaultConfig(dirpath string) *Config {
 	prefixDBDir := filepath.Join(dirpath, "prefixdb")
 	return &Config{
-		BaseDir:                           dirpath,
-		AccountDir:                        filepath.Join(prefixDBDir, "na"),
-		StorageDir:                        filepath.Join(prefixDBDir, "storagefiles"),
+		BaseDir:                          dirpath,
+		AccountDir:                       filepath.Join(prefixDBDir, "na"),
+		StorageDir:                       filepath.Join(prefixDBDir, "storagefiles"),
 		NodeFileGCUnsortedRatioThreshold: 1.0,
 		StorageGCThreshold:               2.0,
 	}
