@@ -298,7 +298,7 @@ def build_step_cost_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "warnings": row.get("warnings"),
         }
         for key, value in row.items():
-            if key.endswith("_step_cost_us"):
+            if key.endswith("_step_cost_us") or key.endswith("_cache_hit_ratio"):
                 step_cost_row[key] = value
         step_cost_rows.append(step_cost_row)
     return step_cost_rows
@@ -404,7 +404,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", help="write output to file instead of stdout")
     parser.add_argument(
         "--step-cost-output",
-        help="write step_cost_us-only CSV to file",
+        help="write breakdown performance CSV (step_cost_us + cache_hit_ratio) to file",
     )
     parser.add_argument(
         "--merged-output",

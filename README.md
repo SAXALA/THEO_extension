@@ -33,7 +33,7 @@ Under the extremely resource-constrained setting, THEO is only **16.6% slower** 
 
 ### Ethereum block synchronization traces
 
-Traces are captured as in [ren25]: `CacheTrace`, `NocacheTrace`, and `BareTrace` starting at block 20,500,000.
+Traces are captured as in [ren25]: `CacheTrace`, `NocacheTrace`, and `BareTrace` starting at block 20,500,000. Note that `CacheTrace` and `BareTrace` are captured as in the paper, while `NocacheTrace` is captured with a no-cache configuration and snapshot enabled to simulate a resource-constrained node.
 
 [ren25]: Ren Y, Zhao J, Li J, et al. An Analysis of Ethereum Workloads from a Key-Value Storage Perspective. 2025 IEEE International Symposium on Workload Characterization (IISWC). IEEE, 2025: 394-406.
 
@@ -160,6 +160,9 @@ TEST_RUN_ROUNDS=5 ./exps/all_state_10K.sh
 ### Parameter sensitivity (Appendix)
 
 ```bash
+# Storage backend cache (total) size sensitivity
+TEST_RUN_ROUNDS=5 ./exps/all_all_cache_10K.sh
+
 # State cache size sensitivity
 TEST_RUN_ROUNDS=3 ./exps/theo_state_cache_size_10K.sh
 

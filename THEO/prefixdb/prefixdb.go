@@ -2357,6 +2357,14 @@ func recordTrieStorageGetBreakdownStep(stats *trieStorageGetBreakdownStepStats, 
 	atomic.AddUint64(&stats.noCacheNanos, nanos)
 }
 
+func trieStorageGetBreakdownHitRatio(cacheCount uint64, noCacheCount uint64) float64 {
+	total := cacheCount + noCacheCount
+	if total == 0 {
+		return 0
+	}
+	return float64(cacheCount) / float64(total) * 100.0
+}
+
 func printTrieStorageGetBreakdownStep(label string, stats *trieStorageGetBreakdownStepStats) {
 	printTrieGetBreakdownStep("TrieNodeStorage", label, stats)
 }
@@ -2377,9 +2385,11 @@ func printTrieGetBreakdownStep(kind string, label string, stats *trieStorageGetB
 	if noCacheCount > 0 {
 		noCacheAvgMicros = float64(noCacheNanos) / float64(noCacheCount) / 1000.0
 	}
-	fmt.Printf("PrefixDB %s get breakdown [%s]: cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
+	cacheHitRatio := trieStorageGetBreakdownHitRatio(cacheCount, noCacheCount)
+	fmt.Printf("PrefixDB %s get breakdown [%s]: cacheHitRatio=%0.2f%% cacheCount=%d cacheTotal=%s cacheAvg=%0.2fus noCacheCount=%d noCacheTotal=%s noCacheAvg=%0.2fus\n",
 		kind,
 		label,
+		cacheHitRatio,
 		cacheCount,
 		time.Duration(cacheNanos),
 		cacheAvgMicros,

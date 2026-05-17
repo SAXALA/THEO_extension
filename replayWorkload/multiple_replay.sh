@@ -202,6 +202,9 @@ resolve_backend_cache_mib() {
 	local backend="$1"
 	local cache_mib="$2"
 	case "$backend" in
+		theo)
+			echo "$cache_mib"
+			;;
 		chainkv)
 			echo "$cache_mib"
 			;;
@@ -351,8 +354,9 @@ for ((round_idx = 1; round_idx <= TEST_RUN_ROUNDS; round_idx++)); do
 								for replay_cgroup_enabled in "${REPLAY_CGROUP_CASES[@]}"; do
 									run_idx=$((run_idx + 1))
 									if [ "$backend" = "theo" ]; then
-										echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file BLOCK_RANGE=${start_block_id}-${end_block_id} CHUNK_FILE_SIZE_BYTES=${chunk_file_size_bytes} TOTAL_CACHE_SIZE=${cache_size_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
+										echo "[$run_idx/$total_runs] ACTION=$ACTION BACKEND=$backend TRACE_FILE=$trace_file BLOCK_RANGE=${start_block_id}-${end_block_id} CHUNK_FILE_SIZE_BYTES=${chunk_file_size_bytes} TOTAL_CACHE_SIZE=${cache_size_mib}MiB PEBBLE_CACHE=${backend_cache_mib}MiB CACHE_COUNT=${cache_count} COMMIT_BLOCK_INTERVAL=${commit_block_interval} REPLAY_CGROUP_IO_LIMIT_ENABLED=${replay_cgroup_enabled} RUN_ROUND=${round_idx}/${TEST_RUN_ROUNDS}"
 										TOTAL_CACHE_SIZE_MIB="$cache_size_mib" \
+										PEBBLE_CACHE_MB="$backend_cache_mib" \
 										CACHE_COUNT="$cache_count" \
 										COMMIT_BLOCK_INTERVAL="$commit_block_interval" \
 										TRACE_FILE="$trace_file" \

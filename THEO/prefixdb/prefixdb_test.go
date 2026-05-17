@@ -579,6 +579,25 @@ func TestTrieNodeAccountGetBreakdownTracksIndexLocateIOReadAndSearch(t *testing.
 	}
 }
 
+func TestTrieStorageGetBreakdownHitRatio(t *testing.T) {
+	assertRatio := func(cacheCount uint64, noCacheCount uint64, want float64) {
+		t.Helper()
+		got := trieStorageGetBreakdownHitRatio(cacheCount, noCacheCount)
+		diff := got - want
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > 0.000001 {
+			t.Fatalf("trieStorageGetBreakdownHitRatio(%d, %d)=%f, want %f", cacheCount, noCacheCount, got, want)
+		}
+	}
+
+	assertRatio(0, 0, 0)
+	assertRatio(0, 4, 0)
+	assertRatio(3, 0, 100)
+	assertRatio(2, 3, 40)
+}
+
 func writeLargeChunkFileForTest(t *testing.T, path string, entryCount int, targetKey []byte, targetValue []byte) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
