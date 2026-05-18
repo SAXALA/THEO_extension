@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -246,6 +248,10 @@ func classifyDataType(dt theo.DataType) string {
 		return "StateData"
 	}
 	return "OtherData"
+}
+
+func isContractDataType(dt theo.DataType) bool {
+	return theo.PrefixDBHandledDataTypes[dt]
 }
 
 func reportLatencyStats(stats map[string]map[opType]*latencyHistogram) {
@@ -1794,6 +1800,153 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	backend.PrintCommitStats()
 }
 
+func analyzeTrace(traceFile string, maxOps int64, startBlockID int64, endBlockID int64, lruCap int, pebbleDir string) error {
+	file, err := os.Open(traceFile)
+	if err != nil {
+		return fmt.Errorf("analyzeTrace: failed to open trace file: %w", err)
+	}
+	defer file.Close()
+
+	analyzers := make(map[theo.DataType]*gapAnalyzer, 2)
+	dataTypes := []theo.DataType{theo.TrieNodeAccountDataType, theo.TrieNodeStorageDataType}
+	for _, dt := range dataTypes {
+		name := dataTypeName(dt)
+		dir := fmt.Sprintf("%s_%s", pebbleDir, strings.ToLower(name))
+		analyzer, initErr := newGapAnalyzer(lruCap, dir)
+		if initErr != nil {
+			return fmt.Errorf("analyzeTrace: failed to init analyzer for %s: %w", name, initErr)
+		}
+		analyzers[dt] = analyzer
+	}
+	defer func() {
+		for _, analyzer := range analyzers {
+			if analyzer != nil && analyzer.disk != nil {
+				_ = analyzer.disk.Close()
+			}
+		}
+	}()
+
+	reader := bufio.NewReader(file)
+	var (
+		replayStarted    bool
+		lastEndedBlockID int64
+		processedOps     int64
+	)
+	if startBlockID <= 0 {
+		replayStarted = true
+	}
+
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			if readErr == io.EOF {
+				if line == "" {
+					break
+				}
+			} else {
+				return fmt.Errorf("analyzeTrace: read error: %w", readErr)
+			}
+		}
+		line = strings.TrimSpace(line)
+
+		if marker := blockMarkerRegex.FindStringSubmatch(line); len(marker) == 3 {
+			markerType := marker[1]
+			markerID, parseErr := strconv.ParseInt(marker[2], 10, 64)
+			if parseErr == nil {
+				if markerType == "start" && !replayStarted && markerID == startBlockID {
+					replayStarted = true
+				}
+				if markerType == "end" && replayStarted {
+					lastEndedBlockID = markerID
+					if endBlockID > 0 && markerID >= endBlockID {
+						break
+					}
+				}
+			}
+			continue
+		}
+		if !replayStarted {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+		if !strings.Contains(line, "OPType:") {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+		matches := opRegex.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+
+		opTypeStr := matches[1]
+		if len(matches) < 3 || matches[2] == "" {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+		keyBytes, err := hex.DecodeString(matches[2])
+		if err != nil || len(keyBytes) == 0 {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+		dataType := theo.GetDataTypeFromKey(keyBytes)
+		if dataType != theo.TrieNodeAccountDataType && dataType != theo.TrieNodeStorageDataType {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+		analyzer := analyzers[dataType]
+		if analyzer == nil {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+
+		switch opTypeStr {
+		case "Put", "BatchPut", "Delete", "BatchDelete":
+			if err := analyzer.onPut(keyBytes); err != nil {
+				return fmt.Errorf("analyzeTrace: onPut failed: %w", err)
+			}
+			processedOps++
+		case "Get":
+			if err := analyzer.onGet(keyBytes); err != nil {
+				return fmt.Errorf("analyzeTrace: onGet failed: %w", err)
+			}
+			processedOps++
+		}
+
+		if maxOps > 0 && processedOps >= maxOps {
+			break
+		}
+		if readErr == io.EOF {
+			break
+		}
+	}
+
+	fmt.Printf("[analyzeTrace] finished at block=%d ops=%d\n", lastEndedBlockID, processedOps)
+	for _, dt := range dataTypes {
+		analyzer := analyzers[dt]
+		if analyzer == nil {
+			continue
+		}
+		fmt.Printf("[analyzeTrace] dataType=%s\n", dataTypeName(dt))
+		analyzer.report()
+	}
+	return nil
+}
+
 func printRuntimeArgsSnapshot(
 	mode string,
 	backend string,
@@ -1907,7 +2060,7 @@ func main() {
 	})
 
 	configPath := flag.String("config", "replay_config.json", "Path to replay config JSON")
-	mode := flag.String("mode", "re", "Mode of operation: ld/re/recovery/gc/upgrade-index")
+	mode := flag.String("mode", "re", "Mode of operation: ld/re/recovery/gc/upgrade-index/analyzeTrace")
 	backend := flag.String("backend", "theo", "Backend for ld/re mode: theo, chainkv, or pebble")
 	maxOps := flag.Int64("max-ops", 100*1000*1000, "Max operations to replay, 0 means no limit")
 	startBlockID := flag.Int64("start-block-id", 0, "Replay start block ID (0 means from beginning)")
@@ -1935,6 +2088,8 @@ func main() {
 	upgradeStateDir := flag.String("upgrade-state-dir", "", "State DB directory for upgrade-index mode (direct path, no copy)")
 	prefixdbLoadStageRaw := flag.String("prefixdb-load-stage", "all", "PrefixDB load stage for ld mode: all, account, storage")
 	prefixdbStateDir := flag.String("prefixdb-state-dir", "", "Target PrefixDB statedb directory for prefixdb ld mode; required for storage stage")
+	gapLRUCap := flag.Int("gap-lru-cap", 1000000, "LRU capacity for analyzeTrace gap analyzer")
+	gapPebbleDir := flag.String("gap-pebble-dir", "gap_trace_index", "Pebble dir for analyzeTrace gap analyzer")
 	flag.Parse()
 	resolvedPrefixDBLoadStage, err := parsePrefixDBLoadStage(*prefixdbLoadStageRaw)
 	if err != nil {
@@ -2084,8 +2239,12 @@ func main() {
 		if err := runUpgradeIndex(*backend, *upgradeStateDir, *contractChunkFileSizeBytes, *totalCacheSizeMiB, *contractCachePrefetchCount, *prefixdbHandles, *nodeFileGCRatioThreshold, resolvedGCWorkers, *storageGCThreshold, *nodeFileSortedCompression, *segmentIndexCompression); err != nil {
 			log.Fatalf("upgrade-index failed: %v", err)
 		}
+	case "analyzeTrace":
+		if err := analyzeTrace(traceFile, *maxOps, *startBlockID, *endBlockID, *gapLRUCap, *gapPebbleDir); err != nil {
+			log.Fatalf("analyzeTrace failed: %v", err)
+		}
 	default:
-		log.Fatalf("unknown mode %q, use ld/re/recovery/gc/upgrade-index", *mode)
+		log.Fatalf("unknown mode %q, use ld/re/recovery/gc/upgrade-index/analyzeTrace", *mode)
 	}
 }
 
@@ -2866,4 +3025,231 @@ func insertAccountHashKeyPebbleToTheoPebble(accountHashKeyPebbleDir string, theo
 	}
 	fmt.Printf("Copied %d entries from account hash key pebble to theo pebble\n", copiedCount)
 	return nil
+}
+
+type gapAnalyzer struct {
+	opIndex       int64
+	totalWrite    int64
+	totalRead     int64
+	minGap        int64
+	maxGap        int64
+	totalGap      int64
+	writeGapCount int64
+
+	readGapCount int64
+	readGapMin   int64
+	readGapMax   int64
+	readGapSum   int64
+
+	hist *latencyHistogram
+	// readGapHist tracks read->read gaps when no prior write is found.
+	readGapHist *latencyHistogram
+
+	// 内存层
+	writeLRU *simpleLRU // key -> writeIndex
+	readLRU  *simpleLRU // key -> lastReadIndex
+
+	// 磁盘层
+	disk *pebble.DB
+}
+
+const (
+	diskKeyWritePrefix = byte('w')
+	diskKeyReadPrefix  = byte('r')
+)
+
+type simpleLRU struct {
+	cap int
+	ll  *list.List
+	m   map[string]*list.Element
+}
+
+type lruEntry struct {
+	key        string
+	writeIndex int64
+}
+
+func newSimpleLRU(cap int) *simpleLRU {
+	return &simpleLRU{
+		cap: cap,
+		ll:  list.New(),
+		m:   make(map[string]*list.Element),
+	}
+}
+
+func (l *simpleLRU) Get(key string) (int64, bool) {
+	if el, ok := l.m[key]; ok {
+		l.ll.MoveToFront(el)
+		return el.Value.(lruEntry).writeIndex, true
+	}
+	return 0, false
+}
+
+func (l *simpleLRU) Put(key string, writeIndex int64) (evicted *lruEntry, evictedOK bool) {
+	if el, ok := l.m[key]; ok {
+		el.Value = lruEntry{key: key, writeIndex: writeIndex}
+		l.ll.MoveToFront(el)
+		return nil, false
+	}
+
+	el := l.ll.PushFront(lruEntry{key: key, writeIndex: writeIndex})
+	l.m[key] = el
+	if l.ll.Len() > l.cap {
+		tail := l.ll.Back()
+		if tail != nil {
+			l.ll.Remove(tail)
+			entry := tail.Value.(lruEntry)
+			delete(l.m, entry.key)
+			return &entry, true
+		}
+	}
+	return nil, false
+}
+
+func (l *simpleLRU) Delete(key string) {
+	if el, ok := l.m[key]; ok {
+		l.ll.Remove(el)
+		delete(l.m, key)
+	}
+}
+
+func newGapAnalyzer(lruCap int, pebbleDir string) (*gapAnalyzer, error) {
+	db, err := pebble.Open(pebbleDir, &pebble.Options{})
+	if err != nil {
+		return nil, err
+	}
+	return &gapAnalyzer{
+		minGap:      math.MaxInt64,
+		readGapMin:  math.MaxInt64,
+		hist:        newLatencyHistogram(),
+		readGapHist: newLatencyHistogram(),
+		writeLRU:    newSimpleLRU(lruCap),
+		readLRU:     newSimpleLRU(lruCap),
+		disk:        db,
+	}, nil
+}
+
+func (g *gapAnalyzer) onPut(key []byte) error {
+	g.opIndex++
+	g.totalWrite++
+	keyStr := string(key)
+
+	if ev, ok := g.writeLRU.Put(keyStr, g.opIndex); ok {
+		// LRU 淘汰 -> 落盘
+		if err := g.setDiskIndex(diskKeyWritePrefix, ev.key, ev.writeIndex); err != nil {
+			return err
+		}
+	}
+	// Write overrides any pending read-only tracking for the key.
+	g.readLRU.Delete(keyStr)
+	_ = g.deleteDiskIndex(diskKeyReadPrefix, keyStr)
+	return nil
+}
+
+func (g *gapAnalyzer) onGet(key []byte) error {
+	g.opIndex++
+	g.totalRead++
+	keyStr := string(key)
+
+	if idx, ok := g.writeLRU.Get(keyStr); ok {
+		g.observeGap(g.opIndex - idx)
+		g.writeLRU.Delete(keyStr)
+		_ = g.deleteDiskIndex(diskKeyWritePrefix, keyStr)
+		// Clear read-only state after a successful write->read match.
+		g.readLRU.Delete(keyStr)
+		_ = g.deleteDiskIndex(diskKeyReadPrefix, keyStr)
+		return nil
+	}
+
+	// LRU 未命中 -> 查磁盘 (write index)
+	if idx, ok, err := g.getDiskIndex(diskKeyWritePrefix, keyStr); err != nil {
+		return err
+	} else if ok {
+		g.observeGap(g.opIndex - idx)
+		_ = g.deleteDiskIndex(diskKeyWritePrefix, keyStr)
+		g.readLRU.Delete(keyStr)
+		_ = g.deleteDiskIndex(diskKeyReadPrefix, keyStr)
+		return nil
+	}
+
+	// No write observed: track read->read gaps.
+	if idx, ok := g.readLRU.Get(keyStr); ok {
+		g.observeReadGap(g.opIndex - idx)
+	}
+	if ev, ok := g.readLRU.Put(keyStr, g.opIndex); ok {
+		if err := g.setDiskIndex(diskKeyReadPrefix, ev.key, ev.writeIndex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (g *gapAnalyzer) observeGap(gap int64) {
+	g.writeGapCount++
+	if gap < g.minGap {
+		g.minGap = gap
+	}
+	if gap > g.maxGap {
+		g.maxGap = gap
+	}
+	g.totalGap += gap
+	// 直方图里记录 gap（以“op 次数”为单位）
+	g.hist.observe(time.Duration(gap) * time.Microsecond)
+}
+
+func (g *gapAnalyzer) observeReadGap(gap int64) {
+	g.readGapCount++
+	if gap < g.readGapMin {
+		g.readGapMin = gap
+	}
+	if gap > g.readGapMax {
+		g.readGapMax = gap
+	}
+	g.readGapSum += gap
+	// 直方图里记录 gap（以“op 次数”为单位）
+	g.readGapHist.observe(time.Duration(gap) * time.Microsecond)
+}
+
+func (g *gapAnalyzer) report() {
+	fmt.Printf("writes=%d reads=%d\n", g.totalWrite, g.totalRead)
+	if g.writeGapCount > 0 {
+		avg := float64(g.totalGap) / float64(g.writeGapCount)
+		fmt.Printf("gap avg=%.2f min=%d max=%d\n", avg, g.minGap, g.maxGap)
+		reportHistogramSummary("contract-gap", g.hist)
+	}
+	if g.readGapCount > 0 {
+		avg := float64(g.readGapSum) / float64(g.readGapCount)
+		fmt.Printf("read-only gap avg=%.2f min=%d max=%d\n", avg, g.readGapMin, g.readGapMax)
+		reportHistogramSummary("contract-gap-read-only", g.readGapHist)
+	}
+}
+
+func (g *gapAnalyzer) makeDiskKey(prefix byte, key string) []byte {
+	buf := make([]byte, 1+len(key))
+	buf[0] = prefix
+	copy(buf[1:], key)
+	return buf
+}
+
+func (g *gapAnalyzer) setDiskIndex(prefix byte, key string, index int64) error {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(index))
+	return g.disk.Set(g.makeDiskKey(prefix, key), buf, nil)
+}
+
+func (g *gapAnalyzer) getDiskIndex(prefix byte, key string) (int64, bool, error) {
+	val, closer, err := g.disk.Get(g.makeDiskKey(prefix, key))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	idx := int64(binary.BigEndian.Uint64(val))
+	closer.Close()
+	return idx, true, nil
+}
+
+func (g *gapAnalyzer) deleteDiskIndex(prefix byte, key string) error {
+	return g.disk.Delete(g.makeDiskKey(prefix, key), nil)
 }
