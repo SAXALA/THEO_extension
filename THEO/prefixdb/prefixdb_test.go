@@ -2282,6 +2282,106 @@ func TestStorageBatchCommitRefreshesStorageCacheTombstone(t *testing.T) {
 	}
 }
 
+func TestStorageBatchCommitCacheReadSkipsCorruptedBufferLog(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x29)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+	want := []byte("committed-value")
+	if err := db.StorageBatchPut(rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit failed: %v", err)
+	}
+
+	bufferLogPath, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPathForAccount failed: %v", err)
+	}
+	if err := os.WriteFile(bufferLogPath, []byte{0xff, 0x00, 0x01}, 0o644); err != nil {
+		t.Fatalf("WriteFile buffer log failed: %v", err)
+	}
+
+	readOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage result: found=%t value=%q", found, got)
+	}
+	readOpsAfter := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageCommonLogs].readOps)
+	if readOpsAfter != readOpsBefore {
+		t.Fatalf("expected cache-first read to skip buffer log, common log reads before=%d after=%d", readOpsBefore, readOpsAfter)
+	}
+}
+
+func TestBufferLogStatsTrackHitsAndMigrations(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x2a)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x03)
+	want := []byte("bufferlog-value")
+	if err := db.StorageBatchPut(rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit failed: %v", err)
+	}
+
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	db.removeStorageCacheValue(accountKey, storageKey)
+
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage result: found=%t value=%q", found, got)
+	}
+
+	if got := loadUint64Stat(&db.bufferLogLookupCount); got != 1 {
+		t.Fatalf("unexpected bufferlog lookup count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogHitCount); got != 1 {
+		t.Fatalf("unexpected bufferlog hit count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogHitBytes); got != uint64(len(want)) {
+		t.Fatalf("unexpected bufferlog hit bytes: got=%d want=%d", got, len(want))
+	}
+
+	if err := db.migrateBufferLogForAccount(accountKey, []kvPair{{key: storageKey, val: want}}); err != nil {
+		t.Fatalf("migrateBufferLogForAccount failed: %v", err)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigrationCount); got != 1 {
+		t.Fatalf("unexpected bufferlog migration count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigratedKVCount); got != 1 {
+		t.Fatalf("unexpected bufferlog migrated kv count: got=%d want=1", got)
+	}
+}
+
 func TestGCAllStorageChunkFilesRefreshesStorageCacheTombstone(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 64, 8, 16)

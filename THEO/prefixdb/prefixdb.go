@@ -27,6 +27,9 @@ const storageMaxFileSize int64 = 1 << 30 // 1GB
 const (
 	segmentedStorageFlag            uint32 = 1 << 31
 	segmentIndexFileName                   = "index.meta"
+	bufferLogFileName                      = "buffer.log"
+	bufferLogBloomBitCount          uint64 = 1 << 27
+	bufferLogBloomHashCount                = 5
 	accountFolderBloomBitCount      uint64 = 1 << 20
 	segmentIndexCacheThresholdBytes        = 0   // cache all decoded segment indexes
 	segmentIndexCacheCapacityMiB           = 64  // total segment-index cache budget in MiB
@@ -232,6 +235,12 @@ type accountFolderFilter struct {
 	exact map[string]struct{}
 }
 
+type bufferLogBloom struct {
+	mu    sync.RWMutex
+	count []uint8
+	mask  uint64
+}
+
 func newAccountFolderFilter(bitCount uint64) *accountFolderFilter {
 	if bitCount == 0 {
 		bitCount = accountFolderBloomBitCount
@@ -310,6 +319,92 @@ func (f *accountFolderFilter) maybeContains(accountKey []byte) bool {
 	_, ok := f.exact[string(accountKey)]
 	f.mu.RUnlock()
 	return ok
+}
+
+func newBufferLogBloom(bitCount uint64) *bufferLogBloom {
+	if bitCount == 0 {
+		bitCount = bufferLogBloomBitCount
+	}
+	if bitCount&(bitCount-1) != 0 {
+		pow := uint64(1)
+		for pow < bitCount {
+			pow <<= 1
+		}
+		bitCount = pow
+	}
+	return &bufferLogBloom{
+		count: make([]uint8, bitCount),
+		mask:  bitCount - 1,
+	}
+}
+
+func mixBufferLogHash(accountKey, storageKey []byte, seed uint64) uint64 {
+	h := seed ^ 0x9e3779b97f4a7c15
+	for _, c := range accountKey {
+		h ^= uint64(c) + 0x9e3779b97f4a7c15 + (h << 6) + (h >> 2)
+	}
+	for _, c := range storageKey {
+		h ^= uint64(c) + 0x9e3779b97f4a7c15 + (h << 6) + (h >> 2)
+	}
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
+}
+
+func (b *bufferLogBloom) bloomIndexes(accountKey, storageKey []byte) [bufferLogBloomHashCount]uint64 {
+	h1 := mixBufferLogHash(accountKey, storageKey, 0x100000001b3)
+	h2 := mixBufferLogHash(accountKey, storageKey, 0x84222325cbf29ce4)
+	var idx [bufferLogBloomHashCount]uint64
+	for i := 0; i < bufferLogBloomHashCount; i++ {
+		idx[i] = (h1 + uint64(i)*h2) & b.mask
+	}
+	return idx
+}
+
+func (b *bufferLogBloom) add(accountKey, storageKey []byte) {
+	if b == nil || len(accountKey) == 0 || len(storageKey) == 0 {
+		return
+	}
+	idx := b.bloomIndexes(accountKey, storageKey)
+	b.mu.Lock()
+	for _, bitIdx := range idx {
+		if b.count[bitIdx] < 0xff {
+			b.count[bitIdx]++
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *bufferLogBloom) remove(accountKey, storageKey []byte) {
+	if b == nil || len(accountKey) == 0 || len(storageKey) == 0 {
+		return
+	}
+	idx := b.bloomIndexes(accountKey, storageKey)
+	b.mu.Lock()
+	for _, bitIdx := range idx {
+		if b.count[bitIdx] > 0 {
+			b.count[bitIdx]--
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *bufferLogBloom) maybeContains(accountKey, storageKey []byte) bool {
+	if b == nil || len(accountKey) == 0 || len(storageKey) == 0 {
+		return false
+	}
+	idx := b.bloomIndexes(accountKey, storageKey)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, bitIdx := range idx {
+		if b.count[bitIdx] == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type storageGCJob struct {
@@ -935,6 +1030,26 @@ type PrefixDB struct {
 	storagePrefetchTrackedCount       uint64
 	storagePrefetchPending            map[string]struct{}
 
+	bufferLogMu                 sync.Mutex
+	lastBufferLogAccount        string
+	bufferLogRead               map[string]map[string][]byte
+	bufferLogBloom              *bufferLogBloom
+	bufferLogCacheMu            sync.Mutex
+	bufferLogCachePath          string
+	bufferLogCacheSize          int64
+	bufferLogCacheModTime       int64
+	bufferLogCacheBuf           []byte
+	bufferLogLookupCount        uint64
+	bufferLogBloomRejectCount   uint64
+	bufferLogHitCount           uint64
+	bufferLogHitBytes           uint64
+	bufferLogTombstoneHitCount  uint64
+	bufferLogMissCount          uint64
+	bufferLogErrorCount         uint64
+	bufferLogMigrationCount     uint64
+	bufferLogMigratedKVCount    uint64
+	bufferLogMigrationWaitGroup sync.WaitGroup
+
 	// nodeCache access stats (read path)
 	nodeCacheLookups uint64
 	nodeCacheHits    uint64
@@ -1083,6 +1198,8 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		gcWorkers:                        cfg.GCWorkers,
 		nodeFileSortedCompression:        resolvedNodeFileSortedCompression,
 		segmentIndexCompression:          resolvedSegmentIndexCompression,
+		bufferLogRead:                    make(map[string]map[string][]byte),
+		bufferLogBloom:                   newBufferLogBloom(bufferLogBloomBitCount),
 	}
 	if nodeFileGCRatioThreshold > 0 {
 		db.nodeFileGCUnsortedRatioThreshold = nodeFileGCRatioThreshold
@@ -1250,6 +1367,17 @@ func (db *PrefixDB) getStorage(key []byte, accountKey []byte) ([]byte, bool, err
 		valueBytes := value.([]byte)
 		db.addTrieStorageFetchStats(true, valueBytes)
 		return valueBytes, true, nil
+	}
+
+	if value, found, err := db.readBufferLogValue(accountKey, storageKey); err != nil {
+		db.logStorageKVReadFailure(storageKey, accountKey, "buffer-log-read", err)
+		return nil, false, err
+	} else if found {
+		if value == nil {
+			db.logStorageKVReadFailure(storageKey, accountKey, "buffer-log-tombstone", nil)
+			return nil, false, nil
+		}
+		return value, true, nil
 	}
 	missStart := time.Now()
 	missTracker := &cacheMissCostTracker{}
@@ -2488,6 +2616,58 @@ func printTrieStoragePrefetchStats(db *PrefixDB) {
 	)
 }
 
+func (db *PrefixDB) addBufferLogMigrationStats(migratedKVs int) {
+	if migratedKVs <= 0 {
+		return
+	}
+	addUint64Stat(&db.bufferLogMigrationCount, 1)
+	addUint64Stat(&db.bufferLogMigratedKVCount, uint64(migratedKVs))
+}
+
+func printBufferLogStats(db *PrefixDB) {
+	if !analysisStatsEnabled || db == nil {
+		return
+	}
+	lookups := loadUint64Stat(&db.bufferLogLookupCount)
+	bloomRejects := loadUint64Stat(&db.bufferLogBloomRejectCount)
+	hits := loadUint64Stat(&db.bufferLogHitCount)
+	hitBytes := loadUint64Stat(&db.bufferLogHitBytes)
+	tombstoneHits := loadUint64Stat(&db.bufferLogTombstoneHitCount)
+	misses := loadUint64Stat(&db.bufferLogMissCount)
+	errors := loadUint64Stat(&db.bufferLogErrorCount)
+	migrations := loadUint64Stat(&db.bufferLogMigrationCount)
+	migratedKVs := loadUint64Stat(&db.bufferLogMigratedKVCount)
+
+	totalHits := hits + tombstoneHits
+	hitRate := 0.0
+	if lookups > 0 {
+		hitRate = float64(totalHits) / float64(lookups) * 100.0
+	}
+	avgHitBytes := 0.0
+	if hits > 0 {
+		avgHitBytes = float64(hitBytes) / float64(hits)
+	}
+	avgMigratedKVs := 0.0
+	if migrations > 0 {
+		avgMigratedKVs = float64(migratedKVs) / float64(migrations)
+	}
+
+	fmt.Printf("PrefixDB bufferlog stats: lookups=%d bloomRejects=%d hits=%d tombstoneHits=%d misses=%d errors=%d hitRate=%0.2f%% hitBytes=%d avgHitBytes=%0.2f migrations=%d migratedKVs=%d avgMigratedKVs=%0.2f\n",
+		lookups,
+		bloomRejects,
+		hits,
+		tombstoneHits,
+		misses,
+		errors,
+		hitRate,
+		hitBytes,
+		avgHitBytes,
+		migrations,
+		migratedKVs,
+		avgMigratedKVs,
+	)
+}
+
 func (db *PrefixDB) Close() error {
 	errs := []error{}
 	// Flush any pending storage batch writes before tearing down files.
@@ -2500,6 +2680,7 @@ func (db *PrefixDB) Close() error {
 	}
 
 	db.stopStorageGCWorker()
+	db.bufferLogMigrationWaitGroup.Wait()
 
 	if analysisStatsEnabled {
 		fmt.Printf("PrefixDB GC stats: count=%d writeBytes=%d\n",
@@ -2537,6 +2718,7 @@ func (db *PrefixDB) Close() error {
 		printCacheMissCostStats("storage-data", &db.storageDataMissStats)
 		printSharedCacheLockStats(db.sharedCache)
 		printTrieStoragePrefetchStats(db)
+		printBufferLogStats(db)
 		printTrieStorageGetBreakdownStep("storage-kv-pairs", &db.trieStorageKVStats)
 		lookups := atomic.LoadUint64(&db.nodeCacheLookups)
 		hits := atomic.LoadUint64(&db.nodeCacheHits)
@@ -6454,6 +6636,402 @@ func (db *PrefixDB) storagePathByFileID(fileID uint32) (path string, realID uint
 	}
 	realID = fileID
 	return filepath.Join(db.storageDir, fmt.Sprintf("storage_%08d.dat", realID)), realID
+}
+
+func (db *PrefixDB) bufferLogPathForAccount(accountKey []byte) (string, error) {
+	if len(accountKey) == 0 {
+		return "", errors.New("account key required for buffer log")
+	}
+	folderPath := db.segmentedFolderPathForAccount(accountKey)
+	return filepath.Join(folderPath, bufferLogFileName), nil
+}
+
+func (db *PrefixDB) appendBufferLogEntries(accountKey []byte, kvs []kvPair, blockID uint64) error {
+	if len(accountKey) == 0 || len(kvs) == 0 {
+		return nil
+	}
+	if db.bufferLogBloom != nil {
+		for _, kv := range kvs {
+			if len(kv.key) == 0 {
+				continue
+			}
+			db.bufferLogBloom.add(accountKey, kv.key)
+		}
+	}
+	path, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	seg, release, _, err := db.serializeStorageSegment(kvs)
+	if err != nil {
+		return err
+	}
+	defer release()
+	payload := append([]byte(nil), seg...)
+	payload = appendForwardCommitTag(payload, blockID)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(payload); err != nil {
+		return err
+	}
+	db.addDiskWrite(diskIOUsageStorageCommonLogs, len(payload))
+	return nil
+}
+
+func (db *PrefixDB) readBufferLogEntries(accountKey []byte) ([]kvPair, error) {
+	path, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, statErr
+	}
+	modTime := info.ModTime().UnixNano()
+	fileSize := info.Size()
+	var data []byte
+	db.bufferLogCacheMu.Lock()
+	if db.bufferLogCachePath == path && db.bufferLogCacheSize == fileSize && db.bufferLogCacheModTime == modTime && len(db.bufferLogCacheBuf) > 0 {
+		data = db.bufferLogCacheBuf
+		db.bufferLogCacheMu.Unlock()
+	} else {
+		db.bufferLogCacheMu.Unlock()
+		data, err = db.readFileWithStats(path, diskIOUsageStorageCommonLogs)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, nil
+		}
+		db.bufferLogCacheMu.Lock()
+		db.bufferLogCachePath = path
+		db.bufferLogCacheSize = fileSize
+		db.bufferLogCacheModTime = modTime
+		db.bufferLogCacheBuf = data
+		db.bufferLogCacheMu.Unlock()
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	payload, kvCount, err := parseSegmentBuffer(data)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := buildPairsFromPayload(payload, kvCount, segmentedChunkEntryHeaderSize, nil)
+	if err != nil {
+		return nil, err
+	}
+	entries = normalizeStorageEntries(entries)
+	return entries, nil
+}
+
+func (db *PrefixDB) readBufferLogValue(accountKey, storageKey []byte) ([]byte, bool, error) {
+	if len(accountKey) == 0 || len(storageKey) == 0 {
+		return nil, false, nil
+	}
+	addUint64Stat(&db.bufferLogLookupCount, 1)
+	if err := db.maybeRotateBufferLogAccount(accountKey); err != nil {
+		prefixdbDebugf("buffer log rotate failed account=%x err=%v", accountKey, err)
+	}
+	if db.bufferLogBloom != nil && !db.bufferLogBloom.maybeContains(accountKey, storageKey) {
+		addUint64Stat(&db.bufferLogBloomRejectCount, 1)
+		addUint64Stat(&db.bufferLogMissCount, 1)
+		return nil, false, nil
+	}
+	entries, err := db.readBufferLogEntries(accountKey)
+	if err != nil {
+		addUint64Stat(&db.bufferLogErrorCount, 1)
+		return nil, false, err
+	}
+	if len(entries) == 0 {
+		addUint64Stat(&db.bufferLogMissCount, 1)
+		return nil, false, err
+	}
+	db.markBufferLogRead(accountKey)
+	idx := sort.Search(len(entries), func(i int) bool {
+		return bytes.Compare(entries[i].key, storageKey) >= 0
+	})
+	if idx >= len(entries) || !bytes.Equal(entries[idx].key, storageKey) {
+		addUint64Stat(&db.bufferLogMissCount, 1)
+		return nil, false, nil
+	}
+	val := entries[idx].val
+	db.recordBufferLogReadEntry(accountKey, storageKey, val)
+	if val == nil {
+		addUint64Stat(&db.bufferLogTombstoneHitCount, 1)
+		return nil, true, nil
+	}
+	addUint64Stat(&db.bufferLogHitCount, 1)
+	addUint64Stat(&db.bufferLogHitBytes, uint64(len(val)))
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	return valCopy, true, nil
+}
+
+func (db *PrefixDB) maybeRotateBufferLogAccount(accountKey []byte) error {
+	if len(accountKey) == 0 {
+		return nil
+	}
+	current := string(accountKey)
+	var prev string
+	var prevEntries []kvPair
+	db.bufferLogMu.Lock()
+	if db.lastBufferLogAccount == "" || db.lastBufferLogAccount == current {
+		db.lastBufferLogAccount = current
+		db.bufferLogMu.Unlock()
+		return nil
+	}
+	prev = db.lastBufferLogAccount
+	db.lastBufferLogAccount = current
+	prevEntries = db.popBufferLogReadEntriesLocked(prev)
+	db.bufferLogMu.Unlock()
+	if prev == "" || prev == current {
+		return nil
+	}
+	if len(prevEntries) > 0 {
+		prevBytes := []byte(prev)
+		db.bufferLogMigrationWaitGroup.Add(1)
+		go func() {
+			defer db.bufferLogMigrationWaitGroup.Done()
+			if err := db.migrateBufferLogForAccount(prevBytes, prevEntries); err != nil {
+				prefixdbDebugf("buffer log async migrate failed account=%x err=%v", prevBytes, err)
+			}
+		}()
+	}
+	return nil
+}
+
+func (db *PrefixDB) markBufferLogRead(accountKey []byte) {
+	if len(accountKey) == 0 {
+		return
+	}
+	key := string(accountKey)
+	db.bufferLogMu.Lock()
+	if db.bufferLogRead == nil {
+		db.bufferLogRead = make(map[string]map[string][]byte)
+	}
+	if _, ok := db.bufferLogRead[key]; !ok {
+		db.bufferLogRead[key] = make(map[string][]byte)
+	}
+	db.bufferLogMu.Unlock()
+}
+
+func (db *PrefixDB) recordBufferLogReadEntry(accountKey, storageKey, value []byte) {
+	if len(accountKey) == 0 || len(storageKey) == 0 {
+		return
+	}
+	key := string(accountKey)
+	storageKeyStr := string(storageKey)
+	var valCopy []byte
+	if value != nil {
+		valCopy = make([]byte, len(value))
+		copy(valCopy, value)
+	}
+	db.bufferLogMu.Lock()
+	if db.bufferLogRead == nil {
+		db.bufferLogRead = make(map[string]map[string][]byte)
+	}
+	perAccount := db.bufferLogRead[key]
+	if perAccount == nil {
+		perAccount = make(map[string][]byte)
+		db.bufferLogRead[key] = perAccount
+	}
+	perAccount[storageKeyStr] = valCopy
+	db.bufferLogMu.Unlock()
+}
+
+func (db *PrefixDB) popBufferLogReadEntriesLocked(accountKey string) []kvPair {
+	if db.bufferLogRead == nil || accountKey == "" {
+		return nil
+	}
+	perAccount := db.bufferLogRead[accountKey]
+	if len(perAccount) == 0 {
+		return nil
+	}
+	entries := make([]kvPair, 0, len(perAccount))
+	for key, value := range perAccount {
+		keyCopy := []byte(key)
+		var valCopy []byte
+		if value != nil {
+			valCopy = make([]byte, len(value))
+			copy(valCopy, value)
+		}
+		entries = append(entries, kvPair{key: keyCopy, val: valCopy})
+	}
+	delete(db.bufferLogRead, accountKey)
+	return entries
+}
+
+func (db *PrefixDB) migrateBufferLogForAccount(accountKey []byte, bufferEntries []kvPair) error {
+	if len(accountKey) == 0 {
+		return nil
+	}
+	if len(bufferEntries) == 0 {
+		return nil
+	}
+	if db.bufferLogBloom != nil {
+		for _, kv := range bufferEntries {
+			if len(kv.key) == 0 {
+				continue
+			}
+			db.bufferLogBloom.remove(accountKey, kv.key)
+		}
+	}
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+
+	accountKeyStr := string(accountKey)
+	node, err := db.getNode(accountKey)
+	if err != nil {
+		return err
+	}
+	var accOff uint64
+	var accSize uint32
+	if node != nil {
+		accOff = node.accountOffset
+		accSize = node.accountSize
+	}
+
+	existingEntries, err := db.readAccountStorageEntriesForMigration(accountKey, node)
+	if err != nil {
+		return err
+	}
+	if len(existingEntries) > 1 {
+		sortKVPairs(existingEntries)
+	}
+	if len(bufferEntries) > 1 {
+		sortKVPairs(bufferEntries)
+	}
+	merged := mergeAndDedupPairs(existingEntries, bufferEntries)
+	if len(merged) == 0 {
+		if err := db.prefixTree.Put(accountKey, accOff, accSize, 0, 0, 0); err != nil {
+			return err
+		}
+		db.nodeCache.UpdateStoragePointer(accountKeyStr, StorageInfo{})
+		if db.accountBatch != nil {
+			_ = db.accountBatch.updateStoragePointer(accountKeyStr, StorageInfo{})
+		}
+		db.clearAccountStorageFolder(accountKey)
+		if err := db.removeBufferLogForAccount(accountKey); err != nil {
+			return err
+		}
+		db.addBufferLogMigrationStats(len(bufferEntries))
+		return nil
+	}
+	fileID, offset, size, err := db.rewriteAccountNamedSegmentedStorageWithBlockID(accountKey, merged, 0)
+	if err != nil {
+		return err
+	}
+	if err := db.prefixTree.Put(accountKey, accOff, accSize, fileID, offset, size); err != nil {
+		return err
+	}
+	info := StorageInfo{storageFileID: fileID, storageOffset: offset, storageSize: size}
+	db.nodeCache.UpdateStoragePointer(accountKeyStr, info)
+	if db.accountBatch != nil {
+		_ = db.accountBatch.updateStoragePointer(accountKeyStr, info)
+	}
+	db.syncStorageCacheEntries(accountKey, merged)
+	db.addBufferLogMigrationStats(len(bufferEntries))
+	return nil
+}
+
+func (db *PrefixDB) removeBufferLogForAccount(accountKey []byte) error {
+	path, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	db.bufferLogCacheMu.Lock()
+	if db.bufferLogCachePath == path {
+		db.bufferLogCachePath = ""
+		db.bufferLogCacheSize = 0
+		db.bufferLogCacheModTime = 0
+		db.bufferLogCacheBuf = nil
+	}
+	db.bufferLogCacheMu.Unlock()
+	return nil
+}
+
+func (db *PrefixDB) readAccountStorageEntriesForMigration(accountKey []byte, node *TrieNode) ([]kvPair, error) {
+	if len(accountKey) == 0 {
+		return nil, nil
+	}
+	useSegmented := db.isAccountStorageFolderManaged(accountKey)
+	if node != nil && isSegmentedStorage(node.storageFileID) {
+		useSegmented = true
+	}
+	if useSegmented {
+		folderPath := db.segmentedFolderPathForAccount(accountKey)
+		metas, err := db.readSegmentIndexNoCacheByPath(folderPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errSegmentIndexEntryNotFound) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		entries := make([]kvPair, 0)
+		for i := range metas {
+			chunkEntries, backing, err := db.readSegmentChunkFileWithUsageByPath(folderPath, metas[i].FileName, diskIOUsageStorageSeparatedLogs)
+			if err != nil {
+				return nil, err
+			}
+			if len(chunkEntries) > 0 {
+				for _, kv := range chunkEntries {
+					keyCopy := make([]byte, len(kv.key))
+					copy(keyCopy, kv.key)
+					var valCopy []byte
+					if kv.val != nil {
+						valCopy = make([]byte, len(kv.val))
+						copy(valCopy, kv.val)
+					}
+					entries = append(entries, kvPair{key: keyCopy, val: valCopy})
+				}
+			}
+			if backing != nil {
+				backing.Release()
+			}
+		}
+		return entries, nil
+	}
+	if node == nil || node.storageFileID == 0 || node.storageSize == 0 {
+		return nil, nil
+	}
+	entries, backing, err := db.readStorageSegmentPairs(node.storageFileID, node.storageOffset, node.storageSize)
+	if err != nil {
+		return nil, err
+	}
+	if backing != nil {
+		defer backing.Release()
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	cloned := make([]kvPair, 0, len(entries))
+	for _, kv := range entries {
+		keyCopy := make([]byte, len(kv.key))
+		copy(keyCopy, kv.key)
+		var valCopy []byte
+		if kv.val != nil {
+			valCopy = make([]byte, len(kv.val))
+			copy(valCopy, kv.val)
+		}
+		cloned = append(cloned, kvPair{key: keyCopy, val: valCopy})
+	}
+	return cloned, nil
 }
 
 func findLastForwardCommitTagEnd(payload []byte, allowLeadingPadding bool) (int64, bool) {

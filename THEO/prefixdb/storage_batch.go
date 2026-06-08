@@ -192,36 +192,40 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 	}
 
 	// Hold the write lock across the commit to serialize with regular Put/Delete.
-	shouldWaitForStorageGC := false
-	var plans []storageCommitPlan
+	// Cache updates stay inside the same critical section so cache-first reads
+	// cannot observe an appended buffer log before its cache entry is visible.
 	db.writeMutex.Lock()
 	err = func() error {
-		plans, err = db.prepareStorageCommitPlans(batch, unresolved, nil, 0)
-		if err != nil {
+		if err := db.resolveUnresolvedStorageBatch(batch, unresolved); err != nil {
 			return err
 		}
-		if err := db.appendPreparedInlineStorageSegments(plans); err != nil {
-			return err
+		if len(batch) == 0 {
+			return nil
 		}
-		if len(plans) > 0 {
-			shouldWaitForStorageGC = true
+		accountKeys := make([]string, 0, len(batch))
+		for accountKey := range batch {
+			accountKeys = append(accountKeys, accountKey)
 		}
-		if err := db.applyStorageCommitPlans(plans, nil, true); err != nil {
-			return err
+		sort.Strings(accountKeys)
+		for _, accountKey := range accountKeys {
+			perAccount := batch[accountKey]
+			if len(perAccount) == 0 {
+				continue
+			}
+			kvs := make([]kvPair, 0, len(perAccount))
+			for key, value := range perAccount {
+				kvs = append(kvs, kvPair{key: []byte(key), val: value})
+			}
+			sortKVPairs(kvs)
+			if err := db.appendBufferLogEntries([]byte(accountKey), kvs, 0); err != nil {
+				return err
+			}
+			db.syncStorageCacheEntries([]byte(accountKey), kvs)
 		}
 		return nil
 	}()
 	db.writeMutex.Unlock()
-	if err != nil {
-		return err
-	}
-	for _, plan := range plans {
-		db.syncStorageCacheEntries([]byte(plan.accountKey), plan.cacheEntries)
-	}
-	if shouldWaitForStorageGC {
-		return db.waitForStorageGCIdle()
-	}
-	return nil
+	return err
 }
 
 func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (*preparedAccountCommit, error) {
