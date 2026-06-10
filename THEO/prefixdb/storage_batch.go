@@ -199,33 +199,37 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 		if err := db.resolveUnresolvedStorageBatch(batch, unresolved); err != nil {
 			return err
 		}
-		if len(batch) == 0 {
-			return nil
-		}
-		accountKeys := make([]string, 0, len(batch))
-		for accountKey := range batch {
-			accountKeys = append(accountKeys, accountKey)
-		}
-		sort.Strings(accountKeys)
-		for _, accountKey := range accountKeys {
-			perAccount := batch[accountKey]
-			if len(perAccount) == 0 {
-				continue
-			}
-			kvs := make([]kvPair, 0, len(perAccount))
-			for key, value := range perAccount {
-				kvs = append(kvs, kvPair{key: []byte(key), val: value})
-			}
-			sortKVPairs(kvs)
-			if err := db.appendBufferLogEntries([]byte(accountKey), kvs, 0); err != nil {
-				return err
-			}
-			db.syncStorageCacheEntries([]byte(accountKey), kvs)
-		}
-		return nil
+		return db.appendStorageBatchToBufferLogs(batch, 0)
 	}()
 	db.writeMutex.Unlock()
 	return err
+}
+
+func (db *PrefixDB) appendStorageBatchToBufferLogs(batch map[string]map[string][]byte, blockID uint64) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	accountKeys := make([]string, 0, len(batch))
+	for accountKey := range batch {
+		accountKeys = append(accountKeys, accountKey)
+	}
+	sort.Strings(accountKeys)
+	for _, accountKey := range accountKeys {
+		perAccount := batch[accountKey]
+		if len(perAccount) == 0 {
+			continue
+		}
+		kvs := make([]kvPair, 0, len(perAccount))
+		for key, value := range perAccount {
+			kvs = append(kvs, kvPair{key: []byte(key), val: value})
+		}
+		sortKVPairs(kvs)
+		if err := db.appendBufferLogEntries([]byte(accountKey), kvs, blockID); err != nil {
+			return err
+		}
+		db.syncStorageCacheEntries([]byte(accountKey), kvs)
+	}
+	return nil
 }
 
 func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (*preparedAccountCommit, error) {
@@ -256,6 +260,32 @@ func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (
 		prepared.totalSize += len(entry)
 	}
 	return prepared, nil
+}
+
+func (db *PrefixDB) preserveAccountStoragePointers(accountOps map[string]WriteOperation) error {
+	if len(accountOps) == 0 {
+		return nil
+	}
+	for key, op := range accountOps {
+		if op.value == nil {
+			continue
+		}
+		if op.storageFileID != 0 || op.storageOffset != 0 || op.storageSize != 0 {
+			continue
+		}
+		node, err := db.getNode([]byte(key))
+		if err != nil {
+			return err
+		}
+		if node == nil {
+			continue
+		}
+		op.storageFileID = node.storageFileID
+		op.storageOffset = node.storageOffset
+		op.storageSize = node.storageSize
+		accountOps[key] = op
+	}
+	return nil
 }
 
 func (db *PrefixDB) prepareStorageCommitPlans(batch map[string]map[string][]byte, unresolved map[string][]byte, accountOps map[string]WriteOperation, blockID uint64) ([]storageCommitPlan, error) {

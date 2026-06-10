@@ -1030,25 +1030,31 @@ type PrefixDB struct {
 	storagePrefetchTrackedCount       uint64
 	storagePrefetchPending            map[string]struct{}
 
-	bufferLogMu                 sync.Mutex
-	lastBufferLogAccount        string
-	bufferLogRead               map[string]map[string][]byte
-	bufferLogBloom              *bufferLogBloom
-	bufferLogCacheMu            sync.Mutex
-	bufferLogCachePath          string
-	bufferLogCacheSize          int64
-	bufferLogCacheModTime       int64
-	bufferLogCacheBuf           []byte
-	bufferLogLookupCount        uint64
-	bufferLogBloomRejectCount   uint64
-	bufferLogHitCount           uint64
-	bufferLogHitBytes           uint64
-	bufferLogTombstoneHitCount  uint64
-	bufferLogMissCount          uint64
-	bufferLogErrorCount         uint64
-	bufferLogMigrationCount     uint64
-	bufferLogMigratedKVCount    uint64
-	bufferLogMigrationWaitGroup sync.WaitGroup
+	bufferLogMu                  sync.Mutex
+	lastBufferLogAccount         string
+	bufferLogRead                map[string]map[string][]byte
+	bufferLogBloomLoadedAccounts map[string]struct{}
+	bufferLogBloom               *bufferLogBloom
+	bufferLogCacheMu             sync.Mutex
+	bufferLogCachePath           string
+	bufferLogCacheSize           int64
+	bufferLogCacheModTime        int64
+	bufferLogCacheBuf            []byte
+	bufferLogLookupCount         uint64
+	bufferLogBloomRejectCount    uint64
+	bufferLogHitCount            uint64
+	bufferLogHitBytes            uint64
+	bufferLogTombstoneHitCount   uint64
+	bufferLogMissCount           uint64
+	bufferLogErrorCount          uint64
+	bufferLogAppendAccountCount  uint64
+	bufferLogAppendKVCount       uint64
+	bufferLogAppendBytes         uint64
+	bufferLogBloomLoadCount      uint64
+	bufferLogBloomLoadKVCount    uint64
+	bufferLogMigrationCount      uint64
+	bufferLogMigratedKVCount     uint64
+	bufferLogMigrationWaitGroup  sync.WaitGroup
 
 	// nodeCache access stats (read path)
 	nodeCacheLookups uint64
@@ -1074,6 +1080,7 @@ const (
 	diskIOUsageNodeFileMutation
 	diskIOUsageNodeFileGC
 	diskIOUsageStorageCommonLogs
+	diskIOUsageStorageBufferLogs
 	diskIOUsageStorageSeparatedLogs
 	diskIOUsageStorageGC
 	diskIOUsageStorageSegmentIndex
@@ -1086,6 +1093,7 @@ var diskIOUsageNames = [...]string{
 	"nodefile-mutation",
 	"nodefile-gc",
 	"storage-common-logs",
+	"storage-buffer-logs",
 	"storage-separated-logs",
 	"storage-gc",
 	"storage-segment-index",
@@ -1199,6 +1207,7 @@ func NewPrefixDBWithRuntimeOptions(dirpath string, storageChunkFileSize int, tot
 		nodeFileSortedCompression:        resolvedNodeFileSortedCompression,
 		segmentIndexCompression:          resolvedSegmentIndexCompression,
 		bufferLogRead:                    make(map[string]map[string][]byte),
+		bufferLogBloomLoadedAccounts:     make(map[string]struct{}),
 		bufferLogBloom:                   newBufferLogBloom(bufferLogBloomBitCount),
 	}
 	if nodeFileGCRatioThreshold > 0 {
@@ -1595,29 +1604,46 @@ func (db *PrefixDB) BatchCommitWithBlockID(blockID uint64) (err error) {
 	db.writeMutex.Lock()
 	err = func() error {
 		stageStart := time.Now()
-		storagePlans, err = db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps, blockID)
-		if err != nil {
-			return err
-		}
-		stageStart = time.Now()
-		if err := db.appendPreparedInlineStorageSegments(storagePlans); err != nil {
-			return err
-		}
-		prefixdbDebugf("BatchCommit: inline storage appends applied elapsed=%s", time.Since(stageStart))
-		prefixdbDebugf("BatchCommit: storage plans ready count=%d elapsed=%s", len(storagePlans), time.Since(stageStart))
-		if len(storagePlans) > 0 && accountOps != nil {
-			stageStart = time.Now()
-			for _, plan := range storagePlans {
-				op, ok := accountOps[plan.accountKey]
-				if !ok || op.value == nil {
-					continue
-				}
-				op.storageFileID = plan.storageInfo.storageFileID
-				op.storageOffset = plan.storageInfo.storageOffset
-				op.storageSize = plan.storageInfo.storageSize
-				accountOps[plan.accountKey] = op
+		useBufferLogForStorageBatch := blockID != 0
+		if useBufferLogForStorageBatch {
+			if storageBatch == nil {
+				storageBatch = make(map[string]map[string][]byte)
 			}
-			prefixdbDebugf("BatchCommit: storage pointers merged elapsed=%s", time.Since(stageStart))
+			if err := db.resolveUnresolvedStorageBatch(storageBatch, storageUnresolved); err != nil {
+				return err
+			}
+			if err := db.appendStorageBatchToBufferLogs(storageBatch, blockID); err != nil {
+				return err
+			}
+			prefixdbDebugf("BatchCommit: storage batch appended to buffer logs accounts=%d elapsed=%s", len(storageBatch), time.Since(stageStart))
+			if err := db.preserveAccountStoragePointers(accountOps); err != nil {
+				return err
+			}
+		} else {
+			storagePlans, err = db.prepareStorageCommitPlans(storageBatch, storageUnresolved, accountOps, blockID)
+			if err != nil {
+				return err
+			}
+			stageStart = time.Now()
+			if err := db.appendPreparedInlineStorageSegments(storagePlans); err != nil {
+				return err
+			}
+			prefixdbDebugf("BatchCommit: inline storage appends applied elapsed=%s", time.Since(stageStart))
+			prefixdbDebugf("BatchCommit: storage plans ready count=%d elapsed=%s", len(storagePlans), time.Since(stageStart))
+			if len(storagePlans) > 0 && accountOps != nil {
+				stageStart = time.Now()
+				for _, plan := range storagePlans {
+					op, ok := accountOps[plan.accountKey]
+					if !ok || op.value == nil {
+						continue
+					}
+					op.storageFileID = plan.storageInfo.storageFileID
+					op.storageOffset = plan.storageInfo.storageOffset
+					op.storageSize = plan.storageInfo.storageSize
+					accountOps[plan.accountKey] = op
+				}
+				prefixdbDebugf("BatchCommit: storage pointers merged elapsed=%s", time.Since(stageStart))
+			}
 		}
 
 		stageStart = time.Now()
@@ -2635,6 +2661,11 @@ func printBufferLogStats(db *PrefixDB) {
 	tombstoneHits := loadUint64Stat(&db.bufferLogTombstoneHitCount)
 	misses := loadUint64Stat(&db.bufferLogMissCount)
 	errors := loadUint64Stat(&db.bufferLogErrorCount)
+	appends := loadUint64Stat(&db.bufferLogAppendAccountCount)
+	appendedKVs := loadUint64Stat(&db.bufferLogAppendKVCount)
+	appendBytes := loadUint64Stat(&db.bufferLogAppendBytes)
+	bloomLoads := loadUint64Stat(&db.bufferLogBloomLoadCount)
+	bloomLoadKVs := loadUint64Stat(&db.bufferLogBloomLoadKVCount)
 	migrations := loadUint64Stat(&db.bufferLogMigrationCount)
 	migratedKVs := loadUint64Stat(&db.bufferLogMigratedKVCount)
 
@@ -2651,8 +2682,12 @@ func printBufferLogStats(db *PrefixDB) {
 	if migrations > 0 {
 		avgMigratedKVs = float64(migratedKVs) / float64(migrations)
 	}
+	avgAppendKVs := 0.0
+	if appends > 0 {
+		avgAppendKVs = float64(appendedKVs) / float64(appends)
+	}
 
-	fmt.Printf("PrefixDB bufferlog stats: lookups=%d bloomRejects=%d hits=%d tombstoneHits=%d misses=%d errors=%d hitRate=%0.2f%% hitBytes=%d avgHitBytes=%0.2f migrations=%d migratedKVs=%d avgMigratedKVs=%0.2f\n",
+	fmt.Printf("PrefixDB bufferlog stats: lookups=%d bloomRejects=%d hits=%d tombstoneHits=%d misses=%d errors=%d hitRate=%0.2f%% hitBytes=%d avgHitBytes=%0.2f appends=%d appendedKVs=%d appendBytes=%d avgAppendKVs=%0.2f bloomLoads=%d bloomLoadKVs=%d migrations=%d migratedKVs=%d avgMigratedKVs=%0.2f\n",
 		lookups,
 		bloomRejects,
 		hits,
@@ -2662,6 +2697,12 @@ func printBufferLogStats(db *PrefixDB) {
 		hitRate,
 		hitBytes,
 		avgHitBytes,
+		appends,
+		appendedKVs,
+		appendBytes,
+		avgAppendKVs,
+		bloomLoads,
+		bloomLoadKVs,
 		migrations,
 		migratedKVs,
 		avgMigratedKVs,
@@ -6658,6 +6699,7 @@ func (db *PrefixDB) appendBufferLogEntries(accountKey []byte, kvs []kvPair, bloc
 			db.bufferLogBloom.add(accountKey, kv.key)
 		}
 	}
+	db.markBufferLogBloomLoaded(accountKey)
 	path, err := db.bufferLogPathForAccount(accountKey)
 	if err != nil {
 		return err
@@ -6680,7 +6722,10 @@ func (db *PrefixDB) appendBufferLogEntries(accountKey []byte, kvs []kvPair, bloc
 	if _, err := f.Write(payload); err != nil {
 		return err
 	}
-	db.addDiskWrite(diskIOUsageStorageCommonLogs, len(payload))
+	db.addDiskWrite(diskIOUsageStorageBufferLogs, len(payload))
+	addUint64Stat(&db.bufferLogAppendAccountCount, 1)
+	addUint64Stat(&db.bufferLogAppendKVCount, uint64(len(kvs)))
+	addUint64Stat(&db.bufferLogAppendBytes, uint64(len(payload)))
 	return nil
 }
 
@@ -6705,7 +6750,7 @@ func (db *PrefixDB) readBufferLogEntries(accountKey []byte) ([]kvPair, error) {
 		db.bufferLogCacheMu.Unlock()
 	} else {
 		db.bufferLogCacheMu.Unlock()
-		data, err = db.readFileWithStats(path, diskIOUsageStorageCommonLogs)
+		data, err = db.readFileWithStats(path, diskIOUsageStorageBufferLogs)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, nil
@@ -6746,9 +6791,16 @@ func (db *PrefixDB) readBufferLogValue(accountKey, storageKey []byte) ([]byte, b
 		prefixdbDebugf("buffer log rotate failed account=%x err=%v", accountKey, err)
 	}
 	if db.bufferLogBloom != nil && !db.bufferLogBloom.maybeContains(accountKey, storageKey) {
-		addUint64Stat(&db.bufferLogBloomRejectCount, 1)
-		addUint64Stat(&db.bufferLogMissCount, 1)
-		return nil, false, nil
+		loaded, err := db.ensureBufferLogBloomForAccount(accountKey)
+		if err != nil {
+			addUint64Stat(&db.bufferLogErrorCount, 1)
+			return nil, false, err
+		}
+		if !loaded || !db.bufferLogBloom.maybeContains(accountKey, storageKey) {
+			addUint64Stat(&db.bufferLogBloomRejectCount, 1)
+			addUint64Stat(&db.bufferLogMissCount, 1)
+			return nil, false, nil
+		}
 	}
 	entries, err := db.readBufferLogEntries(accountKey)
 	if err != nil {
@@ -6778,6 +6830,75 @@ func (db *PrefixDB) readBufferLogValue(accountKey, storageKey []byte) ([]byte, b
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
 	return valCopy, true, nil
+}
+
+func (db *PrefixDB) ensureBufferLogBloomForAccount(accountKey []byte) (bool, error) {
+	if db == nil || db.bufferLogBloom == nil || len(accountKey) == 0 {
+		return false, nil
+	}
+	if db.isBufferLogBloomLoaded(accountKey) {
+		return true, nil
+	}
+	path, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			db.markBufferLogBloomLoaded(accountKey)
+			return true, nil
+		}
+		return false, err
+	}
+	entries, err := db.readBufferLogEntries(accountKey)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) == 0 {
+		db.markBufferLogBloomLoaded(accountKey)
+		return true, nil
+	}
+	for _, kv := range entries {
+		if len(kv.key) == 0 {
+			continue
+		}
+		db.bufferLogBloom.add(accountKey, kv.key)
+	}
+	db.markBufferLogBloomLoaded(accountKey)
+	addUint64Stat(&db.bufferLogBloomLoadCount, 1)
+	addUint64Stat(&db.bufferLogBloomLoadKVCount, uint64(len(entries)))
+	return true, nil
+}
+
+func (db *PrefixDB) isBufferLogBloomLoaded(accountKey []byte) bool {
+	if db == nil || len(accountKey) == 0 {
+		return false
+	}
+	db.bufferLogMu.Lock()
+	_, ok := db.bufferLogBloomLoadedAccounts[string(accountKey)]
+	db.bufferLogMu.Unlock()
+	return ok
+}
+
+func (db *PrefixDB) markBufferLogBloomLoaded(accountKey []byte) {
+	if db == nil || len(accountKey) == 0 {
+		return
+	}
+	db.bufferLogMu.Lock()
+	if db.bufferLogBloomLoadedAccounts == nil {
+		db.bufferLogBloomLoadedAccounts = make(map[string]struct{})
+	}
+	db.bufferLogBloomLoadedAccounts[string(accountKey)] = struct{}{}
+	db.bufferLogMu.Unlock()
+}
+
+func (db *PrefixDB) unmarkBufferLogBloomLoaded(accountKey []byte) {
+	if db == nil || len(accountKey) == 0 {
+		return
+	}
+	db.bufferLogMu.Lock()
+	delete(db.bufferLogBloomLoadedAccounts, string(accountKey))
+	db.bufferLogMu.Unlock()
 }
 
 func (db *PrefixDB) maybeRotateBufferLogAccount(accountKey []byte) error {
@@ -6888,6 +7009,7 @@ func (db *PrefixDB) migrateBufferLogForAccount(accountKey []byte, bufferEntries 
 			}
 			db.bufferLogBloom.remove(accountKey, kv.key)
 		}
+		db.unmarkBufferLogBloomLoaded(accountKey)
 	}
 	db.writeMutex.Lock()
 	defer db.writeMutex.Unlock()
@@ -7159,10 +7281,27 @@ func (db *PrefixDB) TrimLogsAfterCommitTag(blockID uint64) error {
 				return readErr
 			}
 			for _, chunkEntry := range chunkEntries {
-				if chunkEntry.IsDir() || !strings.HasSuffix(chunkEntry.Name(), ".dat") {
+				if chunkEntry.IsDir() {
 					continue
 				}
 				chunkPath := filepath.Join(path, chunkEntry.Name())
+				if chunkEntry.Name() == bufferLogFileName {
+					if _, trimErr := trimFileAfterLastCommitTag(chunkPath, false, false); trimErr != nil {
+						return fmt.Errorf("trim buffer log %s: %w", chunkPath, trimErr)
+					}
+					db.bufferLogCacheMu.Lock()
+					if db.bufferLogCachePath == chunkPath {
+						db.bufferLogCachePath = ""
+						db.bufferLogCacheSize = 0
+						db.bufferLogCacheModTime = 0
+						db.bufferLogCacheBuf = nil
+					}
+					db.bufferLogCacheMu.Unlock()
+					continue
+				}
+				if !strings.HasSuffix(chunkEntry.Name(), ".dat") {
+					continue
+				}
 				if _, trimErr := trimFileAfterLastCommitTag(chunkPath, true, false); trimErr != nil {
 					return fmt.Errorf("trim storage chunk %s: %w", chunkPath, trimErr)
 				}

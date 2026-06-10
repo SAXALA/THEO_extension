@@ -1068,7 +1068,7 @@ func TestBatchCommitBatchesCommonStorageFileWrites(t *testing.T) {
 	}
 }
 
-func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
+func TestStorageBatchCommitWritesBufferLogsAndPreservesNodePointers(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 256, 8, 16)
 	if err != nil {
@@ -1096,13 +1096,21 @@ func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
 		t.Fatalf("StorageBatchPut accountB failed: %v", err)
 	}
 
-	before := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	commonWritesBefore := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	bufferWritesBefore := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageBufferLogs].writeOps)
 	if err := db.StorageBatchCommit(); err != nil {
 		t.Fatalf("StorageBatchCommit failed: %v", err)
 	}
-	after := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
-	if got := after - before; got != 1 {
-		t.Fatalf("expected storage batch to append common log once, got %d writeOps", got)
+	commonWritesAfter := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
+	bufferWritesAfter := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageBufferLogs].writeOps)
+	if got := commonWritesAfter - commonWritesBefore; got != 0 {
+		t.Fatalf("expected storage batch to avoid common log writes, got %d writeOps", got)
+	}
+	if got := bufferWritesAfter - bufferWritesBefore; got != 2 {
+		t.Fatalf("expected storage batch to append one buffer log per account, got %d writeOps", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogAppendKVCount); got != 2 {
+		t.Fatalf("unexpected bufferlog append kv count: got=%d want=2", got)
 	}
 
 	nodeA, err := db.getNode(accountA)
@@ -1116,14 +1124,8 @@ func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
 	if nodeA == nil || nodeB == nil {
 		t.Fatalf("expected account nodes after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
 	}
-	if nodeA.storageFileID == 0 || nodeB.storageFileID == 0 || isSegmentedStorage(nodeA.storageFileID) || isSegmentedStorage(nodeB.storageFileID) {
-		t.Fatalf("expected inline storage pointers after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
-	}
-	if nodeA.storageFileID != nodeB.storageFileID {
-		t.Fatalf("expected storage-only batch to reuse the same common log file, got %d and %d", nodeA.storageFileID, nodeB.storageFileID)
-	}
-	if nodeA.storageOffset == nodeB.storageOffset || nodeA.storageSize == 0 || nodeB.storageSize == 0 {
-		t.Fatalf("expected distinct storage ranges after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
+	if nodeA.storageFileID != 0 || nodeA.storageOffset != 0 || nodeA.storageSize != 0 || nodeB.storageFileID != 0 || nodeB.storageOffset != 0 || nodeB.storageSize != 0 {
+		t.Fatalf("expected storage-only bufferlog commit to preserve empty node pointers, got A=%+v B=%+v", nodeA, nodeB)
 	}
 
 	if err := db.Close(); err != nil {
@@ -1168,6 +1170,193 @@ func TestStorageBatchCommitBatchedCommonStorageKeepsNodePointers(t *testing.T) {
 		if !found || !bytes.Equal(got, tc.want) {
 			t.Fatalf("unexpected reopened storage value for %x: found=%t got=%q want=%q", tc.accountKey, found, got, tc.want)
 		}
+	}
+	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 2 {
+		t.Fatalf("unexpected reopened bufferlog bloom load count: got=%d want=2", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogHitCount); got != 2 {
+		t.Fatalf("unexpected reopened bufferlog hit count: got=%d want=2", got)
+	}
+}
+
+func TestBatchCommitWithBlockIDUsesBufferLogForStorageBatch(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x76)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-v1"), nil); err != nil {
+		t.Fatalf("BatchPut account v1 failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account v1 failed: %v", err)
+	}
+
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x01)
+	want := []byte("bufferlog-via-batchcommit")
+	separatedWriteOpsBefore := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].writeOps)
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-v2"), nil); err != nil {
+		t.Fatalf("BatchPut account v2 failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(10); err != nil {
+		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+	separatedWriteOpsAfter := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].writeOps)
+	if separatedWriteOpsAfter != separatedWriteOpsBefore {
+		t.Fatalf("expected BatchCommitWithBlockID storage batch to avoid separated log writes, before=%d after=%d", separatedWriteOpsBefore, separatedWriteOpsAfter)
+	}
+	if got := loadUint64Stat(&db.bufferLogAppendKVCount); got != 1 {
+		t.Fatalf("unexpected bufferlog append kv count: got=%d want=1", got)
+	}
+
+	node, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode failed: %v", err)
+	}
+	if node == nil || node.accountOffset == 0 {
+		t.Fatalf("expected account node after BatchCommitWithBlockID, got %+v", node)
+	}
+	if node.storageFileID != 0 || node.storageOffset != 0 || node.storageSize != 0 {
+		t.Fatalf("expected account node storage pointer to remain empty before bufferlog migration, got %+v", node)
+	}
+
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	db.removeStorageCacheValue(accountKey, storageKey)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected storage value: found=%t got=%q want=%q", found, got, want)
+	}
+	if got := loadUint64Stat(&db.bufferLogHitCount); got != 1 {
+		t.Fatalf("unexpected bufferlog hit count: got=%d want=1", got)
+	}
+}
+
+func TestBatchCommitWithBlockIDBufferLogLazyBloomAfterReopen(t *testing.T) {
+	baseDir := t.TempDir()
+	accountKey := makeTestAccountKey(0x77)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+	want := []byte("bufferlog-survives-reopen")
+
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(20); err != nil {
+		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+	storageKey, err := reopened.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	reopened.removeStorageCacheValue(accountKey, storageKey)
+
+	got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get after reopen failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected reopened storage value: found=%t got=%q want=%q", found, got, want)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
+		t.Fatalf("unexpected bufferlog bloom load count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogHitCount); got != 1 {
+		t.Fatalf("unexpected reopened bufferlog hit count: got=%d want=1", got)
+	}
+}
+
+func TestBufferLogLazyBloomLoadIsPerAccount(t *testing.T) {
+	baseDir := t.TempDir()
+	accountKey := makeTestAccountKey(0x78)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+	missingRawStorageKey := makeTestStorageRawKey(accountKey, 0x03)
+	want := []byte("bufferlog-one-load")
+
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(30); err != nil {
+		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	storageKey, err := reopened.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	missingStorageKey, err := reopened.normalizeStorageKey(missingRawStorageKey)
+	if err != nil {
+		t.Fatalf("normalize missing key failed: %v", err)
+	}
+	reopened.removeStorageCacheValue(accountKey, storageKey)
+	reopened.removeStorageCacheValue(accountKey, missingStorageKey)
+
+	if got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, missingRawStorageKey, accountKey); err != nil {
+		t.Fatalf("missing Get failed: %v", err)
+	} else if found || got != nil {
+		t.Fatalf("unexpected missing storage result: found=%t got=%q", found, got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
+		t.Fatalf("unexpected bloom load count after miss: got=%d want=1", got)
+	}
+
+	got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get existing storage failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected existing storage result: found=%t got=%q want=%q", found, got, want)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
+		t.Fatalf("expected bloom to load once per account, got=%d", got)
 	}
 }
 
@@ -2921,11 +3110,31 @@ func TestTrimLogsAfterCommitTagRemovesTrailingStateData(t *testing.T) {
 	}
 	accountSizeBefore := accountInfo.Size()
 	storagePath, _ := db.storagePathByFileID(db.storageCurFileID)
+	initialStorage, releaseInitialStorage, _, err := db.serializeStorageSegment([]kvPair{{key: []byte{0x01}, val: []byte("storage-10")}})
+	if err != nil {
+		t.Fatalf("serialize initial storage failed: %v", err)
+	}
+	initialStorage = appendForwardCommitTag(append([]byte(nil), initialStorage...), 10)
+	if _, err := db.storageCurFile.WriteAt(initialStorage, 0); err != nil {
+		releaseInitialStorage()
+		t.Fatalf("append initial storage failed: %v", err)
+	}
+	db.storageCurSize = int64(len(initialStorage))
+	releaseInitialStorage()
 	storageInfo, err := os.Stat(storagePath)
 	if err != nil {
 		t.Fatalf("storage Stat failed: %v", err)
 	}
 	storageSizeBefore := storageInfo.Size()
+	bufferLogPath, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPathForAccount failed: %v", err)
+	}
+	bufferLogInfo, err := os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("buffer log Stat failed: %v", err)
+	}
+	bufferLogSizeBefore := bufferLogInfo.Size()
 
 	extraAccount, err := db.ConvertKV(accountKey, []byte("account-11"))
 	if err != nil {
@@ -2943,6 +3152,25 @@ func TestTrimLogsAfterCommitTagRemovesTrailingStateData(t *testing.T) {
 		t.Fatalf("append extra storage failed: %v", err)
 	}
 	release()
+	extraBufferLog, releaseBufferLog, _, err := db.serializeStorageSegment([]kvPair{{key: []byte{0x02}, val: []byte("buffer-11")}})
+	if err != nil {
+		t.Fatalf("serialize extra buffer log failed: %v", err)
+	}
+	bufferLogFile, err := os.OpenFile(bufferLogPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		releaseBufferLog()
+		t.Fatalf("open buffer log failed: %v", err)
+	}
+	if _, err := bufferLogFile.Write(extraBufferLog); err != nil {
+		_ = bufferLogFile.Close()
+		releaseBufferLog()
+		t.Fatalf("append extra buffer log failed: %v", err)
+	}
+	if err := bufferLogFile.Close(); err != nil {
+		releaseBufferLog()
+		t.Fatalf("close buffer log failed: %v", err)
+	}
+	releaseBufferLog()
 
 	if err := db.TrimLogsAfterCommitTag(11); err != nil {
 		t.Fatalf("TrimLogsAfterCommitTag failed: %v", err)
@@ -2960,6 +3188,13 @@ func TestTrimLogsAfterCommitTagRemovesTrailingStateData(t *testing.T) {
 	}
 	if storageInfo.Size() != storageSizeBefore {
 		t.Fatalf("storage log size after trim=%d want=%d", storageInfo.Size(), storageSizeBefore)
+	}
+	bufferLogInfo, err = os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("buffer log Stat after trim failed: %v", err)
+	}
+	if bufferLogInfo.Size() != bufferLogSizeBefore {
+		t.Fatalf("buffer log size after trim=%d want=%d", bufferLogInfo.Size(), bufferLogSizeBefore)
 	}
 
 	folderPath := db.segmentedFolderPathForAccount(accountKey)
