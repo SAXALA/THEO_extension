@@ -1519,6 +1519,8 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	globalStats := make(map[opType]*latencyHistogram)
 	getSuccessByType := make(map[string]int64)
 	getNotFoundByType := make(map[string]int64)
+	getSuccessByRawType := make(map[string]int64)
+	getNotFoundByRawType := make(map[string]int64)
 	getOtherErrByType := make(map[string]int64)
 	getOtherErrByCause := make(map[string]int64)
 	iterNextSuccessByType := make(map[string]int64)
@@ -1531,8 +1533,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		iterNextEndTotal     int64
 	)
 	runCommit := func(reason string, blockID int64, line int64, pending int64) error {
-		// fmt.Printf("[%s] Commit start: reason=%s blockID=%d line=%d pendingBlocks=%d\n", backend.Name(), reason, blockID, line, pending)
-		// commitStart := time.Now()
+		commitStart := time.Now()
 		var commitBlockID uint64
 		if blockID > 0 {
 			commitBlockID = uint64(blockID)
@@ -1540,7 +1541,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 		if err := backend.CommitBlock(commitBlockID); err != nil {
 			return err
 		}
-		// fmt.Printf("[%s] Commit done: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n", backend.Name(), reason, blockID, line, pending, formatDurationCompact(time.Since(commitStart)))
+		if elapsed := time.Since(commitStart); elapsed >= 5*time.Second {
+			fmt.Printf("[%s] Commit slow: reason=%s blockID=%d line=%d pendingBlocks=%d elapsed=%s\n",
+				backend.Name(), reason, blockID, line, pending, formatDurationCompact(elapsed))
+		}
 		return nil
 	}
 	recordOp := func(kvTypeStr string, op opType, elapsed time.Duration) {
@@ -1691,6 +1695,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			continue
 		}
 		kvTypeStr := classifyDataType(dataType)
+		rawDataTypeStr := dataTypeName(dataType)
 
 		//debug
 		// testKeyHex := "4fc01cf44b5fd388621bce9fca946de503c1f9fa5c34765867954352ad3baec0080f01"
@@ -1711,9 +1716,11 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			if opErr == nil {
 				logicReadSize += int64(len(val))
 				getSuccessByType[kvTypeStr]++
+				getSuccessByRawType[rawDataTypeStr]++
 				getSuccessTotal++
 			} else if errors.Is(opErr, theo.ErrNotFound) {
 				getNotFoundByType[kvTypeStr]++
+				getNotFoundByRawType[rawDataTypeStr]++
 				getNotFoundTotal++
 			} else {
 				getOtherErrByType[kvTypeStr]++
@@ -1759,6 +1766,10 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 			}
 		}
 		elapsed := time.Since(start)
+		if elapsed >= 5*time.Second {
+			fmt.Printf("[%s] Op slow: op=%s dataType=%s line=%d ops=%d elapsed=%s key=%s\n",
+				backend.Name(), opTypeStr, kvTypeStr, lineCounter, counter+1, formatDurationCompact(elapsed), keyHex)
+		}
 		totalTime += elapsed
 		recordOp(kvTypeStr, op, elapsed)
 		counter++
@@ -1795,6 +1806,7 @@ func replayTrace(backend replayBackend, traceFile string, maxOps int64, dbType D
 	reportLatencyStats(stats)
 	reportGlobalLatencyStats(globalStats)
 	reportReplayReadStats("GetStats", getSuccessByType, getNotFoundByType, getSuccessTotal, getNotFoundTotal)
+	reportReplayReadStats("GetStatsRaw", getSuccessByRawType, getNotFoundByRawType, getSuccessTotal, getNotFoundTotal)
 	reportReplayOtherErrorStats("GetOtherErrorStats", getOtherErrByType, getOtherErrTotal, getOtherErrByCause)
 	reportReplayReadStats("IteratorNextStats", iterNextSuccessByType, iterNextEndByType, iterNextSuccessTotal, iterNextEndTotal)
 	backend.PrintCommitStats()
