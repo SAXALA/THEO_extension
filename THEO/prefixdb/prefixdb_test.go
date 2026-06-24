@@ -2823,7 +2823,7 @@ func TestBufferLogReadInvalidatesStaleCachedHandle(t *testing.T) {
 		t.Fatal("test setup failed: bufferlog inode was reused")
 	}
 
-	got, found, err := db.readBufferLogValueByIndex(accountKey, storageKey)
+	got, found, _, err := db.readBufferLogValueByIndex(accountKey, storageKey)
 	if err != nil {
 		t.Fatalf("readBufferLogValueByIndex failed: %v", err)
 	}
