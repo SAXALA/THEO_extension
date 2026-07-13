@@ -531,6 +531,28 @@ func makeTestStorageRawKeyWithSuffix(suffix ...byte) []byte {
 	return raw
 }
 
+func makeAccountStorageFolderManagedForTest(t *testing.T, db *PrefixDB, accountKey []byte) {
+	t.Helper()
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0xfe)
+	value := bytes.Repeat([]byte{'s'}, db.storageChunkSize+64)
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, value, accountKey); err != nil {
+		t.Fatalf("BatchPut folder seed storage failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit folder seed storage failed: %v", err)
+	}
+	node, err := db.getNode(accountKey)
+	if err != nil {
+		t.Fatalf("getNode folder seed account failed: %v", err)
+	}
+	if node == nil || !isAccountNamedSegmentedStorage(node.storageFileID) {
+		t.Fatalf("expected folder-managed account after seed, node=%+v", node)
+	}
+	if !db.isAccountStorageFolderManaged(accountKey) {
+		t.Fatal("expected account storage folder to be managed after seed")
+	}
+}
+
 func TestTrieNodeAccountGetBreakdownTracksIndexLocateIOReadAndSearch(t *testing.T) {
 	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
 	if err != nil {
@@ -1068,7 +1090,7 @@ func TestBatchCommitBatchesCommonStorageFileWrites(t *testing.T) {
 	}
 }
 
-func TestStorageBatchCommitWritesBufferLogsAndPreservesNodePointers(t *testing.T) {
+func TestStorageBatchCommitWritesSmallAccountsDirectly(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 256, 8, 16)
 	if err != nil {
@@ -1103,14 +1125,14 @@ func TestStorageBatchCommitWritesBufferLogsAndPreservesNodePointers(t *testing.T
 	}
 	commonWritesAfter := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageCommonLogs].writeOps)
 	bufferWritesAfter := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageBufferLogs].writeOps)
-	if got := commonWritesAfter - commonWritesBefore; got != 0 {
-		t.Fatalf("expected storage batch to avoid common log writes, got %d writeOps", got)
+	if got := commonWritesAfter - commonWritesBefore; got == 0 {
+		t.Fatal("expected small storage batch to write common storage")
 	}
-	if got := bufferWritesAfter - bufferWritesBefore; got != 2 {
-		t.Fatalf("expected storage batch to append one buffer log per account, got %d writeOps", got)
+	if got := bufferWritesAfter - bufferWritesBefore; got != 0 {
+		t.Fatalf("expected small storage batch to avoid buffer logs, got %d writeOps", got)
 	}
-	if got := loadUint64Stat(&db.bufferLogAppendKVCount); got != 2 {
-		t.Fatalf("unexpected bufferlog append kv count: got=%d want=2", got)
+	if got := loadUint64Stat(&db.bufferLogAppendKVCount); got != 0 {
+		t.Fatalf("unexpected bufferlog append kv count: got=%d want=0", got)
 	}
 
 	nodeA, err := db.getNode(accountA)
@@ -1124,8 +1146,8 @@ func TestStorageBatchCommitWritesBufferLogsAndPreservesNodePointers(t *testing.T
 	if nodeA == nil || nodeB == nil {
 		t.Fatalf("expected account nodes after storage batch commit, got A=%+v B=%+v", nodeA, nodeB)
 	}
-	if nodeA.storageFileID != 0 || nodeA.storageOffset != 0 || nodeA.storageSize != 0 || nodeB.storageFileID != 0 || nodeB.storageOffset != 0 || nodeB.storageSize != 0 {
-		t.Fatalf("expected storage-only bufferlog commit to preserve empty node pointers, got A=%+v B=%+v", nodeA, nodeB)
+	if nodeA.storageFileID == 0 || nodeA.storageSize == 0 || nodeB.storageFileID == 0 || nodeB.storageSize == 0 {
+		t.Fatalf("expected small storage batch to update node pointers, got A=%+v B=%+v", nodeA, nodeB)
 	}
 
 	if err := db.Close(); err != nil {
@@ -1171,11 +1193,11 @@ func TestStorageBatchCommitWritesBufferLogsAndPreservesNodePointers(t *testing.T
 			t.Fatalf("unexpected reopened storage value for %x: found=%t got=%q want=%q", tc.accountKey, found, got, tc.want)
 		}
 	}
-	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 2 {
-		t.Fatalf("unexpected reopened bufferlog bloom load count: got=%d want=2", got)
+	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 0 {
+		t.Fatalf("unexpected reopened bufferlog bloom load count: got=%d want=0", got)
 	}
-	if got := loadUint64Stat(&reopened.bufferLogHitCount); got != 2 {
-		t.Fatalf("unexpected reopened bufferlog hit count: got=%d want=2", got)
+	if got := loadUint64Stat(&reopened.bufferLogHitCount); got != 0 {
+		t.Fatalf("unexpected reopened bufferlog hit count: got=%d want=0", got)
 	}
 }
 
@@ -1194,6 +1216,7 @@ func TestBatchCommitWithBlockIDUsesBufferLogForStorageBatch(t *testing.T) {
 	if err := db.BatchCommit(); err != nil {
 		t.Fatalf("BatchCommit account v1 failed: %v", err)
 	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 
 	rawStorageKey := makeTestStorageRawKey(accountKey, 0x01)
 	want := []byte("bufferlog-via-batchcommit")
@@ -1222,8 +1245,8 @@ func TestBatchCommitWithBlockIDUsesBufferLogForStorageBatch(t *testing.T) {
 	if node == nil || node.accountOffset == 0 {
 		t.Fatalf("expected account node after BatchCommitWithBlockID, got %+v", node)
 	}
-	if node.storageFileID != 0 || node.storageOffset != 0 || node.storageSize != 0 {
-		t.Fatalf("expected account node storage pointer to remain empty before bufferlog migration, got %+v", node)
+	if !isAccountNamedSegmentedStorage(node.storageFileID) {
+		t.Fatalf("expected account node storage pointer to remain folder-managed before bufferlog migration, got %+v", node)
 	}
 
 	storageKey, err := db.normalizeStorageKey(rawStorageKey)
@@ -1259,6 +1282,7 @@ func TestBatchCommitWithBlockIDBufferLogLazyBloomAfterReopen(t *testing.T) {
 	if err := db.BatchCommit(); err != nil {
 		t.Fatalf("BatchCommit account failed: %v", err)
 	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
 		t.Fatalf("BatchPut storage failed: %v", err)
 	}
@@ -1288,7 +1312,10 @@ func TestBatchCommitWithBlockIDBufferLogLazyBloomAfterReopen(t *testing.T) {
 		t.Fatalf("unexpected reopened storage value: found=%t got=%q want=%q", found, got, want)
 	}
 	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
-		t.Fatalf("unexpected bufferlog bloom load count: got=%d want=1", got)
+		t.Fatalf("unexpected bufferlog bloom load count from physical index: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical index read should avoid rebuilding bufferlog index, got builds=%d", got)
 	}
 	if got := loadUint64Stat(&reopened.bufferLogHitCount); got != 1 {
 		t.Fatalf("unexpected reopened bufferlog hit count: got=%d want=1", got)
@@ -1312,6 +1339,7 @@ func TestBufferLogLazyBloomLoadIsPerAccount(t *testing.T) {
 	if err := db.BatchCommit(); err != nil {
 		t.Fatalf("BatchCommit account failed: %v", err)
 	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
 		t.Fatalf("BatchPut storage failed: %v", err)
 	}
@@ -1345,7 +1373,13 @@ func TestBufferLogLazyBloomLoadIsPerAccount(t *testing.T) {
 		t.Fatalf("unexpected missing storage result: found=%t got=%q", found, got)
 	}
 	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
-		t.Fatalf("unexpected bloom load count after miss: got=%d want=1", got)
+		t.Fatalf("unexpected bloom load count after miss from physical index: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogBloomRejectCount); got != 1 {
+		t.Fatalf("expected missing key to be rejected by loaded bloom, got=%d", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical-index bloom load should avoid rebuilding bufferlog index, got builds=%d", got)
 	}
 
 	got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
@@ -1356,7 +1390,72 @@ func TestBufferLogLazyBloomLoadIsPerAccount(t *testing.T) {
 		t.Fatalf("unexpected existing storage result: found=%t got=%q want=%q", found, got, want)
 	}
 	if got := loadUint64Stat(&reopened.bufferLogBloomLoadCount); got != 1 {
-		t.Fatalf("expected bloom to load once per account, got=%d", got)
+		t.Fatalf("expected bloom to load once per account from physical index, got=%d", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical index should avoid rebuilding bufferlog index, got builds=%d", got)
+	}
+}
+
+func TestBufferLogAccountFilterRejectsGlobalBloomFalsePositive(t *testing.T) {
+	baseDir := t.TempDir()
+	accountKey := makeTestAccountKey(0x7a)
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x02)
+	missingRawStorageKey := makeTestStorageRawKey(accountKey, 0x04)
+	want := []byte("bufferlog-account-filter")
+
+	db, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
+	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("BatchPut storage failed: %v", err)
+	}
+	if err := db.BatchCommitWithBlockID(40); err != nil {
+		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPrefixDB(baseDir, 256, 8, 16)
+	if err != nil {
+		t.Fatalf("reopen PrefixDB failed: %v", err)
+	}
+	defer reopened.Close()
+
+	missingStorageKey, err := reopened.normalizeStorageKey(missingRawStorageKey)
+	if err != nil {
+		t.Fatalf("normalize missing key failed: %v", err)
+	}
+	reopened.removeStorageCacheValue(accountKey, missingStorageKey)
+	reopened.bufferLogBloom.add(accountKey, missingStorageKey)
+
+	got, found, err := reopened.Get(datatypepkg.TrieNodeStorageDataType, missingRawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("missing Get failed: %v", err)
+	}
+	if found || got != nil {
+		t.Fatalf("unexpected missing storage result: found=%t got=%q", found, got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogAccountFilterLoadCount); got != 1 {
+		t.Fatalf("expected account filter to load once, got=%d", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogAccountFilterRejectCount); got != 1 {
+		t.Fatalf("expected account filter to reject global bloom false positive, got=%d", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexLookupCount); got != 0 {
+		t.Fatalf("account filter reject should avoid physical index scan, got index lookups=%d", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("account filter reject should avoid rebuilding bufferlog index, got builds=%d", got)
 	}
 }
 
@@ -1378,6 +1477,7 @@ func TestBufferLogIndexedReadAvoidsRepeatedFullScan(t *testing.T) {
 	if err := db.BatchCommit(); err != nil {
 		t.Fatalf("BatchCommit account failed: %v", err)
 	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, rawStorageKey1, value1, accountKey); err != nil {
 		t.Fatalf("BatchPut storage1 failed: %v", err)
 	}
@@ -1417,7 +1517,10 @@ func TestBufferLogIndexedReadAvoidsRepeatedFullScan(t *testing.T) {
 	}
 	readOpsAfterFirst := loadUint64Stat(&reopened.diskIOStats[diskIOUsageStorageBufferLogs].readOps)
 	if readOpsAfterFirst <= readOpsBefore {
-		t.Fatalf("expected first read to build bufferlog index")
+		t.Fatalf("expected first read to access bufferlog")
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical index should avoid first-read full index build, got builds=%d", got)
 	}
 
 	got, found, err = reopened.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey2, accountKey)
@@ -1428,8 +1531,321 @@ func TestBufferLogIndexedReadAvoidsRepeatedFullScan(t *testing.T) {
 		t.Fatalf("unexpected second value: found=%t got=%q want=%q", found, got, value2)
 	}
 	readOpsAfterSecond := loadUint64Stat(&reopened.diskIOStats[diskIOUsageStorageBufferLogs].readOps)
-	if got := readOpsAfterSecond - readOpsAfterFirst; got != 1 {
-		t.Fatalf("expected indexed second read to perform one value ReadAt, got %d readOps", got)
+	if got := readOpsAfterSecond - readOpsAfterFirst; got != 3 {
+		t.Fatalf("expected physical-index second read to validate header/key and read value, got %d bufferlog readOps", got)
+	}
+	if got := loadUint64Stat(&reopened.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical index should avoid repeated full index builds, got builds=%d", got)
+	}
+}
+
+func TestBufferLogLargePhysicalIndexPromotesToMemory(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x7f)
+	entryCount := int(bufferLogIndexPromoteMinLogBytes/512) + 128
+	kvs := make([]kvPair, 0, entryCount)
+	for i := 0; i < entryCount; i++ {
+		key := []byte{byte(i >> 8), byte(i)}
+		val := bytes.Repeat([]byte{byte(i)}, 512)
+		kvs = append(kvs, kvPair{key: key, val: val})
+	}
+	if err := db.appendBufferLogEntries(accountKey, kvs, 1); err != nil {
+		t.Fatalf("append bufferlog failed: %v", err)
+	}
+	db.removeBufferLogIndex(accountKey)
+
+	got, found, _, err := db.readBufferLogValueByIndex(accountKey, kvs[0].key)
+	if err != nil {
+		t.Fatalf("first readBufferLogValueByIndex failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, kvs[0].val) {
+		t.Fatalf("unexpected first value: found=%t gotLen=%d wantLen=%d", found, len(got), len(kvs[0].val))
+	}
+	db.bufferLogIndexMu.RLock()
+	cached := db.bufferLogIndexes[string(accountKey)]
+	db.bufferLogIndexMu.RUnlock()
+	if cached == nil {
+		t.Fatal("expected large physical index to be promoted into memory")
+	}
+	if len(cached.entries) != len(kvs) {
+		t.Fatalf("unexpected cached entry count: got=%d want=%d", len(cached.entries), len(kvs))
+	}
+
+	indexReadOpsBeforeSecond := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageBufferIndex].readOps)
+	got, found, _, err = db.readBufferLogValueByIndex(accountKey, kvs[len(kvs)-1].key)
+	if err != nil {
+		t.Fatalf("second readBufferLogValueByIndex failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, kvs[len(kvs)-1].val) {
+		t.Fatalf("unexpected second value: found=%t gotLen=%d wantLen=%d", found, len(got), len(kvs[len(kvs)-1].val))
+	}
+	indexReadOpsAfterSecond := loadUint64Stat(&db.diskIOStats[diskIOUsageStorageBufferIndex].readOps)
+	if indexReadOpsAfterSecond != indexReadOpsBeforeSecond {
+		t.Fatalf("cached read should avoid physical index reads, before=%d after=%d", indexReadOpsBeforeSecond, indexReadOpsAfterSecond)
+	}
+}
+
+func TestBufferLogPhysicalIndexReturnsLatestAppend(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x7d)
+	storageKey := []byte{0x01}
+	oldValue := []byte("bufferlog-physical-index-old")
+	newValue := []byte("bufferlog-physical-index-new")
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: storageKey, val: oldValue}}, 1); err != nil {
+		t.Fatalf("append old bufferlog failed: %v", err)
+	}
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: storageKey, val: newValue}}, 2); err != nil {
+		t.Fatalf("append new bufferlog failed: %v", err)
+	}
+	indexPath, err := db.bufferLogPhysicalIndexPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPhysicalIndexPathForAccount failed: %v", err)
+	}
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("stat physical bufferlog index failed: %v", err)
+	}
+
+	db.removeBufferLogIndex(accountKey)
+	got, found, _, err := db.readBufferLogValueByIndex(accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("readBufferLogValueByIndex failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, newValue) {
+		t.Fatalf("unexpected physical-index value: found=%t got=%q want=%q", found, got, newValue)
+	}
+	if got := loadUint64Stat(&db.bufferLogIndexBuildCount); got != 0 {
+		t.Fatalf("physical index should avoid full index build, got builds=%d", got)
+	}
+}
+
+func TestBufferLogPhysicalIndexTraversesBucketChain(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x78)
+	firstKey := []byte{0x01}
+	firstBucket := bufferLogDiskIndexKeyHash(accountKey, firstKey) & uint64(bufferLogDiskIndexMinBucketCount-1)
+	var secondKey []byte
+	for i := 2; i < 1<<16; i++ {
+		candidate := []byte{byte(i >> 8), byte(i)}
+		if bufferLogDiskIndexKeyHash(accountKey, candidate)&uint64(bufferLogDiskIndexMinBucketCount-1) == firstBucket &&
+			!bytes.Equal(candidate, firstKey) {
+			secondKey = candidate
+			break
+		}
+	}
+	if len(secondKey) == 0 {
+		t.Fatal("failed to find same-bucket test key")
+	}
+
+	firstValue := []byte("bucket-chain-first")
+	secondValue := []byte("bucket-chain-second")
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: firstKey, val: firstValue}}, 1); err != nil {
+		t.Fatalf("append first bufferlog failed: %v", err)
+	}
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: secondKey, val: secondValue}}, 2); err != nil {
+		t.Fatalf("append second bufferlog failed: %v", err)
+	}
+
+	db.removeBufferLogIndex(accountKey)
+	got, found, _, err := db.readBufferLogValueByIndex(accountKey, firstKey)
+	if err != nil {
+		t.Fatalf("read first by bucket chain failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, firstValue) {
+		t.Fatalf("unexpected first value through bucket chain: found=%t got=%q want=%q", found, got, firstValue)
+	}
+	got, found, _, err = db.readBufferLogValueByIndex(accountKey, secondKey)
+	if err != nil {
+		t.Fatalf("read second by bucket chain failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, secondValue) {
+		t.Fatalf("unexpected second value through bucket chain: found=%t got=%q want=%q", found, got, secondValue)
+	}
+}
+
+func TestBufferLogPhysicalIndexUsesBucketedFormat(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x79)
+	kvs := []kvPair{
+		{key: []byte{0x01}, val: []byte("bufferlog-compact-index-one")},
+		{key: []byte{0x02}, val: []byte("bufferlog-compact-index-two")},
+		{key: []byte{0x03}, val: []byte("bufferlog-compact-index-three")},
+	}
+	if err := db.appendBufferLogEntries(accountKey, kvs, 1); err != nil {
+		t.Fatalf("append bufferlog failed: %v", err)
+	}
+	indexPath, err := db.bufferLogPhysicalIndexPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPhysicalIndexPathForAccount failed: %v", err)
+	}
+	indexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat physical bufferlog index failed: %v", err)
+	}
+	meta, ok, err := db.readBufferLogDiskIndexMetadataFull(indexPath)
+	if err != nil {
+		t.Fatalf("readBufferLogDiskIndexMetadataFull failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected bucketed physical index metadata")
+	}
+	if meta.bucketCount != uint64(bufferLogDiskIndexMinBucketCount) {
+		t.Fatalf("unexpected bucket count: got=%d want=%d", meta.bucketCount, bufferLogDiskIndexMinBucketCount)
+	}
+	if meta.recordCount != uint64(len(kvs)) {
+		t.Fatalf("unexpected record count: got=%d want=%d", meta.recordCount, len(kvs))
+	}
+	wantSize := int64(bufferLogDiskIndexFileHeaderSize) + int64(meta.bucketCount)*int64(bufferLogDiskIndexBucketHeadSize) + int64(len(kvs))*int64(bufferLogDiskIndexRecordSize)
+	if indexInfo.Size() != wantSize {
+		t.Fatalf("unexpected bucketed index size: got=%d want=%d", indexInfo.Size(), wantSize)
+	}
+}
+
+func TestBufferLogIncompletePhysicalIndexFallsBack(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x7e)
+	storageKey := []byte{0x01}
+	oldValue := []byte("bufferlog-incomplete-index-old")
+	newValue := []byte("bufferlog-incomplete-index-new")
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: storageKey, val: oldValue}}, 1); err != nil {
+		t.Fatalf("append old bufferlog failed: %v", err)
+	}
+	indexPath, err := db.bufferLogPhysicalIndexPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPhysicalIndexPathForAccount failed: %v", err)
+	}
+	firstIndexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("stat first physical index failed: %v", err)
+	}
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: storageKey, val: newValue}}, 2); err != nil {
+		t.Fatalf("append new bufferlog failed: %v", err)
+	}
+	if err := os.Truncate(indexPath, firstIndexInfo.Size()); err != nil {
+		t.Fatalf("truncate physical index failed: %v", err)
+	}
+
+	db.removeBufferLogIndex(accountKey)
+	got, found, _, err := db.readBufferLogValueByIndex(accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("readBufferLogValueByIndex failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, newValue) {
+		t.Fatalf("fallback should read newest bufferlog value: found=%t got=%q want=%q", found, got, newValue)
+	}
+	if got := loadUint64Stat(&db.bufferLogIndexBuildCount); got == 0 {
+		t.Fatal("expected incomplete physical index to fall back to full index build")
+	}
+}
+
+func TestBufferLogIndexLRUEvictsAndRebuilds(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountA := makeTestAccountKey(0x7a)
+	accountB := makeTestAccountKey(0x7b)
+	keyA := []byte{0x01}
+	keyB := []byte{0x02}
+	valueA := []byte("bufferlog-index-lru-a")
+	valueB := []byte("bufferlog-index-lru-b")
+	if err := db.appendBufferLogEntries(accountA, []kvPair{{key: keyA, val: valueA}}, 0); err != nil {
+		t.Fatalf("append account A bufferlog failed: %v", err)
+	}
+	if err := db.appendBufferLogEntries(accountB, []kvPair{{key: keyB, val: valueB}}, 0); err != nil {
+		t.Fatalf("append account B bufferlog failed: %v", err)
+	}
+
+	db.bufferLogIndexMu.Lock()
+	if got := len(db.bufferLogIndexes); got != 2 {
+		db.bufferLogIndexMu.Unlock()
+		t.Fatalf("expected two cached bufferlog indexes, got %d", got)
+	}
+	db.enforceBufferLogIndexBudgetLocked(1, bufferLogIndexMaxEntries)
+	_, hasA := db.bufferLogIndexes[string(accountA)]
+	_, hasB := db.bufferLogIndexes[string(accountB)]
+	db.bufferLogIndexMu.Unlock()
+	if hasA || !hasB {
+		t.Fatalf("expected LRU to evict account A and keep account B, hasA=%t hasB=%t", hasA, hasB)
+	}
+
+	got, found, _, err := db.readBufferLogValueByIndex(accountA, keyA)
+	if err != nil {
+		t.Fatalf("read evicted account A bufferlog failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, valueA) {
+		t.Fatalf("unexpected rebuilt account A value: found=%t got=%q want=%q", found, got, valueA)
+	}
+}
+
+func TestBufferLogAppendAfterIndexEvictionDoesNotCachePartialIndex(t *testing.T) {
+	db, err := NewPrefixDB(t.TempDir(), 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x7c)
+	key1 := []byte{0x01}
+	key2 := []byte{0x02}
+	value1 := []byte("bufferlog-before-eviction")
+	value2 := []byte("bufferlog-after-eviction")
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: key1, val: value1}}, 0); err != nil {
+		t.Fatalf("append first bufferlog failed: %v", err)
+	}
+	db.removeBufferLogIndex(accountKey)
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: key2, val: value2}}, 0); err != nil {
+		t.Fatalf("append second bufferlog failed: %v", err)
+	}
+
+	db.bufferLogIndexMu.RLock()
+	_, cached := db.bufferLogIndexes[string(accountKey)]
+	db.bufferLogIndexMu.RUnlock()
+	if cached {
+		t.Fatal("expected append to avoid caching a partial index after eviction")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		key   []byte
+		value []byte
+	}{
+		{name: "first", key: key1, value: value1},
+		{name: "second", key: key2, value: value2},
+	} {
+		got, found, _, err := db.readBufferLogValueByIndex(accountKey, tc.key)
+		if err != nil {
+			t.Fatalf("%s readBufferLogValueByIndex failed: %v", tc.name, err)
+		}
+		if !found || !bytes.Equal(got, tc.value) {
+			t.Fatalf("%s unexpected value: found=%t got=%q want=%q", tc.name, found, got, tc.value)
+		}
 	}
 }
 
@@ -2566,6 +2982,9 @@ func TestStorageBatchCommitCacheReadSkipsCorruptedBufferLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bufferLogPathForAccount failed: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Dir(bufferLogPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll buffer log dir failed: %v", err)
+	}
 	if err := os.WriteFile(bufferLogPath, []byte{0xff, 0x00, 0x01}, 0o644); err != nil {
 		t.Fatalf("WriteFile buffer log failed: %v", err)
 	}
@@ -2599,6 +3018,7 @@ func TestBufferLogStatsTrackHitsAndMigrations(t *testing.T) {
 	if err := db.BatchCommit(); err != nil {
 		t.Fatalf("BatchCommit account failed: %v", err)
 	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 
 	rawStorageKey := makeTestStorageRawKey(accountKey, 0x03)
 	want := []byte("bufferlog-value")
@@ -2644,6 +3064,256 @@ func TestBufferLogStatsTrackHitsAndMigrations(t *testing.T) {
 	}
 }
 
+func TestBufferLogMigrationRunsOnCommitWithoutSizeThreshold(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x2c)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
+
+	rawStorageKey := makeTestStorageRawKey(accountKey, 0x04)
+	want := []byte("commit-triggered-bufferlog-migration")
+	if err := db.StorageBatchPut(rawStorageKey, want, accountKey); err != nil {
+		t.Fatalf("StorageBatchPut failed: %v", err)
+	}
+	if err := db.StorageBatchCommit(); err != nil {
+		t.Fatalf("StorageBatchCommit failed: %v", err)
+	}
+
+	bufferLogPath, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPathForAccount failed: %v", err)
+	}
+	bufferLogInfo, err := os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("stat buffer log failed: %v", err)
+	}
+	if bufferLogInfo.Size() >= 1<<20 {
+		t.Fatalf("test setup expected small bufferlog, got size=%d", bufferLogInfo.Size())
+	}
+
+	storageKey, err := db.normalizeStorageKey(rawStorageKey)
+	if err != nil {
+		t.Fatalf("normalizeStorageKey failed: %v", err)
+	}
+	db.removeStorageCacheValue(accountKey, storageKey)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, rawStorageKey, accountKey)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected bufferlog value: found=%t got=%q want=%q", found, got, want)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigrationCount); got != 0 {
+		t.Fatalf("expected read to avoid immediate migration, got migration count=%d", got)
+	}
+
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("empty BatchCommit failed: %v", err)
+	}
+	db.bufferLogMigrationWaitGroup.Wait()
+
+	if got := loadUint64Stat(&db.bufferLogMigrationCount); got != 1 {
+		t.Fatalf("unexpected bufferlog migration count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigratedKVCount); got != 1 {
+		t.Fatalf("unexpected migrated kv count: got=%d want=1", got)
+	}
+	db.removeStorageCacheValue(accountKey, storageKey)
+	got, ok, failure, err := db.readAccountStorageValueWithTracker(accountKey, storageKey, &cacheMissCostTracker{})
+	if err != nil {
+		t.Fatalf("readAccountStorageValueWithTracker failed: failure=%+v err=%v", failure, err)
+	}
+	if !ok || !bytes.Equal(got, want) {
+		t.Fatalf("unexpected migrated storage value: ok=%t got=%q want=%q", ok, got, want)
+	}
+}
+
+func TestBufferLogMigrationReadsOnlyAccessedKVs(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	accountKey := makeTestAccountKey(0x4e)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
+
+	const coldCount = 25000
+	coldValue := bytes.Repeat([]byte("c"), 32)
+	kvs := make([]kvPair, 0, coldCount+1)
+	for i := 0; i < coldCount; i++ {
+		key := make([]byte, 32)
+		key[0] = 0xc0
+		binary.BigEndian.PutUint64(key[24:], uint64(i))
+		kvs = append(kvs, kvPair{key: key, val: coldValue})
+	}
+	hotKey := make([]byte, 32)
+	hotKey[0] = 0xf0
+	binary.BigEndian.PutUint64(hotKey[24:], uint64(coldCount+1))
+	hotValue := []byte("hot-bufferlog-value")
+	kvs = append(kvs, kvPair{key: hotKey, val: hotValue})
+
+	if err := db.appendBufferLogEntries(accountKey, kvs, 1); err != nil {
+		t.Fatalf("appendBufferLogEntries failed: %v", err)
+	}
+	bufferLogPath, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPathForAccount failed: %v", err)
+	}
+	bufferLogBefore, err := os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("stat buffer log before migration failed: %v", err)
+	}
+	if bufferLogBefore.Size() <= 1<<20 {
+		t.Fatalf("test setup expected large bufferlog, got size=%d", bufferLogBefore.Size())
+	}
+
+	got, found, err := db.readBufferLogValue(accountKey, hotKey)
+	if err != nil {
+		t.Fatalf("readBufferLogValue hot failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, hotValue) {
+		t.Fatalf("unexpected hot bufferlog value before migration: found=%t got=%q want=%q", found, got, hotValue)
+	}
+	readBytesBefore := loadUint64Stat(&db.bufferLogMigrationReadBytes)
+	diskReadBytesBefore := loadUint64Stat(&db.bufferLogMigrationDiskReadBytes)
+	if err := db.migrateBufferLogForAccount(accountKey, nil); err != nil {
+		t.Fatalf("migrateBufferLogForAccount failed: %v", err)
+	}
+	readBytesAfter := loadUint64Stat(&db.bufferLogMigrationReadBytes)
+	diskReadBytesAfter := loadUint64Stat(&db.bufferLogMigrationDiskReadBytes)
+	readDelta := readBytesAfter - readBytesBefore
+	if readDelta != 0 {
+		t.Fatalf("expected migration to use in-memory accessed kv without reading bufferlog, got readBytes=%d bufferlogSize=%d", readDelta, bufferLogBefore.Size())
+	}
+	if diskReadDelta := diskReadBytesAfter - diskReadBytesBefore; diskReadDelta != 0 {
+		t.Fatalf("expected migration to avoid index/bufferlog disk reads, got diskReadBytes=%d", diskReadDelta)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigrationCount); got != 1 {
+		t.Fatalf("unexpected bufferlog migration count: got=%d want=1", got)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigratedKVCount); got != 1 {
+		t.Fatalf("unexpected migrated kv count: got=%d want=1", got)
+	}
+
+	db.removeStorageCacheValue(accountKey, hotKey)
+	got, ok, failure, err := db.readAccountStorageValueWithTracker(accountKey, hotKey, &cacheMissCostTracker{})
+	if err != nil {
+		t.Fatalf("readAccountStorageValueWithTracker failed: failure=%+v err=%v", failure, err)
+	}
+	if !ok || !bytes.Equal(got, hotValue) {
+		t.Fatalf("unexpected migrated hot value: ok=%t got=%q want=%q", ok, got, hotValue)
+	}
+	coldKey := kvs[0].key
+	got, found, _, err = db.readBufferLogValueByIndex(accountKey, coldKey)
+	if err != nil {
+		t.Fatalf("readBufferLogValueByIndex cold failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, coldValue) {
+		t.Fatalf("expected cold value to remain in bufferlog: found=%t gotLen=%d wantLen=%d", found, len(got), len(coldValue))
+	}
+}
+
+func TestBufferLogAccessedPendingSkipsSmallAccountsAndDuplicateCopies(t *testing.T) {
+	baseDir := t.TempDir()
+	db, err := NewPrefixDB(baseDir, 128, 8, 16)
+	if err != nil {
+		t.Fatalf("NewPrefixDB failed: %v", err)
+	}
+	defer db.Close()
+
+	smallAccountKey := makeTestAccountKey(0x52)
+	smallStorageKey := bytes.Repeat([]byte{0x21}, 32)
+	smallValue := []byte("small-account-bufferlog-value")
+	if err := db.appendBufferLogEntries(smallAccountKey, []kvPair{{key: smallStorageKey, val: smallValue}}, 1); err != nil {
+		t.Fatalf("appendBufferLogEntries small account failed: %v", err)
+	}
+	got, found, err := db.readBufferLogValue(smallAccountKey, smallStorageKey)
+	if err != nil {
+		t.Fatalf("readBufferLogValue small account failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, smallValue) {
+		t.Fatalf("unexpected small account bufferlog value: found=%t got=%q want=%q", found, got, smallValue)
+	}
+	if accessed := db.snapshotBufferLogAccessed(smallAccountKey); len(accessed) != 0 {
+		t.Fatalf("small account should not create migration pending entries, got=%d", len(accessed))
+	}
+	if err := db.migrateBufferLogForAccount(smallAccountKey, []kvPair{{key: smallStorageKey, val: smallValue}}); err != nil {
+		t.Fatalf("migrateBufferLogForAccount small account failed: %v", err)
+	}
+	if got := loadUint64Stat(&db.bufferLogMigrationCount); got != 0 {
+		t.Fatalf("small account should not migrate bufferlog entries, got migration count=%d", got)
+	}
+
+	accountKey := makeTestAccountKey(0x53)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
+		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("BatchCommit account failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
+
+	storageKey := bytes.Repeat([]byte{0x33}, 32)
+	value := bytes.Repeat([]byte("v"), 128)
+	if err := db.appendBufferLogEntries(accountKey, []kvPair{{key: storageKey, val: value}}, 2); err != nil {
+		t.Fatalf("appendBufferLogEntries folder account failed: %v", err)
+	}
+	got, found, err = db.readBufferLogValue(accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("first readBufferLogValue folder account failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, value) {
+		t.Fatalf("unexpected first folder account bufferlog value: found=%t gotLen=%d wantLen=%d", found, len(got), len(value))
+	}
+	account := string(accountKey)
+	key := string(storageKey)
+	db.bufferLogMu.Lock()
+	pending := db.bufferLogAccessed[account][key]
+	if len(pending.val) == 0 {
+		db.bufferLogMu.Unlock()
+		t.Fatal("expected folder account read to create pending migration value")
+	}
+	pending.val[0] = 'X'
+	db.bufferLogMu.Unlock()
+
+	got, found, err = db.readBufferLogValue(accountKey, storageKey)
+	if err != nil {
+		t.Fatalf("second readBufferLogValue folder account failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, value) {
+		t.Fatalf("unexpected second folder account bufferlog value: found=%t gotLen=%d wantLen=%d", found, len(got), len(value))
+	}
+	db.bufferLogMu.Lock()
+	pending = db.bufferLogAccessed[account][key]
+	gotPending := byte(0)
+	if len(pending.val) > 0 {
+		gotPending = pending.val[0]
+	}
+	db.bufferLogMu.Unlock()
+	if gotPending != 'X' {
+		t.Fatalf("duplicate read replaced pending value copy, got first byte=%q", gotPending)
+	}
+}
+
 func TestBufferLogMigrationPreservesExistingAndMultiAppendEntries(t *testing.T) {
 	baseDir := t.TempDir()
 	db, err := NewPrefixDB(baseDir, 128, 8, 16)
@@ -2656,6 +3326,10 @@ func TestBufferLogMigrationPreservesExistingAndMultiAppendEntries(t *testing.T) 
 	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account"), nil); err != nil {
 		t.Fatalf("BatchPut account failed: %v", err)
 	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("account BatchCommit failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
 	existingRawKey := makeTestStorageRawKey(accountKey, 0x01)
 	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, existingRawKey, []byte("existing-value"), accountKey); err != nil {
 		t.Fatalf("BatchPut existing storage failed: %v", err)
@@ -2678,8 +3352,52 @@ func TestBufferLogMigrationPreservesExistingAndMultiAppendEntries(t *testing.T) 
 	if err := db.BatchCommitWithBlockID(2); err != nil {
 		t.Fatalf("BatchCommitWithBlockID second failed: %v", err)
 	}
+
+	firstStorageKey, err := db.normalizeStorageKey(firstRawKey)
+	if err != nil {
+		t.Fatalf("first normalizeStorageKey failed: %v", err)
+	}
+	db.removeStorageCacheValue(accountKey, firstStorageKey)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, firstRawKey, accountKey)
+	if err != nil {
+		t.Fatalf("first pre-migration Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, []byte("buffer-first")) {
+		t.Fatalf("first pre-migration unexpected value: found=%t got=%q", found, got)
+	}
+
+	bufferLogPath, err := db.bufferLogPathForAccount(accountKey)
+	if err != nil {
+		t.Fatalf("bufferLogPathForAccount failed: %v", err)
+	}
+	bufferLogBefore, err := os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("stat buffer log before migration failed: %v", err)
+	}
+
+	secondStorageKey, err := db.normalizeStorageKey(secondRawKey)
+	if err != nil {
+		t.Fatalf("second normalizeStorageKey failed: %v", err)
+	}
 	if err := db.migrateBufferLogForAccount(accountKey, nil); err != nil {
 		t.Fatalf("migrateBufferLogForAccount failed: %v", err)
+	}
+	bufferLogAfter, err := os.Stat(bufferLogPath)
+	if err != nil {
+		t.Fatalf("stat buffer log after migration failed: %v", err)
+	}
+	if bufferLogAfter.Size() != bufferLogBefore.Size() {
+		t.Fatalf("expected migration to leave bufferlog size unchanged, before=%d after=%d", bufferLogBefore.Size(), bufferLogAfter.Size())
+	}
+	if got, found, _, err := db.readBufferLogValueByIndex(accountKey, firstStorageKey); err != nil {
+		t.Fatalf("first readBufferLogValueByIndex failed: %v", err)
+	} else if !found || !bytes.Equal(got, []byte("buffer-first")) {
+		t.Fatalf("expected migrated first value to remain readable from bufferlog: found=%t got=%q", found, got)
+	}
+	if got, found, _, err := db.readBufferLogValueByIndex(accountKey, secondStorageKey); err != nil {
+		t.Fatalf("second readBufferLogValueByIndex failed: %v", err)
+	} else if !found || !bytes.Equal(got, []byte("buffer-second")) {
+		t.Fatalf("expected unaccessed second value to remain in bufferlog: found=%t got=%q", found, got)
 	}
 
 	cases := []struct {
@@ -2707,6 +3425,9 @@ func TestBufferLogMigrationPreservesExistingAndMultiAppendEntries(t *testing.T) 
 	}
 	if got := loadUint64Stat(&db.bufferLogMigrationCount); got == 0 {
 		t.Fatal("expected at least one bufferlog migration")
+	}
+	if got := loadUint64Stat(&db.bufferLogMigratedKVCount); got != 1 {
+		t.Fatalf("unexpected migrated kv count: got=%d want=1", got)
 	}
 }
 
@@ -2745,6 +3466,19 @@ func TestBufferLogMigrationAppendsToExistingSegmentedStorage(t *testing.T) {
 	}
 	if err := db.BatchCommitWithBlockID(3); err != nil {
 		t.Fatalf("BatchCommitWithBlockID failed: %v", err)
+	}
+
+	bufferStorageKey, err := db.normalizeStorageKey(bufferRawKey)
+	if err != nil {
+		t.Fatalf("buffer normalizeStorageKey failed: %v", err)
+	}
+	db.removeStorageCacheValue(accountKey, bufferStorageKey)
+	got, found, err := db.Get(datatypepkg.TrieNodeStorageDataType, bufferRawKey, accountKey)
+	if err != nil {
+		t.Fatalf("buffer pre-migration Get failed: %v", err)
+	}
+	if !found || !bytes.Equal(got, bufferValue) {
+		t.Fatalf("buffer pre-migration unexpected value: found=%t got=%q", found, got)
 	}
 
 	separatedReadOpsBefore := atomic.LoadUint64(&db.diskIOStats[diskIOUsageStorageSeparatedLogs].readOps)
@@ -3357,6 +4091,13 @@ func TestTrimLogsAfterCommitTagRemovesTrailingStateData(t *testing.T) {
 	storageKey := append(append([]byte{'O'}, accountHash...), 0x01)
 	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-10"), nil); err != nil {
 		t.Fatalf("BatchPut account failed: %v", err)
+	}
+	if err := db.BatchCommit(); err != nil {
+		t.Fatalf("initial account BatchCommit failed: %v", err)
+	}
+	makeAccountStorageFolderManagedForTest(t, db, accountKey)
+	if err := db.BatchPut(datatypepkg.TrieNodeAccountDataType, accountKey, []byte("account-10"), nil); err != nil {
+		t.Fatalf("BatchPut account block 10 failed: %v", err)
 	}
 	if err := db.BatchPut(datatypepkg.TrieNodeStorageDataType, storageKey, []byte("storage-10"), accountKey); err != nil {
 		t.Fatalf("BatchPut storage failed: %v", err)

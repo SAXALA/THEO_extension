@@ -172,6 +172,11 @@ func (db *PrefixDB) StorageBatchPut(key, value, accountKey []byte) error {
 
 // StorageBatchCommit persists all staged storage kvs and waits for storage GC completion.
 func (db *PrefixDB) StorageBatchCommit() (err error) {
+	defer func() {
+		if err == nil {
+			db.scheduleAccessedBufferLogMigrations()
+		}
+	}()
 	if db.storageBatch == nil {
 		return nil
 	}
@@ -199,10 +204,52 @@ func (db *PrefixDB) StorageBatchCommit() (err error) {
 		if err := db.resolveUnresolvedStorageBatch(batch, unresolved); err != nil {
 			return err
 		}
-		return db.appendStorageBatchToBufferLogs(batch, 0)
+		bufferLogBatch, directBatch := db.splitStorageBatchByBufferLogEligibility(batch)
+		if err := db.appendStorageBatchToBufferLogs(bufferLogBatch, 0); err != nil {
+			return err
+		}
+		plans, err := db.prepareStorageCommitPlans(directBatch, nil, nil, 0)
+		if err != nil {
+			return err
+		}
+		if err := db.appendPreparedInlineStorageSegments(plans); err != nil {
+			return err
+		}
+		if err := db.applyStorageCommitPlans(plans, nil, false); err != nil {
+			return err
+		}
+		for _, plan := range plans {
+			db.syncStorageCacheEntries([]byte(plan.accountKey), plan.cacheEntries)
+		}
+		return nil
 	}()
 	db.writeMutex.Unlock()
 	return err
+}
+
+func (db *PrefixDB) splitStorageBatchByBufferLogEligibility(batch map[string]map[string][]byte) (map[string]map[string][]byte, map[string]map[string][]byte) {
+	if len(batch) == 0 {
+		return nil, nil
+	}
+	var bufferLogBatch map[string]map[string][]byte
+	var directBatch map[string]map[string][]byte
+	for accountKey, perAccount := range batch {
+		if len(perAccount) == 0 {
+			continue
+		}
+		if db.isAccountStorageFolderManaged([]byte(accountKey)) {
+			if bufferLogBatch == nil {
+				bufferLogBatch = make(map[string]map[string][]byte)
+			}
+			bufferLogBatch[accountKey] = perAccount
+			continue
+		}
+		if directBatch == nil {
+			directBatch = make(map[string]map[string][]byte)
+		}
+		directBatch[accountKey] = perAccount
+	}
+	return bufferLogBatch, directBatch
 }
 
 func (db *PrefixDB) appendStorageBatchToBufferLogs(batch map[string]map[string][]byte, blockID uint64) error {
@@ -263,10 +310,17 @@ func (db *PrefixDB) prepareAccountCommit(accountOps map[string]WriteOperation) (
 }
 
 func (db *PrefixDB) preserveAccountStoragePointers(accountOps map[string]WriteOperation) error {
+	return db.preserveAccountStoragePointersExcept(accountOps, nil)
+}
+
+func (db *PrefixDB) preserveAccountStoragePointersExcept(accountOps map[string]WriteOperation, skipAccounts map[string]struct{}) error {
 	if len(accountOps) == 0 {
 		return nil
 	}
 	for key, op := range accountOps {
+		if _, skip := skipAccounts[key]; skip {
+			continue
+		}
 		if op.value == nil {
 			continue
 		}
